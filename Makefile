@@ -17,6 +17,9 @@ module:
 daemon: mattx_discd.c
 	gcc $(CFLAGS_USER) -o mattx-discd mattx_discd.c $(LDFLAGS_USER)
 
+stub: mattx_stub.c
+	gcc -Wall -O2 $(shell pkg-config --cflags libnl-3.0 libnl-genl-3.0) -o mattx-stub mattx_stub.c $(shell pkg-config --libs libnl-3.0 libnl-genl-3.0)
+
 clean:
 	$(MAKE) -C $(KDIR) M=$(PWD) clean
 	rm -f mattx-discd
