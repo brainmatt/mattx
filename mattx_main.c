@@ -45,19 +45,36 @@ static int mattx_nl_cmd_node_leave(struct sk_buff *skb, struct genl_info *info) 
 }
 
 static int mattx_nl_cmd_get_blueprint(struct sk_buff *skb, struct genl_info *info) {
+    struct sk_buff *reply_skb;
     void *msg_head;
     int len;
 
     if (!pending_migration) return -ENOENT;
 
+    // Calculate the exact size of the payload
     len = sizeof(struct mattx_migration_req) + (pending_migration->vma_count * sizeof(struct mattx_vma_info));
     
-    // FIXED: Using info->snd_portid and info->snd_seq so libnl accepts the reply
-    msg_head = genlmsg_put(skb, info->snd_portid, info->snd_seq, &mattx_genl_family, 0, MATTX_CMD_GET_BLUEPRINT);
-    if (!msg_head) return -ENOMEM;
+    // 1. Allocate a new socket buffer for the reply
+    reply_skb = nlmsg_new(nla_total_size(len), GFP_KERNEL);
+    if (!reply_skb) return -ENOMEM;
 
-    nla_put(msg_head, MATTX_ATTR_BLUEPRINT, len, pending_migration);
-    return 0; 
+    // 2. Prepare the Generic Netlink reply header
+    msg_head = genlmsg_put_reply(reply_skb, info, &mattx_genl_family, 0, MATTX_CMD_GET_BLUEPRINT);
+    if (!msg_head) {
+        nlmsg_free(reply_skb);
+        return -ENOMEM;
+    }
+
+    // 3. Attach the blueprint data as an attribute
+    if (nla_put(reply_skb, MATTX_ATTR_BLUEPRINT, len, pending_migration)) {
+        genlmsg_cancel(reply_skb, msg_head);
+        nlmsg_free(reply_skb);
+        return -EMSGSIZE;
+    }
+
+    // 4. Finalize and send the reply back to the stub
+    genlmsg_end(reply_skb, msg_head);
+    return genlmsg_reply(reply_skb, info);
 }
 
 static int mattx_nl_cmd_hijack_me(struct sk_buff *skb, struct genl_info *info) {

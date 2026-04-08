@@ -54,17 +54,27 @@ static int blueprint_cb(struct nl_msg *msg, void *arg) {
     struct nlattr *attrs[MATTX_ATTR_MAX + 1];
     struct nla_policy policy[MATTX_ATTR_MAX + 1];
     
+    printf("MattX-Stub: [CALLBACK] Received a Netlink message from kernel!\n");
+
     memset(policy, 0, sizeof(policy));
     policy[MATTX_ATTR_BLUEPRINT].type = NLA_BINARY;
 
-    if (genlmsg_parse(nlh, 0, attrs, MATTX_ATTR_MAX, policy) < 0) return NL_SKIP;
+    if (genlmsg_parse(nlh, 0, attrs, MATTX_ATTR_MAX, policy) < 0) {
+        printf("MattX-Stub: [CALLBACK] ERROR: Failed to parse message attributes.\n");
+        return NL_SKIP;
+    }
 
     if (attrs[MATTX_ATTR_BLUEPRINT]) {
+        printf("MattX-Stub: [CALLBACK] SUCCESS: Blueprint attribute found!\n");
         struct mattx_migration_req *req = nla_data(attrs[MATTX_ATTR_BLUEPRINT]);
         int len = nla_len(attrs[MATTX_ATTR_BLUEPRINT]);
         
         received_req = malloc(len);
-        if (received_req) memcpy(received_req, req, len);
+        if (received_req) {
+            memcpy(received_req, req, len);
+        }
+    } else {
+        printf("MattX-Stub: [CALLBACK] ERROR: Blueprint attribute is missing!\n");
     }
     return NL_OK;
 }
