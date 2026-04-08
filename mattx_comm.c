@@ -23,9 +23,8 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
                 pending_source_node = hdr->sender_id;
 
                 printk(KERN_INFO "MattX: [INCOMING] Received Blueprint for PID %u. Saving to pending...\n", req->orig_pid);
-                if (pending_migration) kvfree(pending_migration); // FIXED: Use kvfree
+                if (pending_migration) kvfree(pending_migration);
                 
-                // FIXED: Use kvmalloc for the potentially large blueprint
                 pending_migration = kvmalloc(hdr->length, GFP_KERNEL);
                 if (pending_migration) {
                     memcpy(pending_migration, req, hdr->length);
@@ -61,6 +60,7 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
             // TODO Phase 7.4: Overwrite RIP/RSP and wake up!
             break;
         default:
+            printk(KERN_WARNING "MattX: [COMM] Unknown message type: %u\n", hdr->type);
             break;
     }
 }
@@ -76,32 +76,63 @@ static int mattx_receiver_loop(void *data) {
     while (!kthread_should_stop()) {
         iov[0].iov_base = &hdr;
         iov[0].iov_len = sizeof(struct mattx_header);
+        
+        // 1. Read the header
         len = kernel_recvmsg(link->sock, &msg, iov, 1, sizeof(struct mattx_header), 0);
         if (len <= 0) break; 
 
+        // 2. Validate the Magic Number!
+        if (hdr.magic != MATTX_MAGIC) {
+            printk(KERN_ERR "MattX: [COMM] FATAL: Stream out of sync! Invalid magic: 0x%x\n", hdr.magic);
+            // In a production system, we would close the socket and reconnect here.
+            // For now, we break the loop to prevent a kernel panic.
+            break;
+        }
+
+        // 3. Validate the payload size!
+        if (hdr.length > MATTX_MAX_PAYLOAD) {
+            printk(KERN_ERR "MattX: [COMM] FATAL: Payload too large (%u bytes). Max is %u.\n", hdr.length, MATTX_MAX_PAYLOAD);
+            break;
+        }
+
+        // 4. Read the payload safely
         if (hdr.length > 0) {
-            // FIXED: Use kvmalloc instead of kmalloc to prevent the __alloc_pages_noprof warning!
             payload = kvmalloc(hdr.length, GFP_KERNEL);
             if (payload) {
                 iov[0].iov_base = payload;
                 iov[0].iov_len = hdr.length;
-                kernel_recvmsg(link->sock, &msg, iov, 1, hdr.length, 0);
+                
+                // We must use MSG_WAITALL to ensure we read the exact amount of data
+                // otherwise the next header read will be out of sync!
+                kernel_recvmsg(link->sock, &msg, iov, 1, hdr.length, MSG_WAITALL);
+            } else {
+                printk(KERN_ERR "MattX: [COMM] Failed to allocate %u bytes for payload\n", hdr.length);
+                break;
             }
         }
+        
         mattx_handle_message(link, &hdr, payload);
         if (payload) { 
-            kvfree(payload); // FIXED: Use kvfree
+            kvfree(payload); 
             payload = NULL; 
         }
     }
+    
+    printk(KERN_INFO "MattX: [COMM] Receiver thread exiting for Node %d\n", link->node_id);
     return 0;
 }
 
 int mattx_comm_send(struct mattx_link *link, u32 type, void *data, u32 len) {
     struct msghdr msg = {0};
     struct kvec iov[2];
-    struct mattx_header hdr = { .type = type, .length = len, .sender_id = link->node_id };
+    struct mattx_header hdr;
     int err;
+
+    // ALWAYS set the magic number
+    hdr.magic = MATTX_MAGIC;
+    hdr.type = type;
+    hdr.length = len;
+    hdr.sender_id = link->node_id;
 
     iov[0].iov_base = &hdr;
     iov[0].iov_len = sizeof(hdr);
