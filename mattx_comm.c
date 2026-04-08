@@ -57,7 +57,41 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
             break;
         case MATTX_MSG_MIGRATE_DONE:
             printk(KERN_INFO "MattX: [INCOMING] All memory transferred successfully!\n");
-            // TODO Phase 7.4: Overwrite RIP/RSP and wake up!
+            
+            // --- PHASE 7.4: THE AWAKENING ---
+            if (hijacked_stub_task && pending_migration) {
+                struct pt_regs *regs;
+
+                printk(KERN_INFO "MattX:[AWAKEN] Commencing brain transplant on PID %d...\n", hijacked_stub_task->pid);
+
+                // 1. Access the CPU registers of the sleeping stub
+                regs = task_pt_regs(hijacked_stub_task);
+                if (regs) {
+                    printk(KERN_INFO "MattX: [AWAKEN] Old RIP: 0x%lx, Old RSP: 0x%lx\n", regs->ip, regs->sp);
+                    
+                    // 2. Overwrite the Instruction Pointer and Stack Pointer
+                    regs->ip = pending_migration->rip;
+                    regs->sp = pending_migration->rsp;
+                    
+                    // 3. Hack for pause(): set RAX to 0 to simulate a clean syscall return
+                    regs->ax = 0; 
+                    
+                    printk(KERN_INFO "MattX: [AWAKEN] New RIP: 0x%lx, New RSP: 0x%lx\n", regs->ip, regs->sp);
+
+                    // 4. The Defibrillator: Wake up the monster!
+                    printk(KERN_INFO "MattX:[AWAKEN] IT'S ALIVE! Sending SIGCONT to PID %d\n", hijacked_stub_task->pid);
+                    send_sig(SIGCONT, hijacked_stub_task, 0);
+                } else {
+                    printk(KERN_ERR "MattX: [AWAKEN] FAILED to access pt_regs!\n");
+                }
+
+                // 5. Cleanup the operating room
+                put_task_struct(hijacked_stub_task);
+                hijacked_stub_task = NULL;
+                kvfree(pending_migration);
+                pending_migration = NULL;
+                pending_source_node = -1;
+            }
             break;
         default:
             printk(KERN_WARNING "MattX: [COMM] Unknown message type: %u\n", hdr->type);
@@ -77,33 +111,24 @@ static int mattx_receiver_loop(void *data) {
         iov[0].iov_base = &hdr;
         iov[0].iov_len = sizeof(struct mattx_header);
         
-        // 1. Read the header
         len = kernel_recvmsg(link->sock, &msg, iov, 1, sizeof(struct mattx_header), 0);
         if (len <= 0) break; 
 
-        // 2. Validate the Magic Number!
         if (hdr.magic != MATTX_MAGIC) {
             printk(KERN_ERR "MattX: [COMM] FATAL: Stream out of sync! Invalid magic: 0x%x\n", hdr.magic);
-            // In a production system, we would close the socket and reconnect here.
-            // For now, we break the loop to prevent a kernel panic.
             break;
         }
 
-        // 3. Validate the payload size!
         if (hdr.length > MATTX_MAX_PAYLOAD) {
             printk(KERN_ERR "MattX: [COMM] FATAL: Payload too large (%u bytes). Max is %u.\n", hdr.length, MATTX_MAX_PAYLOAD);
             break;
         }
 
-        // 4. Read the payload safely
         if (hdr.length > 0) {
             payload = kvmalloc(hdr.length, GFP_KERNEL);
             if (payload) {
                 iov[0].iov_base = payload;
                 iov[0].iov_len = hdr.length;
-                
-                // We must use MSG_WAITALL to ensure we read the exact amount of data
-                // otherwise the next header read will be out of sync!
                 kernel_recvmsg(link->sock, &msg, iov, 1, hdr.length, MSG_WAITALL);
             } else {
                 printk(KERN_ERR "MattX: [COMM] Failed to allocate %u bytes for payload\n", hdr.length);
@@ -128,7 +153,6 @@ int mattx_comm_send(struct mattx_link *link, u32 type, void *data, u32 len) {
     struct mattx_header hdr;
     int err;
 
-    // ALWAYS set the magic number
     hdr.magic = MATTX_MAGIC;
     hdr.type = type;
     hdr.length = len;
