@@ -20,12 +20,16 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
                 char *argv[] = { "/usr/local/bin/mattx-stub", NULL };
                 char *envp[] = { "HOME=/", "PATH=/sbin:/bin:/usr/sbin:/usr/bin", NULL };
                 
-                // Save the source node so we know who to reply to
                 pending_source_node = hdr->sender_id;
 
                 printk(KERN_INFO "MattX: [INCOMING] Received Blueprint for PID %u. Saving to pending...\n", req->orig_pid);
-                if (pending_migration) kfree(pending_migration);
-                pending_migration = kmemdup(req, hdr->length, GFP_KERNEL);
+                if (pending_migration) kvfree(pending_migration); // FIXED: Use kvfree
+                
+                // FIXED: Use kvmalloc for the potentially large blueprint
+                pending_migration = kvmalloc(hdr->length, GFP_KERNEL);
+                if (pending_migration) {
+                    memcpy(pending_migration, req, hdr->length);
+                }
 
                 if (call_usermodehelper(argv[0], argv, envp, UMH_NO_WAIT) != 0) {
                     printk(KERN_ERR "MattX: [INCOMING] Failed to spawn surrogate!\n");
@@ -33,20 +37,16 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
             }
             break;
         case MATTX_MSG_READY_FOR_DATA:
-            // Node 1 receives this from Node 2
             printk(KERN_INFO "MattX:[COMM] Received READY signal from Node %u. Starting data pump...\n", hdr->sender_id);
             mattx_send_vma_data();
             break;
         case MATTX_MSG_PAGE_TRANSFER:
-            // Node 2 receives this from Node 1
             if (payload && pending_migration && hijacked_stub_task) {
                 struct mattx_page_header *ph = (struct mattx_page_header *)payload;
                 void *data = (char *)payload + sizeof(struct mattx_page_header);
                 unsigned long target_addr = pending_migration->vmas[ph->vma_index].vm_start + ph->offset;
                 int res;
 
-                // --- THE MAGIC INJECTION ---
-                // FOLL_WRITE | FOLL_FORCE allows us to write to the stub's memory safely
                 res = access_process_vm(hijacked_stub_task, target_addr, data, ph->length, FOLL_WRITE | FOLL_FORCE);
                 
                 if (res != ph->length) {
@@ -80,7 +80,8 @@ static int mattx_receiver_loop(void *data) {
         if (len <= 0) break; 
 
         if (hdr.length > 0) {
-            payload = kmalloc(hdr.length, GFP_KERNEL);
+            // FIXED: Use kvmalloc instead of kmalloc to prevent the __alloc_pages_noprof warning!
+            payload = kvmalloc(hdr.length, GFP_KERNEL);
             if (payload) {
                 iov[0].iov_base = payload;
                 iov[0].iov_len = hdr.length;
@@ -88,7 +89,10 @@ static int mattx_receiver_loop(void *data) {
             }
         }
         mattx_handle_message(link, &hdr, payload);
-        if (payload) { kfree(payload); payload = NULL; }
+        if (payload) { 
+            kvfree(payload); // FIXED: Use kvfree
+            payload = NULL; 
+        }
     }
     return 0;
 }

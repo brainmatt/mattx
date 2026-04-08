@@ -129,7 +129,7 @@ static void __exit mattx_exit(void) {
     if (balancer_thread) kthread_stop(balancer_thread);
     if (listener_thread) kthread_stop(listener_thread);
     for (i = 0; i < MAX_NODES; i++) mattx_comm_disconnect(i);
-    if (pending_migration) kfree(pending_migration);
+    if (pending_migration) kvfree(pending_migration); // FIXED
     if (hijacked_stub_task) put_task_struct(hijacked_stub_task);
     genl_unregister_family(&mattx_genl_family);
 }
