@@ -20,6 +20,9 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
                 char *argv[] = { "/usr/local/bin/mattx-stub", NULL };
                 char *envp[] = { "HOME=/", "PATH=/sbin:/bin:/usr/sbin:/usr/bin", NULL };
                 
+                // Save the source node so we know who to reply to
+                pending_source_node = hdr->sender_id;
+
                 printk(KERN_INFO "MattX: [INCOMING] Received Blueprint for PID %u. Saving to pending...\n", req->orig_pid);
                 if (pending_migration) kfree(pending_migration);
                 pending_migration = kmemdup(req, hdr->length, GFP_KERNEL);
@@ -29,13 +32,33 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
                 }
             }
             break;
+        case MATTX_MSG_READY_FOR_DATA:
+            // Node 1 receives this from Node 2
+            printk(KERN_INFO "MattX:[COMM] Received READY signal from Node %u. Starting data pump...\n", hdr->sender_id);
+            mattx_send_vma_data();
+            break;
         case MATTX_MSG_PAGE_TRANSFER:
-            if (payload) {
+            // Node 2 receives this from Node 1
+            if (payload && pending_migration && hijacked_stub_task) {
                 struct mattx_page_header *ph = (struct mattx_page_header *)payload;
-                if (ph->offset % (PAGE_SIZE * 100) == 0) {
-                    printk(KERN_INFO "MattX: [INCOMING] Page data for VMA %u at offset %u\n", ph->vma_index, ph->offset);
+                void *data = (char *)payload + sizeof(struct mattx_page_header);
+                unsigned long target_addr = pending_migration->vmas[ph->vma_index].vm_start + ph->offset;
+                int res;
+
+                // --- THE MAGIC INJECTION ---
+                // FOLL_WRITE | FOLL_FORCE allows us to write to the stub's memory safely
+                res = access_process_vm(hijacked_stub_task, target_addr, data, ph->length, FOLL_WRITE | FOLL_FORCE);
+                
+                if (res != ph->length) {
+                    printk(KERN_ERR "MattX: [INJECT] Failed to inject %u bytes at 0x%lx (res: %d)\n", ph->length, target_addr, res);
+                } else if (ph->offset % (PAGE_SIZE * 100) == 0) {
+                    printk(KERN_INFO "MattX: [INJECT] Successfully injected page at 0x%lx\n", target_addr);
                 }
             }
+            break;
+        case MATTX_MSG_MIGRATE_DONE:
+            printk(KERN_INFO "MattX: [INCOMING] All memory transferred successfully!\n");
+            // TODO Phase 7.4: Overwrite RIP/RSP and wake up!
             break;
         default:
             break;

@@ -4,22 +4,23 @@ MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Matthias Rechenburg & AI Copilot");
 MODULE_DESCRIPTION("MattX SSI - Core Module");
 
-// Global State Definitions
 struct mattx_load_info cluster_load_table[MAX_NODES];
 struct mattx_link *cluster_map[MAX_NODES];
 struct mattx_migration_req *pending_migration = NULL;
 
+// NEW: Global state for the receiver
+int pending_source_node = -1;
+struct task_struct *hijacked_stub_task = NULL;
+
 static struct task_struct *balancer_thread;
 static struct task_struct *listener_thread;
 
-// --- Netlink Interface ---
 enum { MATTX_ATTR_UNSPEC, MATTX_ATTR_NODE_ID, MATTX_ATTR_IPV4_ADDR, MATTX_ATTR_STUB_PID, MATTX_ATTR_BLUEPRINT, __MATTX_ATTR_MAX };
 #define MATTX_ATTR_MAX (__MATTX_ATTR_MAX - 1)
 enum { MATTX_CMD_UNSPEC, MATTX_CMD_NODE_JOIN, MATTX_CMD_NODE_LEAVE, MATTX_CMD_HIJACK_ME, MATTX_CMD_GET_BLUEPRINT, __MATTX_CMD_MAX };
 #define MATTX_CMD_MAX (__MATTX_CMD_MAX - 1)
 
-static const struct nla_policy mattx_genl_policy[MATTX_ATTR_MAX + 1] = {
-    [MATTX_ATTR_NODE_ID] = { .type = NLA_U32 },[MATTX_ATTR_IPV4_ADDR] = { .type = NLA_U32 },[MATTX_ATTR_STUB_PID] = { .type = NLA_U32 },[MATTX_ATTR_BLUEPRINT] = { .type = NLA_BINARY },
+static const struct nla_policy mattx_genl_policy[MATTX_ATTR_MAX + 1] = {[MATTX_ATTR_NODE_ID] = { .type = NLA_U32 },[MATTX_ATTR_IPV4_ADDR] = { .type = NLA_U32 },[MATTX_ATTR_STUB_PID] = { .type = NLA_U32 },[MATTX_ATTR_BLUEPRINT] = { .type = NLA_BINARY },
 };
 
 static int mattx_nl_cmd_node_join(struct sk_buff *skb, struct genl_info *info) {
@@ -51,28 +52,23 @@ static int mattx_nl_cmd_get_blueprint(struct sk_buff *skb, struct genl_info *inf
 
     if (!pending_migration) return -ENOENT;
 
-    // Calculate the exact size of the payload
     len = sizeof(struct mattx_migration_req) + (pending_migration->vma_count * sizeof(struct mattx_vma_info));
     
-    // 1. Allocate a new socket buffer for the reply
     reply_skb = nlmsg_new(nla_total_size(len), GFP_KERNEL);
     if (!reply_skb) return -ENOMEM;
 
-    // 2. Prepare the Generic Netlink reply header
     msg_head = genlmsg_put_reply(reply_skb, info, &mattx_genl_family, 0, MATTX_CMD_GET_BLUEPRINT);
     if (!msg_head) {
         nlmsg_free(reply_skb);
         return -ENOMEM;
     }
 
-    // 3. Attach the blueprint data as an attribute
     if (nla_put(reply_skb, MATTX_ATTR_BLUEPRINT, len, pending_migration)) {
         genlmsg_cancel(reply_skb, msg_head);
         nlmsg_free(reply_skb);
         return -EMSGSIZE;
     }
 
-    // 4. Finalize and send the reply back to the stub
     genlmsg_end(reply_skb, msg_head);
     return genlmsg_reply(reply_skb, info);
 }
@@ -90,19 +86,18 @@ static int mattx_nl_cmd_hijack_me(struct sk_buff *skb, struct genl_info *info) {
 
     if (!stub_task) return -ESRCH;
 
-    printk(KERN_INFO "MattX: [HIJACK] Starting Memory Injection for Stub PID %u...\n", stub_pid);
+    // Save the stub task globally so the receiver thread can inject memory into it
+    if (hijacked_stub_task) put_task_struct(hijacked_stub_task);
+    hijacked_stub_task = stub_task;
 
-    mmap_write_lock(stub_task->mm);
-    for (int i = 0; i < pending_migration->vma_count; i++) {
-        if (mattx_inject_vma_data(stub_task->mm, &pending_migration->vmas[i]) < 0) {
-            printk(KERN_ERR "MattX: [HIJACK] Failed to inject VMA %d\n", i);
-        }
+    printk(KERN_INFO "MattX: [HIJACK] SUCCESS! Stub PID %u is carved and ready.\n", stub_pid);
+
+    // --- NEW: Send the Green Light to Node 1 ---
+    if (pending_source_node != -1 && cluster_map[pending_source_node]) {
+        printk(KERN_INFO "MattX: [HIJACK] Sending READY_FOR_DATA signal to Node %d...\n", pending_source_node);
+        mattx_comm_send(cluster_map[pending_source_node], MATTX_MSG_READY_FOR_DATA, NULL, 0);
     }
-    mmap_write_unlock(stub_task->mm);
 
-    printk(KERN_INFO "MattX: [HIJACK] SUCCESS! Memory injected into Stub PID %u\n", stub_pid);
-
-    put_task_struct(stub_task);
     return 0;
 }
 
@@ -135,10 +130,10 @@ static void __exit mattx_exit(void) {
     if (listener_thread) kthread_stop(listener_thread);
     for (i = 0; i < MAX_NODES; i++) mattx_comm_disconnect(i);
     if (pending_migration) kfree(pending_migration);
+    if (hijacked_stub_task) put_task_struct(hijacked_stub_task);
     genl_unregister_family(&mattx_genl_family);
 }
 
 module_init(mattx_init);
 module_exit(mattx_exit);
-
 

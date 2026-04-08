@@ -33,7 +33,9 @@ enum mattx_msg_type {
     MATTX_MSG_HEARTBEAT = 1,
     MATTX_MSG_LOAD_UPDATE,
     MATTX_MSG_MIGRATE_REQ,
+    MATTX_MSG_READY_FOR_DATA, // NEW: Node 2 tells Node 1 to start sending
     MATTX_MSG_PAGE_TRANSFER, 
+    MATTX_MSG_MIGRATE_DONE,   // NEW: Node 1 tells Node 2 it finished sending
     MATTX_MSG_SYSCALL_FWD,
 };
 
@@ -75,25 +77,24 @@ struct mattx_link {
     struct task_struct *receiver_thread;
 };
 
-// --- Global Variables (Defined in mattx_main.c) ---
+// --- Global Variables ---
 extern struct mattx_load_info cluster_load_table[MAX_NODES];
 extern struct mattx_link *cluster_map[MAX_NODES];
 extern struct mattx_migration_req *pending_migration;
 extern struct genl_family mattx_genl_family;
 
+// NEW: State tracking for the migration pipeline
+extern int pending_source_node;
+extern struct task_struct *hijacked_stub_task;
+
 // --- Function Prototypes ---
-// From mattx_comm.c
 int mattx_comm_send(struct mattx_link *link, u32 type, void *data, u32 len);
 struct mattx_link* mattx_comm_connect(__be32 ip_addr, int node_id);
 void mattx_comm_disconnect(int node_id);
 int mattx_listener_loop(void *data);
-
-// From mattx_sched.c
 int mattx_balancer_loop(void *data);
-
-// From mattx_migr.c
 void mattx_capture_and_send_state(struct task_struct *task, int target_node);
-int mattx_inject_vma_data(struct mm_struct *mm, struct mattx_vma_info *vma_info);
+void mattx_send_vma_data(void); // NEW: The data pump
 
 #endif // MATTX_H
 
