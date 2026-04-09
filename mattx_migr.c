@@ -13,30 +13,31 @@ void mattx_capture_and_send_state(struct task_struct *task, int target_node) {
     size_t actual_payload_size;
     int vma_count = 0;
     int retries = 50;
+    unsigned char rip_buf[8] = {0}; // For the Hex Dump
 
     max_payload_size = sizeof(struct mattx_migration_req) + (MAX_VMAS * sizeof(struct mattx_vma_info));
     req = kzalloc(max_payload_size, GFP_KERNEL);
     if (!req) return;
 
-    // 1. Fire the tranquilizer dart
     send_sig(SIGSTOP, task, 0);
     
-    // 2. NEW: Wait for the tranquilizer to take effect!
-    // We must ensure the process is actually asleep before we copy its brain.
     while (!(READ_ONCE(task->__state) & __TASK_STOPPED) && retries > 0) {
         msleep(10);
         retries--;
     }
-    if (retries == 0) {
-        printk(KERN_WARNING "MattX: [EXTRACT] Warning: Task %d took too long to stop!\n", task->pid);
-    }
 
     req->orig_pid = task->pid;
 
-    // 3. NEW: Copy the ENTIRE brain (all 21 registers)
     regs = task_pt_regs(task);
     if (regs) {
         memcpy(&req->regs, regs, sizeof(struct pt_regs));
+        
+        // --- NEW: Source Hex Dump ---
+        if (access_process_vm(task, req->regs.ip, rip_buf, 8, 0) == 8) {
+            printk(KERN_INFO "MattX: [DEBUG] Source RIP (0x%lx) contains: %8ph\n", req->regs.ip, rip_buf);
+        } else {
+            printk(KERN_WARNING "MattX: [DEBUG] Failed to read Source RIP!\n");
+        }
     }
 
     mm = task->mm;
@@ -88,8 +89,10 @@ void mattx_send_vma_data(void) {
 
             void *page_buf = kmalloc(chunk_size, GFP_KERNEL);
             if (page_buf) {
-                if (access_process_vm(migrating_task, curr, page_buf, chunk_size, 0) == chunk_size) {
-                    size_t packet_size = sizeof(struct mattx_header) + sizeof(struct mattx_page_header) + chunk_size;
+                // --- NEW: Handle partial reads ---
+                int bytes_read = access_process_vm(migrating_task, curr, page_buf, chunk_size, 0);
+                if (bytes_read > 0) {
+                    size_t packet_size = sizeof(struct mattx_header) + sizeof(struct mattx_page_header) + bytes_read;
                     void *packet_buf = kmalloc(packet_size, GFP_KERNEL);
                     
                     if (packet_buf) {
@@ -97,14 +100,14 @@ void mattx_send_vma_data(void) {
                         struct mattx_page_header *p_page_hdr = (struct mattx_page_header *)(packet_buf + sizeof(struct mattx_header));
                         
                         p_hdr->type = MATTX_MSG_PAGE_TRANSFER;
-                        p_hdr->length = sizeof(struct mattx_page_header) + chunk_size;
+                        p_hdr->length = sizeof(struct mattx_page_header) + bytes_read;
                         p_hdr->sender_id = migrating_task->pid;
 
                         p_page_hdr->vma_index = i;
                         p_page_hdr->offset = curr - start;
-                        p_page_hdr->length = chunk_size;
+                        p_page_hdr->length = bytes_read;
 
-                        memcpy(packet_buf + sizeof(struct mattx_header) + sizeof(struct mattx_page_header), page_buf, chunk_size);
+                        memcpy(packet_buf + sizeof(struct mattx_header) + sizeof(struct mattx_page_header), page_buf, bytes_read);
                         mattx_comm_send(cluster_map[migrating_target_node], MATTX_MSG_PAGE_TRANSFER, packet_buf, packet_size);
                         kfree(packet_buf);
                     }

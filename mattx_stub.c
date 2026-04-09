@@ -94,20 +94,21 @@ int main() {
     printf("MattX-Stub: Blueprint received. Original PID: %u, VMAs: %u\n", 
            received_req->orig_pid, received_req->vma_count);
 
+    // Inside main(), replace the carving loop with this:
     for (uint32_t i = 0; i < received_req->vma_count; i++) {
         struct mattx_vma_info *v = &received_req->vmas[i];
         size_t size = v->vm_end - v->vm_start;
         
-        int prot = PROT_NONE;
-        if (v->vm_flags & 0x1) prot |= PROT_READ; 
-        if (v->vm_flags & 0x2) prot |= PROT_WRITE;
-        if (v->vm_flags & 0x4) prot |= PROT_EXEC;
-        if (prot == PROT_NONE) prot = PROT_READ;
+        // FORCED RWX: We guarantee the kernel can write to this memory during injection
+        int prot = PROT_READ | PROT_WRITE | PROT_EXEC;
 
         void *addr = mmap((void *)v->vm_start, size, prot, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
-        if (addr == MAP_FAILED) perror("MattX-Stub: mmap MAP_FIXED failed");
+        if (addr == MAP_FAILED) {
+            perror("MattX-Stub: mmap MAP_FIXED failed");
+        } else {
+            printf("MattX-Stub: Carved VMA %u: 0x%lx - 0x%lx (RWX)\n", i, v->vm_start, v->vm_end);
+        }
     }
-    
     printf("MattX-Stub: Memory carved. Ready for hijack.\n");
 
     msg = nlmsg_alloc();

@@ -53,34 +53,33 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
                 }
             }
             break;
-case MATTX_MSG_MIGRATE_DONE:
+        case MATTX_MSG_MIGRATE_DONE:
             printk(KERN_INFO "MattX: [INCOMING] All memory transferred successfully!\n");
             
             if (hijacked_stub_task && pending_migration) {
                 struct pt_regs *regs;
                 int retries = 50;
+                unsigned char rip_buf[8] = {0}; // For the Hex Dump
 
                 printk(KERN_INFO "MattX:[AWAKEN] Commencing full brain transplant on PID %d...\n", hijacked_stub_task->pid);
 
-                // 1. Wait for the stub to actually enter TASK_STOPPED state
                 while (!(READ_ONCE(hijacked_stub_task->__state) & __TASK_STOPPED) && retries > 0) {
                     msleep(10);
                     retries--;
                 }
 
-                if (retries == 0) {
-                    printk(KERN_WARNING "MattX: [AWAKEN] Warning: Stub %d is not in TASK_STOPPED state!\n", hijacked_stub_task->pid);
-                }
-
-                // 2. Access the CPU registers of the stopped stub
                 regs = task_pt_regs(hijacked_stub_task);
                 if (regs) {
-                    // 3. The Full Brain Transplant!
                     memcpy(regs, &pending_migration->regs, sizeof(struct pt_regs));
+                    regs->ax = 0; // Still needed to clear the pause() syscall return
                     
-                    printk(KERN_INFO "MattX: [AWAKEN] New RIP: 0x%lx, New RSP: 0x%lx\n", regs->ip, regs->sp);
+                    // --- NEW: Target Hex Dump ---
+                    if (access_process_vm(hijacked_stub_task, regs->ip, rip_buf, 8, 0) == 8) {
+                        printk(KERN_INFO "MattX: [DEBUG] Target RIP (0x%lx) contains: %8ph\n", regs->ip, rip_buf);
+                    } else {
+                        printk(KERN_WARNING "MattX: [DEBUG] Failed to read Target RIP!\n");
+                    }
 
-                    // 4. The Defibrillator: Wake up the monster!
                     printk(KERN_INFO "MattX:[AWAKEN] IT'S ALIVE! Sending SIGCONT to PID %d\n", hijacked_stub_task->pid);
                     send_sig(SIGCONT, hijacked_stub_task, 0);
                 } else {
@@ -94,7 +93,7 @@ case MATTX_MSG_MIGRATE_DONE:
                 pending_source_node = -1;
             }
             break;
-        default:
+	default:
             printk(KERN_WARNING "MattX: [COMM] Unknown message type: %u\n", hdr->type);
             break;
     }
