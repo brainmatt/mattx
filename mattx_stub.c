@@ -9,6 +9,7 @@
 #include <netinet/in.h>
 #include <stdint.h>
 #include <sys/mman.h> 
+#include <signal.h> // NEW: For raise()
 #include <netlink/netlink.h>
 #include <netlink/genl/genl.h>
 #include <netlink/genl/ctrl.h>
@@ -23,7 +24,6 @@ struct mattx_vma_info {
     uint64_t vm_flags;
 };
 
-// NEW: The Full Brain definition for user-space
 struct mattx_cpu_regs {
     uint64_t r15, r14, r13, r12, rbp, rbx, r11, r10;
     uint64_t r9, r8, rax, rcx, rdx, rsi, rdi, orig_rax;
@@ -118,7 +118,14 @@ int main() {
     nl_socket_free(sock);
     free(received_req);
 
-    while (1) pause(); 
+    printf("MattX-Stub: HIJACK_ME sent. Stopping myself for transplant...\n");
+    
+    // --- NEW: Put the process into TASK_STOPPED state ---
+    raise(SIGSTOP); 
+    
+    // If the transplant is successful, the CPU will jump to the stress code and never reach this line.
+    printf("MattX-Stub: ERROR - I woke up but I am still the stub!\n");
+    while (1) sleep(1); 
     return 0;
 }
 
