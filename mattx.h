@@ -29,9 +29,8 @@
 #define FIXED_LOAD_0_2 409
 #define MAX_VMAS 256 
 
-// NEW: Protocol robustness
-#define MATTX_MAGIC 0x4D415454 // "MATT"
-#define MATTX_MAX_PAYLOAD (10 * 1024 * 1024) // 10 MB max per packet
+#define MATTX_MAGIC 0x4D415454 
+#define MATTX_MAX_PAYLOAD (10 * 1024 * 1024) 
 
 enum mattx_msg_type {
     MATTX_MSG_HEARTBEAT = 1,
@@ -44,7 +43,7 @@ enum mattx_msg_type {
 };
 
 struct mattx_header {
-    u32 magic; // NEW: Magic signature
+    u32 magic; 
     u32 type;
     u32 length;
     u32 sender_id;
@@ -61,11 +60,19 @@ struct mattx_vma_info {
     unsigned long vm_flags;
 };
 
+// NEW: The Full Brain (Matches x86_64 pt_regs exactly)
+struct mattx_cpu_regs {
+    uint64_t r15, r14, r13, r12, rbp, rbx, r11, r10;
+    uint64_t r9, r8, rax, rcx, rdx, rsi, rdi, orig_rax;
+    uint64_t rip, cs, eflags, rsp, ss;
+};
+
 struct mattx_migration_req {
     u32 orig_pid;
-    unsigned long rip;
-    unsigned long rsp;
+    u32 pad; // Padding to ensure 64-bit alignment
+    struct mattx_cpu_regs regs; // The Full Brain
     u32 vma_count;
+    u32 pad2;
     struct mattx_vma_info vmas[]; 
 };
 

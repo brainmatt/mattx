@@ -22,7 +22,7 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
                 
                 pending_source_node = hdr->sender_id;
 
-                printk(KERN_INFO "MattX: [INCOMING] Received Blueprint for PID %u. Saving to pending...\n", req->orig_pid);
+                printk(KERN_INFO "MattX:[INCOMING] Received Blueprint for PID %u. Saving to pending...\n", req->orig_pid);
                 if (pending_migration) kvfree(pending_migration);
                 
                 pending_migration = kvmalloc(hdr->length, GFP_KERNEL);
@@ -50,42 +50,35 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
                 
                 if (res != ph->length) {
                     printk(KERN_ERR "MattX: [INJECT] Failed to inject %u bytes at 0x%lx (res: %d)\n", ph->length, target_addr, res);
-                } else if (ph->offset % (PAGE_SIZE * 100) == 0) {
-                    printk(KERN_INFO "MattX: [INJECT] Successfully injected page at 0x%lx\n", target_addr);
                 }
             }
             break;
         case MATTX_MSG_MIGRATE_DONE:
             printk(KERN_INFO "MattX: [INCOMING] All memory transferred successfully!\n");
             
-            // --- PHASE 7.4: THE AWAKENING ---
             if (hijacked_stub_task && pending_migration) {
                 struct pt_regs *regs;
 
-                printk(KERN_INFO "MattX:[AWAKEN] Commencing brain transplant on PID %d...\n", hijacked_stub_task->pid);
+                printk(KERN_INFO "MattX:[AWAKEN] Commencing full brain transplant on PID %d...\n", hijacked_stub_task->pid);
 
-                // 1. Access the CPU registers of the sleeping stub
                 regs = task_pt_regs(hijacked_stub_task);
                 if (regs) {
-                    printk(KERN_INFO "MattX: [AWAKEN] Old RIP: 0x%lx, Old RSP: 0x%lx\n", regs->ip, regs->sp);
+                    // NEW: The Full Brain Transplant!
+                    // We overwrite all 21 registers with the exact state of the original process.
+                    memcpy(regs, &pending_migration->regs, sizeof(struct pt_regs));
                     
-                    // 2. Overwrite the Instruction Pointer and Stack Pointer
-                    regs->ip = pending_migration->rip;
-                    regs->sp = pending_migration->rsp;
-                    
-                    // 3. Hack for pause(): set RAX to 0 to simulate a clean syscall return
+                    // Hack for pause(): We still set RAX to 0 so the stub's pause() syscall 
+                    // returns cleanly instead of throwing an error.
                     regs->ax = 0; 
                     
                     printk(KERN_INFO "MattX: [AWAKEN] New RIP: 0x%lx, New RSP: 0x%lx\n", regs->ip, regs->sp);
 
-                    // 4. The Defibrillator: Wake up the monster!
                     printk(KERN_INFO "MattX:[AWAKEN] IT'S ALIVE! Sending SIGCONT to PID %d\n", hijacked_stub_task->pid);
                     send_sig(SIGCONT, hijacked_stub_task, 0);
                 } else {
-                    printk(KERN_ERR "MattX: [AWAKEN] FAILED to access pt_regs!\n");
+                    printk(KERN_ERR "MattX:[AWAKEN] FAILED to access pt_regs!\n");
                 }
 
-                // 5. Cleanup the operating room
                 put_task_struct(hijacked_stub_task);
                 hijacked_stub_task = NULL;
                 kvfree(pending_migration);
