@@ -27,6 +27,9 @@ void mattx_capture_and_send_state(struct task_struct *task, int target_node) {
         msleep(10);
         retries--;
     }
+    if (retries == 0) {
+        printk(KERN_WARNING "MattX:[EXTRACT] Warning: Task %d took too long to stop!\n", task->pid);
+    }
 
     req->orig_pid = task->pid;
 
@@ -37,7 +40,7 @@ void mattx_capture_and_send_state(struct task_struct *task, int target_node) {
         if (access_process_vm(task, req->regs.rip, rip_buf, 8, FOLL_FORCE) == 8) {
             printk(KERN_INFO "MattX: [DEBUG] Source RIP (0x%lx) contains: %8ph\n", (unsigned long)req->regs.rip, rip_buf);
         } else {
-            printk(KERN_WARNING "MattX:[DEBUG] Failed to read Source RIP!\n");
+            printk(KERN_WARNING "MattX: [DEBUG] Failed to read Source RIP!\n");
         }
     }
 
@@ -74,11 +77,6 @@ void mattx_capture_and_send_state(struct task_struct *task, int target_node) {
 }
 
 void mattx_send_vma_data(void) {
-    int total_pages = 0;
-    int sent_pages = 0;
-    int skipped_pages = 0;
-    int network_errors = 0;
-
     if (!local_migration_req || !migrating_task || migrating_target_node == -1) return;
     if (!cluster_map[migrating_target_node]) return;
 
@@ -92,44 +90,31 @@ void mattx_send_vma_data(void) {
         while (curr < end) {
             u32 chunk_size = PAGE_SIZE;
             if (curr + chunk_size > end) chunk_size = end - curr;
-            total_pages++;
 
             void *page_buf = kmalloc(chunk_size, GFP_KERNEL);
             if (page_buf) {
-                // FIXED: Added FOLL_FORCE to ensure we read protected/swapped memory
                 int bytes_read = access_process_vm(migrating_task, curr, page_buf, chunk_size, FOLL_FORCE);
-                
                 if (bytes_read > 0) {
-                    size_t packet_size = sizeof(struct mattx_header) + sizeof(struct mattx_page_header) + bytes_read;
-                    void *packet_buf = kmalloc(packet_size, GFP_KERNEL);
                     
-                    if (packet_buf) {
-                        struct mattx_header *p_hdr = (struct mattx_header *)packet_buf;
-                        struct mattx_page_header *p_page_hdr = (struct mattx_page_header *)(packet_buf + sizeof(struct mattx_header));
-                        int send_res;
+                    // FIXED: We only allocate space for the Page Header + Data. 
+                    // mattx_comm_send will add the main header!
+                    size_t payload_size = sizeof(struct mattx_page_header) + bytes_read;
+                    void *payload_buf = kmalloc(payload_size, GFP_KERNEL);
+                    
+                    if (payload_buf) {
+                        struct mattx_page_header *ph = (struct mattx_page_header *)payload_buf;
                         
-                        p_hdr->magic = MATTX_MAGIC;
-                        p_hdr->type = MATTX_MSG_PAGE_TRANSFER;
-                        p_hdr->length = sizeof(struct mattx_page_header) + bytes_read;
-                        p_hdr->sender_id = migrating_task->pid;
+                        ph->vma_index = i;
+                        ph->offset = curr - start;
+                        ph->length = bytes_read;
 
-                        p_page_hdr->vma_index = i;
-                        p_page_hdr->offset = curr - start;
-                        p_page_hdr->length = bytes_read;
-
-                        memcpy(packet_buf + sizeof(struct mattx_header) + sizeof(struct mattx_page_header), page_buf, bytes_read);
+                        // Copy the memory data right after the page header
+                        memcpy(payload_buf + sizeof(struct mattx_page_header), page_buf, bytes_read);
                         
-                        // Check for network short-writes
-                        send_res = mattx_comm_send(cluster_map[migrating_target_node], MATTX_MSG_PAGE_TRANSFER, packet_buf, packet_size);
-                        if (send_res < packet_size) {
-                            network_errors++;
-                        } else {
-                            sent_pages++;
-                        }
-                        kfree(packet_buf);
+                        // Send it!
+                        mattx_comm_send(cluster_map[migrating_target_node], MATTX_MSG_PAGE_TRANSFER, payload_buf, payload_size);
+                        kfree(payload_buf);
                     }
-                } else {
-                    skipped_pages++;
                 }
                 kfree(page_buf);
             }
@@ -137,10 +122,7 @@ void mattx_send_vma_data(void) {
         }
     }
     
-    printk(KERN_INFO "MattX:[MIGRATE] Pipeline stats: %d total, %d sent, %d skipped, %d net errors\n", 
-           total_pages, sent_pages, skipped_pages, network_errors);
     printk(KERN_INFO "MattX:[MIGRATE] Data pipeline complete. Sending DONE signal.\n");
-    
     mattx_comm_send(cluster_map[migrating_target_node], MATTX_MSG_MIGRATE_DONE, NULL, 0);
     
     put_task_struct(migrating_task);
