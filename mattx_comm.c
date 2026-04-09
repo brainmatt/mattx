@@ -1,5 +1,8 @@
 #include "mattx.h"
 
+// Global counter for debugging
+static int injected_pages_count = 0;
+
 static void mattx_handle_message(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
     switch (hdr->type) {
         case MATTX_MSG_HEARTBEAT:
@@ -21,8 +24,9 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
                 char *envp[] = { "HOME=/", "PATH=/sbin:/bin:/usr/sbin:/usr/bin", NULL };
                 
                 pending_source_node = hdr->sender_id;
+                injected_pages_count = 0; // Reset counter
 
-                printk(KERN_INFO "MattX:[INCOMING] Received Blueprint for PID %u. Saving to pending...\n", req->orig_pid);
+                printk(KERN_INFO "MattX: [INCOMING] Received Blueprint for PID %u. Saving to pending...\n", req->orig_pid);
                 if (pending_migration) kvfree(pending_migration);
                 
                 pending_migration = kvmalloc(hdr->length, GFP_KERNEL);
@@ -46,20 +50,27 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
                 unsigned long target_addr = pending_migration->vmas[ph->vma_index].vm_start + ph->offset;
                 int res;
 
+                // --- NEW: The RIP Tracker ---
+                if (target_addr <= pending_migration->regs.rip && pending_migration->regs.rip < target_addr + ph->length) {
+                    printk(KERN_INFO "MattX: [DEBUG] *** INJECTING THE RIP PAGE AT 0x%lx ***\n", target_addr);
+                }
+
                 res = access_process_vm(hijacked_stub_task, target_addr, data, ph->length, FOLL_WRITE | FOLL_FORCE);
                 
                 if (res != ph->length) {
                     printk(KERN_ERR "MattX: [INJECT] Failed to inject %u bytes at 0x%lx (res: %d)\n", ph->length, target_addr, res);
+                } else {
+                    injected_pages_count++;
                 }
             }
             break;
         case MATTX_MSG_MIGRATE_DONE:
-            printk(KERN_INFO "MattX: [INCOMING] All memory transferred successfully!\n");
+            printk(KERN_INFO "MattX: [INCOMING] All memory transferred! Total pages injected: %d\n", injected_pages_count);
             
             if (hijacked_stub_task && pending_migration) {
                 struct pt_regs *regs;
                 int retries = 50;
-                unsigned char rip_buf[8] = {0}; // For the Hex Dump
+                unsigned char rip_buf[8] = {0}; 
 
                 printk(KERN_INFO "MattX:[AWAKEN] Commencing full brain transplant on PID %d...\n", hijacked_stub_task->pid);
 
@@ -71,13 +82,13 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
                 regs = task_pt_regs(hijacked_stub_task);
                 if (regs) {
                     memcpy(regs, &pending_migration->regs, sizeof(struct pt_regs));
-                    regs->ax = 0; // Still needed to clear the pause() syscall return
+                    regs->ax = 0; 
                     
-                    // --- NEW: Target Hex Dump ---
-                    if (access_process_vm(hijacked_stub_task, regs->ip, rip_buf, 8, 0) == 8) {
+                    // --- Target Hex Dump ---
+                    if (access_process_vm(hijacked_stub_task, regs->ip, rip_buf, 8, FOLL_FORCE) == 8) {
                         printk(KERN_INFO "MattX: [DEBUG] Target RIP (0x%lx) contains: %8ph\n", regs->ip, rip_buf);
                     } else {
-                        printk(KERN_WARNING "MattX: [DEBUG] Failed to read Target RIP!\n");
+                        printk(KERN_WARNING "MattX:[DEBUG] Failed to read Target RIP!\n");
                     }
 
                     printk(KERN_INFO "MattX:[AWAKEN] IT'S ALIVE! Sending SIGCONT to PID %d\n", hijacked_stub_task->pid);
@@ -93,8 +104,7 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
                 pending_source_node = -1;
             }
             break;
-	default:
-            printk(KERN_WARNING "MattX: [COMM] Unknown message type: %u\n", hdr->type);
+        default:
             break;
     }
 }
@@ -120,7 +130,7 @@ static int mattx_receiver_loop(void *data) {
         }
 
         if (hdr.length > MATTX_MAX_PAYLOAD) {
-            printk(KERN_ERR "MattX: [COMM] FATAL: Payload too large (%u bytes). Max is %u.\n", hdr.length, MATTX_MAX_PAYLOAD);
+            printk(KERN_ERR "MattX: [COMM] FATAL: Payload too large (%u bytes).\n", hdr.length);
             break;
         }
 
@@ -129,10 +139,12 @@ static int mattx_receiver_loop(void *data) {
             if (payload) {
                 iov[0].iov_base = payload;
                 iov[0].iov_len = hdr.length;
-                kernel_recvmsg(link->sock, &msg, iov, 1, hdr.length, MSG_WAITALL);
-            } else {
-                printk(KERN_ERR "MattX: [COMM] Failed to allocate %u bytes for payload\n", hdr.length);
-                break;
+                
+                // Read the payload safely
+                int payload_len = kernel_recvmsg(link->sock, &msg, iov, 1, hdr.length, MSG_WAITALL);
+                if (payload_len != hdr.length) {
+                    printk(KERN_ERR "MattX: [COMM] Short read on payload! Expected %u, got %d\n", hdr.length, payload_len);
+                }
             }
         }
         
@@ -142,8 +154,6 @@ static int mattx_receiver_loop(void *data) {
             payload = NULL; 
         }
     }
-    
-    printk(KERN_INFO "MattX: [COMM] Receiver thread exiting for Node %d\n", link->node_id);
     return 0;
 }
 
