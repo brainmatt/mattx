@@ -37,10 +37,12 @@ void mattx_capture_and_send_state(struct task_struct *task, int target_node) {
     if (regs) {
         memcpy(&req->regs, regs, sizeof(struct pt_regs));
         
+        // --- NEW: Extract the TLS Bases ---
+        req->fsbase = task->thread.fsbase;
+        req->gsbase = task->thread.gsbase;
+        
         if (access_process_vm(task, req->regs.rip, rip_buf, 8, FOLL_FORCE) == 8) {
             printk(KERN_INFO "MattX: [DEBUG] Source RIP (0x%lx) contains: %8ph\n", (unsigned long)req->regs.rip, rip_buf);
-        } else {
-            printk(KERN_WARNING "MattX: [DEBUG] Failed to read Source RIP!\n");
         }
     }
 

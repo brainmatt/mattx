@@ -9,14 +9,30 @@
 #include <netinet/in.h>
 #include <stdint.h>
 #include <sys/mman.h> 
-#include <signal.h> // NEW: For raise()
+#include <signal.h>
 #include <netlink/netlink.h>
 #include <netlink/genl/genl.h>
 #include <netlink/genl/ctrl.h>
 
-enum { MATTX_ATTR_UNSPEC, MATTX_ATTR_NODE_ID, MATTX_ATTR_IPV4_ADDR, MATTX_ATTR_STUB_PID, MATTX_ATTR_BLUEPRINT, __MATTX_ATTR_MAX };
+enum { 
+    MATTX_ATTR_UNSPEC, 
+    MATTX_ATTR_NODE_ID, 
+    MATTX_ATTR_IPV4_ADDR, 
+    MATTX_ATTR_STUB_PID, 
+    MATTX_ATTR_BLUEPRINT, 
+    __MATTX_ATTR_MAX 
+};
 #define MATTX_ATTR_MAX (__MATTX_ATTR_MAX - 1)
-enum { MATTX_CMD_UNSPEC, MATTX_CMD_NODE_JOIN, MATTX_CMD_NODE_LEAVE, MATTX_CMD_HIJACK_ME, MATTX_CMD_GET_BLUEPRINT, __MATTX_CMD_MAX };
+
+enum { 
+    MATTX_CMD_UNSPEC, 
+    MATTX_CMD_NODE_JOIN, 
+    MATTX_CMD_NODE_LEAVE, 
+    MATTX_CMD_HIJACK_ME, 
+    MATTX_CMD_GET_BLUEPRINT, 
+    __MATTX_CMD_MAX 
+};
+#define MATTX_CMD_MAX (__MATTX_CMD_MAX - 1)
 
 struct mattx_vma_info {
     uint64_t vm_start;
@@ -24,6 +40,7 @@ struct mattx_vma_info {
     uint64_t vm_flags;
 };
 
+// The Full Brain definition for user-space
 struct mattx_cpu_regs {
     uint64_t r15, r14, r13, r12, rbp, rbx, r11, r10;
     uint64_t r9, r8, rax, rcx, rdx, rsi, rdi, orig_rax;
@@ -34,6 +51,8 @@ struct mattx_migration_req {
     uint32_t orig_pid;
     uint32_t pad;
     struct mattx_cpu_regs regs;
+    uint64_t fsbase; // NEW: The Soul (TLS Base)
+    uint64_t gsbase; // NEW: Kernel/User GS Base
     uint32_t vma_count;
     uint32_t pad2;
     struct mattx_vma_info vmas[]; 
@@ -62,6 +81,7 @@ static int blueprint_cb(struct nl_msg *msg, void *arg) {
 }
 
 int main() {
+    // Redirect all output to a file so we can see it when spawned by the kernel
     freopen("/tmp/mattx_stub.log", "a", stdout);
     freopen("/tmp/mattx_stub.log", "a", stderr);
     setvbuf(stdout, NULL, _IONBF, 0); 
@@ -79,22 +99,37 @@ int main() {
     genl_connect(sock);
     family_id = genl_ctrl_resolve(sock, "MATTX");
     
-    if (family_id < 0) return -1;
+    if (family_id < 0) {
+        fprintf(stderr, "MattX-Stub: Kernel module not loaded!\n");
+        return -1;
+    }
 
     nl_socket_modify_cb(sock, NL_CB_VALID, NL_CB_CUSTOM, blueprint_cb, NULL);
 
     msg = nlmsg_alloc();
     genlmsg_put(msg, NL_AUTO_PORT, NL_AUTO_SEQ, family_id, 0, 0, MATTX_CMD_GET_BLUEPRINT, 1);
-    nl_send_auto(sock, msg);
+    
+    if (nl_send_auto(sock, msg) < 0) {
+        fprintf(stderr, "MattX-Stub: Failed to request blueprint.\n");
+        return -1;
+    }
     nlmsg_free(msg);
 
+    printf("MattX-Stub: Waiting for kernel reply...\n");
     int err = nl_recvmsgs_default(sock);
-    if (err < 0 || !received_req) return -1;
+    if (err < 0) {
+        fprintf(stderr, "MattX-Stub: Error receiving netlink message: %d\n", err);
+        return -1;
+    }
+
+    if (!received_req) {
+        fprintf(stderr, "MattX-Stub: No blueprint received from kernel!\n");
+        return -1;
+    }
 
     printf("MattX-Stub: Blueprint received. Original PID: %u, VMAs: %u\n", 
            received_req->orig_pid, received_req->vma_count);
 
-    // Inside main(), replace the carving loop with this:
     for (uint32_t i = 0; i < received_req->vma_count; i++) {
         struct mattx_vma_info *v = &received_req->vmas[i];
         size_t size = v->vm_end - v->vm_start;
@@ -109,19 +144,24 @@ int main() {
             printf("MattX-Stub: Carved VMA %u: 0x%lx - 0x%lx (RWX)\n", i, v->vm_start, v->vm_end);
         }
     }
+    
     printf("MattX-Stub: Memory carved. Ready for hijack.\n");
 
     msg = nlmsg_alloc();
     genlmsg_put(msg, NL_AUTO_PORT, NL_AUTO_SEQ, family_id, 0, 0, MATTX_CMD_HIJACK_ME, 1);
     nla_put_u32(msg, MATTX_ATTR_STUB_PID, my_pid);
-    nl_send_auto(sock, msg);
+
+    if (nl_send_auto(sock, msg) < 0) {
+        fprintf(stderr, "MattX-Stub: Failed to send HIJACK_ME\n");
+    } else {
+        printf("MattX-Stub: HIJACK_ME sent. Stopping myself for transplant...\n");
+    }
+
     nlmsg_free(msg);
     nl_socket_free(sock);
     free(received_req);
 
-    printf("MattX-Stub: HIJACK_ME sent. Stopping myself for transplant...\n");
-    
-    // --- NEW: Put the process into TASK_STOPPED state ---
+    // Put the process into TASK_STOPPED state
     raise(SIGSTOP); 
     
     // If the transplant is successful, the CPU will jump to the stress code and never reach this line.

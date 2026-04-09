@@ -69,8 +69,10 @@ struct mattx_cpu_regs {
 
 struct mattx_migration_req {
     u32 orig_pid;
-    u32 pad; // Padding to ensure 64-bit alignment
-    struct mattx_cpu_regs regs; // The Full Brain
+    u32 pad; 
+    struct mattx_cpu_regs regs; 
+    uint64_t fsbase; // NEW: The Soul (TLS Base)
+    uint64_t gsbase; // NEW: Kernel/User GS Base
     u32 vma_count;
     u32 pad2;
     struct mattx_vma_info vmas[]; 
