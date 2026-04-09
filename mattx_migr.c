@@ -38,10 +38,9 @@ void mattx_capture_and_send_state(struct task_struct *task, int target_node) {
     if (regs) {
         memcpy(&req->regs, regs, sizeof(struct pt_regs));
         
-        // FIXED: Changed req->regs.ip to req->regs.rip
-        // --- NEW: Source Hex Dump ---
+        // FIXED: Cast to (unsigned long) to silence the compiler warning
         if (access_process_vm(task, req->regs.rip, rip_buf, 8, 0) == 8) {
-            printk(KERN_INFO "MattX: [DEBUG] Source RIP (0x%lx) contains: %8ph\n", req->regs.rip, rip_buf);
+            printk(KERN_INFO "MattX: [DEBUG] Source RIP (0x%lx) contains: %8ph\n", (unsigned long)req->regs.rip, rip_buf);
         } else {
             printk(KERN_WARNING "MattX: [DEBUG] Failed to read Source RIP!\n");
         }
@@ -96,7 +95,6 @@ void mattx_send_vma_data(void) {
 
             void *page_buf = kmalloc(chunk_size, GFP_KERNEL);
             if (page_buf) {
-                // --- Handle partial reads ---
                 int bytes_read = access_process_vm(migrating_task, curr, page_buf, chunk_size, 0);
                 if (bytes_read > 0) {
                     size_t packet_size = sizeof(struct mattx_header) + sizeof(struct mattx_page_header) + bytes_read;
