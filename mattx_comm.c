@@ -65,7 +65,7 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
             }
             break;
         case MATTX_MSG_MIGRATE_DONE:
-            printk(KERN_INFO "MattX: [INCOMING] All memory transferred! Total pages injected: %d\n", injected_pages_count);
+            printk(KERN_INFO "MattX: [INCOMING] All memory transferred successfully!\n");
             
             if (hijacked_stub_task && pending_migration) {
                 struct pt_regs *regs;
@@ -87,25 +87,29 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
                     hijacked_stub_task->thread.fsbase = pending_migration->fsbase;
                     hijacked_stub_task->thread.gsbase = pending_migration->gsbase;
                     
-                    // --- NEW: Apply the Nametag ---
-                    set_task_comm(hijacked_stub_task, pending_migration->comm);
+                    // --- FIXED: Direct string copy instead of unexported set_task_comm ---
+                    strscpy(hijacked_stub_task->comm, pending_migration->comm, sizeof(hijacked_stub_task->comm));
                     printk(KERN_INFO "MattX:[AWAKEN] Renamed stub to '%s'\n", hijacked_stub_task->comm);
                     
                     if (access_process_vm(hijacked_stub_task, regs->ip, rip_buf, 8, FOLL_FORCE) == 8) {
                         printk(KERN_INFO "MattX: [DEBUG] Target RIP (0x%lx) contains: %8ph\n", regs->ip, rip_buf);
+                    } else {
+                        printk(KERN_WARNING "MattX:[DEBUG] Failed to read Target RIP!\n");
                     }
 
                     printk(KERN_INFO "MattX:[AWAKEN] IT'S ALIVE! Sending SIGCONT to PID %d\n", hijacked_stub_task->pid);
                     send_sig(SIGCONT, hijacked_stub_task, 0);
+                } else {
+                    printk(KERN_ERR "MattX:[AWAKEN] FAILED to access pt_regs!\n");
                 }
 
-		put_task_struct(hijacked_stub_task);
+                put_task_struct(hijacked_stub_task);
                 hijacked_stub_task = NULL;
                 kvfree(pending_migration);
                 pending_migration = NULL;
                 pending_source_node = -1;
             }
-            break;
+            break;	    
         default:
             break;
     }
