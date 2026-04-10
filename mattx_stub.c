@@ -36,6 +36,7 @@ struct mattx_migration_req {
     struct mattx_cpu_regs regs;
     uint64_t fsbase; 
     uint64_t gsbase; 
+    char comm[16]; // NEW: The Nametag
     uint32_t vma_count;
     uint32_t pad2;
     struct mattx_vma_info vmas[]; 
@@ -54,7 +55,7 @@ static int blueprint_cb(struct nl_msg *msg, void *arg) {
     policy[MATTX_ATTR_BLUEPRINT].type = NLA_BINARY;
 
     if (genlmsg_parse(nlh, 0, attrs, MATTX_ATTR_MAX, policy) < 0) {
-        printf("MattX-Stub: [CALLBACK] Message parsed, but no blueprint found (likely an ACK).\n");
+        printf("MattX-Stub:[CALLBACK] Message parsed, but no blueprint found (likely an ACK).\n");
         return NL_SKIP;
     }
 
@@ -105,7 +106,6 @@ int main() {
 
     printf("MattX-Stub: Waiting for kernel reply...\n");
     
-    // --- FIXED: Loop until we actually get the blueprint! ---
     int retries = 10;
     while (!received_req && retries > 0) {
         int err = nl_recvmsgs_default(sock);
@@ -120,8 +120,8 @@ int main() {
         return -1;
     }
 
-    printf("MattX-Stub: Blueprint received. Original PID: %u, VMAs: %u\n", 
-           received_req->orig_pid, received_req->vma_count);
+    printf("MattX-Stub: Blueprint received. Original PID: %u, Name: '%s', VMAs: %u\n", 
+           received_req->orig_pid, received_req->comm, received_req->vma_count);
 
     for (uint32_t i = 0; i < received_req->vma_count; i++) {
         struct mattx_vma_info *v = &received_req->vmas[i];

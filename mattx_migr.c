@@ -32,6 +32,10 @@ void mattx_capture_and_send_state(struct task_struct *task, int target_node) {
     }
 
     req->orig_pid = task->pid;
+    
+    // --- NEW: Extract the Nametag ---
+    get_task_comm(req->comm, task);
+    printk(KERN_INFO "MattX:[EXTRACT] Captured process name: '%s'\n", req->comm);
 
     regs = task_pt_regs(task);
     if (regs) {

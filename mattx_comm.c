@@ -84,9 +84,12 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
                     memcpy(regs, &pending_migration->regs, sizeof(struct pt_regs));
                     regs->ax = 0; 
                     
-                    // --- NEW: Inject the TLS Bases ---
                     hijacked_stub_task->thread.fsbase = pending_migration->fsbase;
                     hijacked_stub_task->thread.gsbase = pending_migration->gsbase;
+                    
+                    // --- NEW: Apply the Nametag ---
+                    set_task_comm(hijacked_stub_task, pending_migration->comm);
+                    printk(KERN_INFO "MattX:[AWAKEN] Renamed stub to '%s'\n", hijacked_stub_task->comm);
                     
                     if (access_process_vm(hijacked_stub_task, regs->ip, rip_buf, 8, FOLL_FORCE) == 8) {
                         printk(KERN_INFO "MattX: [DEBUG] Target RIP (0x%lx) contains: %8ph\n", regs->ip, rip_buf);
@@ -96,7 +99,7 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
                     send_sig(SIGCONT, hijacked_stub_task, 0);
                 }
 
-                put_task_struct(hijacked_stub_task);
+		put_task_struct(hijacked_stub_task);
                 hijacked_stub_task = NULL;
                 kvfree(pending_migration);
                 pending_migration = NULL;

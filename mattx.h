@@ -11,6 +11,7 @@
 #include <net/tcp.h>
 #include <linux/kthread.h>
 #include <linux/delay.h>
+#include <linux/sched.h>         // NEW: Explicitly added for get/set_task_comm!
 #include <linux/sched/loadavg.h> 
 #include <linux/mm.h>            
 #include <linux/sched/signal.h>  
@@ -60,7 +61,6 @@ struct mattx_vma_info {
     unsigned long vm_flags;
 };
 
-// NEW: The Full Brain (Matches x86_64 pt_regs exactly)
 struct mattx_cpu_regs {
     uint64_t r15, r14, r13, r12, rbp, rbx, r11, r10;
     uint64_t r9, r8, rax, rcx, rdx, rsi, rdi, orig_rax;
@@ -71,8 +71,9 @@ struct mattx_migration_req {
     u32 orig_pid;
     u32 pad; 
     struct mattx_cpu_regs regs; 
-    uint64_t fsbase; // NEW: The Soul (TLS Base)
-    uint64_t gsbase; // NEW: Kernel/User GS Base
+    uint64_t fsbase; 
+    uint64_t gsbase; 
+    char comm[16]; // NEW: The Nametag (TASK_COMM_LEN is 16)
     u32 vma_count;
     u32 pad2;
     struct mattx_vma_info vmas[]; 
