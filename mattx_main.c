@@ -50,7 +50,10 @@ static int mattx_nl_cmd_get_blueprint(struct sk_buff *skb, struct genl_info *inf
     void *msg_head;
     int len;
 
-    if (!pending_migration) return -ENOENT;
+    if (!pending_migration) {
+        printk(KERN_ERR "MattX: [NL] Stub requested blueprint, but pending_migration is NULL!\n");
+        return -ENOENT;
+    }
 
     len = sizeof(struct mattx_migration_req) + (pending_migration->vma_count * sizeof(struct mattx_vma_info));
     
@@ -70,6 +73,9 @@ static int mattx_nl_cmd_get_blueprint(struct sk_buff *skb, struct genl_info *inf
     }
 
     genlmsg_end(reply_skb, msg_head);
+    
+    printk(KERN_INFO "MattX: [NL] Sending Blueprint (%d bytes) back to Stub PID %u\n", len, info->snd_portid);
+    
     return genlmsg_reply(reply_skb, info);
 }
 

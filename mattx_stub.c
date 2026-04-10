@@ -14,25 +14,9 @@
 #include <netlink/genl/genl.h>
 #include <netlink/genl/ctrl.h>
 
-enum { 
-    MATTX_ATTR_UNSPEC, 
-    MATTX_ATTR_NODE_ID, 
-    MATTX_ATTR_IPV4_ADDR, 
-    MATTX_ATTR_STUB_PID, 
-    MATTX_ATTR_BLUEPRINT, 
-    __MATTX_ATTR_MAX 
-};
+enum { MATTX_ATTR_UNSPEC, MATTX_ATTR_NODE_ID, MATTX_ATTR_IPV4_ADDR, MATTX_ATTR_STUB_PID, MATTX_ATTR_BLUEPRINT, __MATTX_ATTR_MAX };
 #define MATTX_ATTR_MAX (__MATTX_ATTR_MAX - 1)
-
-enum { 
-    MATTX_CMD_UNSPEC, 
-    MATTX_CMD_NODE_JOIN, 
-    MATTX_CMD_NODE_LEAVE, 
-    MATTX_CMD_HIJACK_ME, 
-    MATTX_CMD_GET_BLUEPRINT, 
-    __MATTX_CMD_MAX 
-};
-#define MATTX_CMD_MAX (__MATTX_CMD_MAX - 1)
+enum { MATTX_CMD_UNSPEC, MATTX_CMD_NODE_JOIN, MATTX_CMD_NODE_LEAVE, MATTX_CMD_HIJACK_ME, MATTX_CMD_GET_BLUEPRINT, __MATTX_CMD_MAX };
 
 struct mattx_vma_info {
     uint64_t vm_start;
@@ -40,7 +24,6 @@ struct mattx_vma_info {
     uint64_t vm_flags;
 };
 
-// The Full Brain definition for user-space
 struct mattx_cpu_regs {
     uint64_t r15, r14, r13, r12, rbp, rbx, r11, r10;
     uint64_t r9, r8, rax, rcx, rdx, rsi, rdi, orig_rax;
@@ -51,8 +34,8 @@ struct mattx_migration_req {
     uint32_t orig_pid;
     uint32_t pad;
     struct mattx_cpu_regs regs;
-    uint64_t fsbase; // NEW: The Soul (TLS Base)
-    uint64_t gsbase; // NEW: Kernel/User GS Base
+    uint64_t fsbase; 
+    uint64_t gsbase; 
     uint32_t vma_count;
     uint32_t pad2;
     struct mattx_vma_info vmas[]; 
@@ -65,12 +48,18 @@ static int blueprint_cb(struct nl_msg *msg, void *arg) {
     struct nlattr *attrs[MATTX_ATTR_MAX + 1];
     struct nla_policy policy[MATTX_ATTR_MAX + 1];
     
+    printf("MattX-Stub:[CALLBACK] Received a Netlink message from kernel!\n");
+
     memset(policy, 0, sizeof(policy));
     policy[MATTX_ATTR_BLUEPRINT].type = NLA_BINARY;
 
-    if (genlmsg_parse(nlh, 0, attrs, MATTX_ATTR_MAX, policy) < 0) return NL_SKIP;
+    if (genlmsg_parse(nlh, 0, attrs, MATTX_ATTR_MAX, policy) < 0) {
+        printf("MattX-Stub: [CALLBACK] Message parsed, but no blueprint found (likely an ACK).\n");
+        return NL_SKIP;
+    }
 
     if (attrs[MATTX_ATTR_BLUEPRINT]) {
+        printf("MattX-Stub: [CALLBACK] SUCCESS: Blueprint attribute found!\n");
         struct mattx_migration_req *req = nla_data(attrs[MATTX_ATTR_BLUEPRINT]);
         int len = nla_len(attrs[MATTX_ATTR_BLUEPRINT]);
         
@@ -81,7 +70,6 @@ static int blueprint_cb(struct nl_msg *msg, void *arg) {
 }
 
 int main() {
-    // Redirect all output to a file so we can see it when spawned by the kernel
     freopen("/tmp/mattx_stub.log", "a", stdout);
     freopen("/tmp/mattx_stub.log", "a", stderr);
     setvbuf(stdout, NULL, _IONBF, 0); 
@@ -116,14 +104,19 @@ int main() {
     nlmsg_free(msg);
 
     printf("MattX-Stub: Waiting for kernel reply...\n");
-    int err = nl_recvmsgs_default(sock);
-    if (err < 0) {
-        fprintf(stderr, "MattX-Stub: Error receiving netlink message: %d\n", err);
-        return -1;
+    
+    // --- FIXED: Loop until we actually get the blueprint! ---
+    int retries = 10;
+    while (!received_req && retries > 0) {
+        int err = nl_recvmsgs_default(sock);
+        if (err < 0) {
+            fprintf(stderr, "MattX-Stub: Error receiving netlink message: %d\n", err);
+        }
+        retries--;
     }
 
     if (!received_req) {
-        fprintf(stderr, "MattX-Stub: No blueprint received from kernel!\n");
+        fprintf(stderr, "MattX-Stub: FATAL - No blueprint received after 10 attempts!\n");
         return -1;
     }
 
@@ -134,7 +127,6 @@ int main() {
         struct mattx_vma_info *v = &received_req->vmas[i];
         size_t size = v->vm_end - v->vm_start;
         
-        // FORCED RWX: We guarantee the kernel can write to this memory during injection
         int prot = PROT_READ | PROT_WRITE | PROT_EXEC;
 
         void *addr = mmap((void *)v->vm_start, size, prot, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
@@ -161,10 +153,8 @@ int main() {
     nl_socket_free(sock);
     free(received_req);
 
-    // Put the process into TASK_STOPPED state
     raise(SIGSTOP); 
     
-    // If the transplant is successful, the CPU will jump to the stress code and never reach this line.
     printf("MattX-Stub: ERROR - I woke up but I am still the stub!\n");
     while (1) sleep(1); 
     return 0;
