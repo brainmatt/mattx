@@ -28,7 +28,7 @@ void mattx_capture_and_send_state(struct task_struct *task, int target_node) {
         retries--;
     }
     if (retries == 0) {
-        printk(KERN_WARNING "MattX:[EXTRACT] Warning: Task %d took too long to stop!\n", task->pid);
+        printk(KERN_WARNING "MattX: [EXTRACT] Warning: Task %d took too long to stop!\n", task->pid);
     }
 
     req->orig_pid = task->pid;
@@ -37,12 +37,14 @@ void mattx_capture_and_send_state(struct task_struct *task, int target_node) {
     if (regs) {
         memcpy(&req->regs, regs, sizeof(struct pt_regs));
         
-        // --- NEW: Extract the TLS Bases ---
+        // Extract the TLS Bases (The Soul)
         req->fsbase = task->thread.fsbase;
         req->gsbase = task->thread.gsbase;
         
         if (access_process_vm(task, req->regs.rip, rip_buf, 8, FOLL_FORCE) == 8) {
             printk(KERN_INFO "MattX: [DEBUG] Source RIP (0x%lx) contains: %8ph\n", (unsigned long)req->regs.rip, rip_buf);
+        } else {
+            printk(KERN_WARNING "MattX: [DEBUG] Failed to read Source RIP!\n");
         }
     }
 
@@ -98,17 +100,17 @@ void mattx_send_vma_data(void) {
                 int bytes_read = access_process_vm(migrating_task, curr, page_buf, chunk_size, FOLL_FORCE);
                 if (bytes_read > 0) {
                     
-                    // FIXED: We only allocate space for the Page Header + Data. 
-                    // mattx_comm_send will add the main header!
+                    // FIXED: Only allocate space for the Page Header + Data. 
+                    // mattx_comm_send will prepend the main header!
                     size_t payload_size = sizeof(struct mattx_page_header) + bytes_read;
                     void *payload_buf = kmalloc(payload_size, GFP_KERNEL);
                     
                     if (payload_buf) {
-                        struct mattx_page_header *ph = (struct mattx_page_header *)payload_buf;
+                        struct mattx_page_header *p_page_hdr = (struct mattx_page_header *)payload_buf;
                         
-                        ph->vma_index = i;
-                        ph->offset = curr - start;
-                        ph->length = bytes_read;
+                        p_page_hdr->vma_index = i;
+                        p_page_hdr->offset = curr - start;
+                        p_page_hdr->length = bytes_read;
 
                         // Copy the memory data right after the page header
                         memcpy(payload_buf + sizeof(struct mattx_page_header), page_buf, bytes_read);
