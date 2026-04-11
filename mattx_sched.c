@@ -12,6 +12,7 @@ static struct task_struct* mattx_find_candidate_task(void) {
         if (strcmp(p->comm, "mattx-discd") == 0) continue;
         if (strcmp(p->comm, "mattx-stub") == 0) continue;
         
+        // Ignore Guests!
         if (is_guest_process(p->pid)) continue;
 
         if (READ_ONCE(p->__state) != TASK_RUNNING) continue;
@@ -66,6 +67,8 @@ int mattx_balancer_loop(void *data) {
     struct mattx_guest_info dead_guests[16]; 
     int dead_count;
 
+    printk(KERN_INFO "MattX: Balancer thread started\n");
+
     while (!kthread_should_stop()) {
         local_load.cpu_load = (u32)avenrun[0]; 
         local_load.mem_free_mb = (u32)(si_mem_available() >> 20);
@@ -78,12 +81,18 @@ int mattx_balancer_loop(void *data) {
         
         mattx_evaluate_and_balance(local_load.cpu_load);
 
-        // --- NEW: The Heartbeat Monitor ---
+        // --- The Heartbeat Monitor ---
         dead_count = 0;
         spin_lock(&guest_lock);
         for (i = 0; i < guest_count; ) {
-            struct task_struct *task = find_get_task_by_vpid(guest_registry[i].local_pid);
+            struct task_struct *task = NULL;
             bool is_dead = false;
+            
+            // FIXED: Safe LKM way to find a task by PID
+            rcu_read_lock();
+            task = pid_task(find_vpid(guest_registry[i].local_pid), PIDTYPE_PID);
+            if (task) get_task_struct(task);
+            rcu_read_unlock();
             
             if (!task) {
                 is_dead = true; // Process doesn't exist anymore

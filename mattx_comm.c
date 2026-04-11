@@ -1,6 +1,5 @@
 #include "mattx.h"
 
-// Global counter for debugging
 static int injected_pages_count = 0;
 
 static void mattx_handle_message(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
@@ -11,12 +10,14 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
                 cluster_map[link->node_id] = link;
             }
             break;
+            
         case MATTX_MSG_LOAD_UPDATE:
             if (hdr->sender_id < MAX_NODES && payload) {
                 struct mattx_load_info *load = (struct mattx_load_info *)payload;
                 cluster_load_table[hdr->sender_id] = *load;
             }
             break;
+            
         case MATTX_MSG_MIGRATE_REQ:
             if (payload) {
                 struct mattx_migration_req *req = (struct mattx_migration_req *)payload;
@@ -24,6 +25,7 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
                 char *envp[] = { "HOME=/", "PATH=/sbin:/bin:/usr/sbin:/usr/bin", NULL };
                 
                 pending_source_node = hdr->sender_id;
+                injected_pages_count = 0;
 
                 printk(KERN_INFO "MattX: [INCOMING] Received Blueprint for PID %u. Saving to pending...\n", req->orig_pid);
                 if (pending_migration) kvfree(pending_migration);
@@ -38,10 +40,12 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
                 }
             }
             break;
+            
         case MATTX_MSG_READY_FOR_DATA:
             printk(KERN_INFO "MattX:[COMM] Received READY signal from Node %u. Starting data pump...\n", hdr->sender_id);
             mattx_send_vma_data();
             break;
+            
         case MATTX_MSG_PAGE_TRANSFER:
             if (payload && pending_migration && hijacked_stub_task) {
                 struct mattx_page_header *ph = (struct mattx_page_header *)payload;
@@ -53,11 +57,14 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
                 
                 if (res != ph->length) {
                     printk(KERN_ERR "MattX: [INJECT] Failed to inject %u bytes at 0x%lx (res: %d)\n", ph->length, target_addr, res);
+                } else {
+                    injected_pages_count++;
                 }
             }
             break;
+            
         case MATTX_MSG_MIGRATE_DONE:
-            printk(KERN_INFO "MattX: [INCOMING] All memory transferred successfully!\n");
+            printk(KERN_INFO "MattX:[INCOMING] All memory transferred! Total pages injected: %d\n", injected_pages_count);
             
             if (hijacked_stub_task && pending_migration) {
                 struct pt_regs *regs;
@@ -114,7 +121,6 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
                     printk(KERN_INFO "MattX:[AWAKEN] IT'S ALIVE! Sending SIGCONT to PID %d\n", hijacked_stub_task->pid);
                     send_sig(SIGCONT, hijacked_stub_task, 0);
                     
-                    // --- FIXED: Add the full origin info to the registry ---
                     add_guest_process(hijacked_stub_task->pid, pending_migration->orig_pid, pending_source_node);
                     printk(KERN_INFO "MattX:[REGISTRY] PID %d registered as a Guest (Orig: %u, Home: %d).\n", 
                            hijacked_stub_task->pid, pending_migration->orig_pid, pending_source_node);
@@ -128,11 +134,10 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
             }
             break;
             
-        // --- NEW: The Funeral Director (Node 1 receives this) ---
         case MATTX_MSG_PROCESS_EXIT:
             if (payload) {
                 struct mattx_process_exit *exit_msg = (struct mattx_process_exit *)payload;
-                struct task_struct *deputy;
+                struct task_struct *deputy = NULL;
 
                 printk(KERN_INFO "MattX: [FUNERAL] Received exit notice for Deputy PID %u from Node %u\n", 
                        exit_msg->orig_pid, hdr->sender_id);
@@ -179,7 +184,7 @@ static int mattx_receiver_loop(void *data) {
         }
 
         if (hdr.length > MATTX_MAX_PAYLOAD) {
-            printk(KERN_ERR "MattX: [COMM] FATAL: Payload too large (%u bytes).\n", hdr.length);
+            printk(KERN_ERR "MattX:[COMM] FATAL: Payload too large (%u bytes).\n", hdr.length);
             break;
         }
 
@@ -189,7 +194,6 @@ static int mattx_receiver_loop(void *data) {
                 iov[0].iov_base = payload;
                 iov[0].iov_len = hdr.length;
                 
-                // Read the payload safely
                 int payload_len = kernel_recvmsg(link->sock, &msg, iov, 1, hdr.length, MSG_WAITALL);
                 if (payload_len != hdr.length) {
                     printk(KERN_ERR "MattX: [COMM] Short read on payload! Expected %u, got %d\n", hdr.length, payload_len);
