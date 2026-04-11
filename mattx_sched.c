@@ -12,7 +12,6 @@ static struct task_struct* mattx_find_candidate_task(void) {
         if (strcmp(p->comm, "mattx-discd") == 0) continue;
         if (strcmp(p->comm, "mattx-stub") == 0) continue;
         
-        // Ignore Guests!
         if (is_guest_process(p->pid)) continue;
 
         if (READ_ONCE(p->__state) != TASK_RUNNING) continue;
@@ -63,9 +62,12 @@ int mattx_balancer_loop(void *data) {
     struct mattx_load_info local_load;
     int i;
     
-    // Local array to hold dead guests so we don't send network packets while holding a spinlock
     struct mattx_guest_info dead_guests[16]; 
     int dead_count;
+
+    // NEW: Array for dead exports
+    struct mattx_export_info dead_exports[16];
+    int dead_export_count;
 
     printk(KERN_INFO "MattX: Balancer thread started\n");
 
@@ -81,41 +83,36 @@ int mattx_balancer_loop(void *data) {
         
         mattx_evaluate_and_balance(local_load.cpu_load);
 
-        // --- The Heartbeat Monitor ---
+        // --- The Guest Watcher (Node 2) ---
         dead_count = 0;
         spin_lock(&guest_lock);
         for (i = 0; i < guest_count; ) {
             struct task_struct *task = NULL;
             bool is_dead = false;
             
-            // FIXED: Safe LKM way to find a task by PID
             rcu_read_lock();
             task = pid_task(find_vpid(guest_registry[i].local_pid), PIDTYPE_PID);
             if (task) get_task_struct(task);
             rcu_read_unlock();
             
             if (!task) {
-                is_dead = true; // Process doesn't exist anymore
+                is_dead = true; 
             } else {
                 if (task->exit_state != 0) {
-                    is_dead = true; // Process is a Zombie or Dead
+                    is_dead = true; 
                 }
                 put_task_struct(task);
             }
 
             if (is_dead) {
-                if (dead_count < 16) {
-                    dead_guests[dead_count++] = guest_registry[i];
-                }
+                if (dead_count < 16) dead_guests[dead_count++] = guest_registry[i];
                 remove_guest_process(i);
-                // Do not increment 'i' because remove_guest_process swapped the last element into this slot
             } else {
                 i++;
             }
         }
         spin_unlock(&guest_lock);
 
-        // Send the Death Certificates
         for (i = 0; i < dead_count; i++) {
             struct mattx_process_exit exit_msg;
             exit_msg.orig_pid = dead_guests[i].orig_pid;
@@ -126,6 +123,49 @@ int mattx_balancer_loop(void *data) {
                    
             if (cluster_map[dead_guests[i].home_node]) {
                 mattx_comm_send(cluster_map[dead_guests[i].home_node], MATTX_MSG_PROCESS_EXIT, &exit_msg, sizeof(exit_msg));
+            }
+        }
+
+        // --- NEW: The Home Watcher (Node 1) ---
+        dead_export_count = 0;
+        spin_lock(&export_lock);
+        for (i = 0; i < export_count; ) {
+            struct task_struct *task = NULL;
+            bool is_dead = false;
+
+            rcu_read_lock();
+            task = pid_task(find_vpid(export_registry[i].orig_pid), PIDTYPE_PID);
+            if (task) get_task_struct(task);
+            rcu_read_unlock();
+
+            if (!task) {
+                is_dead = true;
+            } else {
+                if (task->exit_state != 0) {
+                    is_dead = true;
+                }
+                put_task_struct(task);
+            }
+
+            if (is_dead) {
+                if (dead_export_count < 16) dead_exports[dead_export_count++] = export_registry[i];
+                remove_export_process(i);
+            } else {
+                i++;
+            }
+        }
+        spin_unlock(&export_lock);
+
+        for (i = 0; i < dead_export_count; i++) {
+            struct mattx_process_exit kill_msg;
+            kill_msg.orig_pid = dead_exports[i].orig_pid;
+            kill_msg.exit_code = 0; 
+
+            printk(KERN_INFO "MattX: [WATCHER] Exported PID %d died. Sending Assassination Order to Node %d...\n",
+                   dead_exports[i].orig_pid, dead_exports[i].target_node);
+
+            if (cluster_map[dead_exports[i].target_node]) {
+                mattx_comm_send(cluster_map[dead_exports[i].target_node], MATTX_MSG_KILL_SURROGATE, &kill_msg, sizeof(kill_msg));
             }
         }
 

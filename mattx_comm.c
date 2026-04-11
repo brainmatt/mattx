@@ -139,7 +139,7 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
                 struct mattx_process_exit *exit_msg = (struct mattx_process_exit *)payload;
                 struct task_struct *deputy = NULL;
 
-                printk(KERN_INFO "MattX: [FUNERAL] Received exit notice for Deputy PID %u from Node %u\n", 
+                printk(KERN_INFO "MattX:[FUNERAL] Received exit notice for Deputy PID %u from Node %u\n", 
                        exit_msg->orig_pid, hdr->sender_id);
 
                 rcu_read_lock();
@@ -153,6 +153,46 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
                     put_task_struct(deputy);
                 } else {
                     printk(KERN_WARNING "MattX: [FUNERAL] Deputy PID %u not found. Already dead?\n", exit_msg->orig_pid);
+                }
+            }
+            break;
+
+        case MATTX_MSG_KILL_SURROGATE:
+            if (payload) {
+                struct mattx_process_exit *kill_msg = (struct mattx_process_exit *)payload;
+                pid_t local_stub_pid = -1;
+                int i;
+
+                printk(KERN_INFO "MattX: [ASSASSIN] Received order to kill surrogate for Orig PID %u from Node %u\n",
+                       kill_msg->orig_pid, hdr->sender_id);
+
+                // Find the local PID from the guest registry
+                spin_lock(&guest_lock);
+                for (i = 0; i < guest_count; i++) {
+                    if (guest_registry[i].orig_pid == kill_msg->orig_pid && guest_registry[i].home_node == hdr->sender_id) {
+                        local_stub_pid = guest_registry[i].local_pid;
+                        remove_guest_process(i);
+                        break;
+                    }
+                }
+                spin_unlock(&guest_lock);
+
+                if (local_stub_pid != -1) {
+                    struct task_struct *surrogate = NULL;
+                    rcu_read_lock();
+                    surrogate = pid_task(find_vpid(local_stub_pid), PIDTYPE_PID);
+                    if (surrogate) get_task_struct(surrogate);
+                    rcu_read_unlock();
+
+                    if (surrogate) {
+                        printk(KERN_INFO "MattX: [ASSASSIN] Executing Surrogate PID %d (Sending SIGKILL)...\n", surrogate->pid);
+                        send_sig(SIGKILL, surrogate, 0);
+                        put_task_struct(surrogate);
+                    } else {
+                        printk(KERN_WARNING "MattX:[ASSASSIN] Surrogate PID %d not found. Already dead?\n", local_stub_pid);
+                    }
+                } else {
+                    printk(KERN_WARNING "MattX: [ASSASSIN] Could not find guest registry entry for Orig PID %u\n", kill_msg->orig_pid);
                 }
             }
             break;

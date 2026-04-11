@@ -43,7 +43,8 @@ enum mattx_msg_type {
     MATTX_MSG_READY_FOR_DATA, 
     MATTX_MSG_PAGE_TRANSFER, 
     MATTX_MSG_MIGRATE_DONE,   
-    MATTX_MSG_PROCESS_EXIT,   // NEW: The Death Certificate
+    MATTX_MSG_PROCESS_EXIT,   
+    MATTX_MSG_KILL_SURROGATE, // NEW: The Assassination Order
     MATTX_MSG_SYSCALL_FWD,
 };
 
@@ -91,7 +92,6 @@ struct mattx_page_header {
     u32 length;
 };
 
-// NEW: The Exit Payload
 struct mattx_process_exit {
     u32 orig_pid;
     int exit_code; 
@@ -104,11 +104,16 @@ struct mattx_link {
     struct task_struct *receiver_thread;
 };
 
-// NEW: Enhanced Guest Info
 struct mattx_guest_info {
     pid_t local_pid;
     u32 orig_pid;
     int home_node;
+};
+
+// NEW: Export Registry Info
+struct mattx_export_info {
+    pid_t orig_pid;
+    int target_node;
 };
 
 extern struct mattx_load_info cluster_load_table[MAX_NODES];
@@ -122,6 +127,11 @@ extern struct mattx_guest_info guest_registry[MAX_GUESTS];
 extern int guest_count;
 extern spinlock_t guest_lock;
 
+// NEW: Export Registry Globals
+extern struct mattx_export_info export_registry[MAX_GUESTS];
+extern int export_count;
+extern spinlock_t export_lock;
+
 int mattx_comm_send(struct mattx_link *link, u32 type, void *data, u32 len);
 struct mattx_link* mattx_comm_connect(__be32 ip_addr, int node_id);
 void mattx_comm_disconnect(int node_id);
@@ -133,6 +143,10 @@ void mattx_send_vma_data(void);
 bool is_guest_process(pid_t pid);
 void add_guest_process(pid_t local_pid, u32 orig_pid, int home_node);
 void remove_guest_process(int index);
+
+// NEW: Export Registry Helpers
+void add_export_process(pid_t orig_pid, int target_node);
+void remove_export_process(int index);
 
 #endif // MATTX_H
 

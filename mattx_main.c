@@ -47,11 +47,32 @@ void add_guest_process(pid_t local_pid, u32 orig_pid, int home_node) {
 }
 
 void remove_guest_process(int index) {
-    // Note: Must be called with guest_lock held!
     if (index < 0 || index >= guest_count) return;
-    // Swap with the last element to keep array contiguous
     guest_registry[index] = guest_registry[guest_count - 1];
     guest_count--;
+}
+
+// --- NEW: Export Registry Implementation ---
+struct mattx_export_info export_registry[MAX_GUESTS];
+int export_count = 0;
+DEFINE_SPINLOCK(export_lock);
+
+void add_export_process(pid_t orig_pid, int target_node) {
+    spin_lock(&export_lock);
+    if (export_count < MAX_GUESTS) {
+        export_registry[export_count].orig_pid = orig_pid;
+        export_registry[export_count].target_node = target_node;
+        export_count++;
+    } else {
+        printk(KERN_WARNING "MattX: [REGISTRY] Export registry is full!\n");
+    }
+    spin_unlock(&export_lock);
+}
+
+void remove_export_process(int index) {
+    if (index < 0 || index >= export_count) return;
+    export_registry[index] = export_registry[export_count - 1];
+    export_count--;
 }
 // ------------------------------------------
 
@@ -137,7 +158,7 @@ static int mattx_nl_cmd_hijack_me(struct sk_buff *skb, struct genl_info *info) {
     printk(KERN_INFO "MattX: [HIJACK] SUCCESS! Stub PID %u is carved and ready.\n", stub_pid);
 
     if (pending_source_node != -1 && cluster_map[pending_source_node]) {
-        printk(KERN_INFO "MattX: [HIJACK] Sending READY_FOR_DATA signal to Node %d...\n", pending_source_node);
+        printk(KERN_INFO "MattX:[HIJACK] Sending READY_FOR_DATA signal to Node %d...\n", pending_source_node);
         mattx_comm_send(cluster_map[pending_source_node], MATTX_MSG_READY_FOR_DATA, NULL, 0);
     }
 
@@ -160,6 +181,7 @@ static int __init mattx_init(void) {
     if (rc) return rc;
     
     spin_lock_init(&guest_lock); 
+    spin_lock_init(&export_lock); // NEW: Initialize export lock
     
     balancer_thread = kthread_run(mattx_balancer_loop, NULL, "mattx_balancer");
     listener_thread = kthread_run(mattx_listener_loop, NULL, "mattx_listener");
