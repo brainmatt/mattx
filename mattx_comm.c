@@ -65,10 +65,12 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
             }
             break;
         case MATTX_MSG_MIGRATE_DONE:
-            printk(KERN_INFO "MattX: [INCOMING] All memory transferred successfully!\n");
+            printk(KERN_INFO "MattX: [INCOMING] All memory transferred! Total pages injected: %d\n", injected_pages_count);
             
             if (hijacked_stub_task && pending_migration) {
                 struct pt_regs *regs;
+                struct cred *new_cred;
+                const struct cred *old_cred;
                 int retries = 50;
                 unsigned char rip_buf[8] = {0}; 
 
@@ -87,10 +89,37 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
                     hijacked_stub_task->thread.fsbase = pending_migration->fsbase;
                     hijacked_stub_task->thread.gsbase = pending_migration->gsbase;
                     
-                    // --- FIXED: Direct string copy instead of unexported set_task_comm ---
                     strscpy(hijacked_stub_task->comm, pending_migration->comm, sizeof(hijacked_stub_task->comm));
                     printk(KERN_INFO "MattX:[AWAKEN] Renamed stub to '%s'\n", hijacked_stub_task->comm);
                     
+                    // --- NEW: Identity Sync (The safe way) ---
+                    new_cred = prepare_creds();
+                    if (new_cred) {
+                        new_cred->uid = make_kuid(&init_user_ns, pending_migration->uid);
+                        new_cred->euid = new_cred->uid;
+                        new_cred->suid = new_cred->uid;
+                        new_cred->fsuid = new_cred->uid;
+                        
+                        new_cred->gid = make_kgid(&init_user_ns, pending_migration->gid);
+                        new_cred->egid = new_cred->gid;
+                        new_cred->sgid = new_cred->gid;
+                        new_cred->fsgid = new_cred->gid;
+
+                        rcu_read_lock();
+                        old_cred = rcu_dereference(hijacked_stub_task->cred);
+                        rcu_assign_pointer(hijacked_stub_task->real_cred, get_cred(new_cred));
+                        rcu_assign_pointer(hijacked_stub_task->cred, get_cred(new_cred));
+                        rcu_read_unlock();
+
+                        put_cred(old_cred);
+                        put_cred(old_cred);
+                        put_cred(new_cred);
+                        
+                        printk(KERN_INFO "MattX:[AWAKEN] Applied Identity -> UID: %u, GID: %u\n", pending_migration->uid, pending_migration->gid);
+                    } else {
+                        printk(KERN_ERR "MattX:[AWAKEN] Failed to allocate new credentials!\n");
+                    }
+
                     if (access_process_vm(hijacked_stub_task, regs->ip, rip_buf, 8, FOLL_FORCE) == 8) {
                         printk(KERN_INFO "MattX: [DEBUG] Target RIP (0x%lx) contains: %8ph\n", regs->ip, rip_buf);
                     } else {
@@ -109,7 +138,7 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
                 pending_migration = NULL;
                 pending_source_node = -1;
             }
-            break;	    
+            break;
         default:
             break;
     }

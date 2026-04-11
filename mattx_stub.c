@@ -32,11 +32,13 @@ struct mattx_cpu_regs {
 
 struct mattx_migration_req {
     uint32_t orig_pid;
+    uint32_t uid; // NEW
+    uint32_t gid; // NEW
     uint32_t pad;
     struct mattx_cpu_regs regs;
     uint64_t fsbase; 
     uint64_t gsbase; 
-    char comm[16]; // NEW: The Nametag
+    char comm[16]; 
     uint32_t vma_count;
     uint32_t pad2;
     struct mattx_vma_info vmas[]; 
@@ -120,8 +122,9 @@ int main() {
         return -1;
     }
 
-    printf("MattX-Stub: Blueprint received. Original PID: %u, Name: '%s', VMAs: %u\n", 
-           received_req->orig_pid, received_req->comm, received_req->vma_count);
+    // --- NEW: Print the Identity and Name ---
+    printf("MattX-Stub: Blueprint received. Original PID: %u, Name: '%s', UID: %u, GID: %u, VMAs: %u\n", 
+           received_req->orig_pid, received_req->comm, received_req->uid, received_req->gid, received_req->vma_count);
 
     for (uint32_t i = 0; i < received_req->vma_count; i++) {
         struct mattx_vma_info *v = &received_req->vmas[i];

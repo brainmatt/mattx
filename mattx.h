@@ -11,7 +11,7 @@
 #include <net/tcp.h>
 #include <linux/kthread.h>
 #include <linux/delay.h>
-#include <linux/sched.h>         // NEW: Explicitly added for get/set_task_comm!
+#include <linux/sched.h>         
 #include <linux/sched/loadavg.h> 
 #include <linux/mm.h>            
 #include <linux/sched/signal.h>  
@@ -21,6 +21,8 @@
 #include <asm/ptrace.h>          
 #include <linux/umh.h>           
 #include <linux/highmem.h>       
+#include <linux/cred.h>          // NEW: For credential management
+#include <linux/uidgid.h>        // NEW: For UID/GID conversions
 
 #define MATTX_PORT 7226
 #define MAX_NODES 1024 
@@ -69,11 +71,13 @@ struct mattx_cpu_regs {
 
 struct mattx_migration_req {
     u32 orig_pid;
+    u32 uid; // NEW: User ID
+    u32 gid; // NEW: Group ID
     u32 pad; 
     struct mattx_cpu_regs regs; 
     uint64_t fsbase; 
     uint64_t gsbase; 
-    char comm[16]; // NEW: The Nametag (TASK_COMM_LEN is 16)
+    char comm[16]; 
     u32 vma_count;
     u32 pad2;
     struct mattx_vma_info vmas[]; 

@@ -28,12 +28,16 @@ void mattx_capture_and_send_state(struct task_struct *task, int target_node) {
         retries--;
     }
     if (retries == 0) {
-        printk(KERN_WARNING "MattX: [EXTRACT] Warning: Task %d took too long to stop!\n", task->pid);
+        printk(KERN_WARNING "MattX:[EXTRACT] Warning: Task %d took too long to stop!\n", task->pid);
     }
 
     req->orig_pid = task->pid;
     
-    // --- NEW: Extract the Nametag ---
+    // --- NEW: Extract Identity ---
+    req->uid = from_kuid(&init_user_ns, task_uid(task));
+    req->gid = from_kgid(&init_user_ns, task_gid(task));
+    printk(KERN_INFO "MattX:[EXTRACT] Captured Identity -> UID: %u, GID: %u\n", req->uid, req->gid);
+
     get_task_comm(req->comm, task);
     printk(KERN_INFO "MattX:[EXTRACT] Captured process name: '%s'\n", req->comm);
 
@@ -41,7 +45,6 @@ void mattx_capture_and_send_state(struct task_struct *task, int target_node) {
     if (regs) {
         memcpy(&req->regs, regs, sizeof(struct pt_regs));
         
-        // Extract the TLS Bases (The Soul)
         req->fsbase = task->thread.fsbase;
         req->gsbase = task->thread.gsbase;
         
@@ -85,6 +88,11 @@ void mattx_capture_and_send_state(struct task_struct *task, int target_node) {
 }
 
 void mattx_send_vma_data(void) {
+    int total_pages = 0;
+    int sent_pages = 0;
+    int skipped_pages = 0;
+    int network_errors = 0;
+
     if (!local_migration_req || !migrating_task || migrating_target_node == -1) return;
     if (!cluster_map[migrating_target_node]) return;
 
@@ -98,14 +106,13 @@ void mattx_send_vma_data(void) {
         while (curr < end) {
             u32 chunk_size = PAGE_SIZE;
             if (curr + chunk_size > end) chunk_size = end - curr;
+            total_pages++;
 
             void *page_buf = kmalloc(chunk_size, GFP_KERNEL);
             if (page_buf) {
                 int bytes_read = access_process_vm(migrating_task, curr, page_buf, chunk_size, FOLL_FORCE);
+                
                 if (bytes_read > 0) {
-                    
-                    // FIXED: Only allocate space for the Page Header + Data. 
-                    // mattx_comm_send will prepend the main header!
                     size_t payload_size = sizeof(struct mattx_page_header) + bytes_read;
                     void *payload_buf = kmalloc(payload_size, GFP_KERNEL);
                     
@@ -116,13 +123,18 @@ void mattx_send_vma_data(void) {
                         p_page_hdr->offset = curr - start;
                         p_page_hdr->length = bytes_read;
 
-                        // Copy the memory data right after the page header
                         memcpy(payload_buf + sizeof(struct mattx_page_header), page_buf, bytes_read);
                         
-                        // Send it!
-                        mattx_comm_send(cluster_map[migrating_target_node], MATTX_MSG_PAGE_TRANSFER, payload_buf, payload_size);
+                        int send_res = mattx_comm_send(cluster_map[migrating_target_node], MATTX_MSG_PAGE_TRANSFER, payload_buf, payload_size);
+                        if (send_res < payload_size) {
+                            network_errors++;
+                        } else {
+                            sent_pages++;
+                        }
                         kfree(payload_buf);
                     }
+                } else {
+                    skipped_pages++;
                 }
                 kfree(page_buf);
             }
@@ -130,7 +142,10 @@ void mattx_send_vma_data(void) {
         }
     }
     
+    printk(KERN_INFO "MattX:[MIGRATE] Pipeline stats: %d total, %d sent, %d skipped, %d net errors\n", 
+           total_pages, sent_pages, skipped_pages, network_errors);
     printk(KERN_INFO "MattX:[MIGRATE] Data pipeline complete. Sending DONE signal.\n");
+    
     mattx_comm_send(cluster_map[migrating_target_node], MATTX_MSG_MIGRATE_DONE, NULL, 0);
     
     put_task_struct(migrating_task);
