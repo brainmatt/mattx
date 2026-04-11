@@ -9,6 +9,7 @@ void mattx_capture_and_send_state(struct task_struct *task, int target_node) {
     struct mm_struct *mm;
     struct vm_area_struct *vma;
     struct mattx_migration_req *req;
+    const struct cred *cred; // NEW: Safe credential pointer
     size_t max_payload_size;
     size_t actual_payload_size;
     int vma_count = 0;
@@ -33,10 +34,16 @@ void mattx_capture_and_send_state(struct task_struct *task, int target_node) {
 
     req->orig_pid = task->pid;
     
-    // --- NEW: Extract Identity ---
-    req->uid = from_kuid(&init_user_ns, task_uid(task));
-    req->gid = from_kgid(&init_user_ns, task_gid(task));
-    printk(KERN_INFO "MattX:[EXTRACT] Captured Identity -> UID: %u, GID: %u\n", req->uid, req->gid);
+    // --- FIXED: Extract Identity Safely ---
+    cred = get_task_cred(task);
+    if (cred) {
+        req->uid = from_kuid(&init_user_ns, cred->uid);
+        req->gid = from_kgid(&init_user_ns, cred->gid);
+        put_cred(cred); // Always release the reference!
+        printk(KERN_INFO "MattX:[EXTRACT] Captured Identity -> UID: %u, GID: %u\n", req->uid, req->gid);
+    } else {
+        printk(KERN_WARNING "MattX:[EXTRACT] Failed to get task credentials!\n");
+    }
 
     get_task_comm(req->comm, task);
     printk(KERN_INFO "MattX:[EXTRACT] Captured process name: '%s'\n", req->comm);
