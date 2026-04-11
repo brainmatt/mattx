@@ -24,7 +24,6 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
                 char *envp[] = { "HOME=/", "PATH=/sbin:/bin:/usr/sbin:/usr/bin", NULL };
                 
                 pending_source_node = hdr->sender_id;
-                injected_pages_count = 0; // Reset counter
 
                 printk(KERN_INFO "MattX: [INCOMING] Received Blueprint for PID %u. Saving to pending...\n", req->orig_pid);
                 if (pending_migration) kvfree(pending_migration);
@@ -50,22 +49,15 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
                 unsigned long target_addr = pending_migration->vmas[ph->vma_index].vm_start + ph->offset;
                 int res;
 
-                // --- NEW: The RIP Tracker ---
-                if (target_addr <= pending_migration->regs.rip && pending_migration->regs.rip < target_addr + ph->length) {
-                    printk(KERN_INFO "MattX: [DEBUG] *** INJECTING THE RIP PAGE AT 0x%lx ***\n", target_addr);
-                }
-
                 res = access_process_vm(hijacked_stub_task, target_addr, data, ph->length, FOLL_WRITE | FOLL_FORCE);
                 
                 if (res != ph->length) {
                     printk(KERN_ERR "MattX: [INJECT] Failed to inject %u bytes at 0x%lx (res: %d)\n", ph->length, target_addr, res);
-                } else {
-                    injected_pages_count++;
                 }
             }
             break;
         case MATTX_MSG_MIGRATE_DONE:
-            printk(KERN_INFO "MattX:[INCOMING] All memory transferred successfully!\n");
+            printk(KERN_INFO "MattX: [INCOMING] All memory transferred successfully!\n");
             
             if (hijacked_stub_task && pending_migration) {
                 struct pt_regs *regs;
@@ -113,8 +105,6 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
                         put_cred(old_cred);
                         put_cred(old_cred);
                         put_cred(new_cred);
-                        
-                        printk(KERN_INFO "MattX:[AWAKEN] Applied Identity -> UID: %u, GID: %u\n", pending_migration->uid, pending_migration->gid);
                     }
 
                     if (access_process_vm(hijacked_stub_task, regs->ip, rip_buf, 8, FOLL_FORCE) == 8) {
@@ -124,9 +114,10 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
                     printk(KERN_INFO "MattX:[AWAKEN] IT'S ALIVE! Sending SIGCONT to PID %d\n", hijacked_stub_task->pid);
                     send_sig(SIGCONT, hijacked_stub_task, 0);
                     
-                    // --- NEW: Add to Guest Registry ---
-                    add_guest_process(hijacked_stub_task->pid);
-                    printk(KERN_INFO "MattX:[REGISTRY] PID %d registered as a Guest. It will not be migrated again.\n", hijacked_stub_task->pid);
+                    // --- FIXED: Add the full origin info to the registry ---
+                    add_guest_process(hijacked_stub_task->pid, pending_migration->orig_pid, pending_source_node);
+                    printk(KERN_INFO "MattX:[REGISTRY] PID %d registered as a Guest (Orig: %u, Home: %d).\n", 
+                           hijacked_stub_task->pid, pending_migration->orig_pid, pending_source_node);
                 }
 
                 put_task_struct(hijacked_stub_task);
@@ -136,7 +127,33 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
                 pending_source_node = -1;
             }
             break;
-	default:
+            
+        // --- NEW: The Funeral Director (Node 1 receives this) ---
+        case MATTX_MSG_PROCESS_EXIT:
+            if (payload) {
+                struct mattx_process_exit *exit_msg = (struct mattx_process_exit *)payload;
+                struct task_struct *deputy;
+
+                printk(KERN_INFO "MattX: [FUNERAL] Received exit notice for Deputy PID %u from Node %u\n", 
+                       exit_msg->orig_pid, hdr->sender_id);
+
+                rcu_read_lock();
+                deputy = pid_task(find_vpid(exit_msg->orig_pid), PIDTYPE_PID);
+                if (deputy) get_task_struct(deputy);
+                rcu_read_unlock();
+
+                if (deputy) {
+                    printk(KERN_INFO "MattX: [FUNERAL] Laying Deputy PID %u to rest (Sending SIGKILL)...\n", deputy->pid);
+                    send_sig(SIGKILL, deputy, 0);
+                    put_task_struct(deputy);
+                } else {
+                    printk(KERN_WARNING "MattX: [FUNERAL] Deputy PID %u not found. Already dead?\n", exit_msg->orig_pid);
+                }
+            }
+            break;
+            
+        default:
+            printk(KERN_WARNING "MattX: [COMM] Unknown message type: %u\n", hdr->type);
             break;
     }
 }

@@ -31,7 +31,7 @@
 #define FIXED_LOAD_1_0 2048
 #define FIXED_LOAD_0_2 409
 #define MAX_VMAS 256 
-#define MAX_GUESTS 1024 // NEW: Maximum number of guests a node can host
+#define MAX_GUESTS 1024 
 
 #define MATTX_MAGIC 0x4D415454 
 #define MATTX_MAX_PAYLOAD (10 * 1024 * 1024) 
@@ -43,6 +43,7 @@ enum mattx_msg_type {
     MATTX_MSG_READY_FOR_DATA, 
     MATTX_MSG_PAGE_TRANSFER, 
     MATTX_MSG_MIGRATE_DONE,   
+    MATTX_MSG_PROCESS_EXIT,   // NEW: The Death Certificate
     MATTX_MSG_SYSCALL_FWD,
 };
 
@@ -90,11 +91,24 @@ struct mattx_page_header {
     u32 length;
 };
 
+// NEW: The Exit Payload
+struct mattx_process_exit {
+    u32 orig_pid;
+    int exit_code; 
+};
+
 struct mattx_link {
     int node_id;
     struct socket *sock;
     struct sock *sk;
     struct task_struct *receiver_thread;
+};
+
+// NEW: Enhanced Guest Info
+struct mattx_guest_info {
+    pid_t local_pid;
+    u32 orig_pid;
+    int home_node;
 };
 
 extern struct mattx_load_info cluster_load_table[MAX_NODES];
@@ -104,8 +118,7 @@ extern struct genl_family mattx_genl_family;
 extern int pending_source_node;
 extern struct task_struct *hijacked_stub_task;
 
-// --- NEW: Guest Registry Globals ---
-extern pid_t guest_registry[MAX_GUESTS];
+extern struct mattx_guest_info guest_registry[MAX_GUESTS];
 extern int guest_count;
 extern spinlock_t guest_lock;
 
@@ -117,9 +130,9 @@ int mattx_balancer_loop(void *data);
 void mattx_capture_and_send_state(struct task_struct *task, int target_node);
 void mattx_send_vma_data(void); 
 
-// --- NEW: Guest Registry Helpers ---
 bool is_guest_process(pid_t pid);
-void add_guest_process(pid_t pid);
+void add_guest_process(pid_t local_pid, u32 orig_pid, int home_node);
+void remove_guest_process(int index);
 
 #endif // MATTX_H
 

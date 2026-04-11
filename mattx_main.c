@@ -14,35 +14,44 @@ struct task_struct *hijacked_stub_task = NULL;
 static struct task_struct *balancer_thread;
 static struct task_struct *listener_thread;
 
-// --- NEW: Guest Registry Implementation ---
-pid_t guest_registry[MAX_GUESTS];
+// --- Guest Registry Implementation ---
+struct mattx_guest_info guest_registry[MAX_GUESTS];
 int guest_count = 0;
 DEFINE_SPINLOCK(guest_lock);
 
 bool is_guest_process(pid_t pid) {
     int i;
     bool found = false;
-    
     spin_lock(&guest_lock);
     for (i = 0; i < guest_count; i++) {
-        if (guest_registry[i] == pid) {
+        if (guest_registry[i].local_pid == pid) {
             found = true;
             break;
         }
     }
     spin_unlock(&guest_lock);
-    
     return found;
 }
 
-void add_guest_process(pid_t pid) {
+void add_guest_process(pid_t local_pid, u32 orig_pid, int home_node) {
     spin_lock(&guest_lock);
     if (guest_count < MAX_GUESTS) {
-        guest_registry[guest_count++] = pid;
+        guest_registry[guest_count].local_pid = local_pid;
+        guest_registry[guest_count].orig_pid = orig_pid;
+        guest_registry[guest_count].home_node = home_node;
+        guest_count++;
     } else {
-        printk(KERN_WARNING "MattX: [REGISTRY] Guest registry is full! Cannot add PID %d\n", pid);
+        printk(KERN_WARNING "MattX: [REGISTRY] Guest registry is full!\n");
     }
     spin_unlock(&guest_lock);
+}
+
+void remove_guest_process(int index) {
+    // Note: Must be called with guest_lock held!
+    if (index < 0 || index >= guest_count) return;
+    // Swap with the last element to keep array contiguous
+    guest_registry[index] = guest_registry[guest_count - 1];
+    guest_count--;
 }
 // ------------------------------------------
 
@@ -150,7 +159,7 @@ static int __init mattx_init(void) {
     int rc = genl_register_family(&mattx_genl_family);
     if (rc) return rc;
     
-    spin_lock_init(&guest_lock); // Initialize the spinlock!
+    spin_lock_init(&guest_lock); 
     
     balancer_thread = kthread_run(mattx_balancer_loop, NULL, "mattx_balancer");
     listener_thread = kthread_run(mattx_listener_loop, NULL, "mattx_listener");
