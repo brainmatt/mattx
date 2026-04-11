@@ -21,8 +21,8 @@
 #include <asm/ptrace.h>          
 #include <linux/umh.h>           
 #include <linux/highmem.h>       
-#include <linux/cred.h>          // NEW: For credential management
-#include <linux/uidgid.h>        // NEW: For UID/GID conversions
+#include <linux/cred.h>          
+#include <linux/uidgid.h>        
 
 #define MATTX_PORT 7226
 #define MAX_NODES 1024 
@@ -31,6 +31,7 @@
 #define FIXED_LOAD_1_0 2048
 #define FIXED_LOAD_0_2 409
 #define MAX_VMAS 256 
+#define MAX_GUESTS 1024 // NEW: Maximum number of guests a node can host
 
 #define MATTX_MAGIC 0x4D415454 
 #define MATTX_MAX_PAYLOAD (10 * 1024 * 1024) 
@@ -71,8 +72,8 @@ struct mattx_cpu_regs {
 
 struct mattx_migration_req {
     u32 orig_pid;
-    u32 uid; // NEW: User ID
-    u32 gid; // NEW: Group ID
+    u32 uid; 
+    u32 gid; 
     u32 pad; 
     struct mattx_cpu_regs regs; 
     uint64_t fsbase; 
@@ -103,6 +104,11 @@ extern struct genl_family mattx_genl_family;
 extern int pending_source_node;
 extern struct task_struct *hijacked_stub_task;
 
+// --- NEW: Guest Registry Globals ---
+extern pid_t guest_registry[MAX_GUESTS];
+extern int guest_count;
+extern spinlock_t guest_lock;
+
 int mattx_comm_send(struct mattx_link *link, u32 type, void *data, u32 len);
 struct mattx_link* mattx_comm_connect(__be32 ip_addr, int node_id);
 void mattx_comm_disconnect(int node_id);
@@ -110,6 +116,10 @@ int mattx_listener_loop(void *data);
 int mattx_balancer_loop(void *data);
 void mattx_capture_and_send_state(struct task_struct *task, int target_node);
 void mattx_send_vma_data(void); 
+
+// --- NEW: Guest Registry Helpers ---
+bool is_guest_process(pid_t pid);
+void add_guest_process(pid_t pid);
 
 #endif // MATTX_H
 

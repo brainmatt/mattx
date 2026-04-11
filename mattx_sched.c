@@ -11,6 +11,10 @@ static struct task_struct* mattx_find_candidate_task(void) {
         if (p->pid <= 1 || (p->flags & PF_EXITING)) continue;
         if (strcmp(p->comm, "mattx-discd") == 0) continue;
         if (strcmp(p->comm, "mattx-stub") == 0) continue;
+        
+        // --- NEW: Ignore Guests! ---
+        if (is_guest_process(p->pid)) continue;
+
         if (READ_ONCE(p->__state) != TASK_RUNNING) continue;
 
         if (p->se.sum_exec_runtime > max_runtime) {
@@ -22,6 +26,7 @@ static struct task_struct* mattx_find_candidate_task(void) {
     rcu_read_unlock();
     return best_candidate;
 }
+
 
 static void mattx_evaluate_and_balance(u32 local_cpu_load) {
     int i;

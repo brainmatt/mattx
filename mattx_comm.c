@@ -65,7 +65,7 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
             }
             break;
         case MATTX_MSG_MIGRATE_DONE:
-            printk(KERN_INFO "MattX: [INCOMING] All memory transferred! Total pages injected: %d\n", injected_pages_count);
+            printk(KERN_INFO "MattX:[INCOMING] All memory transferred successfully!\n");
             
             if (hijacked_stub_task && pending_migration) {
                 struct pt_regs *regs;
@@ -92,7 +92,6 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
                     strscpy(hijacked_stub_task->comm, pending_migration->comm, sizeof(hijacked_stub_task->comm));
                     printk(KERN_INFO "MattX:[AWAKEN] Renamed stub to '%s'\n", hijacked_stub_task->comm);
                     
-                    // --- NEW: Identity Sync (The safe way) ---
                     new_cred = prepare_creds();
                     if (new_cred) {
                         new_cred->uid = make_kuid(&init_user_ns, pending_migration->uid);
@@ -116,20 +115,18 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
                         put_cred(new_cred);
                         
                         printk(KERN_INFO "MattX:[AWAKEN] Applied Identity -> UID: %u, GID: %u\n", pending_migration->uid, pending_migration->gid);
-                    } else {
-                        printk(KERN_ERR "MattX:[AWAKEN] Failed to allocate new credentials!\n");
                     }
 
                     if (access_process_vm(hijacked_stub_task, regs->ip, rip_buf, 8, FOLL_FORCE) == 8) {
                         printk(KERN_INFO "MattX: [DEBUG] Target RIP (0x%lx) contains: %8ph\n", regs->ip, rip_buf);
-                    } else {
-                        printk(KERN_WARNING "MattX:[DEBUG] Failed to read Target RIP!\n");
                     }
 
                     printk(KERN_INFO "MattX:[AWAKEN] IT'S ALIVE! Sending SIGCONT to PID %d\n", hijacked_stub_task->pid);
                     send_sig(SIGCONT, hijacked_stub_task, 0);
-                } else {
-                    printk(KERN_ERR "MattX:[AWAKEN] FAILED to access pt_regs!\n");
+                    
+                    // --- NEW: Add to Guest Registry ---
+                    add_guest_process(hijacked_stub_task->pid);
+                    printk(KERN_INFO "MattX:[REGISTRY] PID %d registered as a Guest. It will not be migrated again.\n", hijacked_stub_task->pid);
                 }
 
                 put_task_struct(hijacked_stub_task);
@@ -139,7 +136,7 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
                 pending_source_node = -1;
             }
             break;
-        default:
+	default:
             break;
     }
 }
