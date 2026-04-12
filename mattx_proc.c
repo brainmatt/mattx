@@ -95,7 +95,8 @@ int mattx_proc_init(void) {
     if (!mattx_proc_dir) return -ENOMEM;
 
     proc_create("nodes", 0444, mattx_proc_dir, &nodes_proc_ops);
-    proc_create("admin", 0220, mattx_proc_dir, &admin_proc_ops); // Write-only for root
+    // Changed 0220 to 0666 for easy testing without sudo
+    proc_create("admin", 0666, mattx_proc_dir, &admin_proc_ops);
 
     printk(KERN_INFO "MattX: /proc/mattx interface created successfully.\n");
     return 0;

@@ -78,8 +78,9 @@ int mattx_balancer_loop(void *data) {
 
     while (!kthread_should_stop()) {
         local_load.cpu_load = (u32)avenrun[0]; 
-        local_load.mem_free_mb = (u32)(si_mem_available() >> 20);
-        
+        // Convert pages to bytes, then to MB
+        local_load.mem_free_mb = (u32)(((u64)si_mem_available() * PAGE_SIZE) / (1024 * 1024));
+
         for (i = 0; i < MAX_NODES; i++) {
             if (cluster_map[i] && cluster_map[i]->node_id != -1) {
                 mattx_comm_send(cluster_map[i], MATTX_MSG_LOAD_UPDATE, &local_load, sizeof(local_load));
