@@ -268,7 +268,9 @@ int mattx_comm_send(struct mattx_link *link, u32 type, void *data, u32 len) {
     hdr.magic = MATTX_MAGIC;
     hdr.type = type;
     hdr.length = len;
-    hdr.sender_id = link->node_id;
+    
+    // FIXED: Send OUR ID, not the target's ID!
+    hdr.sender_id = my_node_id; 
 
     iov[0].iov_base = &hdr;
     iov[0].iov_len = sizeof(hdr);
@@ -335,7 +337,7 @@ int mattx_listener_loop(void *data) {
 
     while (!kthread_should_stop()) {
         struct socket *client_sock = NULL;
-        struct sockaddr_in peer_addr; // NEW
+        struct sockaddr_in peer_addr;
         
         err = kernel_accept(listen_sock, &client_sock, 0);
         if (err < 0) {
@@ -347,8 +349,8 @@ int mattx_listener_loop(void *data) {
             link->sock = client_sock;
             link->node_id = -1; 
             
-            // NEW: Grab the IP address of the incoming connection
-            if (kernel_getpeername(client_sock, (struct sockaddr *)&peer_addr) == 0) {
+            // FIXED: kernel_getpeername returns length (>= 0) on success!
+            if (kernel_getpeername(client_sock, (struct sockaddr *)&peer_addr) >= 0) {
                 link->ip_addr = peer_addr.sin_addr.s_addr;
             }
             

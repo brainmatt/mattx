@@ -16,6 +16,7 @@ static struct task_struct *listener_thread;
 
 // --- Admin Globals (The actual definition!) ---
 bool balancer_enabled = true;
+u32 my_node_id = 0; // NEW
 
 // --- Guest Registry Implementation ---
 struct mattx_guest_info guest_registry[MAX_GUESTS];
@@ -79,19 +80,25 @@ void remove_export_process(int index) {
 }
 // ------------------------------------------
 
-enum { MATTX_ATTR_UNSPEC, MATTX_ATTR_NODE_ID, MATTX_ATTR_IPV4_ADDR, MATTX_ATTR_STUB_PID, MATTX_ATTR_BLUEPRINT, __MATTX_ATTR_MAX };
+// FIXED: Added MATTX_ATTR_MY_NODE_ID here!
+enum { MATTX_ATTR_UNSPEC, MATTX_ATTR_NODE_ID, MATTX_ATTR_IPV4_ADDR, MATTX_ATTR_STUB_PID, MATTX_ATTR_BLUEPRINT, MATTX_ATTR_MY_NODE_ID, __MATTX_ATTR_MAX };
 #define MATTX_ATTR_MAX (__MATTX_ATTR_MAX - 1)
+
 enum { MATTX_CMD_UNSPEC, MATTX_CMD_NODE_JOIN, MATTX_CMD_NODE_LEAVE, MATTX_CMD_HIJACK_ME, MATTX_CMD_GET_BLUEPRINT, __MATTX_CMD_MAX };
 #define MATTX_CMD_MAX (__MATTX_CMD_MAX - 1)
 
-static const struct nla_policy mattx_genl_policy[MATTX_ATTR_MAX + 1] = {
-    [MATTX_ATTR_NODE_ID] = { .type = NLA_U32 },[MATTX_ATTR_IPV4_ADDR] = { .type = NLA_U32 },[MATTX_ATTR_STUB_PID] = { .type = NLA_U32 },[MATTX_ATTR_BLUEPRINT] = { .type = NLA_BINARY },
+static const struct nla_policy mattx_genl_policy[MATTX_ATTR_MAX + 1] = {[MATTX_ATTR_NODE_ID] = { .type = NLA_U32 },[MATTX_ATTR_IPV4_ADDR] = { .type = NLA_U32 },[MATTX_ATTR_STUB_PID] = { .type = NLA_U32 },[MATTX_ATTR_BLUEPRINT] = { .type = NLA_BINARY },[MATTX_ATTR_MY_NODE_ID] = { .type = NLA_U32 }, // NEW: Policy for our ID
 };
 
 static int mattx_nl_cmd_node_join(struct sk_buff *skb, struct genl_info *info) {
     u32 node_id = nla_get_u32(info->attrs[MATTX_ATTR_NODE_ID]);
     u32 ip_addr = nla_get_u32(info->attrs[MATTX_ATTR_IPV4_ADDR]);
     struct mattx_link *link = NULL;
+
+    // NEW: Learn our own identity from the daemon!
+    if (info->attrs[MATTX_ATTR_MY_NODE_ID]) {
+        my_node_id = nla_get_u32(info->attrs[MATTX_ATTR_MY_NODE_ID]);
+    }
 
     if (node_id >= MAX_NODES) return -EINVAL;
     if (cluster_map[node_id]) mattx_comm_disconnect(node_id);

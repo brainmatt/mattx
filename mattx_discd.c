@@ -18,24 +18,11 @@
 #define DEFAULT_IFACE "eth0"
 
 // Must match the kernel definitions
-enum { 
-    MATTX_ATTR_UNSPEC, 
-    MATTX_ATTR_NODE_ID, 
-    MATTX_ATTR_IPV4_ADDR, 
-    MATTX_ATTR_STUB_PID, 
-    MATTX_ATTR_BLUEPRINT, 
-    __MATTX_ATTR_MAX 
-};
+// FIXED: Added MATTX_ATTR_MY_NODE_ID here!
+enum { MATTX_ATTR_UNSPEC, MATTX_ATTR_NODE_ID, MATTX_ATTR_IPV4_ADDR, MATTX_ATTR_STUB_PID, MATTX_ATTR_BLUEPRINT, MATTX_ATTR_MY_NODE_ID, __MATTX_ATTR_MAX };
 #define MATTX_ATTR_MAX (__MATTX_ATTR_MAX - 1)
 
-enum { 
-    MATTX_CMD_UNSPEC, 
-    MATTX_CMD_NODE_JOIN, 
-    MATTX_CMD_NODE_LEAVE, 
-    MATTX_CMD_HIJACK_ME, 
-    MATTX_CMD_GET_BLUEPRINT, 
-    __MATTX_CMD_MAX 
-};
+enum { MATTX_CMD_UNSPEC, MATTX_CMD_NODE_JOIN, MATTX_CMD_NODE_LEAVE, MATTX_CMD_HIJACK_ME, MATTX_CMD_GET_BLUEPRINT, __MATTX_CMD_MAX };
 #define MATTX_CMD_MAX (__MATTX_CMD_MAX - 1)
 
 struct mattx_config {
@@ -79,40 +66,34 @@ int init_netlink() {
 }
 
 void trigger_kernel_join(uint32_t node_id, uint32_t ip_addr) {
+    struct nl_sock *sock = nl_socket_alloc();
     struct nl_msg *msg;
-    
-    if (mattx_family_id < 0) {
-        printf("ERROR: Netlink not initialized. Cannot join Node %u\n", node_id);
-        fflush(stdout);
+    int family_id;
+
+    genl_connect(sock);
+    family_id = genl_ctrl_resolve(sock, "MATTX");
+    if (family_id < 0) {
+        fprintf(stderr, "Kernel module not loaded!\n");
+        nl_socket_free(sock);
         return;
     }
 
-    // Check if we already joined this node
-    for (int i = 0; i < known_nodes_count; i++) {
-        if (known_nodes[i] == node_id) {
-            return; 
-        }
-    }
-
     msg = nlmsg_alloc();
-    genlmsg_put(msg, NL_AUTO_PORT, NL_AUTO_SEQ, mattx_family_id, 0, 0, MATTX_CMD_NODE_JOIN, 1);
+    genlmsg_put(msg, NL_AUTO_PORT, NL_AUTO_SEQ, family_id, 0, 0, MATTX_CMD_NODE_JOIN, 1);
     nla_put_u32(msg, MATTX_ATTR_NODE_ID, node_id);
     nla_put_u32(msg, MATTX_ATTR_IPV4_ADDR, ip_addr);
+    
+    // NEW: Tell the kernel who we are!
+    nla_put_u32(msg, MATTX_ATTR_MY_NODE_ID, config.node_id);
 
-    if (nl_send_auto(nl_sock, msg) < 0) {
-        printf("ERROR: nl_send_auto failed for Node %u\n", node_id);
-        fflush(stdout);
+    if (nl_send_auto(sock, msg) < 0) {
+        fprintf(stderr, "Failed to send JOIN to kernel\n");
     } else {
-        printf("SUCCESS: Sent JOIN command to kernel for Node %u (%s)\n", 
-               node_id, inet_ntoa(*(struct in_addr*)&ip_addr));
-        fflush(stdout);
-        
-        // Add to known nodes
-        if (known_nodes_count < 64) {
-            known_nodes[known_nodes_count++] = node_id;
-        }
+        printf("Triggered kernel JOIN for Node %u (%s)\n", node_id, inet_ntoa(*(struct in_addr*)&ip_addr));
     }
+
     nlmsg_free(msg);
+    nl_socket_free(sock);
 }
 
 // --- Helper Functions ---
