@@ -1,4 +1,6 @@
 # 🚀 MattX v0.1: The Modern SSI Foundation
+**(pronounced: /ˈmedɪks/)**
+
 **Project Goal:** To resurrect the magic of openMosix for the modern Linux 6.x era, creating a transparent, kernel-level distributed computing cluster.
 
 ## 🏗️ Core Architecture
