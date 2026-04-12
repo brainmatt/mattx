@@ -181,7 +181,12 @@ static int __init mattx_init(void) {
     if (rc) return rc;
     
     spin_lock_init(&guest_lock); 
-    spin_lock_init(&export_lock); // NEW: Initialize export lock
+    spin_lock_init(&export_lock); 
+    
+    // --- NEW: Initialize the /proc interface ---
+    if (mattx_proc_init() < 0) {
+        printk(KERN_ERR "MattX: Failed to create /proc/mattx interface\n");
+    }
     
     balancer_thread = kthread_run(mattx_balancer_loop, NULL, "mattx_balancer");
     listener_thread = kthread_run(mattx_listener_loop, NULL, "mattx_listener");
@@ -196,6 +201,10 @@ static void __exit mattx_exit(void) {
     int i;
     if (balancer_thread) kthread_stop(balancer_thread);
     if (listener_thread) kthread_stop(listener_thread);
+    
+    // --- NEW: Cleanup the /proc interface ---
+    mattx_proc_exit();
+    
     for (i = 0; i < MAX_NODES; i++) mattx_comm_disconnect(i);
     if (pending_migration) kvfree(pending_migration);
     if (hijacked_stub_task) put_task_struct(hijacked_stub_task);

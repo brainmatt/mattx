@@ -116,6 +116,8 @@ struct mattx_export_info {
     int target_node;
 };
 
+// ... (keep everything above the same) ...
+
 extern struct mattx_load_info cluster_load_table[MAX_NODES];
 extern struct mattx_link *cluster_map[MAX_NODES];
 extern struct mattx_migration_req *pending_migration;
@@ -127,10 +129,12 @@ extern struct mattx_guest_info guest_registry[MAX_GUESTS];
 extern int guest_count;
 extern spinlock_t guest_lock;
 
-// NEW: Export Registry Globals
 extern struct mattx_export_info export_registry[MAX_GUESTS];
 extern int export_count;
 extern spinlock_t export_lock;
+
+// --- NEW: Admin Globals ---
+extern bool balancer_enabled;
 
 int mattx_comm_send(struct mattx_link *link, u32 type, void *data, u32 len);
 struct mattx_link* mattx_comm_connect(__be32 ip_addr, int node_id);
@@ -144,9 +148,12 @@ bool is_guest_process(pid_t pid);
 void add_guest_process(pid_t local_pid, u32 orig_pid, int home_node);
 void remove_guest_process(int index);
 
-// NEW: Export Registry Helpers
 void add_export_process(pid_t orig_pid, int target_node);
 void remove_export_process(int index);
+
+// --- NEW: ProcFS Helpers ---
+int mattx_proc_init(void);
+void mattx_proc_exit(void);
 
 #endif // MATTX_H
 

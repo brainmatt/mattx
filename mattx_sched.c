@@ -31,6 +31,11 @@ static void mattx_evaluate_and_balance(u32 local_cpu_load) {
     int best_node = -1;
     u32 lowest_remote_load = 0xFFFFFFFF;
 
+    // --- NEW: Check if the admin paused the balancer! ---
+    if (!balancer_enabled) {
+        return; 
+    }
+
     for (i = 0; i < MAX_NODES; i++) {
         if (cluster_map[i] && cluster_map[i]->node_id != -1) {
             u32 remote_load = cluster_load_table[i].cpu_load;
