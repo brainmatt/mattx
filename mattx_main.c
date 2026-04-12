@@ -14,6 +14,9 @@ struct task_struct *hijacked_stub_task = NULL;
 static struct task_struct *balancer_thread;
 static struct task_struct *listener_thread;
 
+// --- Admin Globals (The actual definition!) ---
+bool balancer_enabled = true;
+
 // --- Guest Registry Implementation ---
 struct mattx_guest_info guest_registry[MAX_GUESTS];
 int guest_count = 0;
