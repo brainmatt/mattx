@@ -99,6 +99,7 @@ struct mattx_process_exit {
 
 struct mattx_link {
     int node_id;
+    u32 ip_addr; // NEW: Store the IP address
     struct socket *sock;
     struct sock *sk;
     struct task_struct *receiver_thread;

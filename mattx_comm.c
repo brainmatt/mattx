@@ -138,8 +138,9 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
             if (payload) {
                 struct mattx_process_exit *exit_msg = (struct mattx_process_exit *)payload;
                 struct task_struct *deputy = NULL;
+                int i;
 
-                printk(KERN_INFO "MattX:[FUNERAL] Received exit notice for Deputy PID %u from Node %u\n", 
+                printk(KERN_INFO "MattX: [FUNERAL] Received exit notice for Deputy PID %u from Node %u\n", 
                        exit_msg->orig_pid, hdr->sender_id);
 
                 rcu_read_lock();
@@ -151,9 +152,17 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
                     printk(KERN_INFO "MattX: [FUNERAL] Laying Deputy PID %u to rest (Sending SIGKILL)...\n", deputy->pid);
                     send_sig(SIGKILL, deputy, 0);
                     put_task_struct(deputy);
-                } else {
-                    printk(KERN_WARNING "MattX: [FUNERAL] Deputy PID %u not found. Already dead?\n", exit_msg->orig_pid);
                 }
+                
+                // --- NEW: Remove from export registry so the Watcher doesn't send a redundant Assassination Order ---
+                spin_lock(&export_lock);
+                for (i = 0; i < export_count; i++) {
+                    if (export_registry[i].orig_pid == exit_msg->orig_pid) {
+                        remove_export_process(i);
+                        break;
+                    }
+                }
+                spin_unlock(&export_lock);
             }
             break;
 
@@ -288,6 +297,7 @@ struct mattx_link* mattx_comm_connect(__be32 ip_addr, int node_id) {
     if (err < 0) { kfree(link); return NULL; }
 
     link->node_id = node_id;
+    link->ip_addr = ip_addr; // NEW
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
     addr.sin_port = htons(MATTX_PORT);
@@ -325,15 +335,23 @@ int mattx_listener_loop(void *data) {
 
     while (!kthread_should_stop()) {
         struct socket *client_sock = NULL;
+        struct sockaddr_in peer_addr; // NEW
+        
         err = kernel_accept(listen_sock, &client_sock, 0);
         if (err < 0) {
-            if (err == -EAGAIN || -EINTR == err) continue;
+            if (err == -EAGAIN || err == -EINTR) continue;
             continue;
         }
         struct mattx_link *link = kzalloc(sizeof(*link), GFP_KERNEL);
         if (link) {
             link->sock = client_sock;
             link->node_id = -1; 
+            
+            // NEW: Grab the IP address of the incoming connection
+            if (kernel_getpeername(client_sock, (struct sockaddr *)&peer_addr) == 0) {
+                link->ip_addr = peer_addr.sin_addr.s_addr;
+            }
+            
             mattx_setup_link(link);
         } else {
             sock_release(client_sock);

@@ -9,14 +9,15 @@ static struct proc_dir_entry *mattx_proc_dir;
 static int nodes_show(struct seq_file *m, void *v) {
     int i;
     seq_printf(m, "MattX Cluster Nodes:\n");
-    seq_printf(m, "--------------------------------------------------\n");
-    seq_printf(m, "Node ID\t\tCPU Load\tMem Free (MB)\n");
-    seq_printf(m, "--------------------------------------------------\n");
+    seq_printf(m, "------------------------------------------------------------\n");
+    seq_printf(m, "Node ID\t\tIP Address\tCPU Load\tMem Free (MB)\n");
+    seq_printf(m, "------------------------------------------------------------\n");
 
     for (i = 0; i < MAX_NODES; i++) {
         if (cluster_map[i] && cluster_map[i]->node_id != -1) {
-            seq_printf(m, "%d\t\t%u\t\t%u\n", 
+            seq_printf(m, "%d\t\t%pI4\t%u\t\t%u\n", 
                        cluster_map[i]->node_id, 
+                       &cluster_map[i]->ip_addr, // NEW: Print the IP
                        cluster_load_table[i].cpu_load, 
                        cluster_load_table[i].mem_free_mb);
         }
