@@ -36,6 +36,8 @@
 #define MATTX_MAGIC 0x4D415454 
 #define MATTX_MAX_PAYLOAD (10 * 1024 * 1024) 
 
+// --- The MattX Protocol ---
+
 enum mattx_msg_type {
     MATTX_MSG_HEARTBEAT = 1,
     MATTX_MSG_LOAD_UPDATE,
@@ -44,7 +46,7 @@ enum mattx_msg_type {
     MATTX_MSG_PAGE_TRANSFER, 
     MATTX_MSG_MIGRATE_DONE,   
     MATTX_MSG_PROCESS_EXIT,   
-    MATTX_MSG_KILL_SURROGATE, // NEW: The Assassination Order
+    MATTX_MSG_KILL_SURROGATE, 
     MATTX_MSG_SYSCALL_FWD,
 };
 
@@ -99,7 +101,7 @@ struct mattx_process_exit {
 
 struct mattx_link {
     int node_id;
-    u32 ip_addr; // NEW: Store the IP address
+    u32 ip_addr; // Stores the IP address for /proc/mattx/nodes
     struct socket *sock;
     struct sock *sk;
     struct task_struct *receiver_thread;
@@ -111,14 +113,12 @@ struct mattx_guest_info {
     int home_node;
 };
 
-// NEW: Export Registry Info
 struct mattx_export_info {
     pid_t orig_pid;
     int target_node;
 };
 
-// ... (keep everything above the same) ...
-
+// --- Global Variables ---
 extern struct mattx_load_info cluster_load_table[MAX_NODES];
 extern struct mattx_link *cluster_map[MAX_NODES];
 extern struct mattx_migration_req *pending_migration;
@@ -134,9 +134,10 @@ extern struct mattx_export_info export_registry[MAX_GUESTS];
 extern int export_count;
 extern spinlock_t export_lock;
 
-// --- NEW: Admin Globals ---
 extern bool balancer_enabled;
+extern u32 my_node_id; // <--- THIS IS THE MAGIC LINE THAT WAS MISSING!
 
+// --- Function Prototypes ---
 int mattx_comm_send(struct mattx_link *link, u32 type, void *data, u32 len);
 struct mattx_link* mattx_comm_connect(__be32 ip_addr, int node_id);
 void mattx_comm_disconnect(int node_id);
@@ -152,7 +153,6 @@ void remove_guest_process(int index);
 void add_export_process(pid_t orig_pid, int target_node);
 void remove_export_process(int index);
 
-// --- NEW: ProcFS Helpers ---
 int mattx_proc_init(void);
 void mattx_proc_exit(void);
 
