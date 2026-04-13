@@ -132,7 +132,6 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
                 struct cred *new_cred;
                 const struct cred *old_cred;
                 int retries = 50;
-                unsigned char rip_buf[8] = {0}; 
                 struct file *fake_file1, *fake_file2;
 
                 printk(KERN_INFO "MattX:[AWAKEN] Commencing full brain transplant on PID %d...\n", hijacked_stub_task->pid);
