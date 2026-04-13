@@ -2,7 +2,6 @@
 
 static int injected_pages_count = 0;
 
-// --- NEW: The Fake File Write Operation (Runs on Node 2) ---
 static ssize_t mattx_fake_write(struct file *file, const char __user *buf, size_t count, loff_t *pos) {
     pid_t my_pid = current->pid;
     int home_node = -1;
@@ -14,7 +13,6 @@ static ssize_t mattx_fake_write(struct file *file, const char __user *buf, size_
     struct mattx_header *hdr;
     struct mattx_syscall_req *req;
 
-    // 1. Look up our true identity in the Guest Registry
     spin_lock(&guest_lock);
     for (i = 0; i < guest_count; i++) {
         if (guest_registry[i].local_pid == my_pid) {
@@ -26,10 +24,9 @@ static ssize_t mattx_fake_write(struct file *file, const char __user *buf, size_
     spin_unlock(&guest_lock);
 
     if (home_node == -1 || !cluster_map[home_node]) {
-        return count; // If we can't find home, just drop the text to avoid crashing
+        return count; 
     }
 
-    // 2. Cap the size to prevent massive kmallocs (4KB max per write)
     to_send = min_t(size_t, count, 4096);
 
     packet_size = sizeof(struct mattx_header) + sizeof(struct mattx_syscall_req) + to_send;
@@ -40,28 +37,27 @@ static ssize_t mattx_fake_write(struct file *file, const char __user *buf, size_
     req = (struct mattx_syscall_req *)(packet_buf + sizeof(struct mattx_header));
 
     req->orig_pid = orig_pid;
-    req->fd = (u32)(uintptr_t)file->private_data; // We stored the FD number here!
+    req->fd = (u32)(uintptr_t)file->private_data; 
     req->len = to_send;
 
-    // 3. Copy the text from the Surrogate's user-space memory
     if (copy_from_user(req->data, buf, to_send)) {
         kfree(packet_buf);
         return -EFAULT;
     }
 
-    // 4. Shoot it across the network to the Home Node!
     mattx_comm_send(cluster_map[home_node], MATTX_MSG_SYSCALL_FWD, packet_buf + sizeof(struct mattx_header), sizeof(struct mattx_syscall_req) + to_send);
 
     kfree(packet_buf);
-    return to_send; // Tell the program we successfully wrote the bytes
+    return to_send; 
 }
 
-// The custom file operations for our Fake FDs
 static const struct file_operations mattx_fops = {
     .write = mattx_fake_write,
 };
-// ------------------------------------------------------------
 
+// --- FIXED: Make these static so they survive the function return! ---
+static char *stub_argv[] = { "/usr/local/bin/mattx-stub", NULL };
+static char *stub_envp[] = { "HOME=/", "PATH=/sbin:/bin:/usr/sbin:/usr/bin", NULL };
 
 static void mattx_handle_message(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
     switch (hdr->type) {
@@ -82,8 +78,6 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
         case MATTX_MSG_MIGRATE_REQ:
             if (payload) {
                 struct mattx_migration_req *req = (struct mattx_migration_req *)payload;
-                char *argv[] = { "/usr/local/bin/mattx-stub", NULL };
-                char *envp[] = { "HOME=/", "PATH=/sbin:/bin:/usr/sbin:/usr/bin", NULL };
                 
                 pending_source_node = hdr->sender_id;
                 injected_pages_count = 0;
@@ -96,7 +90,8 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
                     memcpy(pending_migration, req, hdr->length);
                 }
 
-                if (call_usermodehelper(argv[0], argv, envp, UMH_NO_WAIT) != 0) {
+                // FIXED: Using the static arrays
+                if (call_usermodehelper(stub_argv[0], stub_argv, stub_envp, UMH_NO_WAIT) != 0) {
                     printk(KERN_ERR "MattX: [INCOMING] Failed to spawn surrogate!\n");
                 }
             }
@@ -150,11 +145,8 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
                     hijacked_stub_task->thread.fsbase = pending_migration->fsbase;
                     hijacked_stub_task->thread.gsbase = pending_migration->gsbase;
                     
-                    // --- RESTORED: The Nametag ---
                     strscpy(hijacked_stub_task->comm, pending_migration->comm, sizeof(hijacked_stub_task->comm));
-                    printk(KERN_INFO "MattX:[AWAKEN] Renamed stub to '%s'\n", hijacked_stub_task->comm);
                     
-                    // --- Identity Sync ---
                     new_cred = prepare_creds();
                     if (new_cred) {
                         new_cred->uid = make_kuid(&init_user_ns, pending_migration->uid);
@@ -178,7 +170,6 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
                         put_cred(new_cred);
                     }
 
-                    // --- The VFS Proxy (Fake FDs) ---
                     fake_file1 = anon_inode_getfile("mattx_stdout", &mattx_fops, (void *)(uintptr_t)1, O_WRONLY);
                     fake_file2 = anon_inode_getfile("mattx_stderr", &mattx_fops, (void *)(uintptr_t)2, O_WRONLY);
 
@@ -228,11 +219,14 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
                 pending_source_node = -1;
             }
             break;
-
+            
         case MATTX_MSG_PROCESS_EXIT:
             if (payload) {
                 struct mattx_process_exit *exit_msg = (struct mattx_process_exit *)payload;
                 struct task_struct *deputy = NULL;
+
+                printk(KERN_INFO "MattX: [FUNERAL] Received exit notice for Deputy PID %u from Node %u\n", 
+                       exit_msg->orig_pid, hdr->sender_id);
 
                 rcu_read_lock();
                 deputy = pid_task(find_vpid(exit_msg->orig_pid), PIDTYPE_PID);
@@ -240,7 +234,7 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
                 rcu_read_unlock();
 
                 if (deputy) {
-                    printk(KERN_INFO "MattX:[FUNERAL] Laying Deputy PID %u to rest (Sending SIGKILL)...\n", deputy->pid);
+                    printk(KERN_INFO "MattX: [FUNERAL] Laying Deputy PID %u to rest (Sending SIGKILL)...\n", deputy->pid);
                     send_sig(SIGKILL, deputy, 0);
                     put_task_struct(deputy);
                 }
@@ -288,14 +282,12 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
             }
             break;
             
-        // --- NEW: The VMA Proxy (Node 1 receives this) ---
         case MATTX_MSG_SYSCALL_FWD:
             if (payload) {
                 struct mattx_syscall_req *req = (struct mattx_syscall_req *)payload;
                 struct task_struct *deputy = NULL;
                 struct file *file = NULL;
                 
-                // 1. Find the frozen Deputy
                 rcu_read_lock();
                 deputy = pid_task(find_vpid(req->orig_pid), PIDTYPE_PID);
                 if (deputy) get_task_struct(deputy);
@@ -304,21 +296,19 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
                 if (deputy) {
                     struct files_struct *files = deputy->files;
                     if (files) {
-                        // 2. Extract the real file pointer for FD 1 or 2
                         spin_lock(&files->file_lock);
                         struct fdtable *fdt = files_fdtable(files);
                         if (req->fd < fdt->max_fds) {
                             file = rcu_dereference_raw(fdt->fd[req->fd]);
-                            if (file) get_file(file); // Safely grab a reference
+                            if (file) get_file(file); 
                         }
                         spin_unlock(&files->file_lock);
                     }
                     
                     if (file) {
                         loff_t pos = file->f_pos;
-                        // 3. Write the text to the Deputy's terminal!
                         kernel_write(file, req->data, req->len, &pos);
-                        fput(file); // Release the reference
+                        fput(file); 
                     }
                     put_task_struct(deputy);
                 }
