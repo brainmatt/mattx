@@ -8,16 +8,27 @@ static struct proc_dir_entry *mattx_proc_dir;
 // --- 1. The Status File (/proc/mattx/nodes) ---
 static int nodes_show(struct seq_file *m, void *v) {
     int i;
+    
+    // --- NEW: Calculate Local Load on-the-fly ---
+    u32 local_cpu = (u32)avenrun[0];
+    u32 local_mem = (u32)(((u64)si_mem_available() * PAGE_SIZE) / (1024 * 1024));
+
     seq_printf(m, "MattX Cluster Nodes:\n");
     seq_printf(m, "------------------------------------------------------------\n");
     seq_printf(m, "Node ID\t\tIP Address\tCPU Load\tMem Free (MB)\n");
     seq_printf(m, "------------------------------------------------------------\n");
 
+    // --- NEW: Print the Local Node First ---
+    // We use 127.0.0.1 for the local IP to keep the formatting clean
+    seq_printf(m, "%d (Local)\t127.0.0.1\t%u\t\t%u\n", 
+               my_node_id, local_cpu, local_mem);
+
+    // --- Print the Remote Nodes ---
     for (i = 0; i < MAX_NODES; i++) {
         if (cluster_map[i] && cluster_map[i]->node_id != -1) {
             seq_printf(m, "%d\t\t%pI4\t%u\t\t%u\n", 
                        cluster_map[i]->node_id, 
-                       &cluster_map[i]->ip_addr, // NEW: Print the IP
+                       &cluster_map[i]->ip_addr, 
                        cluster_load_table[i].cpu_load, 
                        cluster_load_table[i].mem_free_mb);
         }
@@ -96,8 +107,7 @@ int mattx_proc_init(void) {
     if (!mattx_proc_dir) return -ENOMEM;
 
     proc_create("nodes", 0444, mattx_proc_dir, &nodes_proc_ops);
-    // Changed 0220 to 0666 for easy testing without sudo
-    proc_create("admin", 0666, mattx_proc_dir, &admin_proc_ops);
+    proc_create("admin", 0666, mattx_proc_dir, &admin_proc_ops); // Write-only for everyone (for testing)
 
     printk(KERN_INFO "MattX: /proc/mattx interface created successfully.\n");
     return 0;
