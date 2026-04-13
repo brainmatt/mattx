@@ -2,7 +2,6 @@
 
 static int injected_pages_count = 0;
 
-// --- The Fake File Write Operation (Runs on Node 2) ---
 static ssize_t mattx_fake_write(struct file *file, const char __user *buf, size_t count, loff_t *pos) {
     pid_t my_pid = current->pid;
     int home_node = -1;
@@ -55,9 +54,7 @@ static ssize_t mattx_fake_write(struct file *file, const char __user *buf, size_
 static const struct file_operations mattx_fops = {
     .write = mattx_fake_write,
 };
-// ------------------------------------------------------------
 
-// FIXED: These MUST be static so they survive the function return!
 static char *stub_argv[] = { "/usr/local/bin/mattx-stub", NULL };
 static char *stub_envp[] = { "HOME=/", "PATH=/sbin:/bin:/usr/sbin:/usr/bin", NULL };
 
@@ -92,7 +89,6 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
                     memcpy(pending_migration, req, hdr->length);
                 }
 
-                // FIXED: Using the static arrays
                 if (call_usermodehelper(stub_argv[0], stub_argv, stub_envp, UMH_NO_WAIT) != 0) {
                     printk(KERN_ERR "MattX: [INCOMING] Failed to spawn surrogate!\n");
                 }
@@ -149,6 +145,9 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
                     
                     strscpy(hijacked_stub_task->comm, pending_migration->comm, sizeof(hijacked_stub_task->comm));
                     
+                    // --- RESTORED: The Printk for the Nametag! ---
+                    printk(KERN_INFO "MattX:[AWAKEN] Renamed stub to '%s'\n", hijacked_stub_task->comm);
+                    
                     new_cred = prepare_creds();
                     if (new_cred) {
                         new_cred->uid = make_kuid(&init_user_ns, pending_migration->uid);
@@ -172,7 +171,6 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
                         put_cred(new_cred);
                     }
 
-                    // --- The VFS Proxy (Fake FDs) ---
                     fake_file1 = anon_inode_getfile("mattx_stdout", &mattx_fops, (void *)(uintptr_t)1, O_WRONLY);
                     fake_file2 = anon_inode_getfile("mattx_stderr", &mattx_fops, (void *)(uintptr_t)2, O_WRONLY);
 
@@ -206,7 +204,7 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
                     }
 
                     if (access_process_vm(hijacked_stub_task, regs->ip, rip_buf, 8, FOLL_FORCE) == 8) {
-                        printk(KERN_INFO "MattX: [DEBUG] Target RIP (0x%lx) contains: %8ph\n", regs->ip, rip_buf);
+                        printk(KERN_INFO "MattX:[DEBUG] Target RIP (0x%lx) contains: %8ph\n", regs->ip, rip_buf);
                     }
 
                     printk(KERN_INFO "MattX:[AWAKEN] IT'S ALIVE! Sending SIGCONT to PID %d\n", hijacked_stub_task->pid);
@@ -227,7 +225,6 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
             if (payload) {
                 struct mattx_process_exit *exit_msg = (struct mattx_process_exit *)payload;
                 struct task_struct *deputy = NULL;
-                int i;
 
                 printk(KERN_INFO "MattX: [FUNERAL] Received exit notice for Deputy PID %u from Node %u\n", 
                        exit_msg->orig_pid, hdr->sender_id);
@@ -244,7 +241,7 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
                 }
                 
                 spin_lock(&export_lock);
-                for (i = 0; i < export_count; i++) {
+                for (int i = 0; i < export_count; i++) {
                     if (export_registry[i].orig_pid == exit_msg->orig_pid) {
                         remove_export_process(i);
                         break;
