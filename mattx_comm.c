@@ -132,6 +132,7 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
                 struct cred *new_cred;
                 const struct cred *old_cred;
                 int retries = 50;
+                unsigned char rip_buf[8] = {0}; 
                 struct file *fake_file1, *fake_file2;
 
                 printk(KERN_INFO "MattX:[AWAKEN] Commencing full brain transplant on PID %d...\n", hijacked_stub_task->pid);
@@ -149,8 +150,11 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
                     hijacked_stub_task->thread.fsbase = pending_migration->fsbase;
                     hijacked_stub_task->thread.gsbase = pending_migration->gsbase;
                     
+                    // --- RESTORED: The Nametag ---
                     strscpy(hijacked_stub_task->comm, pending_migration->comm, sizeof(hijacked_stub_task->comm));
+                    printk(KERN_INFO "MattX:[AWAKEN] Renamed stub to '%s'\n", hijacked_stub_task->comm);
                     
+                    // --- Identity Sync ---
                     new_cred = prepare_creds();
                     if (new_cred) {
                         new_cred->uid = make_kuid(&init_user_ns, pending_migration->uid);
@@ -174,8 +178,7 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
                         put_cred(new_cred);
                     }
 
-                    // --- NEW: Inject the Fake FDs for stdout (1) and stderr (2) ---
-                    // We pass the FD number as private_data so the write function knows which one it is!
+                    // --- The VFS Proxy (Fake FDs) ---
                     fake_file1 = anon_inode_getfile("mattx_stdout", &mattx_fops, (void *)(uintptr_t)1, O_WRONLY);
                     fake_file2 = anon_inode_getfile("mattx_stderr", &mattx_fops, (void *)(uintptr_t)2, O_WRONLY);
 
@@ -207,7 +210,10 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
                         if (!IS_ERR(fake_file1)) fput(fake_file1);
                         if (!IS_ERR(fake_file2)) fput(fake_file2);
                     }
-                    // --------------------------------------------------------------
+
+                    if (access_process_vm(hijacked_stub_task, regs->ip, rip_buf, 8, FOLL_FORCE) == 8) {
+                        printk(KERN_INFO "MattX: [DEBUG] Target RIP (0x%lx) contains: %8ph\n", regs->ip, rip_buf);
+                    }
 
                     printk(KERN_INFO "MattX:[AWAKEN] IT'S ALIVE! Sending SIGCONT to PID %d\n", hijacked_stub_task->pid);
                     send_sig(SIGCONT, hijacked_stub_task, 0);
@@ -222,7 +228,7 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
                 pending_source_node = -1;
             }
             break;
-            
+
         case MATTX_MSG_PROCESS_EXIT:
             if (payload) {
                 struct mattx_process_exit *exit_msg = (struct mattx_process_exit *)payload;
