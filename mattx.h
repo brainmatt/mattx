@@ -23,6 +23,10 @@
 #include <linux/highmem.h>       
 #include <linux/cred.h>          
 #include <linux/uidgid.h>        
+#include <linux/fs.h>            // NEW: For file operations
+#include <linux/fdtable.h>       // NEW: For manipulating the FD table
+#include <linux/anon_inodes.h>   // NEW: For creating Fake FDs
+#include <linux/uaccess.h>       // NEW: For copy_from_user
 
 #define MATTX_PORT 7226
 #define MAX_NODES 1024 
@@ -36,8 +40,6 @@
 #define MATTX_MAGIC 0x4D415454 
 #define MATTX_MAX_PAYLOAD (10 * 1024 * 1024) 
 
-// --- The MattX Protocol ---
-
 enum mattx_msg_type {
     MATTX_MSG_HEARTBEAT = 1,
     MATTX_MSG_LOAD_UPDATE,
@@ -47,7 +49,7 @@ enum mattx_msg_type {
     MATTX_MSG_MIGRATE_DONE,   
     MATTX_MSG_PROCESS_EXIT,   
     MATTX_MSG_KILL_SURROGATE, 
-    MATTX_MSG_SYSCALL_FWD,
+    MATTX_MSG_SYSCALL_FWD,    // We will finally use this!
 };
 
 struct mattx_header {
@@ -99,9 +101,17 @@ struct mattx_process_exit {
     int exit_code; 
 };
 
+// NEW: Payload for forwarding stdout/stderr
+struct mattx_syscall_req {
+    u32 orig_pid;
+    u32 fd;
+    u32 len;
+    char data[]; // Flexible array member for the text
+};
+
 struct mattx_link {
     int node_id;
-    u32 ip_addr; // Stores the IP address for /proc/mattx/nodes
+    u32 ip_addr; 
     struct socket *sock;
     struct sock *sk;
     struct task_struct *receiver_thread;
@@ -118,7 +128,6 @@ struct mattx_export_info {
     int target_node;
 };
 
-// --- Global Variables ---
 extern struct mattx_load_info cluster_load_table[MAX_NODES];
 extern struct mattx_link *cluster_map[MAX_NODES];
 extern struct mattx_migration_req *pending_migration;
@@ -135,9 +144,8 @@ extern int export_count;
 extern spinlock_t export_lock;
 
 extern bool balancer_enabled;
-extern u32 my_node_id; // <--- THIS IS THE MAGIC LINE THAT WAS MISSING!
+extern u32 my_node_id; 
 
-// --- Function Prototypes ---
 int mattx_comm_send(struct mattx_link *link, u32 type, void *data, u32 len);
 struct mattx_link* mattx_comm_connect(__be32 ip_addr, int node_id);
 void mattx_comm_disconnect(int node_id);
