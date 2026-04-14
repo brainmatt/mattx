@@ -3,7 +3,7 @@
 static struct mattx_migration_req *local_migration_req = NULL;
 static struct task_struct *migrating_task = NULL;
 static int migrating_target_node = -1;
-static bool is_returning = false; // NEW: Flag to track the direction
+static bool is_returning = false; 
 
 void mattx_capture_and_send_state(struct task_struct *task, int target_node) {
     struct pt_regs *regs;
@@ -17,7 +17,7 @@ void mattx_capture_and_send_state(struct task_struct *task, int target_node) {
     int retries = 50;
     unsigned char rip_buf[8] = {0}; 
 
-    is_returning = false; // This is a forward migration
+    is_returning = false; 
 
     max_payload_size = sizeof(struct mattx_migration_req) + (MAX_VMAS * sizeof(struct mattx_vma_info));
     req = kzalloc(max_payload_size, GFP_KERNEL);
@@ -99,7 +99,7 @@ void mattx_capture_and_return_state(struct task_struct *task, u32 orig_pid, int 
     int vma_count = 0;
     int retries = 50;
 
-    is_returning = true; // NEW: This is a return migration!
+    is_returning = true; 
 
     max_payload_size = sizeof(struct mattx_migration_req) + (MAX_VMAS * sizeof(struct mattx_vma_info));
     req = kzalloc(max_payload_size, GFP_KERNEL);
@@ -193,8 +193,15 @@ void mattx_send_vma_data(void) {
                         p_page_hdr->length = bytes_read;
 
                         memcpy(payload_buf + sizeof(struct mattx_page_header), page_buf, bytes_read);
-                        mattx_comm_send(cluster_map[migrating_target_node], MATTX_MSG_PAGE_TRANSFER, payload_buf, payload_size);
-                        sent_pages++;
+                        
+                        // FIXED: Restored the network error check to clear the warning!
+                        int send_res = mattx_comm_send(cluster_map[migrating_target_node], MATTX_MSG_PAGE_TRANSFER, payload_buf, payload_size);
+                        if (send_res < payload_size) {
+                            network_errors++;
+                        } else {
+                            sent_pages++;
+                        }
+                        
                         kfree(payload_buf);
                     }
                 } else {
@@ -206,14 +213,13 @@ void mattx_send_vma_data(void) {
         }
     }
     
-    printk(KERN_INFO "MattX:[MIGRATE] Pipeline stats: %d total, %d sent, %d skipped\n", total_pages, sent_pages, skipped_pages);
-    
-    // --- NEW: Handle the end of the pipeline based on direction ---
+    printk(KERN_INFO "MattX:[MIGRATE] Pipeline stats: %d total, %d sent, %d skipped, %d net errors\n", 
+           total_pages, sent_pages, skipped_pages, network_errors);
+           
     if (is_returning) {
         printk(KERN_INFO "MattX:[MIGRATE] Return pipeline complete. Sending RETURN_DONE signal.\n");
         mattx_comm_send(cluster_map[migrating_target_node], MATTX_MSG_RETURN_DONE, NULL, 0);
         
-        // Node 2 cleans up the Surrogate!
         printk(KERN_INFO "MattX:[RECALL] Executing local Surrogate PID %d...\n", migrating_task->pid);
         send_sig(SIGKILL, migrating_task, 0);
         
@@ -237,5 +243,26 @@ void mattx_send_vma_data(void) {
     migrating_task = NULL;
     kfree(local_migration_req);
     local_migration_req = NULL;
+}
+
+// --- RESTORED: The Recall Trigger ---
+void mattx_trigger_recall(pid_t orig_pid) {
+    int target_node = get_export_target(orig_pid);
+    struct mattx_recall_req req;
+    
+    if (target_node == -1) {
+        printk(KERN_WARNING "MattX: [RECALL] PID %d is not in the export registry. Cannot recall.\n", orig_pid);
+        return;
+    }
+
+    if (!cluster_map[target_node]) {
+        printk(KERN_ERR "MattX:[RECALL] Target Node %d is disconnected. Cannot recall PID %d.\n", target_node, orig_pid);
+        return;
+    }
+
+    req.orig_pid = orig_pid;
+
+    printk(KERN_INFO "MattX: [RECALL] Sending RECALL_REQ for PID %d to Node %d...\n", orig_pid, target_node);
+    mattx_comm_send(cluster_map[target_node], MATTX_MSG_RECALL_REQ, &req, sizeof(req));
 }
 
