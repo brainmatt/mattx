@@ -322,16 +322,67 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
                 }
             }
             break;
-        // --- NEW: The Recall Receiver (Node 2 receives this) ---
+// Inside mattx_handle_message(), replace the RECALL_REQ case and add the new one:
+
         case MATTX_MSG_RECALL_REQ:
             if (payload) {
                 struct mattx_recall_req *req = (struct mattx_recall_req *)payload;
+                pid_t local_stub_pid = -1;
+                int i;
+
                 printk(KERN_INFO "MattX: [INCOMING] Received RECALL request for Orig PID %u from Node %u\n", 
                        req->orig_pid, hdr->sender_id);
                 
-                // TODO Phase 11.2: Freeze the surrogate, extract state, and send RETURN_BLUEPRINT
+                spin_lock(&guest_lock);
+                for (i = 0; i < guest_count; i++) {
+                    if (guest_registry[i].orig_pid == req->orig_pid && guest_registry[i].home_node == hdr->sender_id) {
+                        local_stub_pid = guest_registry[i].local_pid;
+                        break; // We DO NOT remove it from the registry yet! We need it alive.
+                    }
+                }
+                spin_unlock(&guest_lock);
+
+                if (local_stub_pid != -1) {
+                    struct task_struct *surrogate = NULL;
+                    rcu_read_lock();
+                    surrogate = pid_task(find_vpid(local_stub_pid), PIDTYPE_PID);
+                    if (surrogate) get_task_struct(surrogate);
+                    rcu_read_unlock();
+
+                    if (surrogate) {
+                        printk(KERN_INFO "MattX: [RECALL] Found Surrogate PID %d. Capturing state...\n", surrogate->pid);
+                        
+                        // --- NEW: Trigger the Return Extraction! ---
+                        mattx_capture_and_return_state(surrogate, req->orig_pid, hdr->sender_id);
+                        
+                        put_task_struct(surrogate);
+                    } else {
+                        printk(KERN_WARNING "MattX: [RECALL] Surrogate PID %d not found!\n", local_stub_pid);
+                    }
+                } else {
+                    printk(KERN_WARNING "MattX: [RECALL] Could not find guest registry entry for Orig PID %u\n", req->orig_pid);
+                }
             }
-            break;            
+            break;
+
+        // --- NEW: Node 1 receives the Return Blueprint ---
+        case MATTX_MSG_RETURN_BLUEPRINT:
+            if (payload) {
+                struct mattx_migration_req *req = (struct mattx_migration_req *)payload;
+                printk(KERN_INFO "MattX: [INCOMING] Received RETURN Blueprint for Deputy PID %u. Saving to pending...\n", req->orig_pid);
+                
+                pending_source_node = hdr->sender_id;
+                injected_pages_count = 0;
+
+                if (pending_migration) kvfree(pending_migration);
+                pending_migration = kvmalloc(hdr->length, GFP_KERNEL);
+                if (pending_migration) {
+                    memcpy(pending_migration, req, hdr->length);
+                }
+                
+                // TODO Phase 11.3: Prepare the Deputy's memory and send READY_FOR_DATA
+            }
+            break;
         default:
             printk(KERN_WARNING "MattX: [COMM] Unknown message type: %u\n", hdr->type);
             break;

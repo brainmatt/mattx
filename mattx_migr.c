@@ -59,11 +59,9 @@ void mattx_capture_and_send_state(struct task_struct *task, int target_node) {
 
     mm = task->mm;
     if (mm) {
-        // --- NEW: Capture the Command Line Pointers ---
         req->arg_start = mm->arg_start;
         req->arg_end = mm->arg_end;
         
-        // FIXED: Added (unsigned long) casts to silence the compiler warning!
         printk(KERN_INFO "MattX:[EXTRACT] Captured argv pointers: 0x%lx - 0x%lx\n", 
                (unsigned long)req->arg_start, (unsigned long)req->arg_end);
 
@@ -93,6 +91,75 @@ void mattx_capture_and_send_state(struct task_struct *task, int target_node) {
     if (cluster_map[target_node]) {
         printk(KERN_INFO "MattX:[MIGRATE] Sending blueprint to Node %d. Waiting for READY signal...\n", target_node);
         mattx_comm_send(cluster_map[target_node], MATTX_MSG_MIGRATE_REQ, req, actual_payload_size);
+    }
+    kfree(req);
+}
+
+// --- NEW: The Return Extractor (Runs on Node 2) ---
+void mattx_capture_and_return_state(struct task_struct *task, u32 orig_pid, int target_node) {
+    struct pt_regs *regs;
+    struct mm_struct *mm;
+    struct vm_area_struct *vma;
+    struct mattx_migration_req *req;
+    size_t max_payload_size;
+    size_t actual_payload_size;
+    int vma_count = 0;
+    int retries = 50;
+
+    max_payload_size = sizeof(struct mattx_migration_req) + (MAX_VMAS * sizeof(struct mattx_vma_info));
+    req = kzalloc(max_payload_size, GFP_KERNEL);
+    if (!req) return;
+
+    printk(KERN_INFO "MattX:[EXTRACT] Initiating RETURN state capture for Surrogate PID %d...\n", task->pid);
+
+    send_sig(SIGSTOP, task, 0);
+
+    while (!(READ_ONCE(task->__state) & __TASK_STOPPED) && retries > 0) {
+        msleep(10);
+        retries--;
+    }
+
+    // CRITICAL: We use the Deputy's PID here so Node 1 knows who this belongs to!
+    req->orig_pid = orig_pid;
+
+    regs = task_pt_regs(task);
+    if (regs) {
+        memcpy(&req->regs, regs, sizeof(struct pt_regs));
+        printk(KERN_INFO "MattX: [DEBUG] Return RIP: 0x%lx\n", (unsigned long)req->regs.rip);
+    }
+
+    mm = task->mm;
+    if (mm) {
+        req->arg_start = mm->arg_start;
+        req->arg_end = mm->arg_end;
+
+        mmap_read_lock(mm);
+        VMA_ITERATOR(vmi, mm, 0);
+        for_each_vma(vmi, vma) {
+            if (vma_count >= MAX_VMAS) break;
+            req->vmas[vma_count].vm_start = vma->vm_start;
+            req->vmas[vma_count].vm_end = vma->vm_end;
+            req->vmas[vma_count].vm_flags = vma->vm_flags;
+            vma_count++;
+        }
+        mmap_read_unlock(mm);
+    }
+
+    req->vma_count = vma_count;
+    actual_payload_size = sizeof(struct mattx_migration_req) + (vma_count * sizeof(struct mattx_vma_info));
+
+    // Save state locally so we can use the exact same data pump!
+    if (local_migration_req) kfree(local_migration_req);
+    local_migration_req = kmemdup(req, actual_payload_size, GFP_KERNEL);
+
+    if (migrating_task) put_task_struct(migrating_task);
+    get_task_struct(task);
+    migrating_task = task;
+    migrating_target_node = target_node;
+
+    if (cluster_map[target_node]) {
+        printk(KERN_INFO "MattX:[MIGRATE] Sending RETURN blueprint to Node %d. Waiting for READY signal...\n", target_node);
+        mattx_comm_send(cluster_map[target_node], MATTX_MSG_RETURN_BLUEPRINT, req, actual_payload_size);
     }
     kfree(req);
 }
@@ -158,7 +225,6 @@ void mattx_send_vma_data(void) {
     
     mattx_comm_send(cluster_map[migrating_target_node], MATTX_MSG_MIGRATE_DONE, NULL, 0);
     
-    // Add to Export Registry
     add_export_process(migrating_task->pid, migrating_target_node);
     printk(KERN_INFO "MattX:[REGISTRY] PID %d registered as Exported to Node %d.\n", migrating_task->pid, migrating_target_node);
     
@@ -168,7 +234,6 @@ void mattx_send_vma_data(void) {
     local_migration_req = NULL;
 }
 
-// --- NEW: The Recall Trigger ---
 void mattx_trigger_recall(pid_t orig_pid) {
     int target_node = get_export_target(orig_pid);
     struct mattx_recall_req req;

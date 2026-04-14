@@ -50,7 +50,8 @@ enum mattx_msg_type {
     MATTX_MSG_PROCESS_EXIT,   
     MATTX_MSG_KILL_SURROGATE, 
     MATTX_MSG_SYSCALL_FWD,
-    MATTX_MSG_RECALL_REQ,     // NEW: Home node asks Remote node to return a process
+    MATTX_MSG_RECALL_REQ, 
+    MATTX_MSG_RETURN_BLUEPRINT,
 };
 
 struct mattx_header {
@@ -111,7 +112,6 @@ struct mattx_syscall_req {
     char data[]; 
 };
 
-// NEW: Payload for the Recall Request
 struct mattx_recall_req {
     u32 orig_pid;
 };
@@ -159,6 +159,7 @@ void mattx_comm_disconnect(int node_id);
 int mattx_listener_loop(void *data);
 int mattx_balancer_loop(void *data);
 void mattx_capture_and_send_state(struct task_struct *task, int target_node);
+void mattx_capture_and_return_state(struct task_struct *task, u32 orig_pid, int target_node);
 void mattx_send_vma_data(void); 
 
 bool is_guest_process(pid_t pid);
