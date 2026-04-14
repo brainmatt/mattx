@@ -62,9 +62,12 @@ void mattx_capture_and_send_state(struct task_struct *task, int target_node) {
         // --- NEW: Capture the Command Line Pointers ---
         req->arg_start = mm->arg_start;
         req->arg_end = mm->arg_end;
-        printk(KERN_INFO "MattX:[EXTRACT] Captured argv pointers: 0x%lx - 0x%lx\n", req->arg_start, req->arg_end);
+        
+        // FIXED: Added (unsigned long) casts to silence the compiler warning!
+        printk(KERN_INFO "MattX:[EXTRACT] Captured argv pointers: 0x%lx - 0x%lx\n", 
+               (unsigned long)req->arg_start, (unsigned long)req->arg_end);
 
-	mmap_read_lock(mm);
+        mmap_read_lock(mm);
         VMA_ITERATOR(vmi, mm, 0);
         for_each_vma(vmi, vma) {
             if (vma_count >= MAX_VMAS) break;
@@ -155,7 +158,7 @@ void mattx_send_vma_data(void) {
     
     mattx_comm_send(cluster_map[migrating_target_node], MATTX_MSG_MIGRATE_DONE, NULL, 0);
     
-    // --- NEW: Add to Export Registry ---
+    // Add to Export Registry
     add_export_process(migrating_task->pid, migrating_target_node);
     printk(KERN_INFO "MattX:[REGISTRY] PID %d registered as Exported to Node %d.\n", migrating_task->pid, migrating_target_node);
     
@@ -164,5 +167,4 @@ void mattx_send_vma_data(void) {
     kfree(local_migration_req);
     local_migration_req = NULL;
 }
-
 
