@@ -168,3 +168,24 @@ void mattx_send_vma_data(void) {
     local_migration_req = NULL;
 }
 
+// --- NEW: The Recall Trigger ---
+void mattx_trigger_recall(pid_t orig_pid) {
+    int target_node = get_export_target(orig_pid);
+    struct mattx_recall_req req;
+
+    if (target_node == -1) {
+        printk(KERN_WARNING "MattX: [RECALL] PID %d is not in the export registry. Cannot recall.\n", orig_pid);
+        return;
+    }
+
+    if (!cluster_map[target_node]) {
+        printk(KERN_ERR "MattX: [RECALL] Target Node %d is disconnected. Cannot recall PID %d.\n", target_node, orig_pid);
+        return;
+    }
+
+    req.orig_pid = orig_pid;
+
+    printk(KERN_INFO "MattX: [RECALL] Sending RECALL_REQ for PID %d to Node %d...\n", orig_pid, target_node);
+    mattx_comm_send(cluster_map[target_node], MATTX_MSG_RECALL_REQ, &req, sizeof(req));
+}
+

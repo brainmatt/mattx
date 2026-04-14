@@ -23,10 +23,10 @@
 #include <linux/highmem.h>       
 #include <linux/cred.h>          
 #include <linux/uidgid.h>        
-#include <linux/fs.h>            // NEW: For file operations
-#include <linux/fdtable.h>       // NEW: For manipulating the FD table
-#include <linux/anon_inodes.h>   // NEW: For creating Fake FDs
-#include <linux/uaccess.h>       // NEW: For copy_from_user
+#include <linux/fs.h>            
+#include <linux/fdtable.h>       
+#include <linux/anon_inodes.h>   
+#include <linux/uaccess.h>       
 
 #define MATTX_PORT 7226
 #define MAX_NODES 1024 
@@ -49,7 +49,8 @@ enum mattx_msg_type {
     MATTX_MSG_MIGRATE_DONE,   
     MATTX_MSG_PROCESS_EXIT,   
     MATTX_MSG_KILL_SURROGATE, 
-    MATTX_MSG_SYSCALL_FWD,    // We will finally use this!
+    MATTX_MSG_SYSCALL_FWD,
+    MATTX_MSG_RECALL_REQ,     // NEW: Home node asks Remote node to return a process
 };
 
 struct mattx_header {
@@ -84,8 +85,8 @@ struct mattx_migration_req {
     struct mattx_cpu_regs regs; 
     uint64_t fsbase; 
     uint64_t gsbase; 
-    uint64_t arg_start; // NEW: Pointer to the start of argv
-    uint64_t arg_end;   // NEW: Pointer to the end of argv
+    uint64_t arg_start; 
+    uint64_t arg_end;   
     char comm[16]; 
     u32 vma_count;
     u32 pad2;
@@ -103,12 +104,16 @@ struct mattx_process_exit {
     int exit_code; 
 };
 
-// NEW: Payload for forwarding stdout/stderr
 struct mattx_syscall_req {
     u32 orig_pid;
     u32 fd;
     u32 len;
-    char data[]; // Flexible array member for the text
+    char data[]; 
+};
+
+// NEW: Payload for the Recall Request
+struct mattx_recall_req {
+    u32 orig_pid;
 };
 
 struct mattx_link {
@@ -162,6 +167,8 @@ void remove_guest_process(int index);
 
 void add_export_process(pid_t orig_pid, int target_node);
 void remove_export_process(int index);
+int get_export_target(pid_t orig_pid); // NEW: Lookup helper
+void mattx_trigger_recall(pid_t orig_pid); // NEW: The Recall Trigger
 
 int mattx_proc_init(void);
 void mattx_proc_exit(void);

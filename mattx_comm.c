@@ -322,7 +322,16 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
                 }
             }
             break;
-            
+        // --- NEW: The Recall Receiver (Node 2 receives this) ---
+        case MATTX_MSG_RECALL_REQ:
+            if (payload) {
+                struct mattx_recall_req *req = (struct mattx_recall_req *)payload;
+                printk(KERN_INFO "MattX: [INCOMING] Received RECALL request for Orig PID %u from Node %u\n", 
+                       req->orig_pid, hdr->sender_id);
+                
+                // TODO Phase 11.2: Freeze the surrogate, extract state, and send RETURN_BLUEPRINT
+            }
+            break;            
         default:
             printk(KERN_WARNING "MattX: [COMM] Unknown message type: %u\n", hdr->type);
             break;

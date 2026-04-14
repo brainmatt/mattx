@@ -16,7 +16,7 @@ static struct task_struct *listener_thread;
 
 // --- Admin Globals (The actual definition!) ---
 bool balancer_enabled = true;
-u32 my_node_id = 0; // NEW
+u32 my_node_id = 0; 
 
 // --- Guest Registry Implementation ---
 struct mattx_guest_info guest_registry[MAX_GUESTS];
@@ -56,7 +56,6 @@ void remove_guest_process(int index) {
     guest_count--;
 }
 
-// --- NEW: Export Registry Implementation ---
 struct mattx_export_info export_registry[MAX_GUESTS];
 int export_count = 0;
 DEFINE_SPINLOCK(export_lock);
@@ -78,9 +77,22 @@ void remove_export_process(int index) {
     export_registry[index] = export_registry[export_count - 1];
     export_count--;
 }
-// ------------------------------------------
 
-// FIXED: Added MATTX_ATTR_MY_NODE_ID here!
+// --- NEW: Lookup where a process was exported to ---
+int get_export_target(pid_t orig_pid) {
+    int target = -1;
+    int i;
+    spin_lock(&export_lock);
+    for (i = 0; i < export_count; i++) {
+        if (export_registry[i].orig_pid == orig_pid) {
+            target = export_registry[i].target_node;
+            break;
+        }
+    }
+    spin_unlock(&export_lock);
+    return target;
+}
+
 enum { MATTX_ATTR_UNSPEC, MATTX_ATTR_NODE_ID, MATTX_ATTR_IPV4_ADDR, MATTX_ATTR_STUB_PID, MATTX_ATTR_BLUEPRINT, MATTX_ATTR_MY_NODE_ID, __MATTX_ATTR_MAX };
 #define MATTX_ATTR_MAX (__MATTX_ATTR_MAX - 1)
 
@@ -95,7 +107,6 @@ static int mattx_nl_cmd_node_join(struct sk_buff *skb, struct genl_info *info) {
     u32 ip_addr = nla_get_u32(info->attrs[MATTX_ATTR_IPV4_ADDR]);
     struct mattx_link *link = NULL;
 
-    // NEW: Learn our own identity from the daemon!
     if (info->attrs[MATTX_ATTR_MY_NODE_ID]) {
         my_node_id = nla_get_u32(info->attrs[MATTX_ATTR_MY_NODE_ID]);
     }
@@ -193,7 +204,6 @@ static int __init mattx_init(void) {
     spin_lock_init(&guest_lock); 
     spin_lock_init(&export_lock); 
     
-    // --- NEW: Initialize the /proc interface ---
     if (mattx_proc_init() < 0) {
         printk(KERN_ERR "MattX: Failed to create /proc/mattx interface\n");
     }
@@ -212,7 +222,6 @@ static void __exit mattx_exit(void) {
     if (balancer_thread) kthread_stop(balancer_thread);
     if (listener_thread) kthread_stop(listener_thread);
     
-    // --- NEW: Cleanup the /proc interface ---
     mattx_proc_exit();
     
     for (i = 0; i < MAX_NODES; i++) mattx_comm_disconnect(i);
