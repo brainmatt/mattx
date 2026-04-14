@@ -41,6 +41,8 @@ struct mattx_migration_req {
     struct mattx_cpu_regs regs;
     uint64_t fsbase; 
     uint64_t gsbase; 
+    uint64_t arg_start; // NEW
+    uint64_t arg_end;   // NEW
     char comm[16]; 
     uint32_t vma_count;
     uint32_t pad2;

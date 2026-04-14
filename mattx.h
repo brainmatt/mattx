@@ -84,6 +84,8 @@ struct mattx_migration_req {
     struct mattx_cpu_regs regs; 
     uint64_t fsbase; 
     uint64_t gsbase; 
+    uint64_t arg_start; // NEW: Pointer to the start of argv
+    uint64_t arg_end;   // NEW: Pointer to the end of argv
     char comm[16]; 
     u32 vma_count;
     u32 pad2;

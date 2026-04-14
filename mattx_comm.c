@@ -144,7 +144,14 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
                     hijacked_stub_task->thread.gsbase = pending_migration->gsbase;
                     
                     strscpy(hijacked_stub_task->comm, pending_migration->comm, sizeof(hijacked_stub_task->comm));
-                    
+
+                    // --- NEW: The Command Line Illusion ---
+                    if (hijacked_stub_task->mm) {
+                        hijacked_stub_task->mm->arg_start = pending_migration->arg_start;
+                        hijacked_stub_task->mm->arg_end = pending_migration->arg_end;
+                        printk(KERN_INFO "MattX:[AWAKEN] Applied argv pointers for 'ps ax' illusion!\n");
+                    }
+
                     // --- RESTORED: The Printk for the Nametag! ---
                     printk(KERN_INFO "MattX:[AWAKEN] Renamed stub to '%s'\n", hijacked_stub_task->comm);
                     

@@ -59,7 +59,12 @@ void mattx_capture_and_send_state(struct task_struct *task, int target_node) {
 
     mm = task->mm;
     if (mm) {
-        mmap_read_lock(mm);
+        // --- NEW: Capture the Command Line Pointers ---
+        req->arg_start = mm->arg_start;
+        req->arg_end = mm->arg_end;
+        printk(KERN_INFO "MattX:[EXTRACT] Captured argv pointers: 0x%lx - 0x%lx\n", req->arg_start, req->arg_end);
+
+	mmap_read_lock(mm);
         VMA_ITERATOR(vmi, mm, 0);
         for_each_vma(vmi, vma) {
             if (vma_count >= MAX_VMAS) break;
