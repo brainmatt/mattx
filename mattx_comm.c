@@ -90,7 +90,7 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
                 }
 
                 if (call_usermodehelper(stub_argv[0], stub_argv, stub_envp, UMH_NO_WAIT) != 0) {
-                    printk(KERN_ERR "MattX: [INCOMING] Failed to spawn surrogate!\n");
+                    printk(KERN_ERR "MattX:[INCOMING] Failed to spawn surrogate!\n");
                 }
             }
             break;
@@ -107,10 +107,26 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
                 unsigned long target_addr = pending_migration->vmas[ph->vma_index].vm_start + ph->offset;
                 int res;
 
+                // --- NEW: The Memory Unprotect Hack ---
+                // If we are injecting into the Deputy (Return Migration), we must force the VMA to be writable!
+                if (hijacked_stub_task->mm) {
+                    struct vm_area_struct *vma;
+                    mmap_write_lock(hijacked_stub_task->mm);
+                    vma = find_vma(hijacked_stub_task->mm, target_addr);
+                    if (vma && target_addr >= vma->vm_start) {
+                        // Force the VM_WRITE flag so access_process_vm succeeds
+                        vm_flags_set(vma, VM_WRITE); 
+                    }
+                    mmap_write_unlock(hijacked_stub_task->mm);
+                }
+
                 res = access_process_vm(hijacked_stub_task, target_addr, data, ph->length, FOLL_WRITE | FOLL_FORCE);
                 
                 if (res != ph->length) {
-                    printk(KERN_ERR "MattX: [INJECT] Failed to inject %u bytes at 0x%lx (res: %d)\n", ph->length, target_addr, res);
+                    // Only print errors occasionally to avoid flooding dmesg if a whole VMA fails
+                    if (ph->offset == 0) {
+                        printk(KERN_ERR "MattX: [INJECT] Failed to inject %u bytes at 0x%lx (res: %d)\n", ph->length, target_addr, res);
+                    }
                 } else {
                     injected_pages_count++;
                 }
@@ -144,16 +160,11 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
                     hijacked_stub_task->thread.gsbase = pending_migration->gsbase;
                     
                     strscpy(hijacked_stub_task->comm, pending_migration->comm, sizeof(hijacked_stub_task->comm));
-
-                    // --- NEW: The Command Line Illusion ---
+                    
                     if (hijacked_stub_task->mm) {
                         hijacked_stub_task->mm->arg_start = pending_migration->arg_start;
                         hijacked_stub_task->mm->arg_end = pending_migration->arg_end;
-                        printk(KERN_INFO "MattX:[AWAKEN] Applied argv pointers for 'ps ax' illusion!\n");
                     }
-
-                    // --- RESTORED: The Printk for the Nametag! ---
-                    printk(KERN_INFO "MattX:[AWAKEN] Renamed stub to '%s'\n", hijacked_stub_task->comm);
                     
                     new_cred = prepare_creds();
                     if (new_cred) {
@@ -201,17 +212,14 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
                             
                             if (old_file1) fput(old_file1);
                             if (old_file2) fput(old_file2);
-                            
-                            printk(KERN_INFO "MattX:[AWAKEN] Successfully injected Fake FDs for stdout/stderr!\n");
                         }
                     } else {
-                        printk(KERN_ERR "MattX:[AWAKEN] Failed to create Fake FDs!\n");
                         if (!IS_ERR(fake_file1)) fput(fake_file1);
                         if (!IS_ERR(fake_file2)) fput(fake_file2);
                     }
 
                     if (access_process_vm(hijacked_stub_task, regs->ip, rip_buf, 8, FOLL_FORCE) == 8) {
-                        printk(KERN_INFO "MattX:[DEBUG] Target RIP (0x%lx) contains: %8ph\n", regs->ip, rip_buf);
+                        printk(KERN_INFO "MattX: [DEBUG] Target RIP (0x%lx) contains: %8ph\n", regs->ip, rip_buf);
                     }
 
                     printk(KERN_INFO "MattX:[AWAKEN] IT'S ALIVE! Sending SIGCONT to PID %d\n", hijacked_stub_task->pid);
@@ -232,6 +240,7 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
             if (payload) {
                 struct mattx_process_exit *exit_msg = (struct mattx_process_exit *)payload;
                 struct task_struct *deputy = NULL;
+                int i;
 
                 printk(KERN_INFO "MattX: [FUNERAL] Received exit notice for Deputy PID %u from Node %u\n", 
                        exit_msg->orig_pid, hdr->sender_id);
@@ -248,7 +257,7 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
                 }
                 
                 spin_lock(&export_lock);
-                for (int i = 0; i < export_count; i++) {
+                for (i = 0; i < export_count; i++) {
                     if (export_registry[i].orig_pid == exit_msg->orig_pid) {
                         remove_export_process(i);
                         break;
@@ -322,8 +331,7 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
                 }
             }
             break;
-// Inside mattx_handle_message(), replace the RECALL_REQ case and add the new one:
-
+            
         case MATTX_MSG_RECALL_REQ:
             if (payload) {
                 struct mattx_recall_req *req = (struct mattx_recall_req *)payload;
@@ -337,7 +345,7 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
                 for (i = 0; i < guest_count; i++) {
                     if (guest_registry[i].orig_pid == req->orig_pid && guest_registry[i].home_node == hdr->sender_id) {
                         local_stub_pid = guest_registry[i].local_pid;
-                        break; // We DO NOT remove it from the registry yet! We need it alive.
+                        break; 
                     }
                 }
                 spin_unlock(&guest_lock);
@@ -351,10 +359,7 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
 
                     if (surrogate) {
                         printk(KERN_INFO "MattX: [RECALL] Found Surrogate PID %d. Capturing state...\n", surrogate->pid);
-                        
-                        // --- NEW: Trigger the Return Extraction! ---
                         mattx_capture_and_return_state(surrogate, req->orig_pid, hdr->sender_id);
-                        
                         put_task_struct(surrogate);
                     } else {
                         printk(KERN_WARNING "MattX: [RECALL] Surrogate PID %d not found!\n", local_stub_pid);
@@ -365,13 +370,12 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
             }
             break;
 
-        // --- NEW: Node 1 receives the Return Blueprint ---
         case MATTX_MSG_RETURN_BLUEPRINT:
             if (payload) {
                 struct mattx_migration_req *req = (struct mattx_migration_req *)payload;
                 struct task_struct *deputy = NULL;
 
-                printk(KERN_INFO "MattX: [INCOMING] Received RETURN Blueprint for Deputy PID %u. Saving to pending...\n", req->orig_pid);
+                printk(KERN_INFO "MattX:[INCOMING] Received RETURN Blueprint for Deputy PID %u. Saving to pending...\n", req->orig_pid);
                 
                 pending_source_node = hdr->sender_id;
                 injected_pages_count = 0;
@@ -379,14 +383,13 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
                 if (pending_migration) kvfree(pending_migration);
                 pending_migration = kmemdup(req, hdr->length, GFP_KERNEL);
                 
-                // Find the frozen Deputy
                 rcu_read_lock();
                 deputy = pid_task(find_vpid(req->orig_pid), PIDTYPE_PID);
                 if (deputy) get_task_struct(deputy);
                 rcu_read_unlock();
 
                 if (deputy) {
-                    printk(KERN_INFO "MattX: [RECALL] Found frozen Deputy PID %d. Preparing for memory injection...\n", deputy->pid);
+                    printk(KERN_INFO "MattX:[RECALL] Found frozen Deputy PID %d. Preparing for memory injection...\n", deputy->pid);
                     
                     if (hijacked_stub_task) put_task_struct(hijacked_stub_task);
                     hijacked_stub_task = deputy; 
@@ -407,12 +410,10 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
                 int i;
 
                 if (regs) {
-                    // Restore the updated brain from Node 2
                     memcpy(regs, &pending_migration->regs, sizeof(struct pt_regs));
                     
                     printk(KERN_INFO "MattX:[AWAKEN] Deputy Brain Restored. New RIP: 0x%lx\n", regs->ip);
                     
-                    // Remove from export registry
                     spin_lock(&export_lock);
                     for (i = 0; i < export_count; i++) {
                         if (export_registry[i].orig_pid == hijacked_stub_task->pid) {
@@ -434,7 +435,7 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
             }
             break;
 
-	default:
+        default:
             printk(KERN_WARNING "MattX: [COMM] Unknown message type: %u\n", hdr->type);
             break;
     }
