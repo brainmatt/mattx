@@ -369,21 +369,72 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
         case MATTX_MSG_RETURN_BLUEPRINT:
             if (payload) {
                 struct mattx_migration_req *req = (struct mattx_migration_req *)payload;
+                struct task_struct *deputy = NULL;
+
                 printk(KERN_INFO "MattX: [INCOMING] Received RETURN Blueprint for Deputy PID %u. Saving to pending...\n", req->orig_pid);
                 
                 pending_source_node = hdr->sender_id;
                 injected_pages_count = 0;
 
                 if (pending_migration) kvfree(pending_migration);
-                pending_migration = kvmalloc(hdr->length, GFP_KERNEL);
-                if (pending_migration) {
-                    memcpy(pending_migration, req, hdr->length);
-                }
+                pending_migration = kmemdup(req, hdr->length, GFP_KERNEL);
                 
-                // TODO Phase 11.3: Prepare the Deputy's memory and send READY_FOR_DATA
+                // Find the frozen Deputy
+                rcu_read_lock();
+                deputy = pid_task(find_vpid(req->orig_pid), PIDTYPE_PID);
+                if (deputy) get_task_struct(deputy);
+                rcu_read_unlock();
+
+                if (deputy) {
+                    printk(KERN_INFO "MattX: [RECALL] Found frozen Deputy PID %d. Preparing for memory injection...\n", deputy->pid);
+                    
+                    if (hijacked_stub_task) put_task_struct(hijacked_stub_task);
+                    hijacked_stub_task = deputy; 
+
+                    printk(KERN_INFO "MattX: [RECALL] Sending READY_FOR_DATA signal to Node %d...\n", pending_source_node);
+                    mattx_comm_send(cluster_map[pending_source_node], MATTX_MSG_READY_FOR_DATA, NULL, 0);
+                } else {
+                    printk(KERN_ERR "MattX: [RECALL] ERROR: Deputy PID %u not found!\n", req->orig_pid);
+                }
             }
             break;
-        default:
+
+        case MATTX_MSG_RETURN_DONE:
+            printk(KERN_INFO "MattX:[INCOMING] Return memory transferred successfully! Pages: %d\n", injected_pages_count);
+            
+            if (hijacked_stub_task && pending_migration) {
+                struct pt_regs *regs = task_pt_regs(hijacked_stub_task);
+                int i;
+
+                if (regs) {
+                    // Restore the updated brain from Node 2
+                    memcpy(regs, &pending_migration->regs, sizeof(struct pt_regs));
+                    
+                    printk(KERN_INFO "MattX:[AWAKEN] Deputy Brain Restored. New RIP: 0x%lx\n", regs->ip);
+                    
+                    // Remove from export registry
+                    spin_lock(&export_lock);
+                    for (i = 0; i < export_count; i++) {
+                        if (export_registry[i].orig_pid == hijacked_stub_task->pid) {
+                            remove_export_process(i);
+                            break;
+                        }
+                    }
+                    spin_unlock(&export_lock);
+
+                    printk(KERN_INFO "MattX:[AWAKEN] Welcome home! Sending SIGCONT to Deputy PID %d\n", hijacked_stub_task->pid);
+                    send_sig(SIGCONT, hijacked_stub_task, 0);
+                }
+                
+                put_task_struct(hijacked_stub_task);
+                hijacked_stub_task = NULL;
+                kvfree(pending_migration);
+                pending_migration = NULL;
+                pending_source_node = -1;
+            }
+            break;
+
+	default:
             printk(KERN_WARNING "MattX: [COMM] Unknown message type: %u\n", hdr->type);
             break;
     }

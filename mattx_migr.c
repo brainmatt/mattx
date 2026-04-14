@@ -3,6 +3,7 @@
 static struct mattx_migration_req *local_migration_req = NULL;
 static struct task_struct *migrating_task = NULL;
 static int migrating_target_node = -1;
+static bool is_returning = false; // NEW: Flag to track the direction
 
 void mattx_capture_and_send_state(struct task_struct *task, int target_node) {
     struct pt_regs *regs;
@@ -16,6 +17,8 @@ void mattx_capture_and_send_state(struct task_struct *task, int target_node) {
     int retries = 50;
     unsigned char rip_buf[8] = {0}; 
 
+    is_returning = false; // This is a forward migration
+
     max_payload_size = sizeof(struct mattx_migration_req) + (MAX_VMAS * sizeof(struct mattx_vma_info));
     req = kzalloc(max_payload_size, GFP_KERNEL);
     if (!req) return;
@@ -28,9 +31,6 @@ void mattx_capture_and_send_state(struct task_struct *task, int target_node) {
         msleep(10);
         retries--;
     }
-    if (retries == 0) {
-        printk(KERN_WARNING "MattX:[EXTRACT] Warning: Task %d took too long to stop!\n", task->pid);
-    }
 
     req->orig_pid = task->pid;
     
@@ -39,16 +39,13 @@ void mattx_capture_and_send_state(struct task_struct *task, int target_node) {
         req->uid = from_kuid(&init_user_ns, cred->uid);
         req->gid = from_kgid(&init_user_ns, cred->gid);
         put_cred(cred); 
-        printk(KERN_INFO "MattX:[EXTRACT] Captured Identity -> UID: %u, GID: %u\n", req->uid, req->gid);
     }
 
     get_task_comm(req->comm, task);
-    printk(KERN_INFO "MattX:[EXTRACT] Captured process name: '%s'\n", req->comm);
 
     regs = task_pt_regs(task);
     if (regs) {
         memcpy(&req->regs, regs, sizeof(struct pt_regs));
-        
         req->fsbase = task->thread.fsbase;
         req->gsbase = task->thread.gsbase;
         
@@ -61,9 +58,6 @@ void mattx_capture_and_send_state(struct task_struct *task, int target_node) {
     if (mm) {
         req->arg_start = mm->arg_start;
         req->arg_end = mm->arg_end;
-        
-        printk(KERN_INFO "MattX:[EXTRACT] Captured argv pointers: 0x%lx - 0x%lx\n", 
-               (unsigned long)req->arg_start, (unsigned long)req->arg_end);
 
         mmap_read_lock(mm);
         VMA_ITERATOR(vmi, mm, 0);
@@ -95,7 +89,6 @@ void mattx_capture_and_send_state(struct task_struct *task, int target_node) {
     kfree(req);
 }
 
-// --- NEW: The Return Extractor (Runs on Node 2) ---
 void mattx_capture_and_return_state(struct task_struct *task, u32 orig_pid, int target_node) {
     struct pt_regs *regs;
     struct mm_struct *mm;
@@ -106,6 +99,8 @@ void mattx_capture_and_return_state(struct task_struct *task, u32 orig_pid, int 
     int vma_count = 0;
     int retries = 50;
 
+    is_returning = true; // NEW: This is a return migration!
+
     max_payload_size = sizeof(struct mattx_migration_req) + (MAX_VMAS * sizeof(struct mattx_vma_info));
     req = kzalloc(max_payload_size, GFP_KERNEL);
     if (!req) return;
@@ -113,13 +108,12 @@ void mattx_capture_and_return_state(struct task_struct *task, u32 orig_pid, int 
     printk(KERN_INFO "MattX:[EXTRACT] Initiating RETURN state capture for Surrogate PID %d...\n", task->pid);
 
     send_sig(SIGSTOP, task, 0);
-
+    
     while (!(READ_ONCE(task->__state) & __TASK_STOPPED) && retries > 0) {
         msleep(10);
         retries--;
     }
 
-    // CRITICAL: We use the Deputy's PID here so Node 1 knows who this belongs to!
     req->orig_pid = orig_pid;
 
     regs = task_pt_regs(task);
@@ -144,14 +138,13 @@ void mattx_capture_and_return_state(struct task_struct *task, u32 orig_pid, int 
         }
         mmap_read_unlock(mm);
     }
-
+    
     req->vma_count = vma_count;
     actual_payload_size = sizeof(struct mattx_migration_req) + (vma_count * sizeof(struct mattx_vma_info));
 
-    // Save state locally so we can use the exact same data pump!
     if (local_migration_req) kfree(local_migration_req);
     local_migration_req = kmemdup(req, actual_payload_size, GFP_KERNEL);
-
+    
     if (migrating_task) put_task_struct(migrating_task);
     get_task_struct(task);
     migrating_task = task;
@@ -188,7 +181,6 @@ void mattx_send_vma_data(void) {
             void *page_buf = kmalloc(chunk_size, GFP_KERNEL);
             if (page_buf) {
                 int bytes_read = access_process_vm(migrating_task, curr, page_buf, chunk_size, FOLL_FORCE);
-                
                 if (bytes_read > 0) {
                     size_t payload_size = sizeof(struct mattx_page_header) + bytes_read;
                     void *payload_buf = kmalloc(payload_size, GFP_KERNEL);
@@ -201,13 +193,8 @@ void mattx_send_vma_data(void) {
                         p_page_hdr->length = bytes_read;
 
                         memcpy(payload_buf + sizeof(struct mattx_page_header), page_buf, bytes_read);
-                        
-                        int send_res = mattx_comm_send(cluster_map[migrating_target_node], MATTX_MSG_PAGE_TRANSFER, payload_buf, payload_size);
-                        if (send_res < payload_size) {
-                            network_errors++;
-                        } else {
-                            sent_pages++;
-                        }
+                        mattx_comm_send(cluster_map[migrating_target_node], MATTX_MSG_PAGE_TRANSFER, payload_buf, payload_size);
+                        sent_pages++;
                         kfree(payload_buf);
                     }
                 } else {
@@ -219,38 +206,36 @@ void mattx_send_vma_data(void) {
         }
     }
     
-    printk(KERN_INFO "MattX:[MIGRATE] Pipeline stats: %d total, %d sent, %d skipped, %d net errors\n", 
-           total_pages, sent_pages, skipped_pages, network_errors);
-    printk(KERN_INFO "MattX:[MIGRATE] Data pipeline complete. Sending DONE signal.\n");
+    printk(KERN_INFO "MattX:[MIGRATE] Pipeline stats: %d total, %d sent, %d skipped\n", total_pages, sent_pages, skipped_pages);
     
-    mattx_comm_send(cluster_map[migrating_target_node], MATTX_MSG_MIGRATE_DONE, NULL, 0);
-    
-    add_export_process(migrating_task->pid, migrating_target_node);
-    printk(KERN_INFO "MattX:[REGISTRY] PID %d registered as Exported to Node %d.\n", migrating_task->pid, migrating_target_node);
+    // --- NEW: Handle the end of the pipeline based on direction ---
+    if (is_returning) {
+        printk(KERN_INFO "MattX:[MIGRATE] Return pipeline complete. Sending RETURN_DONE signal.\n");
+        mattx_comm_send(cluster_map[migrating_target_node], MATTX_MSG_RETURN_DONE, NULL, 0);
+        
+        // Node 2 cleans up the Surrogate!
+        printk(KERN_INFO "MattX:[RECALL] Executing local Surrogate PID %d...\n", migrating_task->pid);
+        send_sig(SIGKILL, migrating_task, 0);
+        
+        spin_lock(&guest_lock);
+        for (int i = 0; i < guest_count; i++) {
+            if (guest_registry[i].local_pid == migrating_task->pid) {
+                remove_guest_process(i);
+                break;
+            }
+        }
+        spin_unlock(&guest_lock);
+    } else {
+        printk(KERN_INFO "MattX:[MIGRATE] Data pipeline complete. Sending DONE signal.\n");
+        mattx_comm_send(cluster_map[migrating_target_node], MATTX_MSG_MIGRATE_DONE, NULL, 0);
+        
+        add_export_process(migrating_task->pid, migrating_target_node);
+        printk(KERN_INFO "MattX:[REGISTRY] PID %d registered as Exported to Node %d.\n", migrating_task->pid, migrating_target_node);
+    }
     
     put_task_struct(migrating_task);
     migrating_task = NULL;
     kfree(local_migration_req);
     local_migration_req = NULL;
-}
-
-void mattx_trigger_recall(pid_t orig_pid) {
-    int target_node = get_export_target(orig_pid);
-    struct mattx_recall_req req;
-
-    if (target_node == -1) {
-        printk(KERN_WARNING "MattX: [RECALL] PID %d is not in the export registry. Cannot recall.\n", orig_pid);
-        return;
-    }
-
-    if (!cluster_map[target_node]) {
-        printk(KERN_ERR "MattX: [RECALL] Target Node %d is disconnected. Cannot recall PID %d.\n", target_node, orig_pid);
-        return;
-    }
-
-    req.orig_pid = orig_pid;
-
-    printk(KERN_INFO "MattX: [RECALL] Sending RECALL_REQ for PID %d to Node %d...\n", orig_pid, target_node);
-    mattx_comm_send(cluster_map[target_node], MATTX_MSG_RECALL_REQ, &req, sizeof(req));
 }
 

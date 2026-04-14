@@ -52,6 +52,7 @@ enum mattx_msg_type {
     MATTX_MSG_SYSCALL_FWD,
     MATTX_MSG_RECALL_REQ, 
     MATTX_MSG_RETURN_BLUEPRINT,
+    MATTX_MSG_RETURN_DONE,
 };
 
 struct mattx_header {
