@@ -34,15 +34,14 @@ int main() {
         while (1) {
             printf("[Worker %d] Hello from the MattX Cluster! (Tick: %d)\n", getpid(), counter++);
             fflush(stdout);
-            
-            // --- THE CPU HOG ---
-            // Instead of sleeping, we burn 100% of the CPU for 1 second
-            time_t start = time(NULL);
-            volatile double x = 1.0; // 'volatile' stops the compiler from optimizing this loop away
-            
-            while (time(NULL) - start < 1) {
-                x = x * 1.000001 + 0.000001;
+	    // do some dumb calculations 
+	    sleep(0.5);
+	    double x = 1.0;
+	    while (x < 10000000) {
+		    x = x + 0.1;
             }
+	    fflush(stdout);
+
         }
     } else {
         // --- PARENT PROCESS (The Manager) ---
