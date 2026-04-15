@@ -9,7 +9,7 @@ PWD := $(shell pwd)
 CFLAGS_USER := -Wall -O2 $(shell pkg-config --cflags libnl-3.0 libnl-genl-3.0)
 LDFLAGS_USER := $(shell pkg-config --libs libnl-3.0 libnl-genl-3.0)
 
-all: module daemon stub
+all: module daemon stub migtest
 
 module:
 	$(MAKE) -C $(KDIR) M=$(PWD) modules
@@ -20,7 +20,10 @@ daemon: mattx_discd.c
 stub: mattx_stub.c
 	gcc $(CFLAGS_USER) -o mattx-stub mattx_stub.c $(LDFLAGS_USER)
 
+migtest: migtest.c
+	gcc -o migtest migtest.c
+
 clean:
 	$(MAKE) -C $(KDIR) M=$(PWD) clean
-	rm -f mattx-discd mattx-stub
+	rm -f mattx-discd mattx-stub migtest
 
