@@ -1,0 +1,13 @@
+[Unit]
+Description=MattX Cluster Discovery Daemon
+After=network.target mattx.ko
+
+[Service]
+ExecStart=/usr/local/bin/mattx-discd
+Restart=always
+User=root
+
+[Install]
+WantedBy=multi-user.target
+
+
