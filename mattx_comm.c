@@ -45,8 +45,8 @@ static ssize_t mattx_fake_write(struct file *file, const char __user *buf, size_
         return -EFAULT;
     }
 
-    // --- NEW: Debug print so we know the Wormhole caught it! ---
-    // printk(KERN_INFO "MattX:[WORMHOLE] Caught %zu bytes for FD %u. Forwarding to Node %d...\n", to_send, req->fd, home_node);
+    // --- EXTREME DEBUGGING: See the Wormhole catch the text! ---
+    printk(KERN_INFO "MattX:[WORMHOLE] Caught %zu bytes for FD %u. Forwarding to Node %d...\n", to_send, req->fd, home_node);
 
     mattx_comm_send(cluster_map[home_node], MATTX_MSG_SYSCALL_FWD, packet_buf + sizeof(struct mattx_header), sizeof(struct mattx_syscall_req) + to_send);
 
@@ -130,8 +130,7 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
                 struct cred *new_cred;
                 const struct cred *old_cred;
                 int retries = 50;
-                unsigned char rip_buf[8] = {0}; 
-                struct file *fake_files[MAX_FDS]; // NEW: Array to hold the fake files
+                struct file *fake_files[MAX_FDS]; 
                 int i;
 
                 printk(KERN_INFO "MattX:[AWAKEN] Commencing full brain transplant on PID %d...\n", hijacked_stub_task->pid);
@@ -179,14 +178,12 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
                         put_cred(new_cred);
                     }
 
-                    // --- FIXED: Allocate Fake FDs OUTSIDE the spinlock! ---
                     memset(fake_files, 0, sizeof(fake_files));
                     for (i = 0; i < pending_migration->fd_count; i++) {
                         u32 fd_num = pending_migration->open_fds[i];
                         fake_files[i] = anon_inode_getfile("mattx_vfs_proxy", &mattx_fops, (void *)(uintptr_t)fd_num, O_WRONLY);
                     }
 
-                    // --- FIXED: Swap the pointers INSIDE the spinlock ---
                     if (hijacked_stub_task->files) {
                         spin_lock(&hijacked_stub_task->files->file_lock);
                         struct fdtable *fdt = files_fdtable(hijacked_stub_task->files);
@@ -194,16 +191,11 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
                         for (i = 0; i < pending_migration->fd_count; i++) {
                             u32 fd_num = pending_migration->open_fds[i];
                             if (fd_num < fdt->max_fds && !IS_ERR(fake_files[i])) {
-                                // We overwrite the pointer. (Leaking the old file for this prototype to avoid complex fput logic)
                                 rcu_assign_pointer(fdt->fd[fd_num], fake_files[i]);
                             }
                         }
                         spin_unlock(&hijacked_stub_task->files->file_lock);
                         printk(KERN_INFO "MattX:[AWAKEN] Successfully injected %u Fake FDs!\n", pending_migration->fd_count);
-                    }
-
-                    if (access_process_vm(hijacked_stub_task, regs->ip, rip_buf, 8, FOLL_FORCE) == 8) {
-                        printk(KERN_INFO "MattX: [DEBUG] Target RIP (0x%lx) contains: %8ph\n", regs->ip, rip_buf);
                     }
 
                     printk(KERN_INFO "MattX:[AWAKEN] IT'S ALIVE! Sending SIGCONT to PID %d\n", hijacked_stub_task->pid);
@@ -275,7 +267,7 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
                     rcu_read_unlock();
 
                     if (surrogate) {
-                        printk(KERN_INFO "MattX: [ASSASSIN] Executing Surrogate PID %d (Sending SIGKILL)...\n", surrogate->pid);
+                        printk(KERN_INFO "MattX:[ASSASSIN] Executing Surrogate PID %d (Sending SIGKILL)...\n", surrogate->pid);
                         send_sig(SIGKILL, surrogate, 0);
                         put_task_struct(surrogate);
                     }
@@ -289,6 +281,9 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
                 struct task_struct *deputy = NULL;
                 struct file *file = NULL;
                 
+                // --- EXTREME DEBUGGING: See the Wormhole deliver the text! ---
+                printk(KERN_INFO "MattX:[WORMHOLE] Received %u bytes for FD %u from Node %u. Writing to Deputy...\n", req->len, req->fd, hdr->sender_id);
+
                 rcu_read_lock();
                 deputy = pid_task(find_vpid(req->orig_pid), PIDTYPE_PID);
                 if (deputy) get_task_struct(deputy);

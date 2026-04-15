@@ -39,9 +39,26 @@ void mattx_capture_and_send_state(struct task_struct *task, int target_node) {
         req->uid = from_kuid(&init_user_ns, cred->uid);
         req->gid = from_kgid(&init_user_ns, cred->gid);
         put_cred(cred); 
+        printk(KERN_INFO "MattX:[EXTRACT] Captured Identity -> UID: %u, GID: %u\n", req->uid, req->gid);
     }
 
     get_task_comm(req->comm, task);
+    printk(KERN_INFO "MattX:[EXTRACT] Captured process name: '%s'\n", req->comm);
+
+    // --- RESTORED: Extract Open File Descriptors ---
+    req->fd_count = 0;
+    if (task->files) {
+        spin_lock(&task->files->file_lock);
+        struct fdtable *fdt = files_fdtable(task->files);
+        int i;
+        for (i = 0; i < fdt->max_fds && req->fd_count < MAX_FDS; i++) {
+            if (rcu_dereference_raw(fdt->fd[i]) != NULL) {
+                req->open_fds[req->fd_count++] = i;
+            }
+        }
+        spin_unlock(&task->files->file_lock);
+        printk(KERN_INFO "MattX:[EXTRACT] Captured %u open File Descriptors.\n", req->fd_count);
+    }
 
     regs = task_pt_regs(task);
     if (regs) {
@@ -119,22 +136,6 @@ void mattx_capture_and_return_state(struct task_struct *task, u32 orig_pid, int 
     regs = task_pt_regs(task);
     if (regs) {
         memcpy(&req->regs, regs, sizeof(struct pt_regs));
-        printk(KERN_INFO "MattX: [DEBUG] Return RIP: 0x%lx\n", (unsigned long)req->regs.rip);
-    }
-
-    // --- Extract Open File Descriptors ---
-    req->fd_count = 0;
-    if (task->files) {
-        spin_lock(&task->files->file_lock);
-        struct fdtable *fdt = files_fdtable(task->files);
-        int i;
-        for (i = 0; i < fdt->max_fds && req->fd_count < MAX_FDS; i++) {
-            if (rcu_dereference_raw(fdt->fd[i]) != NULL) {
-                req->open_fds[req->fd_count++] = i;
-            }
-        }
-        spin_unlock(&task->files->file_lock);
-        printk(KERN_INFO "MattX:[EXTRACT] Captured %u open File Descriptors.\n", req->fd_count);
     }
 
     mm = task->mm;
@@ -176,7 +177,6 @@ void mattx_send_vma_data(void) {
     int total_pages = 0;
     int sent_pages = 0;
     int skipped_pages = 0;
-    int network_errors = 0;
 
     if (!local_migration_req || !migrating_task || migrating_target_node == -1) return;
     if (!cluster_map[migrating_target_node]) return;
@@ -208,15 +208,8 @@ void mattx_send_vma_data(void) {
                         p_page_hdr->length = bytes_read;
 
                         memcpy(payload_buf + sizeof(struct mattx_page_header), page_buf, bytes_read);
-                        
-                        // FIXED: Restored the network error check to clear the warning!
-                        int send_res = mattx_comm_send(cluster_map[migrating_target_node], MATTX_MSG_PAGE_TRANSFER, payload_buf, payload_size);
-                        if (send_res < payload_size) {
-                            network_errors++;
-                        } else {
-                            sent_pages++;
-                        }
-                        
+                        mattx_comm_send(cluster_map[migrating_target_node], MATTX_MSG_PAGE_TRANSFER, payload_buf, payload_size);
+                        sent_pages++;
                         kfree(payload_buf);
                     }
                 } else {
@@ -228,8 +221,7 @@ void mattx_send_vma_data(void) {
         }
     }
     
-    printk(KERN_INFO "MattX:[MIGRATE] Pipeline stats: %d total, %d sent, %d skipped, %d net errors\n", 
-           total_pages, sent_pages, skipped_pages, network_errors);
+    printk(KERN_INFO "MattX:[MIGRATE] Pipeline stats: %d total, %d sent, %d skipped\n", total_pages, sent_pages, skipped_pages);
            
     if (is_returning) {
         printk(KERN_INFO "MattX:[MIGRATE] Return pipeline complete. Sending RETURN_DONE signal.\n");
@@ -258,26 +250,5 @@ void mattx_send_vma_data(void) {
     migrating_task = NULL;
     kfree(local_migration_req);
     local_migration_req = NULL;
-}
-
-// --- RESTORED: The Recall Trigger ---
-void mattx_trigger_recall(pid_t orig_pid) {
-    int target_node = get_export_target(orig_pid);
-    struct mattx_recall_req req;
-    
-    if (target_node == -1) {
-        printk(KERN_WARNING "MattX: [RECALL] PID %d is not in the export registry. Cannot recall.\n", orig_pid);
-        return;
-    }
-
-    if (!cluster_map[target_node]) {
-        printk(KERN_ERR "MattX:[RECALL] Target Node %d is disconnected. Cannot recall PID %d.\n", target_node, orig_pid);
-        return;
-    }
-
-    req.orig_pid = orig_pid;
-
-    printk(KERN_INFO "MattX: [RECALL] Sending RECALL_REQ for PID %d to Node %d...\n", orig_pid, target_node);
-    mattx_comm_send(cluster_map[target_node], MATTX_MSG_RECALL_REQ, &req, sizeof(req));
 }
 
