@@ -30,7 +30,10 @@ int main() {
         // --- CHILD PROCESS (The Worker) ---
         printf("[Worker] I am alive! My PID is %d. Migrate ME!\n", getpid());
         int counter = 0;
+	FILE *testfile = fopen("/tmp/mattx-fd.log", "w");
         
+	sleep(10);
+
         while (1) {
             printf("[Worker %d] Hello from the MattX Cluster! (Tick: %d)\n", getpid(), counter++);
             fflush(stdout);
@@ -42,7 +45,16 @@ int main() {
             }
 	    fflush(stdout);
 
+	    // here we write to a file sequentially
+            if (testfile == NULL) {
+                 perror("ERROR: opening file");
+                 return 1;
+            }
+            fprintf(testfile, "[Worker %d] Hello from the MattX Cluster! (Tick: %d).\n", getpid(), counter);
+	    fflush(testfile);
+
         }
+	fclose(testfile);
     } else {
         // --- PARENT PROCESS (The Manager) ---
         // Register the Ctrl-C handler
