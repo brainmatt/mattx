@@ -45,6 +45,9 @@ static ssize_t mattx_fake_write(struct file *file, const char __user *buf, size_
         return -EFAULT;
     }
 
+    // --- NEW: Debug print so we know the Wormhole caught it! ---
+    // printk(KERN_INFO "MattX:[WORMHOLE] Caught %zu bytes for FD %u. Forwarding to Node %d...\n", to_send, req->fd, home_node);
+
     mattx_comm_send(cluster_map[home_node], MATTX_MSG_SYSCALL_FWD, packet_buf + sizeof(struct mattx_header), sizeof(struct mattx_syscall_req) + to_send);
 
     kfree(packet_buf);
@@ -90,7 +93,7 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
                 }
 
                 if (call_usermodehelper(stub_argv[0], stub_argv, stub_envp, UMH_NO_WAIT) != 0) {
-                    printk(KERN_ERR "MattX: [INCOMING] Failed to spawn surrogate!\n");
+                    printk(KERN_ERR "MattX:[INCOMING] Failed to spawn surrogate!\n");
                 }
             }
             break;
@@ -107,7 +110,6 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
                 unsigned long target_addr = pending_migration->vmas[ph->vma_index].vm_start + ph->offset;
                 int res;
 
-                // We removed the old VM_WRITE hack because the memory is now explicitly carved as RWX!
                 res = access_process_vm(hijacked_stub_task, target_addr, data, ph->length, FOLL_WRITE | FOLL_FORCE);
                 
                 if (res != ph->length) {
@@ -129,6 +131,8 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
                 const struct cred *old_cred;
                 int retries = 50;
                 unsigned char rip_buf[8] = {0}; 
+                struct file *fake_files[MAX_FDS]; // NEW: Array to hold the fake files
+                int i;
 
                 printk(KERN_INFO "MattX:[AWAKEN] Commencing full brain transplant on PID %d...\n", hijacked_stub_task->pid);
 
@@ -175,36 +179,26 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
                         put_cred(new_cred);
                     }
 
-                    // --- Dynamic VFS Proxy Injection ---
+                    // --- FIXED: Allocate Fake FDs OUTSIDE the spinlock! ---
+                    memset(fake_files, 0, sizeof(fake_files));
+                    for (i = 0; i < pending_migration->fd_count; i++) {
+                        u32 fd_num = pending_migration->open_fds[i];
+                        fake_files[i] = anon_inode_getfile("mattx_vfs_proxy", &mattx_fops, (void *)(uintptr_t)fd_num, O_WRONLY);
+                    }
+
+                    // --- FIXED: Swap the pointers INSIDE the spinlock ---
                     if (hijacked_stub_task->files) {
-                        struct files_struct *files = hijacked_stub_task->files;
-                        int i;
-                        
-                        spin_lock(&files->file_lock);
-                        struct fdtable *fdt = files_fdtable(files);
+                        spin_lock(&hijacked_stub_task->files->file_lock);
+                        struct fdtable *fdt = files_fdtable(hijacked_stub_task->files);
                         
                         for (i = 0; i < pending_migration->fd_count; i++) {
                             u32 fd_num = pending_migration->open_fds[i];
-                            
-                            // Ensure the stub expanded its table enough
-                            if (fd_num < fdt->max_fds) {
-                                struct file *fake_file;
-                                struct file *old_file;
-                                
-                                // Create a fake file for this specific FD
-                                fake_file = anon_inode_getfile("mattx_vfs_proxy", &mattx_fops, (void *)(uintptr_t)fd_num, O_WRONLY);
-                                
-                                if (!IS_ERR(fake_file)) {
-                                    old_file = rcu_dereference_raw(fdt->fd[fd_num]);
-                                    rcu_assign_pointer(fdt->fd[fd_num], fake_file);
-                                    
-                                    // We must fput the old file outside the spinlock, so we do a tiny hack here
-                                    // In a production module we'd queue these for deletion, but for the prototype
-                                    // we just let the stub's exit routine clean up the old dup2() references.
-                                }
+                            if (fd_num < fdt->max_fds && !IS_ERR(fake_files[i])) {
+                                // We overwrite the pointer. (Leaking the old file for this prototype to avoid complex fput logic)
+                                rcu_assign_pointer(fdt->fd[fd_num], fake_files[i]);
                             }
                         }
-                        spin_unlock(&files->file_lock);
+                        spin_unlock(&hijacked_stub_task->files->file_lock);
                         printk(KERN_INFO "MattX:[AWAKEN] Successfully injected %u Fake FDs!\n", pending_migration->fd_count);
                     }
 
@@ -241,7 +235,7 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
                 rcu_read_unlock();
 
                 if (deputy) {
-                    printk(KERN_INFO "MattX:[FUNERAL] Laying Deputy PID %u to rest (Sending SIGKILL)...\n", deputy->pid);
+                    printk(KERN_INFO "MattX: [FUNERAL] Laying Deputy PID %u to rest (Sending SIGKILL)...\n", deputy->pid);
                     send_sig(SIGKILL, deputy, 0);
                     put_task_struct(deputy);
                 }
@@ -352,7 +346,7 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
                         mattx_capture_and_return_state(surrogate, req->orig_pid, hdr->sender_id);
                         put_task_struct(surrogate);
                     } else {
-                        printk(KERN_WARNING "MattX: [RECALL] Surrogate PID %d not found!\n", local_stub_pid);
+                        printk(KERN_WARNING "MattX:[RECALL] Surrogate PID %d not found!\n", local_stub_pid);
                     }
                 } else {
                     printk(KERN_WARNING "MattX:[RECALL] Could not find guest registry entry for Orig PID %u\n", req->orig_pid);
@@ -385,7 +379,6 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
                     if (hijacked_stub_task) put_task_struct(hijacked_stub_task);
                     hijacked_stub_task = deputy; 
 
-                    // --- NEW: Memory Adoption & Carving ---
                     if (deputy->mm) {
                         kthread_use_mm(deputy->mm);
                         for (i = 0; i < pending_migration->vma_count; i++) {
