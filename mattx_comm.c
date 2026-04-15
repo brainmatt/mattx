@@ -90,7 +90,7 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
                 }
 
                 if (call_usermodehelper(stub_argv[0], stub_argv, stub_envp, UMH_NO_WAIT) != 0) {
-                    printk(KERN_ERR "MattX:[INCOMING] Failed to spawn surrogate!\n");
+                    printk(KERN_ERR "MattX: [INCOMING] Failed to spawn surrogate!\n");
                 }
             }
             break;
@@ -107,23 +107,10 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
                 unsigned long target_addr = pending_migration->vmas[ph->vma_index].vm_start + ph->offset;
                 int res;
 
-                // --- NEW: The Memory Unprotect Hack ---
-                // If we are injecting into the Deputy (Return Migration), we must force the VMA to be writable!
-                if (hijacked_stub_task->mm) {
-                    struct vm_area_struct *vma;
-                    mmap_write_lock(hijacked_stub_task->mm);
-                    vma = find_vma(hijacked_stub_task->mm, target_addr);
-                    if (vma && target_addr >= vma->vm_start) {
-                        // Force the VM_WRITE flag so access_process_vm succeeds
-                        vm_flags_set(vma, VM_WRITE); 
-                    }
-                    mmap_write_unlock(hijacked_stub_task->mm);
-                }
-
+                // We removed the old VM_WRITE hack because the memory is now explicitly carved as RWX!
                 res = access_process_vm(hijacked_stub_task, target_addr, data, ph->length, FOLL_WRITE | FOLL_FORCE);
                 
                 if (res != ph->length) {
-                    // Only print errors occasionally to avoid flooding dmesg if a whole VMA fails
                     if (ph->offset == 0) {
                         printk(KERN_ERR "MattX: [INJECT] Failed to inject %u bytes at 0x%lx (res: %d)\n", ph->length, target_addr, res);
                     }
@@ -251,7 +238,7 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
                 rcu_read_unlock();
 
                 if (deputy) {
-                    printk(KERN_INFO "MattX: [FUNERAL] Laying Deputy PID %u to rest (Sending SIGKILL)...\n", deputy->pid);
+                    printk(KERN_INFO "MattX:[FUNERAL] Laying Deputy PID %u to rest (Sending SIGKILL)...\n", deputy->pid);
                     send_sig(SIGKILL, deputy, 0);
                     put_task_struct(deputy);
                 }
@@ -338,7 +325,7 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
                 pid_t local_stub_pid = -1;
                 int i;
 
-                printk(KERN_INFO "MattX: [INCOMING] Received RECALL request for Orig PID %u from Node %u\n", 
+                printk(KERN_INFO "MattX:[INCOMING] Received RECALL request for Orig PID %u from Node %u\n", 
                        req->orig_pid, hdr->sender_id);
                 
                 spin_lock(&guest_lock);
@@ -365,7 +352,7 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
                         printk(KERN_WARNING "MattX: [RECALL] Surrogate PID %d not found!\n", local_stub_pid);
                     }
                 } else {
-                    printk(KERN_WARNING "MattX: [RECALL] Could not find guest registry entry for Orig PID %u\n", req->orig_pid);
+                    printk(KERN_WARNING "MattX:[RECALL] Could not find guest registry entry for Orig PID %u\n", req->orig_pid);
                 }
             }
             break;
@@ -374,6 +361,7 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
             if (payload) {
                 struct mattx_migration_req *req = (struct mattx_migration_req *)payload;
                 struct task_struct *deputy = NULL;
+                int i;
 
                 printk(KERN_INFO "MattX:[INCOMING] Received RETURN Blueprint for Deputy PID %u. Saving to pending...\n", req->orig_pid);
                 
@@ -389,10 +377,29 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
                 rcu_read_unlock();
 
                 if (deputy) {
-                    printk(KERN_INFO "MattX:[RECALL] Found frozen Deputy PID %d. Preparing for memory injection...\n", deputy->pid);
+                    printk(KERN_INFO "MattX:[RECALL] Found frozen Deputy PID %d. Preparing memory map...\n", deputy->pid);
                     
                     if (hijacked_stub_task) put_task_struct(hijacked_stub_task);
                     hijacked_stub_task = deputy; 
+
+                    // --- NEW: Memory Adoption & Carving ---
+                    if (deputy->mm) {
+                        kthread_use_mm(deputy->mm);
+                        for (i = 0; i < pending_migration->vma_count; i++) {
+                            unsigned long start = pending_migration->vmas[i].vm_start;
+                            unsigned long len = pending_migration->vmas[i].vm_end - start;
+                            unsigned long prot = PROT_READ | PROT_WRITE | PROT_EXEC;
+                            unsigned long flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED;
+                            unsigned long ret_addr;
+
+                            ret_addr = vm_mmap(NULL, start, len, prot, flags, 0);
+                            if (IS_ERR_VALUE(ret_addr)) {
+                                printk(KERN_ERR "MattX:[RECALL] Failed to carve VMA at 0x%lx (err: %ld)\n", start, ret_addr);
+                            }
+                        }
+                        kthread_unuse_mm(deputy->mm);
+                        printk(KERN_INFO "MattX:[RECALL] Successfully carved %u VMAs into Deputy!\n", pending_migration->vma_count);
+                    }
 
                     printk(KERN_INFO "MattX: [RECALL] Sending READY_FOR_DATA signal to Node %d...\n", pending_source_node);
                     mattx_comm_send(cluster_map[pending_source_node], MATTX_MSG_READY_FOR_DATA, NULL, 0);

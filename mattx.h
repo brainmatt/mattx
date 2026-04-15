@@ -27,6 +27,8 @@
 #include <linux/fdtable.h>       
 #include <linux/anon_inodes.h>   
 #include <linux/uaccess.h>       
+#include <linux/mman.h>          // NEW: For PROT_ and MAP_ flags
+#include <linux/mmu_context.h>   // NEW: For kthread_use_mm
 
 #define MATTX_PORT 7226
 #define MAX_NODES 1024 
@@ -50,9 +52,9 @@ enum mattx_msg_type {
     MATTX_MSG_PROCESS_EXIT,   
     MATTX_MSG_KILL_SURROGATE, 
     MATTX_MSG_SYSCALL_FWD,
-    MATTX_MSG_RECALL_REQ, 
-    MATTX_MSG_RETURN_BLUEPRINT,
-    MATTX_MSG_RETURN_DONE,
+    MATTX_MSG_RECALL_REQ,     
+    MATTX_MSG_RETURN_BLUEPRINT, 
+    MATTX_MSG_RETURN_DONE,    
 };
 
 struct mattx_header {
@@ -160,7 +162,7 @@ void mattx_comm_disconnect(int node_id);
 int mattx_listener_loop(void *data);
 int mattx_balancer_loop(void *data);
 void mattx_capture_and_send_state(struct task_struct *task, int target_node);
-void mattx_capture_and_return_state(struct task_struct *task, u32 orig_pid, int target_node);
+void mattx_capture_and_return_state(struct task_struct *task, u32 orig_pid, int target_node); 
 void mattx_send_vma_data(void); 
 
 bool is_guest_process(pid_t pid);
@@ -169,8 +171,8 @@ void remove_guest_process(int index);
 
 void add_export_process(pid_t orig_pid, int target_node);
 void remove_export_process(int index);
-int get_export_target(pid_t orig_pid); // NEW: Lookup helper
-void mattx_trigger_recall(pid_t orig_pid); // NEW: The Recall Trigger
+int get_export_target(pid_t orig_pid); 
+void mattx_trigger_recall(pid_t orig_pid); 
 
 int mattx_proc_init(void);
 void mattx_proc_exit(void);
