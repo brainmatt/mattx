@@ -122,6 +122,21 @@ void mattx_capture_and_return_state(struct task_struct *task, u32 orig_pid, int 
         printk(KERN_INFO "MattX: [DEBUG] Return RIP: 0x%lx\n", (unsigned long)req->regs.rip);
     }
 
+    // --- Extract Open File Descriptors ---
+    req->fd_count = 0;
+    if (task->files) {
+        spin_lock(&task->files->file_lock);
+        struct fdtable *fdt = files_fdtable(task->files);
+        int i;
+        for (i = 0; i < fdt->max_fds && req->fd_count < MAX_FDS; i++) {
+            if (rcu_dereference_raw(fdt->fd[i]) != NULL) {
+                req->open_fds[req->fd_count++] = i;
+            }
+        }
+        spin_unlock(&task->files->file_lock);
+        printk(KERN_INFO "MattX:[EXTRACT] Captured %u open File Descriptors.\n", req->fd_count);
+    }
+
     mm = task->mm;
     if (mm) {
         req->arg_start = mm->arg_start;

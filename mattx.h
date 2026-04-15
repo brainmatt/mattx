@@ -27,8 +27,8 @@
 #include <linux/fdtable.h>       
 #include <linux/anon_inodes.h>   
 #include <linux/uaccess.h>       
-#include <linux/mman.h>          // NEW: For PROT_ and MAP_ flags
-#include <linux/mmu_context.h>   // NEW: For kthread_use_mm
+#include <linux/mman.h>          
+#include <linux/mmu_context.h>   
 
 #define MATTX_PORT 7226
 #define MAX_NODES 1024 
@@ -38,6 +38,7 @@
 #define FIXED_LOAD_0_2 409
 #define MAX_VMAS 256 
 #define MAX_GUESTS 1024 
+#define MAX_FDS 64 // NEW: Max open files we will migrate for now
 
 #define MATTX_MAGIC 0x4D415454 
 #define MATTX_MAX_PAYLOAD (10 * 1024 * 1024) 
@@ -92,6 +93,8 @@ struct mattx_migration_req {
     uint64_t arg_start; 
     uint64_t arg_end;   
     char comm[16]; 
+    u32 fd_count;          // NEW: Number of open files
+    u32 open_fds[MAX_FDS]; // NEW: Array of open FD numbers
     u32 vma_count;
     u32 pad2;
     struct mattx_vma_info vmas[]; 

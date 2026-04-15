@@ -14,12 +14,11 @@
 #include <netlink/genl/genl.h>
 #include <netlink/genl/ctrl.h>
 
-// FIXED: Added MATTX_ATTR_MY_NODE_ID here!
+#define MAX_FDS 64
+
 enum { MATTX_ATTR_UNSPEC, MATTX_ATTR_NODE_ID, MATTX_ATTR_IPV4_ADDR, MATTX_ATTR_STUB_PID, MATTX_ATTR_BLUEPRINT, MATTX_ATTR_MY_NODE_ID, __MATTX_ATTR_MAX };
 #define MATTX_ATTR_MAX (__MATTX_ATTR_MAX - 1)
-
 enum { MATTX_CMD_UNSPEC, MATTX_CMD_NODE_JOIN, MATTX_CMD_NODE_LEAVE, MATTX_CMD_HIJACK_ME, MATTX_CMD_GET_BLUEPRINT, __MATTX_CMD_MAX };
-#define MATTX_CMD_MAX (__MATTX_CMD_MAX - 1)
 
 struct mattx_vma_info {
     uint64_t vm_start;
@@ -35,15 +34,17 @@ struct mattx_cpu_regs {
 
 struct mattx_migration_req {
     uint32_t orig_pid;
-    uint32_t uid; // NEW
-    uint32_t gid; // NEW
+    uint32_t uid; 
+    uint32_t gid; 
     uint32_t pad;
     struct mattx_cpu_regs regs;
     uint64_t fsbase; 
     uint64_t gsbase; 
-    uint64_t arg_start; // NEW
-    uint64_t arg_end;   // NEW
+    uint64_t arg_start; 
+    uint64_t arg_end;   
     char comm[16]; 
+    uint32_t fd_count;          // NEW
+    uint32_t open_fds[MAX_FDS]; // NEW
     uint32_t vma_count;
     uint32_t pad2;
     struct mattx_vma_info vmas[]; 
@@ -56,18 +57,12 @@ static int blueprint_cb(struct nl_msg *msg, void *arg) {
     struct nlattr *attrs[MATTX_ATTR_MAX + 1];
     struct nla_policy policy[MATTX_ATTR_MAX + 1];
     
-    printf("MattX-Stub:[CALLBACK] Received a Netlink message from kernel!\n");
-
     memset(policy, 0, sizeof(policy));
     policy[MATTX_ATTR_BLUEPRINT].type = NLA_BINARY;
 
-    if (genlmsg_parse(nlh, 0, attrs, MATTX_ATTR_MAX, policy) < 0) {
-        printf("MattX-Stub:[CALLBACK] Message parsed, but no blueprint found (likely an ACK).\n");
-        return NL_SKIP;
-    }
+    if (genlmsg_parse(nlh, 0, attrs, MATTX_ATTR_MAX, policy) < 0) return NL_SKIP;
 
     if (attrs[MATTX_ATTR_BLUEPRINT]) {
-        printf("MattX-Stub: [CALLBACK] SUCCESS: Blueprint attribute found!\n");
         struct mattx_migration_req *req = nla_data(attrs[MATTX_ATTR_BLUEPRINT]);
         int len = nla_len(attrs[MATTX_ATTR_BLUEPRINT]);
         
@@ -95,75 +90,48 @@ int main() {
     genl_connect(sock);
     family_id = genl_ctrl_resolve(sock, "MATTX");
     
-    if (family_id < 0) {
-        fprintf(stderr, "MattX-Stub: Kernel module not loaded!\n");
-        return -1;
-    }
+    if (family_id < 0) return -1;
 
     nl_socket_modify_cb(sock, NL_CB_VALID, NL_CB_CUSTOM, blueprint_cb, NULL);
 
     msg = nlmsg_alloc();
     genlmsg_put(msg, NL_AUTO_PORT, NL_AUTO_SEQ, family_id, 0, 0, MATTX_CMD_GET_BLUEPRINT, 1);
-    
-    if (nl_send_auto(sock, msg) < 0) {
-        fprintf(stderr, "MattX-Stub: Failed to request blueprint.\n");
-        return -1;
-    }
+    nl_send_auto(sock, msg);
     nlmsg_free(msg);
 
-    printf("MattX-Stub: Waiting for kernel reply...\n");
-    
     int retries = 10;
     while (!received_req && retries > 0) {
-        int err = nl_recvmsgs_default(sock);
-        if (err < 0) {
-            fprintf(stderr, "MattX-Stub: Error receiving netlink message: %d\n", err);
-        }
+        nl_recvmsgs_default(sock);
         retries--;
     }
 
-    if (!received_req) {
-        fprintf(stderr, "MattX-Stub: FATAL - No blueprint received after 10 attempts!\n");
-        return -1;
-    }
+    if (!received_req) return -1;
 
-    // --- NEW: Print the Identity and Name ---
-    printf("MattX-Stub: Blueprint received. Original PID: %u, Name: '%s', UID: %u, GID: %u, VMAs: %u\n", 
-           received_req->orig_pid, received_req->comm, received_req->uid, received_req->gid, received_req->vma_count);
+    printf("MattX-Stub: Blueprint received. Original PID: %u, Name: '%s', VMAs: %u, FDs: %u\n", 
+           received_req->orig_pid, received_req->comm, received_req->vma_count, received_req->fd_count);
 
     for (uint32_t i = 0; i < received_req->vma_count; i++) {
         struct mattx_vma_info *v = &received_req->vmas[i];
         size_t size = v->vm_end - v->vm_start;
-        
         int prot = PROT_READ | PROT_WRITE | PROT_EXEC;
-
-        void *addr = mmap((void *)v->vm_start, size, prot, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
-        if (addr == MAP_FAILED) {
-            perror("MattX-Stub: mmap MAP_FIXED failed");
-        } else {
-            printf("MattX-Stub: Carved VMA %u: 0x%lx - 0x%lx (RWX)\n", i, v->vm_start, v->vm_end);
-        }
+        mmap((void *)v->vm_start, size, prot, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
     }
     
-    printf("MattX-Stub: Memory carved. Ready for hijack.\n");
+    // --- NEW: Expand the FD table safely in user-space! ---
+    for (int i = 3; i < MAX_FDS; i++) {
+        dup2(0, i); // Duplicate stdin to every FD up to 64 to force the kernel to allocate the table
+    }
+    printf("MattX-Stub: Memory carved and FD table expanded. Ready for hijack.\n");
 
     msg = nlmsg_alloc();
     genlmsg_put(msg, NL_AUTO_PORT, NL_AUTO_SEQ, family_id, 0, 0, MATTX_CMD_HIJACK_ME, 1);
     nla_put_u32(msg, MATTX_ATTR_STUB_PID, my_pid);
-
-    if (nl_send_auto(sock, msg) < 0) {
-        fprintf(stderr, "MattX-Stub: Failed to send HIJACK_ME\n");
-    } else {
-        printf("MattX-Stub: HIJACK_ME sent. Stopping myself for transplant...\n");
-    }
-
+    nl_send_auto(sock, msg);
     nlmsg_free(msg);
     nl_socket_free(sock);
     free(received_req);
 
     raise(SIGSTOP); 
-    
-    printf("MattX-Stub: ERROR - I woke up but I am still the stub!\n");
     while (1) sleep(1); 
     return 0;
 }
