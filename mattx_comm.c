@@ -45,13 +45,11 @@ static ssize_t mattx_fake_write(struct file *file, const char __user *buf, size_
         return -EFAULT;
     }
 
-    printk(KERN_INFO "MattX:[WORMHOLE] Caught %zu bytes for FD %u. Forwarding to Node %d...\n", to_send, req->fd, home_node);
-
     mattx_comm_send(cluster_map[home_node], MATTX_MSG_SYSCALL_FWD, packet_buf + sizeof(struct mattx_header), sizeof(struct mattx_syscall_req) + to_send);
 
     kfree(packet_buf);
     
-    // --- FIXED: Update the file position pointer! ---
+    // Advance the fake file position so libc doesn't get confused
     *pos += to_send;
     
     return to_send; 
@@ -87,7 +85,7 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
                 pending_source_node = hdr->sender_id;
                 injected_pages_count = 0;
 
-                printk(KERN_INFO "MattX:[INCOMING] Received Blueprint for PID %u. Saving to pending...\n", req->orig_pid);
+                printk(KERN_INFO "MattX: [INCOMING] Received Blueprint for PID %u. Saving to pending...\n", req->orig_pid);
                 if (pending_migration) kvfree(pending_migration);
                 
                 pending_migration = kvmalloc(hdr->length, GFP_KERNEL);
@@ -113,6 +111,16 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
                 unsigned long target_addr = pending_migration->vmas[ph->vma_index].vm_start + ph->offset;
                 int res;
 
+                if (hijacked_stub_task->mm) {
+                    struct vm_area_struct *vma;
+                    mmap_write_lock(hijacked_stub_task->mm);
+                    vma = find_vma(hijacked_stub_task->mm, target_addr);
+                    if (vma && target_addr >= vma->vm_start) {
+                        vm_flags_set(vma, VM_WRITE); 
+                    }
+                    mmap_write_unlock(hijacked_stub_task->mm);
+                }
+
                 res = access_process_vm(hijacked_stub_task, target_addr, data, ph->length, FOLL_WRITE | FOLL_FORCE);
                 
                 if (res != ph->length) {
@@ -133,7 +141,6 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
                 struct cred *new_cred;
                 const struct cred *old_cred;
                 int retries = 50;
-                unsigned char rip_buf[8] = {0}; 
                 struct file *fake_files[MAX_FDS]; 
                 int i;
 
@@ -202,10 +209,6 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
                         printk(KERN_INFO "MattX:[AWAKEN] Successfully injected %u Fake FDs!\n", pending_migration->fd_count);
                     }
 
-                    if (access_process_vm(hijacked_stub_task, regs->ip, rip_buf, 8, FOLL_FORCE) == 8) {
-                        printk(KERN_INFO "MattX: [DEBUG] Target RIP (0x%lx) contains: %8ph\n", regs->ip, rip_buf);
-                    }
-
                     printk(KERN_INFO "MattX:[AWAKEN] IT'S ALIVE! Sending SIGCONT to PID %d\n", hijacked_stub_task->pid);
                     send_sig(SIGCONT, hijacked_stub_task, 0);
                     
@@ -226,16 +229,12 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
                 struct task_struct *deputy = NULL;
                 int i;
 
-                printk(KERN_INFO "MattX: [FUNERAL] Received exit notice for Deputy PID %u from Node %u\n", 
-                       exit_msg->orig_pid, hdr->sender_id);
-
                 rcu_read_lock();
                 deputy = pid_task(find_vpid(exit_msg->orig_pid), PIDTYPE_PID);
                 if (deputy) get_task_struct(deputy);
                 rcu_read_unlock();
 
                 if (deputy) {
-                    printk(KERN_INFO "MattX: [FUNERAL] Laying Deputy PID %u to rest (Sending SIGKILL)...\n", deputy->pid);
                     send_sig(SIGKILL, deputy, 0);
                     put_task_struct(deputy);
                 }
@@ -275,7 +274,6 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
                     rcu_read_unlock();
 
                     if (surrogate) {
-                        printk(KERN_INFO "MattX:[ASSASSIN] Executing Surrogate PID %d (Sending SIGKILL)...\n", surrogate->pid);
                         send_sig(SIGKILL, surrogate, 0);
                         put_task_struct(surrogate);
                     }
@@ -289,8 +287,6 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
                 struct task_struct *deputy = NULL;
                 struct file *file = NULL;
                 
-                printk(KERN_INFO "MattX:[WORMHOLE] Received %u bytes for FD %u from Node %u. Writing to Deputy...\n", req->len, req->fd, hdr->sender_id);
-
                 rcu_read_lock();
                 deputy = pid_task(find_vpid(req->orig_pid), PIDTYPE_PID);
                 if (deputy) get_task_struct(deputy);
@@ -310,7 +306,28 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
                     
                     if (file) {
                         loff_t pos = file->f_pos;
-                        kernel_write(file, req->data, req->len, &pos);
+                        ssize_t ret;
+                        const struct cred *old_cred;
+
+                        // --- FIXED: The True VFS Proxy ---
+                        // 1. Borrow the Deputy's memory space and credentials
+                        if (deputy->mm) kthread_use_mm(deputy->mm);
+                        old_cred = override_creds(deputy->cred);
+
+                        // 2. Execute the write as if we are the Deputy
+                        ret = kernel_write(file, req->data, req->len, &pos);
+                        
+                        if (ret < 0) {
+                            printk(KERN_ERR "MattX:[WORMHOLE] kernel_write failed for FD %u with error %zd\n", req->fd, ret);
+                        } else {
+                            // 3. FIXED: Update the file position so we don't overwrite the same bytes!
+                            file->f_pos = pos;
+                        }
+
+                        // 4. Restore our original kernel thread context
+                        revert_creds(old_cred);
+                        if (deputy->mm) kthread_unuse_mm(deputy->mm);
+
                         fput(file); 
                     }
                     put_task_struct(deputy);
@@ -324,9 +341,6 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
                 pid_t local_stub_pid = -1;
                 int i;
 
-                printk(KERN_INFO "MattX:[INCOMING] Received RECALL request for Orig PID %u from Node %u\n", 
-                       req->orig_pid, hdr->sender_id);
-                
                 spin_lock(&guest_lock);
                 for (i = 0; i < guest_count; i++) {
                     if (guest_registry[i].orig_pid == req->orig_pid && guest_registry[i].home_node == hdr->sender_id) {
@@ -344,14 +358,9 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
                     rcu_read_unlock();
 
                     if (surrogate) {
-                        printk(KERN_INFO "MattX: [RECALL] Found Surrogate PID %d. Capturing state...\n", surrogate->pid);
                         mattx_capture_and_return_state(surrogate, req->orig_pid, hdr->sender_id);
                         put_task_struct(surrogate);
-                    } else {
-                        printk(KERN_WARNING "MattX:[RECALL] Surrogate PID %d not found!\n", local_stub_pid);
                     }
-                } else {
-                    printk(KERN_WARNING "MattX:[RECALL] Could not find guest registry entry for Orig PID %u\n", req->orig_pid);
                 }
             }
             break;
@@ -362,8 +371,6 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
                 struct task_struct *deputy = NULL;
                 int i;
 
-                printk(KERN_INFO "MattX:[INCOMING] Received RETURN Blueprint for Deputy PID %u. Saving to pending...\n", req->orig_pid);
-                
                 pending_source_node = hdr->sender_id;
                 injected_pages_count = 0;
 
@@ -376,8 +383,6 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
                 rcu_read_unlock();
 
                 if (deputy) {
-                    printk(KERN_INFO "MattX:[RECALL] Found frozen Deputy PID %d. Preparing memory map...\n", deputy->pid);
-                    
                     if (hijacked_stub_task) put_task_struct(hijacked_stub_task);
                     hijacked_stub_task = deputy; 
 
@@ -388,36 +393,23 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
                             unsigned long len = pending_migration->vmas[i].vm_end - start;
                             unsigned long prot = PROT_READ | PROT_WRITE | PROT_EXEC;
                             unsigned long flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED;
-                            unsigned long ret_addr;
-
-                            ret_addr = vm_mmap(NULL, start, len, prot, flags, 0);
-                            if (IS_ERR_VALUE(ret_addr)) {
-                                printk(KERN_ERR "MattX:[RECALL] Failed to carve VMA at 0x%lx (err: %ld)\n", start, ret_addr);
-                            }
+                            vm_mmap(NULL, start, len, prot, flags, 0);
                         }
                         kthread_unuse_mm(deputy->mm);
-                        printk(KERN_INFO "MattX:[RECALL] Successfully carved %u VMAs into Deputy!\n", pending_migration->vma_count);
                     }
 
-                    printk(KERN_INFO "MattX:[RECALL] Sending READY_FOR_DATA signal to Node %d...\n", pending_source_node);
                     mattx_comm_send(cluster_map[pending_source_node], MATTX_MSG_READY_FOR_DATA, NULL, 0);
-                } else {
-                    printk(KERN_ERR "MattX: [RECALL] ERROR: Deputy PID %u not found!\n", req->orig_pid);
                 }
             }
             break;
 
         case MATTX_MSG_RETURN_DONE:
-            printk(KERN_INFO "MattX:[INCOMING] Return memory transferred successfully! Pages: %d\n", injected_pages_count);
-            
             if (hijacked_stub_task && pending_migration) {
                 struct pt_regs *regs = task_pt_regs(hijacked_stub_task);
                 int i;
 
                 if (regs) {
                     memcpy(regs, &pending_migration->regs, sizeof(struct pt_regs));
-                    
-                    printk(KERN_INFO "MattX:[AWAKEN] Deputy Brain Restored. New RIP: 0x%lx\n", regs->ip);
                     
                     spin_lock(&export_lock);
                     for (i = 0; i < export_count; i++) {
@@ -428,7 +420,6 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
                     }
                     spin_unlock(&export_lock);
 
-                    printk(KERN_INFO "MattX:[AWAKEN] Welcome home! Sending SIGCONT to Deputy PID %d\n", hijacked_stub_task->pid);
                     send_sig(SIGCONT, hijacked_stub_task, 0);
                 }
                 
@@ -441,7 +432,6 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
             break;
 
         default:
-            printk(KERN_WARNING "MattX: [COMM] Unknown message type: %u\n", hdr->type);
             break;
     }
 }
@@ -461,26 +451,15 @@ static int mattx_receiver_loop(void *data) {
         len = kernel_recvmsg(link->sock, &msg, iov, 1, sizeof(struct mattx_header), 0);
         if (len <= 0) break; 
 
-        if (hdr.magic != MATTX_MAGIC) {
-            printk(KERN_ERR "MattX: [COMM] FATAL: Stream out of sync! Invalid magic: 0x%x\n", hdr.magic);
-            break;
-        }
-
-        if (hdr.length > MATTX_MAX_PAYLOAD) {
-            printk(KERN_ERR "MattX:[COMM] FATAL: Payload too large (%u bytes).\n", hdr.length);
-            break;
-        }
+        if (hdr.magic != MATTX_MAGIC) break;
+        if (hdr.length > MATTX_MAX_PAYLOAD) break;
 
         if (hdr.length > 0) {
             payload = kvmalloc(hdr.length, GFP_KERNEL);
             if (payload) {
                 iov[0].iov_base = payload;
                 iov[0].iov_len = hdr.length;
-                
-                int payload_len = kernel_recvmsg(link->sock, &msg, iov, 1, hdr.length, MSG_WAITALL);
-                if (payload_len != hdr.length) {
-                    printk(KERN_ERR "MattX: [COMM] Short read on payload! Expected %u, got %d\n", hdr.length, payload_len);
-                }
+                kernel_recvmsg(link->sock, &msg, iov, 1, hdr.length, MSG_WAITALL);
             }
         }
         
