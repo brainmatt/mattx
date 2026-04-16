@@ -36,8 +36,8 @@ When a process is migrated from Node A (Home) to Node B (Remote):
 
 ### Installation
 code
-# Compile the kernel module and user-space tools
 Bash
+# Compile the kernel module and user-space tools
 make
 
 # Install the surrogate stub (Crucial: The kernel looks for it here!)
