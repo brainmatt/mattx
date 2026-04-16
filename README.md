@@ -30,7 +30,7 @@ When a process is migrated from Node A (Home) to Node B (Remote):
 
 ## 🛠️ Getting Started
 
-Full MattX Documentation [All MattX Details](DOCUMENTATION.md).
+Full MattX Documentation [All MattX Details](https://github.com/brainmatt/mattx/blob/main/DOCUMENTATION.md).
 
 
 ### Prerequisites
