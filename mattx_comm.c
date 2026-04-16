@@ -393,7 +393,12 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
                             unsigned long len = pending_migration->vmas[i].vm_end - start;
                             unsigned long prot = PROT_READ | PROT_WRITE | PROT_EXEC;
                             unsigned long flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED;
-                            vm_mmap(NULL, start, len, prot, flags, 0);
+			    unsigned long ret_addr;
+
+			    ret_addr = vm_mmap(NULL, start, len, prot, flags, 0);
+			    if (IS_ERR_VALUE(ret_addr)) {
+			        printk(KERN_ERR "MattX:[RECALL] Failed to carve VMA at 0x%lx (err: %ld)\n", start, ret_addr);
+			    }
                         }
                         kthread_unuse_mm(deputy->mm);
                     }
