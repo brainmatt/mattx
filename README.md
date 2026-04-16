@@ -30,6 +30,9 @@ When a process is migrated from Node A (Home) to Node B (Remote):
 
 ## 🛠️ Getting Started
 
+Full MattX Documentation [All MattX Details](DOCUMENTATION.md).
+
+
 ### Prerequisites
 *   Linux Kernel 6.x (Tested on 6.12+)
 *   `build-essential`, `linux-headers`, `libnl-3-dev`, `libnl-genl-3-dev`
