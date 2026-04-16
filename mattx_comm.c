@@ -45,12 +45,15 @@ static ssize_t mattx_fake_write(struct file *file, const char __user *buf, size_
         return -EFAULT;
     }
 
-    // --- EXTREME DEBUGGING: See the Wormhole catch the text! ---
     printk(KERN_INFO "MattX:[WORMHOLE] Caught %zu bytes for FD %u. Forwarding to Node %d...\n", to_send, req->fd, home_node);
 
     mattx_comm_send(cluster_map[home_node], MATTX_MSG_SYSCALL_FWD, packet_buf + sizeof(struct mattx_header), sizeof(struct mattx_syscall_req) + to_send);
 
     kfree(packet_buf);
+    
+    // --- FIXED: Update the file position pointer! ---
+    *pos += to_send;
+    
     return to_send; 
 }
 
@@ -84,7 +87,7 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
                 pending_source_node = hdr->sender_id;
                 injected_pages_count = 0;
 
-                printk(KERN_INFO "MattX: [INCOMING] Received Blueprint for PID %u. Saving to pending...\n", req->orig_pid);
+                printk(KERN_INFO "MattX:[INCOMING] Received Blueprint for PID %u. Saving to pending...\n", req->orig_pid);
                 if (pending_migration) kvfree(pending_migration);
                 
                 pending_migration = kvmalloc(hdr->length, GFP_KERNEL);
@@ -130,6 +133,7 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
                 struct cred *new_cred;
                 const struct cred *old_cred;
                 int retries = 50;
+                unsigned char rip_buf[8] = {0}; 
                 struct file *fake_files[MAX_FDS]; 
                 int i;
 
@@ -196,6 +200,10 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
                         }
                         spin_unlock(&hijacked_stub_task->files->file_lock);
                         printk(KERN_INFO "MattX:[AWAKEN] Successfully injected %u Fake FDs!\n", pending_migration->fd_count);
+                    }
+
+                    if (access_process_vm(hijacked_stub_task, regs->ip, rip_buf, 8, FOLL_FORCE) == 8) {
+                        printk(KERN_INFO "MattX: [DEBUG] Target RIP (0x%lx) contains: %8ph\n", regs->ip, rip_buf);
                     }
 
                     printk(KERN_INFO "MattX:[AWAKEN] IT'S ALIVE! Sending SIGCONT to PID %d\n", hijacked_stub_task->pid);
@@ -281,7 +289,6 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
                 struct task_struct *deputy = NULL;
                 struct file *file = NULL;
                 
-                // --- EXTREME DEBUGGING: See the Wormhole deliver the text! ---
                 printk(KERN_INFO "MattX:[WORMHOLE] Received %u bytes for FD %u from Node %u. Writing to Deputy...\n", req->len, req->fd, hdr->sender_id);
 
                 rcu_read_lock();
@@ -392,7 +399,7 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
                         printk(KERN_INFO "MattX:[RECALL] Successfully carved %u VMAs into Deputy!\n", pending_migration->vma_count);
                     }
 
-                    printk(KERN_INFO "MattX: [RECALL] Sending READY_FOR_DATA signal to Node %d...\n", pending_source_node);
+                    printk(KERN_INFO "MattX:[RECALL] Sending READY_FOR_DATA signal to Node %d...\n", pending_source_node);
                     mattx_comm_send(cluster_map[pending_source_node], MATTX_MSG_READY_FOR_DATA, NULL, 0);
                 } else {
                     printk(KERN_ERR "MattX: [RECALL] ERROR: Deputy PID %u not found!\n", req->orig_pid);
