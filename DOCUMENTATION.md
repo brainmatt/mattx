@@ -1,5 +1,84 @@
 # 📖 The MattX Grimoire: Internal Function Documentation
 
+***
+```mermaid
+
+sequenceDiagram
+    autonumber
+    participant Admin as Admin (VM1)
+    participant VM1 as Node 1 (Home)
+    participant VM2 as Node 2 (Remote)
+    participant Stub as mattx-stub (VM2)
+
+    rect rgb(200, 220, 240)
+    Note over Admin, Stub: Phase 1: Forward Migration (The Teleportation)
+    
+    Admin->>VM1: echo "migrate 1234 814" > /proc/mattx/admin
+    
+    Note over VM1: 1. Freeze Deputy (SIGSTOP)<br/>2. Extract Brain (pt_regs)<br/>3. Extract Soul (Credentials)<br/>4. Map VMAs (Blueprint)
+    
+    VM1->>VM2: MATTX_MSG_MIGRATE_REQ (Blueprint)
+    
+    Note over VM2: Save Blueprint to pending_migration
+    VM2->>Stub: call_usermodehelper()
+    
+    Stub->>VM2: MATTX_CMD_GET_BLUEPRINT (Netlink)
+    VM2-->>Stub: Return Blueprint
+    
+    Note over Stub: 1. mmap(MAP_FIXED) to carve memory<br/>2. dup2() to expand FD table
+    
+    Stub->>VM2: MATTX_CMD_HIJACK_ME (Netlink)
+    Note over Stub: raise(SIGSTOP)
+    
+    VM2->>VM1: MATTX_MSG_READY_FOR_DATA
+    
+    Note over VM1: Start Data Pump
+    loop Every 4KB Page
+        VM1->>VM2: MATTX_MSG_PAGE_TRANSFER
+        Note over VM2: access_process_vm(FOLL_WRITE)
+    end
+    
+    VM1->>VM2: MATTX_MSG_MIGRATE_DONE
+    
+    Note over VM2: 1. Overwrite pt_regs (Brain)<br/>2. Apply UID/GID (Soul)<br/>3. Inject Fake FDs (VFS Proxy)<br/>4. Rename to 'stress'<br/>5. send_sig(SIGCONT)
+    
+    Note over Stub: Surrogate Awakens & Executes!
+    end
+
+    rect rgb(240, 220, 200)
+    Note over Admin, Stub: Phase 2: Return Migration (The Recall)
+    
+    Admin->>VM1: echo "migrate 1234 home" > /proc/mattx/admin
+    
+    VM1->>VM2: MATTX_MSG_RECALL_REQ (Orig PID 1234)
+    
+    Note over VM2: 1. Freeze Surrogate (SIGSTOP)<br/>2. Extract updated Brain & VMAs
+    
+    VM2->>VM1: MATTX_MSG_RETURN_BLUEPRINT
+    
+    Note over VM1: kthread_use_mm(deputy)<br/>vm_mmap() to carve new memory holes
+    
+    VM1->>VM2: MATTX_MSG_READY_FOR_DATA
+    
+    Note over VM2: Start Reverse Data Pump
+    loop Every 4KB Page
+        VM2->>VM1: MATTX_MSG_PAGE_TRANSFER
+        Note over VM1: access_process_vm(FOLL_WRITE)
+    end
+    
+    VM2->>VM1: MATTX_MSG_RETURN_DONE
+    
+    Note over VM2: send_sig(SIGKILL) to Surrogate
+    
+    Note over VM1: 1. Overwrite pt_regs (Brain)<br/>2. send_sig(SIGCONT)
+    
+    Note over VM1: Deputy Awakens & Executes Natively!
+    end
+
+```
+***
+
+
 ## 📂 File: mattx_main.c
 *This file acts as the central nervous system of the module, handling initialization, the Netlink bridge to user-space, and the global registries.*
 
@@ -149,82 +228,5 @@
 ### Tool: mattx-stub (The Vessel)
 *   **Usage:** Spawned by the kernel on a remote node. It asks the kernel for the incoming Blueprint. It uses `mmap(MAP_FIXED)` to carve out the exact memory holes required by the incoming Frankenstein. It expands its File Descriptor table using `dup2()`. It then sends `HIJACK_ME` and calls `raise(SIGSTOP)`, going into a coma so the kernel can overwrite its Brain and Soul.
 
-***
-
-```mermaid
-
-sequenceDiagram
-    autonumber
-    participant Admin as Admin (VM1)
-    participant VM1 as Node 1 (Home)
-    participant VM2 as Node 2 (Remote)
-    participant Stub as mattx-stub (VM2)
-
-    rect rgb(200, 220, 240)
-    Note over Admin, Stub: Phase 1: Forward Migration (The Teleportation)
-    
-    Admin->>VM1: echo "migrate 1234 814" > /proc/mattx/admin
-    
-    Note over VM1: 1. Freeze Deputy (SIGSTOP)<br/>2. Extract Brain (pt_regs)<br/>3. Extract Soul (Credentials)<br/>4. Map VMAs (Blueprint)
-    
-    VM1->>VM2: MATTX_MSG_MIGRATE_REQ (Blueprint)
-    
-    Note over VM2: Save Blueprint to pending_migration
-    VM2->>Stub: call_usermodehelper()
-    
-    Stub->>VM2: MATTX_CMD_GET_BLUEPRINT (Netlink)
-    VM2-->>Stub: Return Blueprint
-    
-    Note over Stub: 1. mmap(MAP_FIXED) to carve memory<br/>2. dup2() to expand FD table
-    
-    Stub->>VM2: MATTX_CMD_HIJACK_ME (Netlink)
-    Note over Stub: raise(SIGSTOP)
-    
-    VM2->>VM1: MATTX_MSG_READY_FOR_DATA
-    
-    Note over VM1: Start Data Pump
-    loop Every 4KB Page
-        VM1->>VM2: MATTX_MSG_PAGE_TRANSFER
-        Note over VM2: access_process_vm(FOLL_WRITE)
-    end
-    
-    VM1->>VM2: MATTX_MSG_MIGRATE_DONE
-    
-    Note over VM2: 1. Overwrite pt_regs (Brain)<br/>2. Apply UID/GID (Soul)<br/>3. Inject Fake FDs (VFS Proxy)<br/>4. Rename to 'stress'<br/>5. send_sig(SIGCONT)
-    
-    Note over Stub: Surrogate Awakens & Executes!
-    end
-
-    rect rgb(240, 220, 200)
-    Note over Admin, Stub: Phase 2: Return Migration (The Recall)
-    
-    Admin->>VM1: echo "migrate 1234 home" > /proc/mattx/admin
-    
-    VM1->>VM2: MATTX_MSG_RECALL_REQ (Orig PID 1234)
-    
-    Note over VM2: 1. Freeze Surrogate (SIGSTOP)<br/>2. Extract updated Brain & VMAs
-    
-    VM2->>VM1: MATTX_MSG_RETURN_BLUEPRINT
-    
-    Note over VM1: kthread_use_mm(deputy)<br/>vm_mmap() to carve new memory holes
-    
-    VM1->>VM2: MATTX_MSG_READY_FOR_DATA
-    
-    Note over VM2: Start Reverse Data Pump
-    loop Every 4KB Page
-        VM2->>VM1: MATTX_MSG_PAGE_TRANSFER
-        Note over VM1: access_process_vm(FOLL_WRITE)
-    end
-    
-    VM2->>VM1: MATTX_MSG_RETURN_DONE
-    
-    Note over VM2: send_sig(SIGKILL) to Surrogate
-    
-    Note over VM1: 1. Overwrite pt_regs (Brain)<br/>2. send_sig(SIGCONT)
-    
-    Note over VM1: Deputy Awakens & Executes Natively!
-    end
-
-```
 
 
