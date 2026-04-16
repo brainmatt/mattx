@@ -35,10 +35,10 @@ When a process is migrated from Node A (Home) to Node B (Remote):
 *   `build-essential`, `linux-headers`, `libnl-3-dev`, `libnl-genl-3-dev`
 
 ### Installation
-code
-Bash
+~~~
 # Compile the kernel module and user-space tools
 make
+~~~
 
 # Install the surrogate stub (Crucial: The kernel looks for it here!)
 code
