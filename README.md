@@ -35,41 +35,53 @@ When a process is migrated from Node A (Home) to Node B (Remote):
 *   `build-essential`, `linux-headers`, `libnl-3-dev`, `libnl-genl-3-dev`
 
 ### Installation
-bash
 # 1. Compile the kernel module and user-space tools
+code
+Bash
 make
 
 # 2. Install the surrogate stub (Crucial: The kernel looks for it here!)
+code
+Bash
 sudo cp mattx-stub /usr/local/bin/
 
 # 3. Load the kernel module
+code
+Bash
 sudo insmod mattx.ko
 
 # 4. Start the discovery daemon
+code
+Bash
 sudo ./mattx-discd &
 
-🎛️ Administration (/proc/mattx)
+### 🎛️ Administration (/proc/mattx)
 MattX embraces the UNIX philosophy. Cluster management is handled entirely through a simple, scriptable /proc virtual filesystem.
+
 View Cluster State:
 code
 Bash
 cat /proc/mattx/nodes
+
 Displays a live table of connected Node IDs, IP Addresses, CPU Load, and Free Memory.
 Disable Automatic Load Balancing:
 code
 Bash
 echo "balancer 0" > /proc/mattx/admin
+
 Manual Forward Migration:
 code
 Bash
 # Teleport PID 1234 to Node 814
 echo "migrate 1234 814" > /proc/mattx/admin
+
 Manual Return Migration (Recall):
 code
 Bash
 # Pull a previously migrated process back to its Home Node
 echo "migrate 1234 home" > /proc/mattx/admin
-⚠️ Disclaimer
+
+### ⚠️ Disclaimer
 MattX is an experimental prototype diving into the deep "dark arts" of the Linux kernel (manipulating pt_regs, memory maps, and VFS structures on the fly). While it has been engineered with extreme care to avoid kernel panics, it should not be run on production systems containing critical data.
 Built with 🍚, 🥚, and a lot of ☕.
 
