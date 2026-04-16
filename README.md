@@ -35,22 +35,22 @@ When a process is migrated from Node A (Home) to Node B (Remote):
 *   `build-essential`, `linux-headers`, `libnl-3-dev`, `libnl-genl-3-dev`
 
 ### Installation
-# 1. Compile the kernel module and user-space tools
 code
+# Compile the kernel module and user-space tools
 Bash
 make
 
-# 2. Install the surrogate stub (Crucial: The kernel looks for it here!)
+# Install the surrogate stub (Crucial: The kernel looks for it here!)
 code
 Bash
 sudo cp mattx-stub /usr/local/bin/
 
-# 3. Load the kernel module
+# Load the kernel module
 code
 Bash
 sudo insmod mattx.ko
 
-# 4. Start the discovery daemon
+# Start the discovery daemon
 code
 Bash
 sudo ./mattx-discd &
