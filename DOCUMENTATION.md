@@ -151,6 +151,7 @@
 
 ***
 
+```mermaid
 
 sequenceDiagram
     autonumber
@@ -224,6 +225,6 @@ sequenceDiagram
     Note over VM1: Deputy Awakens & Executes Natively!
     end
 
-
+```
 
 
