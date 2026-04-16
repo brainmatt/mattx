@@ -35,7 +35,7 @@ When a process is migrated from Node A (Home) to Node B (Remote):
 *   `build-essential`, `linux-headers`, `libnl-3-dev`, `libnl-genl-3-dev`
 
 ### Installation
-```bash
+bash
 # 1. Compile the kernel module and user-space tools
 make
 
@@ -47,6 +47,7 @@ sudo insmod mattx.ko
 
 # 4. Start the discovery daemon
 sudo ./mattx-discd &
+
 🎛️ Administration (/proc/mattx)
 MattX embraces the UNIX philosophy. Cluster management is handled entirely through a simple, scriptable /proc virtual filesystem.
 View Cluster State:
