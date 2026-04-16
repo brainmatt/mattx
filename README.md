@@ -65,6 +65,14 @@ Display a live table of connected Node IDs, IP Addresses, CPU Load, and Free Mem
 ~~~
 # View Cluster State:
 cat /proc/mattx/nodes
+MattX Cluster Nodes:
+------------------------------------------------------------
+Node ID		IP Address	CPU Load	Mem Free (MB)
+------------------------------------------------------------
+709 (Local)	127.0.0.1	2048		727
+814		192.168.122.38	2048		738
+
+Balancer Enabled: YES
 ~~~
 
 Configure loadbalancer:
