@@ -1,6 +1,6 @@
 # --- Kernel Module Build Config ---
 obj-m += mattx.o
-mattx-objs := mattx_main.o mattx_comm.o mattx_sched.o mattx_migr.o mattx_proc.o
+mattx-objs := mattx_main.o mattx_comm.o mattx_sched.o mattx_migr.o mattx_proc.o mattx_hooks.o
 
 KDIR := /lib/modules/$(shell uname -r)/build
 PWD := $(shell pwd)

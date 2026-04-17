@@ -29,6 +29,7 @@
 #include <linux/uaccess.h>       
 #include <linux/mman.h>          
 #include <linux/mmu_context.h>   
+#include <linux/kprobes.h>
 
 #define MATTX_PORT 7226
 #define MAX_NODES 1024 
@@ -180,6 +181,9 @@ void mattx_trigger_recall(pid_t orig_pid);
 
 int mattx_proc_init(void);
 void mattx_proc_exit(void);
+
+int mattx_hooks_init(void);
+void mattx_hooks_exit(void);
 
 #endif // MATTX_H
 

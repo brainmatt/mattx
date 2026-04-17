@@ -16,7 +16,7 @@ static struct task_struct *listener_thread;
 
 bool balancer_enabled = true;
 u32 my_node_id = 0; 
-u32 my_ip_addr = 0; // NEW: Initialize to 0.0.0.0
+u32 my_ip_addr = 0;
 
 struct mattx_guest_info guest_registry[MAX_GUESTS];
 int guest_count = 0;
@@ -91,19 +91,16 @@ int get_export_target(pid_t orig_pid) {
     return target;
 }
 
-// --- Netlink Interface ---
-// NEW: Added MATTX_ATTR_LOCAL_IP
 enum { MATTX_ATTR_UNSPEC, MATTX_ATTR_NODE_ID, MATTX_ATTR_IPV4_ADDR, MATTX_ATTR_STUB_PID, MATTX_ATTR_BLUEPRINT, MATTX_ATTR_MY_NODE_ID, MATTX_ATTR_LOCAL_IP, __MATTX_ATTR_MAX };
 #define MATTX_ATTR_MAX (__MATTX_ATTR_MAX - 1)
 
-// NEW: Added MATTX_CMD_SET_LOCAL_IP
 enum { MATTX_CMD_UNSPEC, MATTX_CMD_NODE_JOIN, MATTX_CMD_NODE_LEAVE, MATTX_CMD_HIJACK_ME, MATTX_CMD_GET_BLUEPRINT, MATTX_CMD_SET_LOCAL_IP, __MATTX_CMD_MAX };
 #define MATTX_CMD_MAX (__MATTX_CMD_MAX - 1)
 
 static const struct nla_policy mattx_genl_policy[MATTX_ATTR_MAX + 1] = {[MATTX_ATTR_NODE_ID] = { .type = NLA_U32 },[MATTX_ATTR_IPV4_ADDR] = { .type = NLA_U32 },
     [MATTX_ATTR_STUB_PID] = { .type = NLA_U32 },
     [MATTX_ATTR_BLUEPRINT] = { .type = NLA_BINARY },[MATTX_ATTR_MY_NODE_ID] = { .type = NLA_U32 },
-    [MATTX_ATTR_LOCAL_IP] = { .type = NLA_U32 }, // NEW
+    [MATTX_ATTR_LOCAL_IP] = { .type = NLA_U32 }, 
 };
 
 static int mattx_nl_cmd_node_join(struct sk_buff *skb, struct genl_info *info) {
@@ -190,7 +187,6 @@ static int mattx_nl_cmd_hijack_me(struct sk_buff *skb, struct genl_info *info) {
     return 0;
 }
 
-// --- NEW: The Self-Aware Handler ---
 static int mattx_nl_cmd_set_local_ip(struct sk_buff *skb, struct genl_info *info) {
     if (info->attrs[MATTX_ATTR_LOCAL_IP]) {
         my_ip_addr = nla_get_u32(info->attrs[MATTX_ATTR_LOCAL_IP]);
@@ -204,7 +200,7 @@ static const struct genl_ops mattx_genl_ops[] = {
     { .cmd = MATTX_CMD_NODE_LEAVE, .policy = mattx_genl_policy, .doit = mattx_nl_cmd_node_leave },
     { .cmd = MATTX_CMD_GET_BLUEPRINT, .policy = mattx_genl_policy, .doit = mattx_nl_cmd_get_blueprint },
     { .cmd = MATTX_CMD_HIJACK_ME, .policy = mattx_genl_policy, .doit = mattx_nl_cmd_hijack_me },
-    { .cmd = MATTX_CMD_SET_LOCAL_IP, .policy = mattx_genl_policy, .doit = mattx_nl_cmd_set_local_ip }, // NEW
+    { .cmd = MATTX_CMD_SET_LOCAL_IP, .policy = mattx_genl_policy, .doit = mattx_nl_cmd_set_local_ip }, 
 };
 
 struct genl_family mattx_genl_family = {
@@ -222,9 +218,14 @@ static int __init mattx_init(void) {
         printk(KERN_ERR "MattX: Failed to create /proc/mattx interface\n");
     }
     
+    if (mattx_hooks_init() < 0) {
+        printk(KERN_ERR "MattX: Failed to register Kprobes! Syscall routing disabled.\n");
+    }
+    
     balancer_thread = kthread_run(mattx_balancer_loop, NULL, "mattx_balancer");
     listener_thread = kthread_run(mattx_listener_loop, NULL, "mattx_listener");
     if (IS_ERR(balancer_thread) || IS_ERR(listener_thread)) {
+        mattx_hooks_exit(); 
         genl_unregister_family(&mattx_genl_family);
         return -ENOMEM;
     }
@@ -237,6 +238,8 @@ static void __exit mattx_exit(void) {
     if (listener_thread) kthread_stop(listener_thread);
     
     mattx_proc_exit();
+    
+    mattx_hooks_exit();
     
     for (i = 0; i < MAX_NODES; i++) mattx_comm_disconnect(i);
     if (pending_migration) kvfree(pending_migration);
