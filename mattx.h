@@ -38,7 +38,7 @@
 #define FIXED_LOAD_0_2 409
 #define MAX_VMAS 256 
 #define MAX_GUESTS 1024 
-#define MAX_FDS 64 // NEW: Max open files we will migrate for now
+#define MAX_FDS 64 
 
 #define MATTX_MAGIC 0x4D415454 
 #define MATTX_MAX_PAYLOAD (10 * 1024 * 1024) 
@@ -93,8 +93,8 @@ struct mattx_migration_req {
     uint64_t arg_start; 
     uint64_t arg_end;   
     char comm[16]; 
-    u32 fd_count;          // NEW: Number of open files
-    u32 open_fds[MAX_FDS]; // NEW: Array of open FD numbers
+    u32 fd_count;          
+    u32 open_fds[MAX_FDS]; 
     u32 vma_count;
     u32 pad2;
     struct mattx_vma_info vmas[]; 
@@ -158,6 +158,7 @@ extern spinlock_t export_lock;
 
 extern bool balancer_enabled;
 extern u32 my_node_id; 
+extern u32 my_ip_addr; // NEW: The kernel now knows its own IP!
 
 int mattx_comm_send(struct mattx_link *link, u32 type, void *data, u32 len);
 struct mattx_link* mattx_comm_connect(__be32 ip_addr, int node_id);

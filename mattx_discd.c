@@ -17,12 +17,11 @@
 #define DEFAULT_PORT 7225
 #define DEFAULT_IFACE "eth0"
 
-// Must match the kernel definitions
-// FIXED: Added MATTX_ATTR_MY_NODE_ID here!
-enum { MATTX_ATTR_UNSPEC, MATTX_ATTR_NODE_ID, MATTX_ATTR_IPV4_ADDR, MATTX_ATTR_STUB_PID, MATTX_ATTR_BLUEPRINT, MATTX_ATTR_MY_NODE_ID, __MATTX_ATTR_MAX };
+// NEW: Added MATTX_ATTR_LOCAL_IP and MATTX_CMD_SET_LOCAL_IP
+enum { MATTX_ATTR_UNSPEC, MATTX_ATTR_NODE_ID, MATTX_ATTR_IPV4_ADDR, MATTX_ATTR_STUB_PID, MATTX_ATTR_BLUEPRINT, MATTX_ATTR_MY_NODE_ID, MATTX_ATTR_LOCAL_IP, __MATTX_ATTR_MAX };
 #define MATTX_ATTR_MAX (__MATTX_ATTR_MAX - 1)
 
-enum { MATTX_CMD_UNSPEC, MATTX_CMD_NODE_JOIN, MATTX_CMD_NODE_LEAVE, MATTX_CMD_HIJACK_ME, MATTX_CMD_GET_BLUEPRINT, __MATTX_CMD_MAX };
+enum { MATTX_CMD_UNSPEC, MATTX_CMD_NODE_JOIN, MATTX_CMD_NODE_LEAVE, MATTX_CMD_HIJACK_ME, MATTX_CMD_GET_BLUEPRINT, MATTX_CMD_SET_LOCAL_IP, __MATTX_CMD_MAX };
 #define MATTX_CMD_MAX (__MATTX_CMD_MAX - 1)
 
 struct mattx_config {
@@ -41,15 +40,12 @@ struct mattx_config config;
 struct nl_sock *nl_sock = NULL;
 int mattx_family_id = -1;
 
-// Simple list to track known nodes to avoid spamming the kernel
 uint32_t known_nodes[64];
 int known_nodes_count = 0;
 
 void load_config();
 uint32_t generate_node_id(const char *iface);
 uint32_t get_interface_ip(const char *iface);
-
-// --- Netlink Logic ---
 
 int init_netlink() {
     nl_sock = nl_socket_alloc();
@@ -65,38 +61,60 @@ int init_netlink() {
     return 0;
 }
 
-void trigger_kernel_join(uint32_t node_id, uint32_t ip_addr) {
-    struct nl_sock *sock = nl_socket_alloc();
+// --- NEW: Tell the kernel our IP address ---
+void register_local_ip(uint32_t ip_addr) {
     struct nl_msg *msg;
-    int family_id;
+    
+    if (mattx_family_id < 0) return;
 
-    genl_connect(sock);
-    family_id = genl_ctrl_resolve(sock, "MATTX");
-    if (family_id < 0) {
-        fprintf(stderr, "Kernel module not loaded!\n");
-        nl_socket_free(sock);
+    msg = nlmsg_alloc();
+    genlmsg_put(msg, NL_AUTO_PORT, NL_AUTO_SEQ, mattx_family_id, 0, 0, MATTX_CMD_SET_LOCAL_IP, 1);
+    nla_put_u32(msg, MATTX_ATTR_LOCAL_IP, ip_addr);
+
+    if (nl_send_auto(nl_sock, msg) < 0) {
+        printf("ERROR: Failed to register local IP with kernel.\n");
+    } else {
+        printf("SUCCESS: Registered local IP %s with kernel.\n", inet_ntoa(*(struct in_addr*)&ip_addr));
+    }
+    fflush(stdout);
+    nlmsg_free(msg);
+}
+
+void trigger_kernel_join(uint32_t node_id, uint32_t ip_addr) {
+    struct nl_msg *msg;
+    
+    if (mattx_family_id < 0) {
+        printf("ERROR: Netlink not initialized. Cannot join Node %u\n", node_id);
+        fflush(stdout);
         return;
     }
 
-    msg = nlmsg_alloc();
-    genlmsg_put(msg, NL_AUTO_PORT, NL_AUTO_SEQ, family_id, 0, 0, MATTX_CMD_NODE_JOIN, 1);
-    nla_put_u32(msg, MATTX_ATTR_NODE_ID, node_id);
-    nla_put_u32(msg, MATTX_ATTR_IPV4_ADDR, ip_addr);
-    
-    // NEW: Tell the kernel who we are!
-    nla_put_u32(msg, MATTX_ATTR_MY_NODE_ID, config.node_id);
-
-    if (nl_send_auto(sock, msg) < 0) {
-        fprintf(stderr, "Failed to send JOIN to kernel\n");
-    } else {
-        printf("Triggered kernel JOIN for Node %u (%s)\n", node_id, inet_ntoa(*(struct in_addr*)&ip_addr));
+    for (int i = 0; i < known_nodes_count; i++) {
+        if (known_nodes[i] == node_id) {
+            return; 
+        }
     }
 
-    nlmsg_free(msg);
-    nl_socket_free(sock);
-}
+    msg = nlmsg_alloc();
+    genlmsg_put(msg, NL_AUTO_PORT, NL_AUTO_SEQ, mattx_family_id, 0, 0, MATTX_CMD_NODE_JOIN, 1);
+    nla_put_u32(msg, MATTX_ATTR_NODE_ID, node_id);
+    nla_put_u32(msg, MATTX_ATTR_IPV4_ADDR, ip_addr);
+    nla_put_u32(msg, MATTX_ATTR_MY_NODE_ID, config.node_id);
 
-// --- Helper Functions ---
+    if (nl_send_auto(nl_sock, msg) < 0) {
+        printf("ERROR: nl_send_auto failed for Node %u\n", node_id);
+        fflush(stdout);
+    } else {
+        printf("SUCCESS: Sent JOIN command to kernel for Node %u (%s)\n", 
+               node_id, inet_ntoa(*(struct in_addr*)&ip_addr));
+        fflush(stdout);
+        
+        if (known_nodes_count < 64) {
+            known_nodes[known_nodes_count++] = node_id;
+        }
+    }
+    nlmsg_free(msg);
+}
 
 uint32_t generate_node_id(const char *iface) {
     struct ifreq ifr;
@@ -139,8 +157,6 @@ void load_config() {
     if (config.node_id == 0) config.node_id = generate_node_id(config.interface);
 }
 
-// --- Thread: Send Beacons ---
-
 void* beacon_sender(void* arg) {
     int s = socket(AF_INET, SOCK_DGRAM, 0);
     struct sockaddr_in addr;
@@ -162,8 +178,6 @@ void* beacon_sender(void* arg) {
     return NULL;
 }
 
-// --- Main: Listen for Beacons ---
-
 int main() {
     int s;
     struct sockaddr_in addr, group_addr;
@@ -177,6 +191,10 @@ int main() {
         fprintf(stderr, "Critical Error: Could not initialize Netlink. Exiting.\n");
         return -1;
     }
+
+    // --- NEW: Tell the kernel our IP address right away! ---
+    uint32_t my_ip = get_interface_ip(config.interface);
+    register_local_ip(my_ip);
 
     s = socket(AF_INET, SOCK_DGRAM, 0);
     int reuse = 1;

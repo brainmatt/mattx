@@ -5,7 +5,6 @@
 
 static struct proc_dir_entry *mattx_proc_dir;
 
-// --- 1. The Status File (/proc/mattx/nodes) ---
 static int nodes_show(struct seq_file *m, void *v) {
     int i;
     
@@ -17,8 +16,9 @@ static int nodes_show(struct seq_file *m, void *v) {
     seq_printf(m, "Node ID\t\tIP Address\tCPU Load\tMem Free (MB)\n");
     seq_printf(m, "------------------------------------------------------------\n");
 
-    seq_printf(m, "%d (Local)\t127.0.0.1\t%u\t\t%u\n", 
-               my_node_id, local_cpu, local_mem);
+    // --- FIXED: Print the real IP address! ---
+    seq_printf(m, "%d (Local)\t%pI4\t%u\t\t%u\n", 
+               my_node_id, &my_ip_addr, local_cpu, local_mem);
 
     for (i = 0; i < MAX_NODES; i++) {
         if (cluster_map[i] && cluster_map[i]->node_id != -1) {
@@ -45,7 +45,6 @@ static const struct proc_ops nodes_proc_ops = {
     .proc_release = single_release,
 };
 
-// --- 2. The Remote File (/proc/mattx/remote) ---
 static int remote_show(struct seq_file *m, void *v) {
     int i;
     
@@ -69,7 +68,6 @@ static const struct proc_ops remote_proc_ops = {
     .proc_release = single_release,
 };
 
-// --- 3. The Guests File (/proc/mattx/guests) ---
 static int guests_show(struct seq_file *m, void *v) {
     int i;
     
@@ -93,7 +91,6 @@ static const struct proc_ops guests_proc_ops = {
     .proc_release = single_release,
 };
 
-// --- 4. The Control File (/proc/mattx/admin) ---
 static ssize_t admin_write(struct file *file, const char __user *ubuf, size_t count, loff_t *ppos) {
     char buf[64];
     char cmd[32];
@@ -151,14 +148,13 @@ static const struct proc_ops admin_proc_ops = {
     .proc_write = admin_write,
 };
 
-// --- Init & Exit ---
 int mattx_proc_init(void) {
     mattx_proc_dir = proc_mkdir("mattx", NULL);
     if (!mattx_proc_dir) return -ENOMEM;
 
     proc_create("nodes", 0444, mattx_proc_dir, &nodes_proc_ops);
-    proc_create("remote", 0444, mattx_proc_dir, &remote_proc_ops); // NEW
-    proc_create("guests", 0444, mattx_proc_dir, &guests_proc_ops); // NEW
+    proc_create("remote", 0444, mattx_proc_dir, &remote_proc_ops); 
+    proc_create("guests", 0444, mattx_proc_dir, &guests_proc_ops); 
     proc_create("admin", 0666, mattx_proc_dir, &admin_proc_ops); 
 
     printk(KERN_INFO "MattX: /proc/mattx interface created successfully.\n");
@@ -168,8 +164,8 @@ int mattx_proc_init(void) {
 void mattx_proc_exit(void) {
     if (mattx_proc_dir) {
         remove_proc_entry("nodes", mattx_proc_dir);
-        remove_proc_entry("remote", mattx_proc_dir); // NEW
-        remove_proc_entry("guests", mattx_proc_dir); // NEW
+        remove_proc_entry("remote", mattx_proc_dir); 
+        remove_proc_entry("guests", mattx_proc_dir); 
         remove_proc_entry("admin", mattx_proc_dir);
         remove_proc_entry("mattx", NULL);
     }

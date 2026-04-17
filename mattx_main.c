@@ -14,11 +14,10 @@ struct task_struct *hijacked_stub_task = NULL;
 static struct task_struct *balancer_thread;
 static struct task_struct *listener_thread;
 
-// --- Admin Globals (The actual definition!) ---
 bool balancer_enabled = true;
 u32 my_node_id = 0; 
+u32 my_ip_addr = 0; // NEW: Initialize to 0.0.0.0
 
-// --- Guest Registry Implementation ---
 struct mattx_guest_info guest_registry[MAX_GUESTS];
 int guest_count = 0;
 DEFINE_SPINLOCK(guest_lock);
@@ -45,7 +44,7 @@ void add_guest_process(pid_t local_pid, u32 orig_pid, int home_node) {
         guest_registry[guest_count].home_node = home_node;
         guest_count++;
     } else {
-        printk(KERN_WARNING "MattX: [REGISTRY] Guest registry is full!\n");
+        printk(KERN_WARNING "MattX:[REGISTRY] Guest registry is full!\n");
     }
     spin_unlock(&guest_lock);
 }
@@ -78,7 +77,6 @@ void remove_export_process(int index) {
     export_count--;
 }
 
-// --- NEW: Lookup where a process was exported to ---
 int get_export_target(pid_t orig_pid) {
     int target = -1;
     int i;
@@ -93,13 +91,19 @@ int get_export_target(pid_t orig_pid) {
     return target;
 }
 
-enum { MATTX_ATTR_UNSPEC, MATTX_ATTR_NODE_ID, MATTX_ATTR_IPV4_ADDR, MATTX_ATTR_STUB_PID, MATTX_ATTR_BLUEPRINT, MATTX_ATTR_MY_NODE_ID, __MATTX_ATTR_MAX };
+// --- Netlink Interface ---
+// NEW: Added MATTX_ATTR_LOCAL_IP
+enum { MATTX_ATTR_UNSPEC, MATTX_ATTR_NODE_ID, MATTX_ATTR_IPV4_ADDR, MATTX_ATTR_STUB_PID, MATTX_ATTR_BLUEPRINT, MATTX_ATTR_MY_NODE_ID, MATTX_ATTR_LOCAL_IP, __MATTX_ATTR_MAX };
 #define MATTX_ATTR_MAX (__MATTX_ATTR_MAX - 1)
 
-enum { MATTX_CMD_UNSPEC, MATTX_CMD_NODE_JOIN, MATTX_CMD_NODE_LEAVE, MATTX_CMD_HIJACK_ME, MATTX_CMD_GET_BLUEPRINT, __MATTX_CMD_MAX };
+// NEW: Added MATTX_CMD_SET_LOCAL_IP
+enum { MATTX_CMD_UNSPEC, MATTX_CMD_NODE_JOIN, MATTX_CMD_NODE_LEAVE, MATTX_CMD_HIJACK_ME, MATTX_CMD_GET_BLUEPRINT, MATTX_CMD_SET_LOCAL_IP, __MATTX_CMD_MAX };
 #define MATTX_CMD_MAX (__MATTX_CMD_MAX - 1)
 
-static const struct nla_policy mattx_genl_policy[MATTX_ATTR_MAX + 1] = {[MATTX_ATTR_NODE_ID] = { .type = NLA_U32 },[MATTX_ATTR_IPV4_ADDR] = { .type = NLA_U32 },[MATTX_ATTR_STUB_PID] = { .type = NLA_U32 },[MATTX_ATTR_BLUEPRINT] = { .type = NLA_BINARY },[MATTX_ATTR_MY_NODE_ID] = { .type = NLA_U32 }, // NEW: Policy for our ID
+static const struct nla_policy mattx_genl_policy[MATTX_ATTR_MAX + 1] = {[MATTX_ATTR_NODE_ID] = { .type = NLA_U32 },[MATTX_ATTR_IPV4_ADDR] = { .type = NLA_U32 },
+    [MATTX_ATTR_STUB_PID] = { .type = NLA_U32 },
+    [MATTX_ATTR_BLUEPRINT] = { .type = NLA_BINARY },[MATTX_ATTR_MY_NODE_ID] = { .type = NLA_U32 },
+    [MATTX_ATTR_LOCAL_IP] = { .type = NLA_U32 }, // NEW
 };
 
 static int mattx_nl_cmd_node_join(struct sk_buff *skb, struct genl_info *info) {
@@ -179,10 +183,19 @@ static int mattx_nl_cmd_hijack_me(struct sk_buff *skb, struct genl_info *info) {
     printk(KERN_INFO "MattX: [HIJACK] SUCCESS! Stub PID %u is carved and ready.\n", stub_pid);
 
     if (pending_source_node != -1 && cluster_map[pending_source_node]) {
-        printk(KERN_INFO "MattX:[HIJACK] Sending READY_FOR_DATA signal to Node %d...\n", pending_source_node);
+        printk(KERN_INFO "MattX: [HIJACK] Sending READY_FOR_DATA signal to Node %d...\n", pending_source_node);
         mattx_comm_send(cluster_map[pending_source_node], MATTX_MSG_READY_FOR_DATA, NULL, 0);
     }
 
+    return 0;
+}
+
+// --- NEW: The Self-Aware Handler ---
+static int mattx_nl_cmd_set_local_ip(struct sk_buff *skb, struct genl_info *info) {
+    if (info->attrs[MATTX_ATTR_LOCAL_IP]) {
+        my_ip_addr = nla_get_u32(info->attrs[MATTX_ATTR_LOCAL_IP]);
+        printk(KERN_INFO "MattX: [NL] Daemon registered local IP: %pI4\n", &my_ip_addr);
+    }
     return 0;
 }
 
@@ -191,6 +204,7 @@ static const struct genl_ops mattx_genl_ops[] = {
     { .cmd = MATTX_CMD_NODE_LEAVE, .policy = mattx_genl_policy, .doit = mattx_nl_cmd_node_leave },
     { .cmd = MATTX_CMD_GET_BLUEPRINT, .policy = mattx_genl_policy, .doit = mattx_nl_cmd_get_blueprint },
     { .cmd = MATTX_CMD_HIJACK_ME, .policy = mattx_genl_policy, .doit = mattx_nl_cmd_hijack_me },
+    { .cmd = MATTX_CMD_SET_LOCAL_IP, .policy = mattx_genl_policy, .doit = mattx_nl_cmd_set_local_ip }, // NEW
 };
 
 struct genl_family mattx_genl_family = {
