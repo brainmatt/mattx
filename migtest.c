@@ -32,6 +32,8 @@ int main() {
         int counter = 0;
 
 	sleep(20);
+	printf("- file open starts soon....");
+	sleep(20);
 	FILE *testfile = fopen("/tmp/mattx-fd.log", "w");
         
 	//sleep(10);
