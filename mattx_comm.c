@@ -436,6 +436,54 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
             }
             break;
 
+        // --- NEW: Node 1 receives the request to open a file ---
+        case MATTX_MSG_SYS_OPEN_REQ:
+            if (payload) {
+                struct mattx_sys_open_req *req = (struct mattx_sys_open_req *)payload;
+                struct mattx_sys_open_reply reply;
+
+                printk(KERN_INFO "MattX:[RPC] Received OPEN request from Node %u for file: '%s'\n", hdr->sender_id, req->filename);
+
+                // For Micro-Step 12.2, we just send a dummy FD back to prove the round-trip works!
+                // In 12.3, we will actually call filp_open() here.
+                reply.orig_pid = req->orig_pid;
+                reply.remote_fd = 99; // Magic dummy FD
+                reply.error = 0;
+
+                printk(KERN_INFO "MattX:[RPC] Sending OPEN_REPLY (Remote FD: 99) back to Node %u...\n", hdr->sender_id);
+                if (cluster_map[hdr->sender_id]) {
+                    mattx_comm_send(cluster_map[hdr->sender_id], MATTX_MSG_SYS_OPEN_REPLY, &reply, sizeof(reply));
+                }
+            }
+            break;
+
+        // --- NEW: Node 2 receives the reply and wakes up the Surrogate ---
+        case MATTX_MSG_SYS_OPEN_REPLY:
+            if (payload) {
+                struct mattx_sys_open_reply *reply = (struct mattx_sys_open_reply *)payload;
+                int i;
+
+                printk(KERN_INFO "MattX:[RPC] Received OPEN_REPLY for Orig PID %u. Remote FD is %d.\n", reply->orig_pid, reply->remote_fd);
+
+                spin_lock(&guest_lock);
+                for (i = 0; i < guest_count; i++) {
+                    if (guest_registry[i].orig_pid == reply->orig_pid && guest_registry[i].home_node == hdr->sender_id) {
+                        
+                        // Save the result and mark the RPC as done
+                        guest_registry[i].rpc_remote_fd = reply->remote_fd;
+                        guest_registry[i].rpc_done = true;
+                        
+                        // Wake up the sleeping Kprobe!
+                        if (guest_registry[i].rpc_wq) {
+                            wake_up_interruptible(guest_registry[i].rpc_wq);
+                        }
+                        break;
+                    }
+                }
+                spin_unlock(&guest_lock);
+            }
+            break;
+
         default:
             break;
     }

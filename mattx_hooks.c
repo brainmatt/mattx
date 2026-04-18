@@ -1,53 +1,96 @@
 #include "mattx.h"
+#include <linux/wait.h> // NEW: For wait_event_interruptible
 
-// We use a Kretprobe (Return Probe) so we can eventually hijack the return value (the FD)
 static struct kretprobe openat_kprobe;
 
-// This function runs right BEFORE do_sys_openat2 executes
+// Helper to safely check if the RPC is done while we are sleeping
+static bool check_rpc_done(pid_t pid) {
+    bool done = false;
+    spin_lock(&guest_lock);
+    for (int i = 0; i < guest_count; i++) {
+        if (guest_registry[i].local_pid == pid) {
+            done = guest_registry[i].rpc_done;
+            break;
+        }
+    }
+    spin_unlock(&guest_lock);
+    return done;
+}
+
 static int entry_handler_openat(struct kretprobe_instance *ri, struct pt_regs *regs) {
     pid_t my_pid = current->pid;
 
-    // 1. FAST PATH: If this is a normal process, do absolutely nothing!
-    // This guarantees zero performance impact for native applications.
     if (!is_guest_process(my_pid)) {
         return 0; 
     }
 
-    // 2. We have a Guest! 
-    // In x86_64, the 2nd argument to do_sys_openat2 is the filename pointer (stored in the RSI register)
-    // We save this pointer inside the Kretprobe instance so the return handler can read it.
     *((const char __user **)ri->data) = (const char __user *)regs->si;
-
     return 0;
 }
 
-// This function runs right AFTER do_sys_openat2 finishes, but BEFORE it returns to user-space
 static int ret_handler_openat(struct kretprobe_instance *ri, struct pt_regs *regs) {
     pid_t my_pid = current->pid;
     const char __user *filename_ptr;
     char filename[256] = {0};
-    long ret_val;
+    int home_node = -1;
+    u32 orig_pid = 0;
+    int i;
+    
+    // NEW: Create a wait queue directly on the kernel stack!
+    DECLARE_WAIT_QUEUE_HEAD_ONSTACK(rpc_wq);
 
-    // Fast path check again (just to be safe)
-    if (!is_guest_process(my_pid)) {
-        return 0;
-    }
+    if (!is_guest_process(my_pid)) return 0;
 
-    // Retrieve the filename pointer we saved in the entry handler
     filename_ptr = *((const char __user **)ri->data);
 
-    // Safely copy the filename string from user-space memory into our kernel buffer
     if (strncpy_from_user(filename, filename_ptr, sizeof(filename) - 1) > 0) {
         
-        // The return value of the syscall (the File Descriptor) is stored in the RAX register
-        ret_val = regs_return_value(regs);
+        // 1. Find our Home Node and attach the Wait Queue
+        spin_lock(&guest_lock);
+        for (i = 0; i < guest_count; i++) {
+            if (guest_registry[i].local_pid == my_pid) {
+                home_node = guest_registry[i].home_node;
+                orig_pid = guest_registry[i].orig_pid;
+                
+                // Attach our stack's wait queue to the registry so the receiver thread can wake us up
+                guest_registry[i].rpc_wq = &rpc_wq;
+                guest_registry[i].rpc_done = false;
+                break;
+            }
+        }
+        spin_unlock(&guest_lock);
 
-        // --- EXTREME DEBUGGING ---
-        printk(KERN_INFO "MattX:[HOOK] Intercepted open() by Guest PID %d!\n", my_pid);
-        printk(KERN_INFO "MattX:[HOOK] Filename: '%s'\n", filename);
-        printk(KERN_INFO "MattX:[HOOK] Kernel assigned Local FD: %ld\n", ret_val);
-        
-        // TODO Phase 12.2: Pause the process here and ask Node 1 to open the file instead!
+        if (home_node != -1 && cluster_map[home_node]) {
+            struct mattx_sys_open_req req;
+            memset(&req, 0, sizeof(req));
+            req.orig_pid = orig_pid;
+            strncpy(req.filename, filename, sizeof(req.filename) - 1);
+
+            printk(KERN_INFO "MattX:[HOOK] Intercepted open('%s'). Pausing Surrogate %d...\n", filename, my_pid);
+            printk(KERN_INFO "MattX:[HOOK] Sending OPEN_REQ to Home Node %d...\n", home_node);
+            
+            // 2. Send the request to Node 1
+            mattx_comm_send(cluster_map[home_node], MATTX_MSG_SYS_OPEN_REQ, &req, sizeof(req));
+
+            // 3. GO TO SLEEP! The kernel will pause this thread until check_rpc_done returns true.
+            wait_event_interruptible(rpc_wq, check_rpc_done(my_pid));
+
+            // 4. We woke up! Node 1 must have replied. Let's get the result.
+            int remote_fd = -1;
+            spin_lock(&guest_lock);
+            for (i = 0; i < guest_count; i++) {
+                if (guest_registry[i].local_pid == my_pid) {
+                    remote_fd = guest_registry[i].rpc_remote_fd;
+                    guest_registry[i].rpc_wq = NULL; // Detach the wait queue
+                    break;
+                }
+            }
+            spin_unlock(&guest_lock);
+
+            printk(KERN_INFO "MattX:[HOOK] Surrogate %d woke up! Node 1 assigned Remote FD: %d\n", my_pid, remote_fd);
+            
+            // TODO Phase 12.4: Hijack the return value (regs->ax) and inject the Fake FD!
+        }
     }
 
     return 0;
@@ -55,21 +98,18 @@ static int ret_handler_openat(struct kretprobe_instance *ri, struct pt_regs *reg
 
 int mattx_hooks_init(void) {
     int ret;
-
-    // Configure the Kretprobe for do_sys_openat2
     memset(&openat_kprobe, 0, sizeof(openat_kprobe));
     openat_kprobe.kp.symbol_name = "do_sys_openat2";
     openat_kprobe.entry_handler = entry_handler_openat;
     openat_kprobe.handler = ret_handler_openat;
-    openat_kprobe.data_size = sizeof(const char __user *); // Space to store the filename pointer
-    openat_kprobe.maxactive = 64; // Max concurrent open() calls we can track
+    openat_kprobe.data_size = sizeof(const char __user *); 
+    openat_kprobe.maxactive = 64; 
 
     ret = register_kretprobe(&openat_kprobe);
     if (ret < 0) {
         printk(KERN_ERR "MattX: register_kretprobe failed, returned %d\n", ret);
         return ret;
     }
-
     printk(KERN_INFO "MattX: Syscall Hooks (Kprobes) registered successfully.\n");
     return 0;
 }

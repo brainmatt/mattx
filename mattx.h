@@ -57,6 +57,8 @@ enum mattx_msg_type {
     MATTX_MSG_RECALL_REQ,     
     MATTX_MSG_RETURN_BLUEPRINT, 
     MATTX_MSG_RETURN_DONE,    
+    MATTX_MSG_SYS_OPEN_REQ, 
+    MATTX_MSG_SYS_OPEN_REPLY, 
 };
 
 struct mattx_header {
@@ -131,10 +133,27 @@ struct mattx_link {
     struct task_struct *receiver_thread;
 };
 
+struct mattx_sys_open_req {
+    u32 orig_pid;
+    int flags;
+    int mode;
+    char filename[256];
+};
+
+struct mattx_sys_open_reply {
+    u32 orig_pid;
+    int remote_fd;
+    int error;
+};
+
 struct mattx_guest_info {
     pid_t local_pid;
     u32 orig_pid;
     int home_node;
+
+    wait_queue_head_t *rpc_wq;
+    int rpc_remote_fd;
+    bool rpc_done;
 };
 
 struct mattx_export_info {
