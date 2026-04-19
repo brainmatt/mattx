@@ -441,46 +441,116 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
             if (payload) {
                 struct mattx_sys_open_req *req = (struct mattx_sys_open_req *)payload;
                 struct mattx_sys_open_reply reply;
+                struct file *filp;
+                int remote_fd = -1;
+                int i, j;
 
                 printk(KERN_INFO "MattX:[RPC] Received OPEN request from Node %u for file: '%s'\n", hdr->sender_id, req->filename);
 
-                // For Micro-Step 12.2, we just send a dummy FD back to prove the round-trip works!
-                // In 12.3, we will actually call filp_open() here.
-                reply.orig_pid = req->orig_pid;
-                reply.remote_fd = 99; // Magic dummy FD
-                reply.error = 0;
+                // --- NEW: Node 1 actually opens the file! ---
+                // We use O_CREAT | O_WRONLY | O_APPEND for the prototype so migtest can write to it.
+                filp = filp_open(req->filename, O_CREAT | O_WRONLY | O_APPEND, 0666);
+                
+                if (IS_ERR(filp)) {
+                    printk(KERN_ERR "MattX:[RPC] Failed to open file '%s' on Home Node (err: %ld)\n", req->filename, PTR_ERR(filp));
+                    reply.error = PTR_ERR(filp);
+                } else {
+                    // Store the real file pointer in the Export Registry
+                    spin_lock(&export_lock);
+                    for (i = 0; i < export_count; i++) {
+                        if (export_registry[i].orig_pid == req->orig_pid) {
+                            for (j = 0; j < MAX_FDS; j++) {
+                                if (export_registry[i].remote_files[j] == NULL) {
+                                    export_registry[i].remote_files[j] = filp;
+                                    remote_fd = j + 1000; // Offset by 1000 to distinguish from stdout/stderr
+                                    break;
+                                }
+                            }
+                            break;
+                        }
+                    }
+                    spin_unlock(&export_lock);
+                    
+                    if (remote_fd == -1) {
+                        fput(filp); 
+                        reply.error = -ENFILE;
+                    } else {
+                        reply.error = 0;
+                    }
+                }
 
-                printk(KERN_INFO "MattX:[RPC] Sending OPEN_REPLY (Remote FD: 99) back to Node %u...\n", hdr->sender_id);
+                reply.orig_pid = req->orig_pid;
+                reply.remote_fd = remote_fd;
+
+                printk(KERN_INFO "MattX:[RPC] Sending OPEN_REPLY (Remote FD: %d) back to Node %u...\n", remote_fd, hdr->sender_id);
                 if (cluster_map[hdr->sender_id]) {
                     mattx_comm_send(cluster_map[hdr->sender_id], MATTX_MSG_SYS_OPEN_REPLY, &reply, sizeof(reply));
                 }
             }
             break;
 
-        // --- NEW: Node 2 receives the reply and wakes up the Surrogate ---
-        case MATTX_MSG_SYS_OPEN_REPLY:
+// ... (skip down to SYSCALL_FWD) ...
+
+        case MATTX_MSG_SYSCALL_FWD:
             if (payload) {
-                struct mattx_sys_open_reply *reply = (struct mattx_sys_open_reply *)payload;
+                struct mattx_syscall_req *req = (struct mattx_syscall_req *)payload;
+                struct task_struct *deputy = NULL;
+                struct file *file = NULL;
                 int i;
+                
+                printk(KERN_INFO "MattX:[WORMHOLE] Received %u bytes for FD %u from Node %u. Writing to Deputy...\n", req->len, req->fd, hdr->sender_id);
 
-                printk(KERN_INFO "MattX:[RPC] Received OPEN_REPLY for Orig PID %u. Remote FD is %d.\n", reply->orig_pid, reply->remote_fd);
-
-                spin_lock(&guest_lock);
-                for (i = 0; i < guest_count; i++) {
-                    if (guest_registry[i].orig_pid == reply->orig_pid && guest_registry[i].home_node == hdr->sender_id) {
-                        
-                        // Save the result and mark the RPC as done
-                        guest_registry[i].rpc_remote_fd = reply->remote_fd;
-                        guest_registry[i].rpc_done = true;
-                        
-                        // Wake up the sleeping Kprobe!
-                        if (guest_registry[i].rpc_wq) {
-                            wake_up_interruptible(guest_registry[i].rpc_wq);
+                // --- NEW: Check if this is a dynamically opened Remote FD (>= 1000) ---
+                if (req->fd >= 1000) {
+                    int slot = req->fd - 1000;
+                    spin_lock(&export_lock);
+                    for (i = 0; i < export_count; i++) {
+                        if (export_registry[i].orig_pid == req->orig_pid) {
+                            if (slot < MAX_FDS && export_registry[i].remote_files[slot]) {
+                                file = export_registry[i].remote_files[slot];
+                                get_file(file); // Safely grab reference
+                            }
+                            break;
                         }
-                        break;
+                    }
+                    spin_unlock(&export_lock);
+                } else {
+                    // Old logic for inherited FDs (stdout/stderr)
+                    rcu_read_lock();
+                    deputy = pid_task(find_vpid(req->orig_pid), PIDTYPE_PID);
+                    if (deputy) get_task_struct(deputy);
+                    rcu_read_unlock();
+                    
+                    if (deputy) {
+                        struct files_struct *files = deputy->files;
+                        if (files) {
+                            spin_lock(&files->file_lock);
+                            struct fdtable *fdt = files_fdtable(files);
+                            if (req->fd < fdt->max_fds) {
+                                file = rcu_dereference_raw(fdt->fd[req->fd]);
+                                if (file) get_file(file); 
+                            }
+                            spin_unlock(&files->file_lock);
+                        }
+                        put_task_struct(deputy);
                     }
                 }
-                spin_unlock(&guest_lock);
+                
+                if (file) {
+                    loff_t pos = file->f_pos;
+                    ssize_t ret;
+                    
+                    ret = kernel_write(file, req->data, req->len, &pos);
+                    
+                    if (ret < 0) {
+                        printk(KERN_ERR "MattX:[WORMHOLE] kernel_write failed for FD %u with error %zd\n", req->fd, ret);
+                    } else {
+                        file->f_pos = pos;
+                    }
+                    fput(file); 
+                } else {
+                    printk(KERN_ERR "MattX:[WORMHOLE] Invalid FD %u requested by Node %u\n", req->fd, hdr->sender_id);
+                }
             }
             break;
 
@@ -633,4 +703,10 @@ void mattx_comm_disconnect(int node_id) {
     kfree(cluster_map[node_id]);
     cluster_map[node_id] = NULL;
 }
+
+const struct file_operations mattx_fops = {
+    .write = mattx_fake_write,
+};
+EXPORT_SYMBOL(mattx_fops);
+
 

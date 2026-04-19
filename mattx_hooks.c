@@ -3,27 +3,35 @@
 
 static struct kretprobe openat_kprobe;
 
-// --- NEW: The Workqueue Handler (Runs in Process Context!) ---
+static bool check_rpc_done(pid_t pid) {
+    bool done = false;
+    spin_lock(&guest_lock);
+    for (int i = 0; i < guest_count; i++) {
+        if (guest_registry[i].local_pid == pid) {
+            done = guest_registry[i].rpc_done;
+            break;
+        }
+    }
+    spin_unlock(&guest_lock);
+    return done;
+}
+
 static void mattx_rpc_worker(struct work_struct *work) {
     struct mattx_rpc_work *rpc = container_of(work, struct mattx_rpc_work, work);
     struct mattx_sys_open_req req;
     int i;
+    int remote_fd = -1;
     
-    // 1. Prepare the network request
     memset(&req, 0, sizeof(req));
     req.orig_pid = rpc->orig_pid;
     strncpy(req.filename, rpc->filename, sizeof(req.filename) - 1);
 
     printk(KERN_INFO "MattX:[RPC] Worker started for PID %d. Sending OPEN_REQ to Node %d...\n", rpc->local_pid, rpc->home_node);
     
-    // 2. Send the request to Node 1
     if (cluster_map[rpc->home_node]) {
         mattx_comm_send(cluster_map[rpc->home_node], MATTX_MSG_SYS_OPEN_REQ, &req, sizeof(req));
     }
 
-    // 3. Wait for the reply (We can safely sleep here!)
-    // For this micro-step, we will just simulate the wait using a simple loop.
-    // In the next step, we will wire this to the actual network reply.
     int retries = 50;
     bool done = false;
     while (!done && retries > 0) {
@@ -32,6 +40,7 @@ static void mattx_rpc_worker(struct work_struct *work) {
         for (i = 0; i < guest_count; i++) {
             if (guest_registry[i].local_pid == rpc->local_pid) {
                 done = guest_registry[i].rpc_done;
+                if (done) remote_fd = guest_registry[i].rpc_remote_fd;
                 break;
             }
         }
@@ -39,9 +48,6 @@ static void mattx_rpc_worker(struct work_struct *work) {
         retries--;
     }
 
-    printk(KERN_INFO "MattX:[RPC] Worker finished for PID %d. Waking Surrogate...\n", rpc->local_pid);
-
-    // 4. Wake the Surrogate back up!
     struct task_struct *surrogate = NULL;
     rcu_read_lock();
     surrogate = pid_task(find_vpid(rpc->local_pid), PIDTYPE_PID);
@@ -49,21 +55,49 @@ static void mattx_rpc_worker(struct work_struct *work) {
     rcu_read_unlock();
 
     if (surrogate) {
+        // --- NEW: The Frozen Hijack ---
+        if (remote_fd >= 0) {
+            struct file *fake_file = anon_inode_getfile("mattx_vfs_proxy", &mattx_fops, (void *)(uintptr_t)remote_fd, O_WRONLY);
+            int local_fd = -1;
+
+            if (!IS_ERR(fake_file) && surrogate->files) {
+                spin_lock(&surrogate->files->file_lock);
+                struct fdtable *fdt = files_fdtable(surrogate->files);
+                
+                // Find a free FD slot in the Surrogate's table (starting at 3 to avoid stdout/err)
+                for (int j = 3; j < fdt->max_fds; j++) {
+                    if (rcu_dereference_raw(fdt->fd[j]) == NULL) {
+                        rcu_assign_pointer(fdt->fd[j], fake_file);
+                        __set_bit(j, fdt->open_fds); // Mark it as open in the kernel bitmap!
+                        local_fd = j;
+                        break;
+                    }
+                }
+                spin_unlock(&surrogate->files->file_lock);
+            }
+
+            if (local_fd >= 0) {
+                struct pt_regs *regs = task_pt_regs(surrogate);
+                if (regs) {
+                    regs->ax = local_fd; // HIJACK THE RETURN VALUE!
+                    printk(KERN_INFO "MattX:[RPC] Illusion Complete! Mapped Remote FD %d to Local FD %d\n", remote_fd, local_fd);
+                }
+            } else {
+                if (!IS_ERR(fake_file)) fput(fake_file);
+            }
+        }
+
+        printk(KERN_INFO "MattX:[RPC] Worker finished for PID %d. Waking Surrogate...\n", rpc->local_pid);
         send_sig(SIGCONT, surrogate, 0);
         put_task_struct(surrogate);
     }
 
     kfree(rpc);
 }
-// ---------------------------------------------------------
 
 static int entry_handler_openat(struct kretprobe_instance *ri, struct pt_regs *regs) {
     pid_t my_pid = current->pid;
-
-    if (!is_guest_process(my_pid)) {
-        return 0; 
-    }
-
+    if (!is_guest_process(my_pid)) return 0; 
     *((const char __user **)ri->data) = (const char __user *)regs->si;
     return 0;
 }
@@ -87,16 +121,14 @@ static int ret_handler_openat(struct kretprobe_instance *ri, struct pt_regs *reg
             if (guest_registry[i].local_pid == my_pid) {
                 home_node = guest_registry[i].home_node;
                 orig_pid = guest_registry[i].orig_pid;
-                guest_registry[i].rpc_done = false; // Reset the flag
+                guest_registry[i].rpc_done = false; 
                 break;
             }
         }
         spin_unlock(&guest_lock);
 
         if (home_node != -1) {
-            // --- NEW: The Escape Hatch ---
-            // We allocate a work struct, fill it, and throw it to the kernel's global workqueue
-            struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); // MUST use GFP_ATOMIC inside a Kprobe!
+            struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
             if (rpc) {
                 INIT_WORK(&rpc->work, mattx_rpc_worker);
                 rpc->local_pid = my_pid;
@@ -106,15 +138,11 @@ static int ret_handler_openat(struct kretprobe_instance *ri, struct pt_regs *reg
 
                 printk(KERN_INFO "MattX:[HOOK] Intercepted open('%s'). Freezing Surrogate %d and escaping to Workqueue...\n", filename, my_pid);
                 
-                // Freeze the Surrogate!
                 send_sig(SIGSTOP, current, 0);
-                
-                // Schedule the background worker
                 schedule_work(&rpc->work);
             }
         }
     }
-
     return 0;
 }
 

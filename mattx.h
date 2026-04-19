@@ -29,8 +29,9 @@
 #include <linux/uaccess.h>       
 #include <linux/mman.h>          
 #include <linux/mmu_context.h>   
-#include <linux/kprobes.h>
-#include <linux/workqueue.h>
+#include <linux/kprobes.h>       
+#include <linux/workqueue.h>     
+#include <linux/bitops.h>        // NEW: For manipulating the FD bitmap
 
 #define MATTX_PORT 7226
 #define MAX_NODES 1024 
@@ -58,7 +59,7 @@ enum mattx_msg_type {
     MATTX_MSG_RECALL_REQ,     
     MATTX_MSG_RETURN_BLUEPRINT, 
     MATTX_MSG_RETURN_DONE,    
-    MATTX_MSG_SYS_OPEN_REQ, 
+    MATTX_MSG_SYS_OPEN_REQ,   
     MATTX_MSG_SYS_OPEN_REPLY, 
 };
 
@@ -126,14 +127,6 @@ struct mattx_recall_req {
     u32 orig_pid;
 };
 
-struct mattx_link {
-    int node_id;
-    u32 ip_addr; 
-    struct socket *sock;
-    struct sock *sk;
-    struct task_struct *receiver_thread;
-};
-
 struct mattx_sys_open_req {
     u32 orig_pid;
     int flags;
@@ -155,11 +148,18 @@ struct mattx_rpc_work {
     char filename[256];
 };
 
+struct mattx_link {
+    int node_id;
+    u32 ip_addr; 
+    struct socket *sock;
+    struct sock *sk;
+    struct task_struct *receiver_thread;
+};
+
 struct mattx_guest_info {
     pid_t local_pid;
     u32 orig_pid;
     int home_node;
-
     wait_queue_head_t *rpc_wq;
     int rpc_remote_fd;
     bool rpc_done;
@@ -168,6 +168,7 @@ struct mattx_guest_info {
 struct mattx_export_info {
     pid_t orig_pid;
     int target_node;
+    struct file *remote_files[MAX_FDS]; // NEW: Store files opened on behalf of the Surrogate
 };
 
 extern struct mattx_load_info cluster_load_table[MAX_NODES];
@@ -187,7 +188,7 @@ extern spinlock_t export_lock;
 
 extern bool balancer_enabled;
 extern u32 my_node_id; 
-extern u32 my_ip_addr; // NEW: The kernel now knows its own IP!
+extern u32 my_ip_addr; 
 
 int mattx_comm_send(struct mattx_link *link, u32 type, void *data, u32 len);
 struct mattx_link* mattx_comm_connect(__be32 ip_addr, int node_id);
@@ -212,6 +213,8 @@ void mattx_proc_exit(void);
 
 int mattx_hooks_init(void);
 void mattx_hooks_exit(void);
+
+extern const struct file_operations mattx_fops; // NEW: Expose fops for the Workqueue
 
 #endif // MATTX_H
 
