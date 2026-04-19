@@ -71,7 +71,7 @@ int mattx_balancer_loop(void *data) {
     int dead_count;
 
     // NEW: Array for dead exports
-    struct mattx_export_info dead_exports[16];
+    struct { u32 orig_pid; int target_node; } dead_exports[16];
     int dead_export_count;
 
     printk(KERN_INFO "MattX: Balancer thread started\n");
@@ -154,7 +154,11 @@ int mattx_balancer_loop(void *data) {
             }
 
             if (is_dead) {
-                if (dead_export_count < 16) dead_exports[dead_export_count++] = export_registry[i];
+                if (dead_export_count < 16) {
+                    dead_exports[dead_export_count].orig_pid = export_registry[i].orig_pid;
+                    dead_exports[dead_export_count].target_node = export_registry[i].target_node;
+                    dead_export_count++;
+                }
                 remove_export_process(i);
             } else {
                 i++;

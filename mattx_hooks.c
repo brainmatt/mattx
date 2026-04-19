@@ -3,19 +3,6 @@
 
 static struct kretprobe openat_kprobe;
 
-static bool check_rpc_done(pid_t pid) {
-    bool done = false;
-    spin_lock(&guest_lock);
-    for (int i = 0; i < guest_count; i++) {
-        if (guest_registry[i].local_pid == pid) {
-            done = guest_registry[i].rpc_done;
-            break;
-        }
-    }
-    spin_unlock(&guest_lock);
-    return done;
-}
-
 static void mattx_rpc_worker(struct work_struct *work) {
     struct mattx_rpc_work *rpc = container_of(work, struct mattx_rpc_work, work);
     struct mattx_sys_open_req req;
