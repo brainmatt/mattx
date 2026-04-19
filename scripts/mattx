@@ -1,0 +1,7 @@
+#!/bin/bash
+
+mload
+dstart
+echo "balancer 0" > /proc/mattx/admin
+
+
