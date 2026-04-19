@@ -28,7 +28,7 @@ int main() {
 
     if (child_pid == 0) {
         // --- CHILD PROCESS (The Worker) ---
-        printf("[Worker] I am alive! My PID is %d. Migrate ME!\n", getpid());
+        printf("[Worker] I am alive! My PID is %d Migrate ME!\n", getpid());
         int counter = 0;
 
 	sleep(20);
