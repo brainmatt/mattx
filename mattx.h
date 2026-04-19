@@ -214,7 +214,7 @@ void mattx_proc_exit(void);
 int mattx_hooks_init(void);
 void mattx_hooks_exit(void);
 
-static extern const struct file_operations mattx_fops; // NEW: Expose fops for the Workqueue
+extern const struct file_operations mattx_fops; // NEW: Expose fops for the Workqueue
 
 #endif // MATTX_H
 
