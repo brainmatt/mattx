@@ -1,21 +1,61 @@
 #include "mattx.h"
-#include <linux/wait.h> // NEW: For wait_event_interruptible
+#include <linux/wait.h> 
 
 static struct kretprobe openat_kprobe;
 
-// Helper to safely check if the RPC is done while we are sleeping
-static bool check_rpc_done(pid_t pid) {
-    bool done = false;
-    spin_lock(&guest_lock);
-    for (int i = 0; i < guest_count; i++) {
-        if (guest_registry[i].local_pid == pid) {
-            done = guest_registry[i].rpc_done;
-            break;
-        }
+// --- NEW: The Workqueue Handler (Runs in Process Context!) ---
+static void mattx_rpc_worker(struct work_struct *work) {
+    struct mattx_rpc_work *rpc = container_of(work, struct mattx_rpc_work, work);
+    struct mattx_sys_open_req req;
+    int i;
+    
+    // 1. Prepare the network request
+    memset(&req, 0, sizeof(req));
+    req.orig_pid = rpc->orig_pid;
+    strncpy(req.filename, rpc->filename, sizeof(req.filename) - 1);
+
+    printk(KERN_INFO "MattX:[RPC] Worker started for PID %d. Sending OPEN_REQ to Node %d...\n", rpc->local_pid, rpc->home_node);
+    
+    // 2. Send the request to Node 1
+    if (cluster_map[rpc->home_node]) {
+        mattx_comm_send(cluster_map[rpc->home_node], MATTX_MSG_SYS_OPEN_REQ, &req, sizeof(req));
     }
-    spin_unlock(&guest_lock);
-    return done;
+
+    // 3. Wait for the reply (We can safely sleep here!)
+    // For this micro-step, we will just simulate the wait using a simple loop.
+    // In the next step, we will wire this to the actual network reply.
+    int retries = 50;
+    bool done = false;
+    while (!done && retries > 0) {
+        msleep(100);
+        spin_lock(&guest_lock);
+        for (i = 0; i < guest_count; i++) {
+            if (guest_registry[i].local_pid == rpc->local_pid) {
+                done = guest_registry[i].rpc_done;
+                break;
+            }
+        }
+        spin_unlock(&guest_lock);
+        retries--;
+    }
+
+    printk(KERN_INFO "MattX:[RPC] Worker finished for PID %d. Waking Surrogate...\n", rpc->local_pid);
+
+    // 4. Wake the Surrogate back up!
+    struct task_struct *surrogate = NULL;
+    rcu_read_lock();
+    surrogate = pid_task(find_vpid(rpc->local_pid), PIDTYPE_PID);
+    if (surrogate) get_task_struct(surrogate);
+    rcu_read_unlock();
+
+    if (surrogate) {
+        send_sig(SIGCONT, surrogate, 0);
+        put_task_struct(surrogate);
+    }
+
+    kfree(rpc);
 }
+// ---------------------------------------------------------
 
 static int entry_handler_openat(struct kretprobe_instance *ri, struct pt_regs *regs) {
     pid_t my_pid = current->pid;
@@ -35,9 +75,6 @@ static int ret_handler_openat(struct kretprobe_instance *ri, struct pt_regs *reg
     int home_node = -1;
     u32 orig_pid = 0;
     int i;
-    
-    // NEW: Create a wait queue directly on the kernel stack!
-    DECLARE_WAIT_QUEUE_HEAD_ONSTACK(rpc_wq);
 
     if (!is_guest_process(my_pid)) return 0;
 
@@ -45,51 +82,36 @@ static int ret_handler_openat(struct kretprobe_instance *ri, struct pt_regs *reg
 
     if (strncpy_from_user(filename, filename_ptr, sizeof(filename) - 1) > 0) {
         
-        // 1. Find our Home Node and attach the Wait Queue
         spin_lock(&guest_lock);
         for (i = 0; i < guest_count; i++) {
             if (guest_registry[i].local_pid == my_pid) {
                 home_node = guest_registry[i].home_node;
                 orig_pid = guest_registry[i].orig_pid;
-                
-                // Attach our stack's wait queue to the registry so the receiver thread can wake us up
-                guest_registry[i].rpc_wq = &rpc_wq;
-                guest_registry[i].rpc_done = false;
+                guest_registry[i].rpc_done = false; // Reset the flag
                 break;
             }
         }
         spin_unlock(&guest_lock);
 
-        if (home_node != -1 && cluster_map[home_node]) {
-            struct mattx_sys_open_req req;
-            memset(&req, 0, sizeof(req));
-            req.orig_pid = orig_pid;
-            strncpy(req.filename, filename, sizeof(req.filename) - 1);
+        if (home_node != -1) {
+            // --- NEW: The Escape Hatch ---
+            // We allocate a work struct, fill it, and throw it to the kernel's global workqueue
+            struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); // MUST use GFP_ATOMIC inside a Kprobe!
+            if (rpc) {
+                INIT_WORK(&rpc->work, mattx_rpc_worker);
+                rpc->local_pid = my_pid;
+                rpc->orig_pid = orig_pid;
+                rpc->home_node = home_node;
+                strncpy(rpc->filename, filename, sizeof(rpc->filename) - 1);
 
-            printk(KERN_INFO "MattX:[HOOK] Intercepted open('%s'). Pausing Surrogate %d...\n", filename, my_pid);
-            printk(KERN_INFO "MattX:[HOOK] Sending OPEN_REQ to Home Node %d...\n", home_node);
-            
-            // 2. Send the request to Node 1
-            mattx_comm_send(cluster_map[home_node], MATTX_MSG_SYS_OPEN_REQ, &req, sizeof(req));
-
-            // 3. GO TO SLEEP! The kernel will pause this thread until check_rpc_done returns true.
-            wait_event_interruptible(rpc_wq, check_rpc_done(my_pid));
-
-            // 4. We woke up! Node 1 must have replied. Let's get the result.
-            int remote_fd = -1;
-            spin_lock(&guest_lock);
-            for (i = 0; i < guest_count; i++) {
-                if (guest_registry[i].local_pid == my_pid) {
-                    remote_fd = guest_registry[i].rpc_remote_fd;
-                    guest_registry[i].rpc_wq = NULL; // Detach the wait queue
-                    break;
-                }
+                printk(KERN_INFO "MattX:[HOOK] Intercepted open('%s'). Freezing Surrogate %d and escaping to Workqueue...\n", filename, my_pid);
+                
+                // Freeze the Surrogate!
+                send_sig(SIGSTOP, current, 0);
+                
+                // Schedule the background worker
+                schedule_work(&rpc->work);
             }
-            spin_unlock(&guest_lock);
-
-            printk(KERN_INFO "MattX:[HOOK] Surrogate %d woke up! Node 1 assigned Remote FD: %d\n", my_pid, remote_fd);
-            
-            // TODO Phase 12.4: Hijack the return value (regs->ax) and inject the Fake FD!
         }
     }
 

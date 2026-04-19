@@ -30,6 +30,7 @@
 #include <linux/mman.h>          
 #include <linux/mmu_context.h>   
 #include <linux/kprobes.h>
+#include <linux/workqueue.h>
 
 #define MATTX_PORT 7226
 #define MAX_NODES 1024 
@@ -144,6 +145,14 @@ struct mattx_sys_open_reply {
     u32 orig_pid;
     int remote_fd;
     int error;
+};
+
+struct mattx_rpc_work {
+    struct work_struct work;
+    pid_t local_pid;
+    u32 orig_pid;
+    int home_node;
+    char filename[256];
 };
 
 struct mattx_guest_info {
