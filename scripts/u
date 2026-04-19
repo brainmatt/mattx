@@ -1,0 +1,6 @@
+#!/bin/bash
+
+make clean
+git pull
+m
+
