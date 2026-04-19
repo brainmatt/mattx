@@ -31,7 +31,7 @@
 #include <linux/mmu_context.h>   
 #include <linux/kprobes.h>       
 #include <linux/workqueue.h>     
-#include <linux/bitops.h>        // NEW: For manipulating the FD bitmap
+#include <linux/bitops.h>        
 
 #define MATTX_PORT 7226
 #define MAX_NODES 1024 
@@ -41,7 +41,9 @@
 #define FIXED_LOAD_0_2 409
 #define MAX_VMAS 256 
 #define MAX_GUESTS 1024 
-#define MAX_FDS 64 
+
+// --- FIXED: Increased to 256 to match the stub's FD expansion ---
+#define MAX_FDS 256 
 
 #define MATTX_MAGIC 0x4D415454 
 #define MATTX_MAX_PAYLOAD (10 * 1024 * 1024) 
@@ -61,6 +63,7 @@ enum mattx_msg_type {
     MATTX_MSG_RETURN_DONE,    
     MATTX_MSG_SYS_OPEN_REQ,   
     MATTX_MSG_SYS_OPEN_REPLY, 
+    MATTX_MSG_SYS_CLOSE_REQ,  // NEW: Node 2 tells Node 1 to close a file
 };
 
 struct mattx_header {
@@ -140,6 +143,12 @@ struct mattx_sys_open_reply {
     int error;
 };
 
+// NEW: Payload for the Close Request
+struct mattx_sys_close_req {
+    u32 orig_pid;
+    u32 remote_fd;
+};
+
 struct mattx_rpc_work {
     struct work_struct work;
     pid_t local_pid;
@@ -168,7 +177,7 @@ struct mattx_guest_info {
 struct mattx_export_info {
     pid_t orig_pid;
     int target_node;
-    struct file *remote_files[MAX_FDS]; // NEW: Store files opened on behalf of the Surrogate
+    struct file *remote_files[MAX_FDS]; 
 };
 
 extern struct mattx_load_info cluster_load_table[MAX_NODES];
@@ -214,7 +223,7 @@ void mattx_proc_exit(void);
 int mattx_hooks_init(void);
 void mattx_hooks_exit(void);
 
-extern const struct file_operations mattx_fops; // NEW: Expose fops for the Workqueue
+extern const struct file_operations mattx_fops; 
 
 #endif // MATTX_H
 
