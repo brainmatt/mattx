@@ -55,7 +55,7 @@ static ssize_t mattx_fake_write(struct file *file, const char __user *buf, size_
     return to_send; 
 }
 
-static const struct file_operations mattx_fops = {
+const struct file_operations mattx_fops = {
     .write = mattx_fake_write,
 };
 
