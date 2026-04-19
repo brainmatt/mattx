@@ -117,10 +117,21 @@ int main() {
         mmap((void *)v->vm_start, size, prot, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
     }
     
-    // --- NEW: Expand the FD table safely in user-space! ---
+    // --- NEW: Expand the FD table safely in user-space! --- // do we still needs this ?
     for (int i = 3; i < MAX_FDS; i++) {
         dup2(0, i); // Duplicate stdin to every FD up to 64 to force the kernel to allocate the table
     }
+
+    // --- NEW: Expand the FD table safely in user-space! ---
+    // We dup2 up to 256 to force the kernel to allocate a large fdtable array.
+    for (int i = 3; i < 256; i++) {
+        dup2(0, i);
+    }
+    // Now we close them! The array stays large, but the slots are NULL and ready for our Fake FDs!
+    for (int i = 3; i < 256; i++) {
+        close(i);
+    }
+
     printf("MattX-Stub: Memory carved and FD table expanded. Ready for hijack.\n");
 
     msg = nlmsg_alloc();

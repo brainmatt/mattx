@@ -450,42 +450,60 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
             if (payload) {
                 struct mattx_sys_open_req *req = (struct mattx_sys_open_req *)payload;
                 struct mattx_sys_open_reply reply;
-                struct file *filp;
+                struct file *filp = NULL;
+                struct task_struct *deputy = NULL;
                 int remote_fd = -1;
                 int i, j;
 
                 printk(KERN_INFO "MattX:[RPC] Received OPEN request from Node %u for file: '%s'\n", hdr->sender_id, req->filename);
 
-                // --- NEW: Node 1 actually opens the file! ---
-                // We use O_CREAT | O_WRONLY | O_APPEND for the prototype so migtest can write to it.
-                filp = filp_open(req->filename, O_CREAT | O_WRONLY | O_APPEND, 0666);
-                
-                if (IS_ERR(filp)) {
-                    printk(KERN_ERR "MattX:[RPC] Failed to open file '%s' on Home Node (err: %ld)\n", req->filename, PTR_ERR(filp));
-                    reply.error = PTR_ERR(filp);
-                } else {
-                    // Store the real file pointer in the Export Registry
-                    spin_lock(&export_lock);
-                    for (i = 0; i < export_count; i++) {
-                        if (export_registry[i].orig_pid == req->orig_pid) {
-                            for (j = 0; j < MAX_FDS; j++) {
-                                if (export_registry[i].remote_files[j] == NULL) {
-                                    export_registry[i].remote_files[j] = filp;
-                                    remote_fd = j + 1000; // Offset by 1000 to distinguish from stdout/stderr
-                                    break;
+                rcu_read_lock();
+                deputy = pid_task(find_vpid(req->orig_pid), PIDTYPE_PID);
+                if (deputy) get_task_struct(deputy);
+                rcu_read_unlock();
+
+                if (deputy) {
+                    const struct cred *old_cred;
+                    
+                    // --- FIXED: Borrow the Deputy's identity and memory space! ---
+                    if (deputy->mm) kthread_use_mm(deputy->mm);
+                    old_cred = override_creds(deputy->cred);
+
+                    // Now the file will be created as 'matt', not 'root'!
+                    filp = filp_open(req->filename, O_CREAT | O_WRONLY | O_APPEND, 0666);
+                    
+                    revert_creds(old_cred);
+                    if (deputy->mm) kthread_unuse_mm(deputy->mm);
+
+                    if (IS_ERR(filp)) {
+                        printk(KERN_ERR "MattX:[RPC] Failed to open file '%s' on Home Node (err: %ld)\n", req->filename, PTR_ERR(filp));
+                        reply.error = PTR_ERR(filp);
+                    } else {
+                        spin_lock(&export_lock);
+                        for (i = 0; i < export_count; i++) {
+                            if (export_registry[i].orig_pid == req->orig_pid) {
+                                for (j = 0; j < MAX_FDS; j++) {
+                                    if (export_registry[i].remote_files[j] == NULL) {
+                                        export_registry[i].remote_files[j] = filp;
+                                        remote_fd = j + 1000; 
+                                        break;
+                                    }
                                 }
+                                break;
                             }
-                            break;
+                        }
+                        spin_unlock(&export_lock);
+                        
+                        if (remote_fd == -1) {
+                            fput(filp); 
+                            reply.error = -ENFILE;
+                        } else {
+                            reply.error = 0;
                         }
                     }
-                    spin_unlock(&export_lock);
-                    
-                    if (remote_fd == -1) {
-                        fput(filp); 
-                        reply.error = -ENFILE;
-                    } else {
-                        reply.error = 0;
-                    }
+                    put_task_struct(deputy);
+                } else {
+                    reply.error = -ESRCH;
                 }
 
                 reply.orig_pid = req->orig_pid;

@@ -44,32 +44,33 @@ static void mattx_rpc_worker(struct work_struct *work) {
     if (surrogate) {
         if (remote_fd >= 0) {
             struct pt_regs *regs = task_pt_regs(surrogate);
-            // --- NEW: The Bait and Switch ---
-            // The local kernel already allocated an FD and put it in RAX. We just steal it!
-            int local_fd = regs ? regs->ax : -1; 
+            int local_fd = -1; 
 
-            if (local_fd >= 0) {
-                struct file *fake_file = anon_inode_getfile("mattx_vfs_proxy", &mattx_fops, (void *)(uintptr_t)remote_fd, O_WRONLY);
-                struct file *old_file = NULL;
+            // --- FIXED: Manual FD Allocation ---
+            // Because we sabotaged the syscall, it returned -EFAULT and didn't allocate an FD.
+            // We find an empty slot in the pre-expanded table and install our Fake File!
+            struct file *fake_file = anon_inode_getfile("mattx_vfs_proxy", &mattx_fops, (void *)(uintptr_t)remote_fd, O_WRONLY);
 
-                if (!IS_ERR(fake_file) && surrogate->files) {
-                    spin_lock(&surrogate->files->file_lock);
-                    struct fdtable *fdt = files_fdtable(surrogate->files);
-                    
-                    if (local_fd < fdt->max_fds) {
-                        // Grab the real local file the kernel just opened
-                        old_file = rcu_dereference_raw(fdt->fd[local_fd]);
-                        // Swap it with our Wormhole!
-                        rcu_assign_pointer(fdt->fd[local_fd], fake_file);
+            if (!IS_ERR(fake_file) && surrogate->files) {
+                spin_lock(&surrogate->files->file_lock);
+                struct fdtable *fdt = files_fdtable(surrogate->files);
+                
+                for (int j = 3; j < fdt->max_fds; j++) {
+                    if (rcu_dereference_raw(fdt->fd[j]) == NULL) {
+                        rcu_assign_pointer(fdt->fd[j], fake_file);
+                        __set_bit(j, fdt->open_fds); 
+                        local_fd = j;
+                        break;
                     }
-                    spin_unlock(&surrogate->files->file_lock);
-                    
-                    // Clean up the local file so we don't leak memory on VM2
-                    if (old_file) fput(old_file); 
-                    
-                    printk(KERN_INFO "MattX:[RPC] Illusion Complete! Swapped Local FD %d with Remote FD %d\n", local_fd, remote_fd);
+                }
+                spin_unlock(&surrogate->files->file_lock);
+                
+                if (local_fd >= 0) {
+                    if (regs) regs->ax = local_fd; // Overwrite the -EFAULT error with our success FD!
+                    printk(KERN_INFO "MattX:[RPC] Illusion Complete! Mapped Remote FD %d to Local FD %d\n", remote_fd, local_fd);
                 } else {
-                    if (!IS_ERR(fake_file)) fput(fake_file);
+                    printk(KERN_ERR "MattX:[RPC] Failed to find empty FD slot!\n");
+                    fput(fake_file);
                 }
             }
         }
@@ -84,8 +85,17 @@ static void mattx_rpc_worker(struct work_struct *work) {
 
 static int entry_handler_openat(struct kretprobe_instance *ri, struct pt_regs *regs) {
     pid_t my_pid = current->pid;
+
     if (!is_guest_process(my_pid)) return 0; 
+
+    // Save the real filename pointer
     *((const char __user **)ri->data) = (const char __user *)regs->si;
+    
+    // --- FIXED: The Sabotage! ---
+    // We set the filename pointer to NULL. do_sys_openat2 will instantly fail with -EFAULT
+    // and return without touching VM2's hard drive!
+    regs->si = 0; 
+
     return 0;
 }
 
@@ -130,6 +140,7 @@ static int ret_handler_openat(struct kretprobe_instance *ri, struct pt_regs *reg
             }
         }
     }
+
     return 0;
 }
 
