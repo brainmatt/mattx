@@ -558,6 +558,32 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
             }
             break;
 
+        case MATTX_MSG_SYS_OPEN_REPLY:
+            if (payload) {
+                struct mattx_sys_open_reply *reply = (struct mattx_sys_open_reply *)payload;
+                int i;
+
+                printk(KERN_INFO "MattX:[RPC] Received OPEN_REPLY for Orig PID %u. Remote FD is %d.\n", reply->orig_pid, reply->remote_fd);
+
+                spin_lock(&guest_lock);
+                for (i = 0; i < guest_count; i++) {
+                    if (guest_registry[i].orig_pid == reply->orig_pid && guest_registry[i].home_node == hdr->sender_id) {
+                        
+                        // Save the result and mark the RPC as done
+                        guest_registry[i].rpc_remote_fd = reply->remote_fd;
+                        guest_registry[i].rpc_done = true;
+                        
+                        // Wake up the sleeping Kprobe!
+                        if (guest_registry[i].rpc_wq) {
+                            wake_up_interruptible(guest_registry[i].rpc_wq);
+                        }
+                        break;
+                    }
+                }
+                spin_unlock(&guest_lock);
+            }
+            break;
+
         default:
             printk(KERN_WARNING "MattX: [COMM] Unknown message type: %u\n", hdr->type);
             break;
