@@ -44,57 +44,39 @@ static void mattx_rpc_worker(struct work_struct *work) {
     if (surrogate) {
         if (remote_fd >= 0) {
             struct pt_regs *regs = task_pt_regs(surrogate);
-            int local_fd = -1; 
+            int local_fd = regs ? regs->ax : -1; 
 
-            // --- FIXED: Manual FD Allocation ---
-            // Because we sabotaged the syscall, it returned -EFAULT and didn't allocate an FD.
-            // We find an empty slot in the pre-expanded table and install our Fake File!
-            struct file *fake_file = anon_inode_getfile("mattx_vfs_proxy", &mattx_fops, (void *)(uintptr_t)remote_fd, O_WRONLY);
+            if (local_fd >= 0) {
+                struct mattx_fake_fd_info *fd_info = kmalloc(sizeof(*fd_info), GFP_KERNEL);
+                if (fd_info) {
+                    fd_info->home_node = rpc->home_node;
+                    fd_info->orig_pid = rpc->orig_pid;
+                    fd_info->remote_fd = remote_fd;
+                    
+                    struct file *fake_file = anon_inode_getfile("mattx_vfs_proxy", &mattx_fops, fd_info, O_WRONLY);
+                    struct file *old_file = NULL;
 
-            if (!IS_ERR(fake_file) && surrogate->files) {
-                spin_lock(&surrogate->files->file_lock);
-                struct fdtable *fdt = files_fdtable(surrogate->files);
-                
-                for (int j = 3; j < fdt->max_fds; j++) {
-                    if (rcu_dereference_raw(fdt->fd[j]) == NULL) {
-                        rcu_assign_pointer(fdt->fd[j], fake_file);
-                        __set_bit(j, fdt->open_fds); 
-                        local_fd = j;
-                        break;
+                    if (!IS_ERR(fake_file) && surrogate->files) {
+                        spin_lock(&surrogate->files->file_lock);
+                        struct fdtable *fdt = files_fdtable(surrogate->files);
+                        
+                        if (local_fd < fdt->max_fds) {
+                            old_file = rcu_dereference_raw(fdt->fd[local_fd]);
+                            rcu_assign_pointer(fdt->fd[local_fd], fake_file);
+                        }
+                        spin_unlock(&surrogate->files->file_lock);
+                        
+                        if (old_file) fput(old_file); 
+                        
+                        // --- RESTORED: Hijack the return value! ---
+                        regs->ax = local_fd; 
+                        
+                        printk(KERN_INFO "MattX:[RPC] Illusion Complete! Mapped Remote FD %d to Local FD %d\n", remote_fd, local_fd);
+                    } else {
+                        if (!IS_ERR(fake_file)) fput(fake_file);
+                        kfree(fd_info);
                     }
                 }
-                spin_unlock(&surrogate->files->file_lock);
-
-	        if (local_fd >= 0) {
-	            // --- NEW: Attach the identity directly to the file! ---
-	            struct mattx_fake_fd_info *fd_info = kmalloc(sizeof(*fd_info), GFP_KERNEL);
-	            if (fd_info) {
-	                fd_info->home_node = rpc->home_node;
-	                fd_info->orig_pid = rpc->orig_pid;
-	                fd_info->remote_fd = remote_fd;
-	            
-	                struct file *fake_file = anon_inode_getfile("mattx_vfs_proxy", &mattx_fops, fd_info, O_WRONLY);
-	                struct file *old_file = NULL;
-
-	                if (!IS_ERR(fake_file) && surrogate->files) {
-	                    spin_lock(&surrogate->files->file_lock);
-	                    struct fdtable *fdt = files_fdtable(surrogate->files);
-	                
-	                    if (local_fd < fdt->max_fds) {
-	                        old_file = rcu_dereference_raw(fdt->fd[local_fd]);
-	                        rcu_assign_pointer(fdt->fd[local_fd], fake_file);
-	                    }
-	                    spin_unlock(&surrogate->files->file_lock);
-	                
-	                    if (old_file) fput(old_file); 
-	                
-	                    printk(KERN_INFO "MattX:[RPC] Illusion Complete! Mapped Remote FD %d to Local FD %d\n", remote_fd, local_fd);
-	                } else {
-	                    if (!IS_ERR(fake_file)) fput(fake_file);
-	                    kfree(fd_info);
-	                }
-	            }
-	        }
             }
         }
 
@@ -111,13 +93,8 @@ static int entry_handler_openat(struct kretprobe_instance *ri, struct pt_regs *r
 
     if (!is_guest_process(my_pid)) return 0; 
 
-    // Save the real filename pointer
     *((const char __user **)ri->data) = (const char __user *)regs->si;
-    
-    // --- FIXED: The Sabotage! ---
-    // We set the filename pointer to NULL. do_sys_openat2 will instantly fail with -EFAULT
-    // and return without touching VM2's hard drive!
-    regs->si = 0; 
+    regs->si = 0; // Sabotage the syscall!
 
     return 0;
 }
