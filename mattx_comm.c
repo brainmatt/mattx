@@ -286,55 +286,64 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
                 struct mattx_syscall_req *req = (struct mattx_syscall_req *)payload;
                 struct task_struct *deputy = NULL;
                 struct file *file = NULL;
+                int i;
                 
-                rcu_read_lock();
-                deputy = pid_task(find_vpid(req->orig_pid), PIDTYPE_PID);
-                if (deputy) get_task_struct(deputy);
-                rcu_read_unlock();
-                
-                if (deputy) {
-                    struct files_struct *files = deputy->files;
-                    if (files) {
-                        spin_lock(&files->file_lock);
-                        struct fdtable *fdt = files_fdtable(files);
-                        if (req->fd < fdt->max_fds) {
-                            file = rcu_dereference_raw(fdt->fd[req->fd]);
-                            if (file) get_file(file); 
+                printk(KERN_INFO "MattX:[WORMHOLE] Received %u bytes for FD %u from Node %u. Writing to Deputy...\n", req->len, req->fd, hdr->sender_id);
+
+                // --- NEW: Check if this is a dynamically opened Remote FD (>= 1000) ---
+                if (req->fd >= 1000) {
+                    int slot = req->fd - 1000;
+                    spin_lock(&export_lock);
+                    for (i = 0; i < export_count; i++) {
+                        if (export_registry[i].orig_pid == req->orig_pid) {
+                            if (slot < MAX_FDS && export_registry[i].remote_files[slot]) {
+                                file = export_registry[i].remote_files[slot];
+                                get_file(file); // Safely grab reference
+                            }
+                            break;
                         }
-                        spin_unlock(&files->file_lock);
                     }
+                    spin_unlock(&export_lock);
+                } else {
+                    // Old logic for inherited FDs (stdout/stderr)
+                    rcu_read_lock();
+                    deputy = pid_task(find_vpid(req->orig_pid), PIDTYPE_PID);
+                    if (deputy) get_task_struct(deputy);
+                    rcu_read_unlock();
                     
-                    if (file) {
-                        loff_t pos = file->f_pos;
-                        ssize_t ret;
-                        const struct cred *old_cred;
-
-                        // --- FIXED: The True VFS Proxy ---
-                        // 1. Borrow the Deputy's memory space and credentials
-                        if (deputy->mm) kthread_use_mm(deputy->mm);
-                        old_cred = override_creds(deputy->cred);
-
-                        // 2. Execute the write as if we are the Deputy
-                        ret = kernel_write(file, req->data, req->len, &pos);
-                        
-                        if (ret < 0) {
-                            printk(KERN_ERR "MattX:[WORMHOLE] kernel_write failed for FD %u with error %zd\n", req->fd, ret);
-                        } else {
-                            // 3. FIXED: Update the file position so we don't overwrite the same bytes!
-                            file->f_pos = pos;
+                    if (deputy) {
+                        struct files_struct *files = deputy->files;
+                        if (files) {
+                            spin_lock(&files->file_lock);
+                            struct fdtable *fdt = files_fdtable(files);
+                            if (req->fd < fdt->max_fds) {
+                                file = rcu_dereference_raw(fdt->fd[req->fd]);
+                                if (file) get_file(file); 
+                            }
+                            spin_unlock(&files->file_lock);
                         }
-
-                        // 4. Restore our original kernel thread context
-                        revert_creds(old_cred);
-                        if (deputy->mm) kthread_unuse_mm(deputy->mm);
-
-                        fput(file); 
+                        put_task_struct(deputy);
                     }
-                    put_task_struct(deputy);
+                }
+                
+                if (file) {
+                    loff_t pos = file->f_pos;
+                    ssize_t ret;
+                    
+                    ret = kernel_write(file, req->data, req->len, &pos);
+                    
+                    if (ret < 0) {
+                        printk(KERN_ERR "MattX:[WORMHOLE] kernel_write failed for FD %u with error %zd\n", req->fd, ret);
+                    } else {
+                        file->f_pos = pos;
+                    }
+                    fput(file); 
+                } else {
+                    printk(KERN_ERR "MattX:[WORMHOLE] Invalid FD %u requested by Node %u\n", req->fd, hdr->sender_id);
                 }
             }
             break;
-            
+
         case MATTX_MSG_RECALL_REQ:
             if (payload) {
                 struct mattx_recall_req *req = (struct mattx_recall_req *)payload;
@@ -489,68 +498,30 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
             }
             break;
 
-// ... (skip down to SYSCALL_FWD) ...
-
-        case MATTX_MSG_SYSCALL_FWD:
+	// --- NEW: Node 2 receives the reply and wakes up the Surrogate ---
+        case MATTX_MSG_SYS_OPEN_REPLY:
             if (payload) {
-                struct mattx_syscall_req *req = (struct mattx_syscall_req *)payload;
-                struct task_struct *deputy = NULL;
-                struct file *file = NULL;
+                struct mattx_sys_open_reply *reply = (struct mattx_sys_open_reply *)payload;
                 int i;
-                
-                printk(KERN_INFO "MattX:[WORMHOLE] Received %u bytes for FD %u from Node %u. Writing to Deputy...\n", req->len, req->fd, hdr->sender_id);
 
-                // --- NEW: Check if this is a dynamically opened Remote FD (>= 1000) ---
-                if (req->fd >= 1000) {
-                    int slot = req->fd - 1000;
-                    spin_lock(&export_lock);
-                    for (i = 0; i < export_count; i++) {
-                        if (export_registry[i].orig_pid == req->orig_pid) {
-                            if (slot < MAX_FDS && export_registry[i].remote_files[slot]) {
-                                file = export_registry[i].remote_files[slot];
-                                get_file(file); // Safely grab reference
-                            }
-                            break;
+                printk(KERN_INFO "MattX:[RPC] Received OPEN_REPLY for Orig PID %u. Remote FD is %d.\n", reply->orig_pid, reply->remote_fd);
+
+                spin_lock(&guest_lock);
+                for (i = 0; i < guest_count; i++) {
+                    if (guest_registry[i].orig_pid == reply->orig_pid && guest_registry[i].home_node == hdr->sender_id) {
+                        
+                        // Save the result and mark the RPC as done
+                        guest_registry[i].rpc_remote_fd = reply->remote_fd;
+                        guest_registry[i].rpc_done = true;
+                        
+                        // Wake up the sleeping Kprobe!
+                        if (guest_registry[i].rpc_wq) {
+                            wake_up_interruptible(guest_registry[i].rpc_wq);
                         }
-                    }
-                    spin_unlock(&export_lock);
-                } else {
-                    // Old logic for inherited FDs (stdout/stderr)
-                    rcu_read_lock();
-                    deputy = pid_task(find_vpid(req->orig_pid), PIDTYPE_PID);
-                    if (deputy) get_task_struct(deputy);
-                    rcu_read_unlock();
-                    
-                    if (deputy) {
-                        struct files_struct *files = deputy->files;
-                        if (files) {
-                            spin_lock(&files->file_lock);
-                            struct fdtable *fdt = files_fdtable(files);
-                            if (req->fd < fdt->max_fds) {
-                                file = rcu_dereference_raw(fdt->fd[req->fd]);
-                                if (file) get_file(file); 
-                            }
-                            spin_unlock(&files->file_lock);
-                        }
-                        put_task_struct(deputy);
+                        break;
                     }
                 }
-                
-                if (file) {
-                    loff_t pos = file->f_pos;
-                    ssize_t ret;
-                    
-                    ret = kernel_write(file, req->data, req->len, &pos);
-                    
-                    if (ret < 0) {
-                        printk(KERN_ERR "MattX:[WORMHOLE] kernel_write failed for FD %u with error %zd\n", req->fd, ret);
-                    } else {
-                        file->f_pos = pos;
-                    }
-                    fput(file); 
-                } else {
-                    printk(KERN_ERR "MattX:[WORMHOLE] Invalid FD %u requested by Node %u\n", req->fd, hdr->sender_id);
-                }
+                spin_unlock(&guest_lock);
             }
             break;
 
@@ -705,5 +676,4 @@ void mattx_comm_disconnect(int node_id) {
 }
 
 EXPORT_SYMBOL(mattx_fops);
-
 
