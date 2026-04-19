@@ -704,9 +704,6 @@ void mattx_comm_disconnect(int node_id) {
     cluster_map[node_id] = NULL;
 }
 
-const struct file_operations mattx_fops = {
-    .write = mattx_fake_write,
-};
 EXPORT_SYMBOL(mattx_fops);
 
 
