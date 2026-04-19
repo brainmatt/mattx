@@ -50,14 +50,10 @@ static ssize_t mattx_fake_write(struct file *file, const char __user *buf, size_
     mattx_comm_send(cluster_map[home_node], MATTX_MSG_SYSCALL_FWD, packet_buf + sizeof(struct mattx_header), sizeof(struct mattx_syscall_req) + to_send);
 
     kfree(packet_buf);
-    
-    // Advance the fake file position so libc doesn't get confused
     *pos += to_send;
-    
     return to_send; 
 }
 
-// --- NEW: The Fake File Close Operation (Runs on Node 2) ---
 static int mattx_fake_release(struct inode *inode, struct file *file) {
     pid_t my_pid = current->pid;
     int home_node = -1;
@@ -65,7 +61,6 @@ static int mattx_fake_release(struct inode *inode, struct file *file) {
     int i;
     struct mattx_sys_close_req req;
 
-    // Look up our true identity
     spin_lock(&guest_lock);
     for (i = 0; i < guest_count; i++) {
         if (guest_registry[i].local_pid == my_pid) {
@@ -81,8 +76,6 @@ static int mattx_fake_release(struct inode *inode, struct file *file) {
         req.remote_fd = (u32)(uintptr_t)file->private_data;
 
         printk(KERN_INFO "MattX:[WORMHOLE] Surrogate %d closed FD %u. Sending CLOSE_REQ to Node %d...\n", my_pid, req.remote_fd, home_node);
-        
-        // Tell Node 1 to close the real file!
         mattx_comm_send(cluster_map[home_node], MATTX_MSG_SYS_CLOSE_REQ, &req, sizeof(req));
     }
 
@@ -91,7 +84,7 @@ static int mattx_fake_release(struct inode *inode, struct file *file) {
 
 const struct file_operations mattx_fops = {
     .write = mattx_fake_write,
-    .release = mattx_fake_release, // NEW: Hook into the VFS close event!
+    .release = mattx_fake_release, 
 };
 
 static char *stub_argv[] = { "/usr/local/bin/mattx-stub", NULL };
@@ -167,7 +160,7 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
                 const struct cred *old_cred;
                 int retries = 50;
                 unsigned char rip_buf[8] = {0}; 
-                struct file **fake_files; // FIXED: Pointer for dynamic allocation
+                struct file **fake_files; 
                 int i;
 
                 printk(KERN_INFO "MattX:[AWAKEN] Commencing full brain transplant on PID %d...\n", hijacked_stub_task->pid);
@@ -186,12 +179,10 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
                     hijacked_stub_task->thread.gsbase = pending_migration->gsbase;
                     
                     strscpy(hijacked_stub_task->comm, pending_migration->comm, sizeof(hijacked_stub_task->comm));
-                    printk(KERN_INFO "MattX:[AWAKEN] Renamed stub to '%s'\n", hijacked_stub_task->comm);
                     
                     if (hijacked_stub_task->mm) {
                         hijacked_stub_task->mm->arg_start = pending_migration->arg_start;
                         hijacked_stub_task->mm->arg_end = pending_migration->arg_end;
-                        printk(KERN_INFO "MattX:[AWAKEN] Applied argv pointers for 'ps ax' illusion!\n");
                     }
                     
                     new_cred = prepare_creds();
@@ -215,11 +206,8 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
                         put_cred(old_cred);
                         put_cred(old_cred);
                         put_cred(new_cred);
-                        
-                        printk(KERN_INFO "MattX:[AWAKEN] Applied Identity -> UID: %u, GID: %u\n", pending_migration->uid, pending_migration->gid);
                     }
 
-                    // --- FIXED: Dynamically allocate the array to protect the kernel stack! ---
                     fake_files = kmalloc_array(pending_migration->fd_count, sizeof(struct file *), GFP_KERNEL);
                     if (fake_files) {
                         memset(fake_files, 0, pending_migration->fd_count * sizeof(struct file *));
@@ -242,21 +230,17 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
                             spin_unlock(&hijacked_stub_task->files->file_lock);
                             printk(KERN_INFO "MattX:[AWAKEN] Successfully injected %u Fake FDs!\n", pending_migration->fd_count);
                         }
-                        kfree(fake_files); // Free the array after injection
+                        kfree(fake_files); 
                     }
 
                     if (access_process_vm(hijacked_stub_task, regs->ip, rip_buf, 8, FOLL_FORCE) == 8) {
                         printk(KERN_INFO "MattX: [DEBUG] Target RIP (0x%lx) contains: %8ph\n", regs->ip, rip_buf);
-                    } else {
-                        printk(KERN_WARNING "MattX:[DEBUG] Failed to read Target RIP!\n");
                     }
 
                     printk(KERN_INFO "MattX:[AWAKEN] IT'S ALIVE! Sending SIGCONT to PID %d\n", hijacked_stub_task->pid);
                     send_sig(SIGCONT, hijacked_stub_task, 0);
                     
                     add_guest_process(hijacked_stub_task->pid, pending_migration->orig_pid, pending_source_node);
-                    printk(KERN_INFO "MattX:[REGISTRY] PID %d registered as a Guest (Orig: %u, Home: %d).\n", 
-                           hijacked_stub_task->pid, pending_migration->orig_pid, pending_source_node);
                 }
 
                 put_task_struct(hijacked_stub_task);
@@ -322,7 +306,7 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
                     rcu_read_unlock();
 
                     if (surrogate) {
-                        printk(KERN_INFO "MattX: [ASSASSIN] Executing Surrogate PID %d (Sending SIGKILL)...\n", surrogate->pid);
+                        printk(KERN_INFO "MattX:[ASSASSIN] Executing Surrogate PID %d (Sending SIGKILL)...\n", surrogate->pid);
                         send_sig(SIGKILL, surrogate, 0);
                         put_task_struct(surrogate);
                     }
@@ -335,75 +319,143 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
                 struct mattx_syscall_req *req = (struct mattx_syscall_req *)payload;
                 struct task_struct *deputy = NULL;
                 struct file *file = NULL;
-                int i;
                 
                 printk(KERN_INFO "MattX:[WORMHOLE] Received %u bytes for FD %u from Node %u. Writing to Deputy...\n", req->len, req->fd, hdr->sender_id);
 
-                if (req->fd >= 1000) {
-                    int slot = req->fd - 1000;
-                    spin_lock(&export_lock);
-                    for (i = 0; i < export_count; i++) {
-                        if (export_registry[i].orig_pid == req->orig_pid) {
-                            if (slot < MAX_FDS && export_registry[i].remote_files[slot]) {
-                                file = export_registry[i].remote_files[slot];
-                                get_file(file); 
-                            }
-                            break;
-                        }
-                    }
-                    spin_unlock(&export_lock);
-                } else {
-                    rcu_read_lock();
-                    deputy = pid_task(find_vpid(req->orig_pid), PIDTYPE_PID);
-                    if (deputy) get_task_struct(deputy);
-                    rcu_read_unlock();
-                    
-                    if (deputy) {
-                        struct files_struct *files = deputy->files;
-                        if (files) {
-                            spin_lock(&files->file_lock);
-                            struct fdtable *fdt = files_fdtable(files);
-                            if (req->fd < fdt->max_fds) {
-                                file = rcu_dereference_raw(fdt->fd[req->fd]);
-                                if (file) get_file(file); 
-                            }
-                            spin_unlock(&files->file_lock);
-                        }
-                        put_task_struct(deputy);
-                    }
-                }
+                rcu_read_lock();
+                deputy = pid_task(find_vpid(req->orig_pid), PIDTYPE_PID);
+                if (deputy) get_task_struct(deputy);
+                rcu_read_unlock();
                 
-                if (file) {
-                    loff_t pos = file->f_pos;
-                    ssize_t ret;
-                    const struct cred *old_cred = NULL;
+                if (deputy) {
+                    struct files_struct *files = deputy->files;
+                    if (files) {
+                        spin_lock(&files->file_lock);
+                        struct fdtable *fdt = files_fdtable(files);
+                        if (req->fd < fdt->max_fds) {
+                            file = rcu_dereference_raw(fdt->fd[req->fd]);
+                            if (file) get_file(file); 
+                        }
+                        spin_unlock(&files->file_lock);
+                    }
                     
-                    // Borrow the Deputy's memory space and credentials if we have a deputy
-                    if (deputy) {
+                    if (file) {
+                        loff_t pos = file->f_pos;
+                        ssize_t ret;
+                        const struct cred *old_cred = NULL;
+                        
                         if (deputy->mm) kthread_use_mm(deputy->mm);
                         old_cred = override_creds(deputy->cred);
-                    }
-                    
-                    ret = kernel_write(file, req->data, req->len, &pos);
-                    
-                    if (deputy) {
+                        
+                        ret = kernel_write(file, req->data, req->len, &pos);
+                        
                         revert_creds(old_cred);
                         if (deputy->mm) kthread_unuse_mm(deputy->mm);
+                        
+                        if (ret < 0) {
+                            printk(KERN_ERR "MattX:[WORMHOLE] kernel_write failed for FD %u with error %zd\n", req->fd, ret);
+                        } else {
+                            file->f_pos = pos;
+                        }
+                        fput(file); 
                     }
-                    
-                    if (ret < 0) {
-                        printk(KERN_ERR "MattX:[WORMHOLE] kernel_write failed for FD %u with error %zd\n", req->fd, ret);
-                    } else {
-                        file->f_pos = pos;
-                    }
-                    fput(file); 
-                } else {
-                    printk(KERN_ERR "MattX:[WORMHOLE] Invalid FD %u requested by Node %u\n", req->fd, hdr->sender_id);
+                    put_task_struct(deputy);
                 }
             }
             break;
 
-        // --- NEW: Node 1 receives the CLOSE request from Node 2 ---
+        // --- RESTORED: Node 1 receives the request to open a file ---
+        case MATTX_MSG_SYS_OPEN_REQ:
+            if (payload) {
+                struct mattx_sys_open_req *req = (struct mattx_sys_open_req *)payload;
+                struct mattx_sys_open_reply reply;
+                struct file *filp = NULL;
+                struct task_struct *deputy = NULL;
+                int remote_fd = -1;
+                int i, j;
+
+                printk(KERN_INFO "MattX:[RPC] Received OPEN request from Node %u for file: '%s'\n", hdr->sender_id, req->filename);
+
+                rcu_read_lock();
+                deputy = pid_task(find_vpid(req->orig_pid), PIDTYPE_PID);
+                if (deputy) get_task_struct(deputy);
+                rcu_read_unlock();
+
+                if (deputy) {
+                    const struct cred *old_cred;
+                    
+                    if (deputy->mm) kthread_use_mm(deputy->mm);
+                    old_cred = override_creds(deputy->cred);
+
+                    filp = filp_open(req->filename, O_CREAT | O_WRONLY | O_APPEND, 0666);
+                    
+                    revert_creds(old_cred);
+                    if (deputy->mm) kthread_unuse_mm(deputy->mm);
+
+                    if (IS_ERR(filp)) {
+                        printk(KERN_ERR "MattX:[RPC] Failed to open file '%s' on Home Node (err: %ld)\n", req->filename, PTR_ERR(filp));
+                        reply.error = PTR_ERR(filp);
+                    } else {
+                        spin_lock(&export_lock);
+                        for (i = 0; i < export_count; i++) {
+                            if (export_registry[i].orig_pid == req->orig_pid) {
+                                for (j = 0; j < MAX_FDS; j++) {
+                                    if (export_registry[i].remote_files[j] == NULL) {
+                                        export_registry[i].remote_files[j] = filp;
+                                        remote_fd = j + 1000; 
+                                        break;
+                                    }
+                                }
+                                break;
+                            }
+                        }
+                        spin_unlock(&export_lock);
+                        
+                        if (remote_fd == -1) {
+                            fput(filp); 
+                            reply.error = -ENFILE;
+                        } else {
+                            reply.error = 0;
+                        }
+                    }
+                    put_task_struct(deputy);
+                } else {
+                    reply.error = -ESRCH;
+                }
+
+                reply.orig_pid = req->orig_pid;
+                reply.remote_fd = remote_fd;
+
+                printk(KERN_INFO "MattX:[RPC] Sending OPEN_REPLY (Remote FD: %d) back to Node %u...\n", remote_fd, hdr->sender_id);
+                if (cluster_map[hdr->sender_id]) {
+                    mattx_comm_send(cluster_map[hdr->sender_id], MATTX_MSG_SYS_OPEN_REPLY, &reply, sizeof(reply));
+                }
+            }
+            break;
+
+        // --- RESTORED: Node 2 receives the reply and wakes up the Surrogate ---
+        case MATTX_MSG_SYS_OPEN_REPLY:
+            if (payload) {
+                struct mattx_sys_open_reply *reply = (struct mattx_sys_open_reply *)payload;
+                int i;
+
+                printk(KERN_INFO "MattX:[RPC] Received OPEN_REPLY for Orig PID %u. Remote FD is %d.\n", reply->orig_pid, reply->remote_fd);
+
+                spin_lock(&guest_lock);
+                for (i = 0; i < guest_count; i++) {
+                    if (guest_registry[i].orig_pid == reply->orig_pid && guest_registry[i].home_node == hdr->sender_id) {
+                        guest_registry[i].rpc_remote_fd = reply->remote_fd;
+                        guest_registry[i].rpc_done = true;
+                        if (guest_registry[i].rpc_wq) {
+                            wake_up_interruptible(guest_registry[i].rpc_wq);
+                        }
+                        break;
+                    }
+                }
+                spin_unlock(&guest_lock);
+            }
+            break;
+
         case MATTX_MSG_SYS_CLOSE_REQ:
             if (payload) {
                 struct mattx_sys_close_req *req = (struct mattx_sys_close_req *)payload;
@@ -417,9 +469,7 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
                     for (i = 0; i < export_count; i++) {
                         if (export_registry[i].orig_pid == req->orig_pid) {
                             if (slot < MAX_FDS && export_registry[i].remote_files[slot]) {
-                                // Close the real file on the hard drive!
                                 fput(export_registry[i].remote_files[slot]);
-                                // Clear the slot so it can be reused
                                 export_registry[i].remote_files[slot] = NULL;
                                 printk(KERN_INFO "MattX:[RPC] Successfully closed Remote FD %u\n", req->remote_fd);
                             }
@@ -515,7 +565,7 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
                     printk(KERN_INFO "MattX: [RECALL] Sending READY_FOR_DATA signal to Node %d...\n", pending_source_node);
                     mattx_comm_send(cluster_map[pending_source_node], MATTX_MSG_READY_FOR_DATA, NULL, 0);
                 } else {
-                    printk(KERN_ERR "MattX: [RECALL] ERROR: Deputy PID %u not found!\n", req->orig_pid);
+                    printk(KERN_ERR "MattX:[RECALL] ERROR: Deputy PID %u not found!\n", req->orig_pid);
                 }
             }
             break;
@@ -592,7 +642,7 @@ static int mattx_receiver_loop(void *data) {
                 
                 int payload_len = kernel_recvmsg(link->sock, &msg, iov, 1, hdr.length, MSG_WAITALL);
                 if (payload_len != hdr.length) {
-                    printk(KERN_ERR "MattX: [COMM] Short read on payload! Expected %u, got %d\n", hdr.length, payload_len);
+                    printk(KERN_ERR "MattX:[COMM] Short read on payload! Expected %u, got %d\n", hdr.length, payload_len);
                 }
             }
         }
