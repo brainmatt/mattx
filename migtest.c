@@ -30,24 +30,7 @@ int main() {
         // --- CHILD PROCESS (The Worker) ---
         printf("[Worker] I am alive! My PID is %d Migrate ME!\n", getpid());
         int counter = 0;
-
-	sleep(20);
-	printf("- file open starts soon....");
-	fflush(stdout);
-	sleep(20);
 	FILE *testfile1 = fopen("/tmp/mattx-fd.log", "w");
-        
-	printf(" - file opened now - closing soon ...");
-	fflush(stdout);
-	sleep(20);
-        fclose(testfile1);
-	printf(" - file closed now - reopening soon for the loop ...");
-	fflush(stdout);
-        sleep(20);
-	FILE *testfile = fopen("/tmp/mattx-fd.log", "w");
-        printf("- file open again - entering the loop ...");
-	fflush(stdout);
-
 
         while (1) {
             printf("[Worker %d] Hello from the MattX Cluster! (Tick: %d)\n", getpid(), counter++);
