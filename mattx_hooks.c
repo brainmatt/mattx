@@ -42,35 +42,35 @@ static void mattx_rpc_worker(struct work_struct *work) {
     rcu_read_unlock();
 
     if (surrogate) {
-        // --- NEW: The Frozen Hijack ---
         if (remote_fd >= 0) {
-            struct file *fake_file = anon_inode_getfile("mattx_vfs_proxy", &mattx_fops, (void *)(uintptr_t)remote_fd, O_WRONLY);
-            int local_fd = -1;
-
-            if (!IS_ERR(fake_file) && surrogate->files) {
-                spin_lock(&surrogate->files->file_lock);
-                struct fdtable *fdt = files_fdtable(surrogate->files);
-                
-                // Find a free FD slot in the Surrogate's table (starting at 3 to avoid stdout/err)
-                for (int j = 3; j < fdt->max_fds; j++) {
-                    if (rcu_dereference_raw(fdt->fd[j]) == NULL) {
-                        rcu_assign_pointer(fdt->fd[j], fake_file);
-                        __set_bit(j, fdt->open_fds); // Mark it as open in the kernel bitmap!
-                        local_fd = j;
-                        break;
-                    }
-                }
-                spin_unlock(&surrogate->files->file_lock);
-            }
+            struct pt_regs *regs = task_pt_regs(surrogate);
+            // --- NEW: The Bait and Switch ---
+            // The local kernel already allocated an FD and put it in RAX. We just steal it!
+            int local_fd = regs ? regs->ax : -1; 
 
             if (local_fd >= 0) {
-                struct pt_regs *regs = task_pt_regs(surrogate);
-                if (regs) {
-                    regs->ax = local_fd; // HIJACK THE RETURN VALUE!
-                    printk(KERN_INFO "MattX:[RPC] Illusion Complete! Mapped Remote FD %d to Local FD %d\n", remote_fd, local_fd);
+                struct file *fake_file = anon_inode_getfile("mattx_vfs_proxy", &mattx_fops, (void *)(uintptr_t)remote_fd, O_WRONLY);
+                struct file *old_file = NULL;
+
+                if (!IS_ERR(fake_file) && surrogate->files) {
+                    spin_lock(&surrogate->files->file_lock);
+                    struct fdtable *fdt = files_fdtable(surrogate->files);
+                    
+                    if (local_fd < fdt->max_fds) {
+                        // Grab the real local file the kernel just opened
+                        old_file = rcu_dereference_raw(fdt->fd[local_fd]);
+                        // Swap it with our Wormhole!
+                        rcu_assign_pointer(fdt->fd[local_fd], fake_file);
+                    }
+                    spin_unlock(&surrogate->files->file_lock);
+                    
+                    // Clean up the local file so we don't leak memory on VM2
+                    if (old_file) fput(old_file); 
+                    
+                    printk(KERN_INFO "MattX:[RPC] Illusion Complete! Swapped Local FD %d with Remote FD %d\n", local_fd, remote_fd);
+                } else {
+                    if (!IS_ERR(fake_file)) fput(fake_file);
                 }
-            } else {
-                if (!IS_ERR(fake_file)) fput(fake_file);
             }
         }
 
