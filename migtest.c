@@ -33,16 +33,21 @@ int main() {
 
 	sleep(20);
 	printf("- file open starts soon....");
+	fflush(stdout);
 	sleep(20);
 	FILE *testfile = fopen("/tmp/mattx-fd.log", "w");
         
 	printf(" - file opened now - closing soon ...");
+	fflush(stdout);
 	sleep(20);
         fclose(testfile);
 	printf(" - file closed now - reopening soon for the loop ...");
+	fflush(stdout);
         sleep(20);
 	testfile = fopen("/tmp/mattx-fd.log", "w");
         printf("- file open again - entering the loop ...");
+	fflush(stdout);
+
 
         while (1) {
             printf("[Worker %d] Hello from the MattX Cluster! (Tick: %d)\n", getpid(), counter++);
