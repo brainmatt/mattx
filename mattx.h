@@ -149,6 +149,13 @@ struct mattx_sys_close_req {
     u32 remote_fd;
 };
 
+// --- NEW: The Self-Aware FD Struct ---
+struct mattx_fake_fd_info {
+    int home_node;
+    u32 orig_pid;
+    u32 remote_fd;
+};
+
 struct mattx_rpc_work {
     struct work_struct work;
     pid_t local_pid;

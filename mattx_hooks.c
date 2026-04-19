@@ -64,14 +64,37 @@ static void mattx_rpc_worker(struct work_struct *work) {
                     }
                 }
                 spin_unlock(&surrogate->files->file_lock);
-                
-                if (local_fd >= 0) {
-                    if (regs) regs->ax = local_fd; // Overwrite the -EFAULT error with our success FD!
-                    printk(KERN_INFO "MattX:[RPC] Illusion Complete! Mapped Remote FD %d to Local FD %d\n", remote_fd, local_fd);
-                } else {
-                    printk(KERN_ERR "MattX:[RPC] Failed to find empty FD slot!\n");
-                    fput(fake_file);
-                }
+
+	        if (local_fd >= 0) {
+	            // --- NEW: Attach the identity directly to the file! ---
+	            struct mattx_fake_fd_info *fd_info = kmalloc(sizeof(*fd_info), GFP_KERNEL);
+	            if (fd_info) {
+	                fd_info->home_node = rpc->home_node;
+	                fd_info->orig_pid = rpc->orig_pid;
+	                fd_info->remote_fd = remote_fd;
+	            
+	                struct file *fake_file = anon_inode_getfile("mattx_vfs_proxy", &mattx_fops, fd_info, O_WRONLY);
+	                struct file *old_file = NULL;
+
+	                if (!IS_ERR(fake_file) && surrogate->files) {
+	                    spin_lock(&surrogate->files->file_lock);
+	                    struct fdtable *fdt = files_fdtable(surrogate->files);
+	                
+	                    if (local_fd < fdt->max_fds) {
+	                        old_file = rcu_dereference_raw(fdt->fd[local_fd]);
+	                        rcu_assign_pointer(fdt->fd[local_fd], fake_file);
+	                    }
+	                    spin_unlock(&surrogate->files->file_lock);
+	                
+	                    if (old_file) fput(old_file); 
+	                
+	                    printk(KERN_INFO "MattX:[RPC] Illusion Complete! Mapped Remote FD %d to Local FD %d\n", remote_fd, local_fd);
+	                } else {
+	                    if (!IS_ERR(fake_file)) fput(fake_file);
+	                    kfree(fd_info);
+	                }
+	            }
+	        }
             }
         }
 
