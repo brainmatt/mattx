@@ -36,7 +36,7 @@ int main() {
 	sleep(20);
 	FILE *testfile = fopen("/tmp/mattx-fd.log", "w");
         
-	printf(" - file opened now - closing soon ...")
+	printf(" - file opened now - closing soon ...");
 	sleep(20);
         fclose(testfile);
 	printf(" - file closed now - reopening soon for the loop ...");
