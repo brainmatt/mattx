@@ -1,1 +1,4 @@
+#!/bin/bash
+
+sudo rmmod mattx 2> /dev/null
 sudo insmod mattx.ko

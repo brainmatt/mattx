@@ -1,2 +1,5 @@
+#!/bin/bash
+
+sudo systemctl stop mattx-discd 2>/dev/null
 sudo systemctl start mattx-discd
 
