@@ -1,0 +1,20 @@
+#!/bin/bash
+
+PID=$1
+
+if [ "$PID" == "" ]; then
+	echo "usage: $0 <pid>"
+	exit
+fi
+
+while true; do 
+
+	echo "migrating foward"
+	echo "migrate $PID 814" > /proc/mattx/admin
+	sleep 10
+	echo "migrating backwards"
+	echo "migrate $PID home" > /proc/mattx/admin
+	sleep 10
+done
+
+
