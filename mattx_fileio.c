@@ -329,11 +329,142 @@ static void handle_sys_close_req(struct mattx_link *link, struct mattx_header *h
     }
 }
 
+static void handle_sys_read_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    if (payload) {
+        struct mattx_sys_read_req *req = (struct mattx_sys_read_req *)payload;
+        struct task_struct *deputy = NULL;
+        struct file *file = NULL;
+        int i;
+        
+        printk(KERN_INFO "MattX:[WORMHOLE] Received READ request for FD %u from Node %u. Reading from Deputy...\n", req->fd, hdr->sender_id);
+
+        if (req->fd >= 1000) {
+            int slot = req->fd - 1000;
+            spin_lock(&export_lock);
+            for (i = 0; i < export_count; i++) {
+                if (export_registry[i].orig_pid == req->orig_pid) {
+                    if (slot < MAX_FDS && export_registry[i].remote_files[slot]) {
+                        file = export_registry[i].remote_files[slot];
+                        get_file(file); 
+                    }
+                    break;
+                }
+            }
+            spin_unlock(&export_lock);
+        } else {
+            rcu_read_lock();
+            deputy = pid_task(find_vpid(req->orig_pid), PIDTYPE_PID);
+            if (deputy) get_task_struct(deputy);
+            rcu_read_unlock();
+            
+            if (deputy) {
+                struct files_struct *files = deputy->files;
+                if (files) {
+                    spin_lock(&files->file_lock);
+                    struct fdtable *fdt = files_fdtable(files);
+                    if (req->fd < fdt->max_fds) {
+                        file = rcu_dereference_raw(fdt->fd[req->fd]);
+                        if (file) get_file(file); 
+                    }
+                    spin_unlock(&files->file_lock);
+                }
+                put_task_struct(deputy);
+            }
+        }
+        
+        if (file) {
+            loff_t pos = file->f_pos;
+            ssize_t ret;
+            const struct cred *old_cred = NULL;
+            void *read_buf = kmalloc(req->count, GFP_KERNEL);
+            
+            if (read_buf) {
+                if (deputy) {
+                    if (deputy->mm) kthread_use_mm(deputy->mm);
+                    old_cred = override_creds(deputy->cred);
+                }
+                
+                ret = kernel_read(file, read_buf, req->count, &pos);
+                
+                if (deputy) {
+                    revert_creds(old_cred);
+                    if (deputy->mm) kthread_unuse_mm(deputy->mm);
+                }
+                
+                if (ret >= 0) {
+                    file->f_pos = pos;
+                }
+
+                // Prepare and send reply
+                size_t reply_size = sizeof(struct mattx_sys_read_reply) + (ret > 0 ? ret : 0);
+                struct mattx_sys_read_reply *reply = kmalloc(reply_size, GFP_KERNEL);
+                if (reply) {
+                    reply->orig_pid = req->orig_pid;
+                    reply->bytes_read = ret;
+                    reply->error = (ret < 0) ? ret : 0;
+                    if (ret > 0) {
+                        memcpy(reply->data, read_buf, ret);
+                    }
+                    mattx_comm_send(cluster_map[hdr->sender_id], MATTX_MSG_SYS_READ_REPLY, reply, reply_size);
+                    kfree(reply);
+                }
+                kfree(read_buf);
+            }
+            fput(file); 
+        } else {
+            // Send error reply
+            struct mattx_sys_read_reply reply;
+            reply.orig_pid = req->orig_pid;
+            reply.bytes_read = -EBADF;
+            reply.error = -EBADF;
+            mattx_comm_send(cluster_map[hdr->sender_id], MATTX_MSG_SYS_READ_REPLY, &reply, sizeof(reply));
+        }
+    }
+}
+
+static void handle_sys_read_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    if (payload) {
+        struct mattx_sys_read_reply *reply = (struct mattx_sys_read_reply *)payload;
+        int i;
+
+        printk(KERN_INFO "MattX:[RPC] Received READ_REPLY for Orig PID %u. Bytes read: %zd\n", reply->orig_pid, reply->bytes_read);
+
+        spin_lock(&guest_lock);
+        for (i = 0; i < guest_count; i++) {
+            if (guest_registry[i].orig_pid == reply->orig_pid && guest_registry[i].home_node == hdr->sender_id) {
+                
+                guest_registry[i].rpc_read_bytes = reply->bytes_read;
+                
+                if (reply->bytes_read > 0) {
+                    guest_registry[i].rpc_read_buf = kmalloc(reply->bytes_read, GFP_ATOMIC);
+                    if (guest_registry[i].rpc_read_buf) {
+                        memcpy(guest_registry[i].rpc_read_buf, reply->data, reply->bytes_read);
+                    } else {
+                        guest_registry[i].rpc_read_bytes = -ENOMEM;
+                    }
+                } else {
+                    guest_registry[i].rpc_read_buf = NULL;
+                }
+
+                guest_registry[i].rpc_done = true;
+                
+                if (guest_registry[i].rpc_wq) {
+                    wake_up_interruptible(guest_registry[i].rpc_wq);
+                }
+                break;
+            }
+        }
+        spin_unlock(&guest_lock);
+    }
+}
+
 void mattx_fileio_init_handlers(void) {
     mattx_register_handler(MATTX_MSG_SYSCALL_FWD, handle_syscall_fwd);
     mattx_register_handler(MATTX_MSG_SYS_OPEN_REQ, handle_sys_open_req);
     mattx_register_handler(MATTX_MSG_SYS_OPEN_REPLY, handle_sys_open_reply);
     mattx_register_handler(MATTX_MSG_SYS_CLOSE_REQ, handle_sys_close_req);
+    mattx_register_handler(MATTX_MSG_SYS_READ_REQ, handle_sys_read_req);
+    mattx_register_handler(MATTX_MSG_SYS_READ_REPLY, handle_sys_read_reply);
     printk(KERN_INFO "MattX: [FILEIO] Network handlers registered.\n");
 }
 
