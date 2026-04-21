@@ -42,7 +42,6 @@
 #define MAX_VMAS 256 
 #define MAX_GUESTS 1024 
 
-// --- FIXED: Increased to 256 to match the stub's FD expansion ---
 #define MAX_FDS 256 
 
 #define MATTX_MAGIC 0x4D415454 
@@ -63,7 +62,9 @@ enum mattx_msg_type {
     MATTX_MSG_RETURN_DONE,    
     MATTX_MSG_SYS_OPEN_REQ,   
     MATTX_MSG_SYS_OPEN_REPLY, 
-    MATTX_MSG_SYS_CLOSE_REQ,  // NEW: Node 2 tells Node 1 to close a file
+    MATTX_MSG_SYS_CLOSE_REQ,  
+    MATTX_MSG_SYS_READ_REQ,   // NEW: Node 2 asks Node 1 to read
+    MATTX_MSG_SYS_READ_REPLY, // NEW: Node 1 sends the data back
 };
 
 struct mattx_header {
@@ -143,17 +144,24 @@ struct mattx_sys_open_reply {
     int error;
 };
 
-// NEW: Payload for the Close Request
 struct mattx_sys_close_req {
     u32 orig_pid;
     u32 remote_fd;
 };
 
-// --- NEW: The Self-Aware FD Struct ---
-struct mattx_fake_fd_info {
-    int home_node;
+// --- NEW: Read Request Payload ---
+struct mattx_sys_read_req {
     u32 orig_pid;
-    u32 remote_fd;
+    u32 fd;
+    size_t count;
+};
+
+// --- NEW: Read Reply Payload ---
+struct mattx_sys_read_reply {
+    u32 orig_pid;
+    ssize_t bytes_read;
+    int error;
+    char data[]; 
 };
 
 struct mattx_rpc_work {
@@ -179,6 +187,10 @@ struct mattx_guest_info {
     wait_queue_head_t *rpc_wq;
     int rpc_remote_fd;
     bool rpc_done;
+    
+    // --- NEW: Buffers for Synchronous Read ---
+    void *rpc_read_buf;
+    ssize_t rpc_read_bytes;
 };
 
 struct mattx_export_info {
