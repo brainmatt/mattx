@@ -252,8 +252,6 @@ void mattx_send_vma_data(void) {
     local_migration_req = NULL;
 }
 
-
-// --- RESTORED: The Recall Trigger ---
 void mattx_trigger_recall(pid_t orig_pid) {
     int target_node = get_export_target(orig_pid);
     struct mattx_recall_req req;
@@ -272,5 +270,54 @@ void mattx_trigger_recall(pid_t orig_pid) {
 
     printk(KERN_INFO "MattX: [RECALL] Sending RECALL_REQ for PID %d to Node %d...\n", orig_pid, target_node);
     mattx_comm_send(cluster_map[target_node], MATTX_MSG_RECALL_REQ, &req, sizeof(req));
+}
+
+static void handle_ready_for_data(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    printk(KERN_INFO "MattX:[EXPORT] Received READY signal from Node %u. Starting data pump...\n", hdr->sender_id);
+    mattx_send_vma_data();
+}
+
+static void handle_recall_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    if (payload) {
+        struct mattx_recall_req *req = (struct mattx_recall_req *)payload;
+        pid_t local_stub_pid = -1;
+        int i;
+
+        printk(KERN_INFO "MattX:[EXPORT] Received RECALL request for Orig PID %u from Node %u\n", 
+               req->orig_pid, hdr->sender_id);
+        
+        spin_lock(&guest_lock);
+        for (i = 0; i < guest_count; i++) {
+            if (guest_registry[i].orig_pid == req->orig_pid && guest_registry[i].home_node == hdr->sender_id) {
+                local_stub_pid = guest_registry[i].local_pid;
+                break; 
+            }
+        }
+        spin_unlock(&guest_lock);
+
+        if (local_stub_pid != -1) {
+            struct task_struct *surrogate = NULL;
+            rcu_read_lock();
+            surrogate = pid_task(find_vpid(local_stub_pid), PIDTYPE_PID);
+            if (surrogate) get_task_struct(surrogate);
+            rcu_read_unlock();
+
+            if (surrogate) {
+                printk(KERN_INFO "MattX:[EXPORT] Found Surrogate PID %d. Capturing state...\n", surrogate->pid);
+                mattx_capture_and_return_state(surrogate, req->orig_pid, hdr->sender_id);
+                put_task_struct(surrogate);
+            } else {
+                printk(KERN_WARNING "MattX:[EXPORT] Surrogate PID %d not found!\n", local_stub_pid);
+            }
+        } else {
+            printk(KERN_WARNING "MattX:[EXPORT] Could not find guest registry entry for Orig PID %u\n", req->orig_pid);
+        }
+    }
+}
+
+void mattx_migr_init_handlers(void) {
+    mattx_register_handler(MATTX_MSG_READY_FOR_DATA, handle_ready_for_data);
+    mattx_register_handler(MATTX_MSG_RECALL_REQ, handle_recall_req);
+    printk(KERN_INFO "MattX: [EXPORT] Network handlers registered.\n");
 }
 
