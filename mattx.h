@@ -187,6 +187,12 @@ struct mattx_export_info {
     struct file *remote_files[MAX_FDS]; 
 };
 
+// This defines the standard signature for all message handlers
+typedef void (*mattx_msg_handler_fn)(struct mattx_link *link, struct mattx_header *hdr, void *payload);
+
+// Function to let other files register their handlers
+void mattx_register_handler(u32 type, mattx_msg_handler_fn handler);
+
 extern struct mattx_load_info cluster_load_table[MAX_NODES];
 extern struct mattx_link *cluster_map[MAX_NODES];
 extern struct mattx_migration_req *pending_migration;
