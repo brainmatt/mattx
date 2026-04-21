@@ -12,63 +12,6 @@ void mattx_register_handler(u32 type, mattx_msg_handler_fn handler) {
 }
 EXPORT_SYMBOL(mattx_register_handler);
 
-static ssize_t mattx_fake_write(struct file *file, const char __user *buf, size_t count, loff_t *pos) {
-    struct mattx_fake_fd_info *fd_info = file->private_data;
-    size_t to_send;
-    size_t packet_size;
-    void *packet_buf;
-    struct mattx_header *hdr;
-    struct mattx_syscall_req *req;
-
-    if (!fd_info || !cluster_map[fd_info->home_node]) return count; 
-
-    to_send = min_t(size_t, count, 4096);
-
-    packet_size = sizeof(struct mattx_header) + sizeof(struct mattx_syscall_req) + to_send;
-    packet_buf = kmalloc(packet_size, GFP_KERNEL);
-    if (!packet_buf) return -ENOMEM;
-
-    hdr = (struct mattx_header *)packet_buf;
-    req = (struct mattx_syscall_req *)(packet_buf + sizeof(struct mattx_header));
-
-    req->orig_pid = fd_info->orig_pid;
-    req->fd = fd_info->remote_fd; 
-    req->len = to_send;
-
-    if (copy_from_user(req->data, buf, to_send)) {
-        kfree(packet_buf);
-        return -EFAULT;
-    }
-
-    mattx_comm_send(cluster_map[fd_info->home_node], MATTX_MSG_SYSCALL_FWD, packet_buf + sizeof(struct mattx_header), sizeof(struct mattx_syscall_req) + to_send);
-
-    kfree(packet_buf);
-    *pos += to_send;
-    return to_send; 
-}
-
-static int mattx_fake_release(struct inode *inode, struct file *file) {
-    struct mattx_fake_fd_info *fd_info = file->private_data;
-    struct mattx_sys_close_req req;
-
-    if (fd_info) {
-        if (cluster_map[fd_info->home_node]) {
-            req.orig_pid = fd_info->orig_pid;
-            req.remote_fd = fd_info->remote_fd;
-
-            printk(KERN_INFO "MattX:[WORMHOLE] Surrogate closed FD %u. Sending CLOSE_REQ to Node %d...\n", req.remote_fd, fd_info->home_node);
-            mattx_comm_send(cluster_map[fd_info->home_node], MATTX_MSG_SYS_CLOSE_REQ, &req, sizeof(req));
-        }
-        kfree(fd_info);
-    }
-    return 0;
-}
-
-const struct file_operations mattx_fops = {
-    .write = mattx_fake_write,
-    .release = mattx_fake_release, 
-};
-
 static void mattx_handle_message(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
     // 1. Check if the message type is valid and if a handler is registered
     if (hdr->type < 256 && msg_handlers[hdr->type] != NULL) {
