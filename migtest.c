@@ -36,8 +36,8 @@ int main() {
             printf("[Worker %d] Hello from the MattX Cluster! (Tick: %d)\n", getpid(), counter++);
             fflush(stdout);
 
-//            FILE *hosts_fp = fopen("/etc/hosts", "r");
-            FILE *hosts_fp = fopen("/tmp/super.txt", "r");
+            FILE *hosts_fp = fopen("/etc/hosts", "r");
+//            FILE *hosts_fp = fopen("/tmp/super.txt", "r");
 
             
             if (hosts_fp != NULL) {

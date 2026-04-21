@@ -236,7 +236,7 @@ static void handle_sys_open_req(struct mattx_link *link, struct mattx_header *hd
             if (deputy->mm) kthread_use_mm(deputy->mm);
             old_cred = override_creds(deputy->cred);
 
-            filp = filp_open(req->filename, O_CREAT | O_WRONLY | O_APPEND, 0666);
+            filp = filp_open(req->filename, req->flags, req->mode);
             
             revert_creds(old_cred);
             if (deputy->mm) kthread_unuse_mm(deputy->mm);
