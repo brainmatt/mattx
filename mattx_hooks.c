@@ -107,17 +107,14 @@ static int entry_handler_openat(struct kretprobe_instance *ri, struct pt_regs *r
     // args: dfd (di), filename (si), open_how (dx)
     data->filename_ptr = (const char __user *)regs->si;
     
-    // We need to safely extract flags/mode from the open_how struct pointed to by dx
-    // For simplicity right now we will just use O_RDWR | O_CREAT or similar if we can't extract it
-    // Actually, do_sys_openat2 takes (int dfd, const char __user *filename, struct open_how *how)
-    // Let's copy the open_how struct from user space to get the real flags
-    struct open_how how;
-    if (copy_from_user(&how, (void __user *)regs->dx, sizeof(how)) == 0) {
-        data->flags = how.flags;
-        data->mode = how.mode;
+    // In do_sys_openat2, the third argument (dx) is a kernel-space pointer to struct open_how
+    struct open_how *how = (struct open_how *)regs->dx;
+    if (how) {
+        data->flags = how->flags;
+        data->mode = how->mode;
     } else {
-        data->flags = O_RDWR;
-        data->mode = 0666;
+        data->flags = O_RDONLY; // Safe default
+        data->mode = 0;
     }
 
     regs->si = 0; // Sabotage the syscall!
