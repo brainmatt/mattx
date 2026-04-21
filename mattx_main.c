@@ -18,79 +18,6 @@ bool balancer_enabled = true;
 u32 my_node_id = 0; 
 u32 my_ip_addr = 0;
 
-struct mattx_guest_info guest_registry[MAX_GUESTS];
-int guest_count = 0;
-DEFINE_SPINLOCK(guest_lock);
-
-bool is_guest_process(pid_t pid) {
-    int i;
-    bool found = false;
-    spin_lock(&guest_lock);
-    for (i = 0; i < guest_count; i++) {
-        if (guest_registry[i].local_pid == pid) {
-            found = true;
-            break;
-        }
-    }
-    spin_unlock(&guest_lock);
-    return found;
-}
-
-void add_guest_process(pid_t local_pid, u32 orig_pid, int home_node) {
-    spin_lock(&guest_lock);
-    if (guest_count < MAX_GUESTS) {
-        guest_registry[guest_count].local_pid = local_pid;
-        guest_registry[guest_count].orig_pid = orig_pid;
-        guest_registry[guest_count].home_node = home_node;
-        guest_count++;
-    } else {
-        printk(KERN_WARNING "MattX:[REGISTRY] Guest registry is full!\n");
-    }
-    spin_unlock(&guest_lock);
-}
-
-void remove_guest_process(int index) {
-    if (index < 0 || index >= guest_count) return;
-    guest_registry[index] = guest_registry[guest_count - 1];
-    guest_count--;
-}
-
-struct mattx_export_info export_registry[MAX_GUESTS];
-int export_count = 0;
-DEFINE_SPINLOCK(export_lock);
-
-void add_export_process(pid_t orig_pid, int target_node) {
-    spin_lock(&export_lock);
-    if (export_count < MAX_GUESTS) {
-        export_registry[export_count].orig_pid = orig_pid;
-        export_registry[export_count].target_node = target_node;
-        export_count++;
-    } else {
-        printk(KERN_WARNING "MattX: [REGISTRY] Export registry is full!\n");
-    }
-    spin_unlock(&export_lock);
-}
-
-void remove_export_process(int index) {
-    if (index < 0 || index >= export_count) return;
-    export_registry[index] = export_registry[export_count - 1];
-    export_count--;
-}
-
-int get_export_target(pid_t orig_pid) {
-    int target = -1;
-    int i;
-    spin_lock(&export_lock);
-    for (i = 0; i < export_count; i++) {
-        if (export_registry[i].orig_pid == orig_pid) {
-            target = export_registry[i].target_node;
-            break;
-        }
-    }
-    spin_unlock(&export_lock);
-    return target;
-}
-
 enum { MATTX_ATTR_UNSPEC, MATTX_ATTR_NODE_ID, MATTX_ATTR_IPV4_ADDR, MATTX_ATTR_STUB_PID, MATTX_ATTR_BLUEPRINT, MATTX_ATTR_MY_NODE_ID, MATTX_ATTR_LOCAL_IP, __MATTX_ATTR_MAX };
 #define MATTX_ATTR_MAX (__MATTX_ATTR_MAX - 1)
 
@@ -211,9 +138,6 @@ static int __init mattx_init(void) {
     int rc = genl_register_family(&mattx_genl_family);
     if (rc) return rc;
     
-    spin_lock_init(&guest_lock); 
-    spin_lock_init(&export_lock); 
-    
     if (mattx_proc_init() < 0) {
         printk(KERN_ERR "MattX: Failed to create /proc/mattx interface\n");
     }
@@ -225,6 +149,7 @@ static int __init mattx_init(void) {
     mattx_sched_init_handlers();
     mattx_import_init_handlers();
     mattx_migr_init_handlers();
+    mattx_guest_init_handlers();
 
     balancer_thread = kthread_run(mattx_balancer_loop, NULL, "mattx_balancer");
     listener_thread = kthread_run(mattx_listener_loop, NULL, "mattx_listener");
