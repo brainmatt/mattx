@@ -144,13 +144,24 @@ struct mattx_sys_open_reply {
     int error;
 };
 
-// NEW: Payload for the Close Request
 struct mattx_sys_close_req {
     u32 orig_pid;
     u32 remote_fd;
 };
 
-// --- NEW: The Self-Aware FD Struct ---
+struct mattx_sys_read_req {
+    u32 orig_pid;
+    u32 fd;
+    size_t count;
+};
+
+struct mattx_sys_read_reply {
+    u32 orig_pid;
+    ssize_t bytes_read;
+    int error;
+    char data[];
+};
+
 struct mattx_fake_fd_info {
     int home_node;
     u32 orig_pid;
