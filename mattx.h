@@ -237,6 +237,7 @@ int mattx_hooks_init(void);
 void mattx_hooks_exit(void);
 
 void mattx_sched_init_handlers(void);
+void mattx_import_init_handlers(void);
 
 extern const struct file_operations mattx_fops; 
 

@@ -223,6 +223,7 @@ static int __init mattx_init(void) {
     }
 
     mattx_sched_init_handlers();
+    mattx_import_init_handlers();
 
     balancer_thread = kthread_run(mattx_balancer_loop, NULL, "mattx_balancer");
     listener_thread = kthread_run(mattx_listener_loop, NULL, "mattx_listener");
