@@ -1,90 +1,6 @@
 #include "mattx.h"
-#include <linux/wait.h> // NEW: For wait_event_interruptible
 
 static int injected_pages_count = 0;
-
-// Helper to safely check if the RPC is done while we are sleeping
-static bool check_rpc_done(pid_t pid) {
-    bool done = false;
-    spin_lock(&guest_lock);
-    for (int i = 0; i < guest_count; i++) {
-        if (guest_registry[i].local_pid == pid) {
-            done = guest_registry[i].rpc_done;
-            break;
-        }
-    }
-    spin_unlock(&guest_lock);
-    return done;
-}
-
-// --- NEW: The Fake File Read Operation (Runs on Node 2) ---
-static ssize_t mattx_fake_read(struct file *file, char __user *buf, size_t count, loff_t *pos) {
-    struct mattx_fake_fd_info *fd_info = file->private_data;
-    struct mattx_sys_read_req req;
-    DECLARE_WAIT_QUEUE_HEAD_ONSTACK(rpc_wq);
-    pid_t my_pid = current->pid;
-    int i;
-    ssize_t ret_bytes = 0;
-    void *read_buf = NULL;
-
-    if (!fd_info || !cluster_map[fd_info->home_node]) return -EIO;
-
-    // Cap read size to prevent massive kmallocs on the network
-    size_t to_read = min_t(size_t, count, 4096);
-
-    req.orig_pid = fd_info->orig_pid;
-    req.fd = fd_info->remote_fd;
-    req.count = to_read;
-
-    // 1. Attach our wait queue to the registry
-    spin_lock(&guest_lock);
-    for (i = 0; i < guest_count; i++) {
-        if (guest_registry[i].local_pid == my_pid) {
-            guest_registry[i].rpc_wq = &rpc_wq;
-            guest_registry[i].rpc_done = false;
-            guest_registry[i].rpc_read_buf = NULL;
-            guest_registry[i].rpc_read_bytes = 0;
-            break;
-        }
-    }
-    spin_unlock(&guest_lock);
-
-    printk(KERN_INFO "MattX:[WORMHOLE] Surrogate %d requesting %zu bytes from FD %u. Sleeping...\n", my_pid, to_read, req.fd);
-
-    // 2. Send the request to Node 1
-    mattx_comm_send(cluster_map[fd_info->home_node], MATTX_MSG_SYS_READ_REQ, &req, sizeof(req));
-
-    // 3. Go to sleep until Node 1 replies!
-    wait_event_interruptible(rpc_wq, check_rpc_done(my_pid));
-
-    // 4. We woke up! Collect the data from the registry
-    spin_lock(&guest_lock);
-    for (i = 0; i < guest_count; i++) {
-        if (guest_registry[i].local_pid == my_pid) {
-            read_buf = guest_registry[i].rpc_read_buf;
-            ret_bytes = guest_registry[i].rpc_read_bytes;
-            
-            guest_registry[i].rpc_wq = NULL;
-            guest_registry[i].rpc_read_buf = NULL;
-            break;
-        }
-    }
-    spin_unlock(&guest_lock);
-
-    // 5. Copy the data to user-space
-    if (ret_bytes > 0 && read_buf) {
-        if (copy_to_user(buf, read_buf, ret_bytes)) {
-            ret_bytes = -EFAULT;
-        } else {
-            *pos += ret_bytes; // Advance the file position!
-        }
-    }
-
-    if (read_buf) kfree(read_buf);
-
-    printk(KERN_INFO "MattX:[WORMHOLE] Surrogate %d woke up! Read %zd bytes.\n", my_pid, ret_bytes);
-    return ret_bytes;
-}
 
 static ssize_t mattx_fake_write(struct file *file, const char __user *buf, size_t count, loff_t *pos) {
     struct mattx_fake_fd_info *fd_info = file->private_data;
@@ -139,7 +55,6 @@ static int mattx_fake_release(struct inode *inode, struct file *file) {
 }
 
 const struct file_operations mattx_fops = {
-    .read = mattx_fake_read, // NEW: Hook into the VFS read event!
     .write = mattx_fake_write,
     .release = mattx_fake_release, 
 };
@@ -227,6 +142,7 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
                     retries--;
                 }
 
+                // --- RESTORED: The Full Brain Transplant! ---
                 regs = task_pt_regs(hijacked_stub_task);
                 if (regs) {
                     memcpy(regs, &pending_migration->regs, sizeof(struct pt_regs));
@@ -383,63 +299,46 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
                 struct mattx_syscall_req *req = (struct mattx_syscall_req *)payload;
                 struct task_struct *deputy = NULL;
                 struct file *file = NULL;
-                int i;
                 
-                if (req->fd >= 1000) {
-                    int slot = req->fd - 1000;
-                    spin_lock(&export_lock);
-                    for (i = 0; i < export_count; i++) {
-                        if (export_registry[i].orig_pid == req->orig_pid) {
-                            if (slot < MAX_FDS && export_registry[i].remote_files[slot]) {
-                                file = export_registry[i].remote_files[slot];
-                                get_file(file); 
-                            }
-                            break;
-                        }
-                    }
-                    spin_unlock(&export_lock);
-                } else {
-                    rcu_read_lock();
-                    deputy = pid_task(find_vpid(req->orig_pid), PIDTYPE_PID);
-                    if (deputy) get_task_struct(deputy);
-                    rcu_read_unlock();
-                    
-                    if (deputy) {
-                        struct files_struct *files = deputy->files;
-                        if (files) {
-                            spin_lock(&files->file_lock);
-                            struct fdtable *fdt = files_fdtable(files);
-                            if (req->fd < fdt->max_fds) {
-                                file = rcu_dereference_raw(fdt->fd[req->fd]);
-                                if (file) get_file(file); 
-                            }
-                            spin_unlock(&files->file_lock);
-                        }
-                        put_task_struct(deputy);
-                    }
-                }
+                rcu_read_lock();
+                deputy = pid_task(find_vpid(req->orig_pid), PIDTYPE_PID);
+                if (deputy) get_task_struct(deputy);
+                rcu_read_unlock();
                 
-                if (file) {
-                    loff_t pos = file->f_pos;
-                    ssize_t ret;
-                    const struct cred *old_cred = NULL;
+                if (deputy) {
+                    struct files_struct *files = deputy->files;
+                    if (files) {
+                        spin_lock(&files->file_lock);
+                        struct fdtable *fdt = files_fdtable(files);
+                        if (req->fd < fdt->max_fds) {
+                            file = rcu_dereference_raw(fdt->fd[req->fd]);
+                            if (file) get_file(file); 
+                        }
+                        spin_unlock(&files->file_lock);
+                    }
                     
-                    if (deputy) {
+                    if (file) {
+                        loff_t pos = file->f_pos;
+                        ssize_t ret;
+                        const struct cred *old_cred = NULL;
+                        
                         if (deputy->mm) kthread_use_mm(deputy->mm);
                         old_cred = override_creds(deputy->cred);
-                    }
-                    
-                    ret = kernel_write(file, req->data, req->len, &pos);
-                    
-                    if (deputy) {
+                        
+                        ret = kernel_write(file, req->data, req->len, &pos);
+                        
                         revert_creds(old_cred);
                         if (deputy->mm) kthread_unuse_mm(deputy->mm);
+                        
+                        if (ret < 0) {
+                            printk(KERN_ERR "MattX:[WORMHOLE] kernel_write failed for FD %u with error %zd\n", req->fd, ret);
+                        } else {
+                            file->f_pos = pos;
+                            // printk(KERN_INFO "MattX:[WORMHOLE] Successfully wrote %zd bytes to FD %u\n", ret, req->fd);
+                        }
+                        fput(file); 
                     }
-                    
-                    if (ret >= 0) {
-                        file->f_pos = pos;
-                    }
-                    fput(file); 
+                    put_task_struct(deputy);
                 }
             }
             break;
@@ -537,137 +436,6 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
             }
             break;
             
-        // --- NEW: Node 1 receives READ_REQ, reads the file, and sends READ_REPLY ---
-        case MATTX_MSG_SYS_READ_REQ:
-            if (payload) {
-                struct mattx_sys_read_req *req = (struct mattx_sys_read_req *)payload;
-                struct task_struct *deputy = NULL;
-                struct file *file = NULL;
-                int i;
-                
-                printk(KERN_INFO "MattX:[WORMHOLE] Received READ request for FD %u from Node %u. Reading from Deputy...\n", req->fd, hdr->sender_id);
-
-                if (req->fd >= 1000) {
-                    int slot = req->fd - 1000;
-                    spin_lock(&export_lock);
-                    for (i = 0; i < export_count; i++) {
-                        if (export_registry[i].orig_pid == req->orig_pid) {
-                            if (slot < MAX_FDS && export_registry[i].remote_files[slot]) {
-                                file = export_registry[i].remote_files[slot];
-                                get_file(file); 
-                            }
-                            break;
-                        }
-                    }
-                    spin_unlock(&export_lock);
-                } else {
-                    rcu_read_lock();
-                    deputy = pid_task(find_vpid(req->orig_pid), PIDTYPE_PID);
-                    if (deputy) get_task_struct(deputy);
-                    rcu_read_unlock();
-                    
-                    if (deputy) {
-                        struct files_struct *files = deputy->files;
-                        if (files) {
-                            spin_lock(&files->file_lock);
-                            struct fdtable *fdt = files_fdtable(files);
-                            if (req->fd < fdt->max_fds) {
-                                file = rcu_dereference_raw(fdt->fd[req->fd]);
-                                if (file) get_file(file); 
-                            }
-                            spin_unlock(&files->file_lock);
-                        }
-                        put_task_struct(deputy);
-                    }
-                }
-                
-                if (file) {
-                    loff_t pos = file->f_pos;
-                    ssize_t ret;
-                    const struct cred *old_cred = NULL;
-                    void *read_buf = kmalloc(req->count, GFP_KERNEL);
-                    
-                    if (read_buf) {
-                        if (deputy) {
-                            if (deputy->mm) kthread_use_mm(deputy->mm);
-                            old_cred = override_creds(deputy->cred);
-                        }
-                        
-                        ret = kernel_read(file, read_buf, req->count, &pos);
-                        
-                        if (deputy) {
-                            revert_creds(old_cred);
-                            if (deputy->mm) kthread_unuse_mm(deputy->mm);
-                        }
-                        
-                        if (ret >= 0) {
-                            file->f_pos = pos;
-                        }
-
-                        // Prepare and send reply
-                        size_t reply_size = sizeof(struct mattx_sys_read_reply) + (ret > 0 ? ret : 0);
-                        struct mattx_sys_read_reply *reply = kmalloc(reply_size, GFP_KERNEL);
-                        if (reply) {
-                            reply->orig_pid = req->orig_pid;
-                            reply->bytes_read = ret;
-                            reply->error = (ret < 0) ? ret : 0;
-                            if (ret > 0) {
-                                memcpy(reply->data, read_buf, ret);
-                            }
-                            mattx_comm_send(cluster_map[hdr->sender_id], MATTX_MSG_SYS_READ_REPLY, reply, reply_size);
-                            kfree(reply);
-                        }
-                        kfree(read_buf);
-                    }
-                    fput(file); 
-                } else {
-                    // Send error reply
-                    struct mattx_sys_read_reply reply;
-                    reply.orig_pid = req->orig_pid;
-                    reply.bytes_read = -EBADF;
-                    reply.error = -EBADF;
-                    mattx_comm_send(cluster_map[hdr->sender_id], MATTX_MSG_SYS_READ_REPLY, &reply, sizeof(reply));
-                }
-            }
-            break;
-
-        // --- NEW: Node 2 receives the READ_REPLY and wakes up the Surrogate ---
-        case MATTX_MSG_SYS_READ_REPLY:
-            if (payload) {
-                struct mattx_sys_read_reply *reply = (struct mattx_sys_read_reply *)payload;
-                int i;
-
-                printk(KERN_INFO "MattX:[RPC] Received READ_REPLY for Orig PID %u. Bytes read: %zd\n", reply->orig_pid, reply->bytes_read);
-
-                spin_lock(&guest_lock);
-                for (i = 0; i < guest_count; i++) {
-                    if (guest_registry[i].orig_pid == reply->orig_pid && guest_registry[i].home_node == hdr->sender_id) {
-                        
-                        guest_registry[i].rpc_read_bytes = reply->bytes_read;
-                        
-                        if (reply->bytes_read > 0) {
-                            guest_registry[i].rpc_read_buf = kmalloc(reply->bytes_read, GFP_ATOMIC);
-                            if (guest_registry[i].rpc_read_buf) {
-                                memcpy(guest_registry[i].rpc_read_buf, reply->data, reply->bytes_read);
-                            } else {
-                                guest_registry[i].rpc_read_bytes = -ENOMEM;
-                            }
-                        } else {
-                            guest_registry[i].rpc_read_buf = NULL;
-                        }
-
-                        guest_registry[i].rpc_done = true;
-                        
-                        if (guest_registry[i].rpc_wq) {
-                            wake_up_interruptible(guest_registry[i].rpc_wq);
-                        }
-                        break;
-                    }
-                }
-                spin_unlock(&guest_lock);
-            }
-            break;
-
         case MATTX_MSG_RECALL_REQ:
             if (payload) {
                 struct mattx_recall_req *req = (struct mattx_recall_req *)payload;
@@ -787,6 +555,32 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
                 kvfree(pending_migration);
                 pending_migration = NULL;
                 pending_source_node = -1;
+            }
+            break;
+
+        case MATTX_MSG_SYS_OPEN_REPLY:
+            if (payload) {
+                struct mattx_sys_open_reply *reply = (struct mattx_sys_open_reply *)payload;
+                int i;
+
+                printk(KERN_INFO "MattX:[RPC] Received OPEN_REPLY for Orig PID %u. Remote FD is %d.\n", reply->orig_pid, reply->remote_fd);
+
+                spin_lock(&guest_lock);
+                for (i = 0; i < guest_count; i++) {
+                    if (guest_registry[i].orig_pid == reply->orig_pid && guest_registry[i].home_node == hdr->sender_id) {
+                        
+                        // Save the result and mark the RPC as done
+                        guest_registry[i].rpc_remote_fd = reply->remote_fd;
+                        guest_registry[i].rpc_done = true;
+                        
+                        // Wake up the sleeping Kprobe!
+                        if (guest_registry[i].rpc_wq) {
+                            wake_up_interruptible(guest_registry[i].rpc_wq);
+                        }
+                        break;
+                    }
+                }
+                spin_unlock(&guest_lock);
             }
             break;
 
