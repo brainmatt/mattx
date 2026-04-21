@@ -240,7 +240,7 @@ void mattx_sched_init_handlers(void);
 void mattx_import_init_handlers(void);
 void mattx_migr_init_handlers(void);
 void mattx_guest_init_handlers(void);
-
+void mattx_fileio_init_handlers(void);
 
 extern const struct file_operations mattx_fops; 
 
