@@ -1,7 +1,5 @@
 #include "mattx.h"
 
-static int injected_pages_count = 0;
-
 // An array of function pointers, indexed by the message type (up to 256 types)
 static mattx_msg_handler_fn msg_handlers[256] = {NULL};
 
@@ -70,9 +68,6 @@ const struct file_operations mattx_fops = {
     .write = mattx_fake_write,
     .release = mattx_fake_release, 
 };
-
-static char *stub_argv[] = { "/usr/local/bin/mattx-stub", NULL };
-static char *stub_envp[] = { "HOME=/", "PATH=/sbin:/bin:/usr/sbin:/usr/bin", NULL };
 
 static void mattx_handle_message(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
     // 1. Check if the message type is valid and if a handler is registered
