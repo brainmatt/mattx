@@ -1,6 +1,90 @@
 #include "mattx.h"
+#include <linux/wait.h>
 
 // --- The VFS Proxy (Fake FDs) ---
+
+// Helper to safely check if the RPC is done while we are sleeping
+static bool check_rpc_done(pid_t pid) {
+    bool done = false;
+    spin_lock(&guest_lock);
+    for (int i = 0; i < guest_count; i++) {
+        if (guest_registry[i].local_pid == pid) {
+            done = guest_registry[i].rpc_done;
+            break;
+        }
+    }
+    spin_unlock(&guest_lock);
+    return done;
+}
+
+// --- NEW: The Fake File Read Operation (Runs on Node 2) ---
+static ssize_t mattx_fake_read(struct file *file, char __user *buf, size_t count, loff_t *pos) {
+    struct mattx_fake_fd_info *fd_info = file->private_data;
+    struct mattx_sys_read_req req;
+    DECLARE_WAIT_QUEUE_HEAD_ONSTACK(rpc_wq);
+    pid_t my_pid = current->pid;
+    int i;
+    ssize_t ret_bytes = 0;
+    void *read_buf = NULL;
+
+    if (!fd_info || !cluster_map[fd_info->home_node]) return -EIO;
+
+    // Cap read size to prevent massive kmallocs on the network
+    size_t to_read = min_t(size_t, count, 4096);
+
+    req.orig_pid = fd_info->orig_pid;
+    req.fd = fd_info->remote_fd;
+    req.count = to_read;
+
+    // 1. Attach our wait queue to the registry
+    spin_lock(&guest_lock);
+    for (i = 0; i < guest_count; i++) {
+        if (guest_registry[i].local_pid == my_pid) {
+            guest_registry[i].rpc_wq = &rpc_wq;
+            guest_registry[i].rpc_done = false;
+            guest_registry[i].rpc_read_buf = NULL;
+            guest_registry[i].rpc_read_bytes = 0;
+            break;
+        }
+    }
+    spin_unlock(&guest_lock);
+
+    printk(KERN_INFO "MattX:[WORMHOLE] Surrogate %d requesting %zu bytes from FD %u. Sleeping...\n", my_pid, to_read, req.fd);
+
+    // 2. Send the request to Node 1
+    mattx_comm_send(cluster_map[fd_info->home_node], MATTX_MSG_SYS_READ_REQ, &req, sizeof(req));
+
+    // 3. Go to sleep until Node 1 replies!
+    wait_event_interruptible(rpc_wq, check_rpc_done(my_pid));
+
+    // 4. We woke up! Collect the data from the registry
+    spin_lock(&guest_lock);
+    for (i = 0; i < guest_count; i++) {
+        if (guest_registry[i].local_pid == my_pid) {
+            read_buf = guest_registry[i].rpc_read_buf;
+            ret_bytes = guest_registry[i].rpc_read_bytes;
+            
+            guest_registry[i].rpc_wq = NULL;
+            guest_registry[i].rpc_read_buf = NULL;
+            break;
+        }
+    }
+    spin_unlock(&guest_lock);
+
+    // 5. Copy the data to user-space
+    if (ret_bytes > 0 && read_buf) {
+        if (copy_to_user(buf, read_buf, ret_bytes)) {
+            ret_bytes = -EFAULT;
+        } else {
+            *pos += ret_bytes; // Advance the file position!
+        }
+    }
+
+    if (read_buf) kfree(read_buf);
+
+    printk(KERN_INFO "MattX:[WORMHOLE] Surrogate %d woke up! Read %zd bytes.\n", my_pid, ret_bytes);
+    return ret_bytes;
+}
 
 static ssize_t mattx_fake_write(struct file *file, const char __user *buf, size_t count, loff_t *pos) {
     struct mattx_fake_fd_info *fd_info = file->private_data;
@@ -55,6 +139,7 @@ static int mattx_fake_release(struct inode *inode, struct file *file) {
 }
 
 const struct file_operations mattx_fops = {
+    .read = mattx_fake_read,
     .write = mattx_fake_write,
     .release = mattx_fake_release, 
 };

@@ -42,7 +42,6 @@
 #define MAX_VMAS 256 
 #define MAX_GUESTS 1024 
 
-// --- FIXED: Increased to 256 to match the stub's FD expansion ---
 #define MAX_FDS 256 
 
 #define MATTX_MAGIC 0x4D415454 
@@ -63,7 +62,9 @@ enum mattx_msg_type {
     MATTX_MSG_RETURN_DONE,    
     MATTX_MSG_SYS_OPEN_REQ,   
     MATTX_MSG_SYS_OPEN_REPLY, 
-    MATTX_MSG_SYS_CLOSE_REQ,  // NEW: Node 2 tells Node 1 to close a file
+    MATTX_MSG_SYS_CLOSE_REQ, 
+    MATTX_MSG_SYS_READ_REQ,
+    MATTX_MSG_SYS_READ_REPLY,
 };
 
 struct mattx_header {
@@ -179,6 +180,8 @@ struct mattx_guest_info {
     wait_queue_head_t *rpc_wq;
     int rpc_remote_fd;
     bool rpc_done;
+    void *rpc_read_buf;
+    ssize_t rpc_read_bytes;
 };
 
 struct mattx_export_info {
