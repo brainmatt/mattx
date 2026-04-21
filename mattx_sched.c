@@ -184,3 +184,27 @@ int mattx_balancer_loop(void *data) {
     return 0;
 }
 
+
+// --- NEW: Network Handlers for the Scheduler ---
+static void handle_heartbeat(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    if (link->node_id == -1 && hdr->sender_id < MAX_NODES) {
+        link->node_id = hdr->sender_id;
+        cluster_map[link->node_id] = link;
+        printk(KERN_INFO "MattX: [SCHED] Registered new connection from Node %u\n", hdr->sender_id);
+    }
+}
+
+static void handle_load_update(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    if (hdr->sender_id < MAX_NODES && payload) {
+        struct mattx_load_info *load = (struct mattx_load_info *)payload;
+        cluster_load_table[hdr->sender_id] = *load;
+    }
+}
+
+// This function tells the core router to send these specific messages to us!
+void mattx_sched_init_handlers(void) {
+    mattx_register_handler(MATTX_MSG_HEARTBEAT, handle_heartbeat);
+    mattx_register_handler(MATTX_MSG_LOAD_UPDATE, handle_load_update);
+    printk(KERN_INFO "MattX: [SCHED] Network handlers registered.\n");
+}
+

@@ -221,7 +221,9 @@ static int __init mattx_init(void) {
     if (mattx_hooks_init() < 0) {
         printk(KERN_ERR "MattX: Failed to register Kprobes! Syscall routing disabled.\n");
     }
-    
+
+    mattx_sched_init_handlers();
+
     balancer_thread = kthread_run(mattx_balancer_loop, NULL, "mattx_balancer");
     listener_thread = kthread_run(mattx_listener_loop, NULL, "mattx_listener");
     if (IS_ERR(balancer_thread) || IS_ERR(listener_thread)) {
