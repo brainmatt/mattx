@@ -174,6 +174,8 @@ struct mattx_rpc_work {
     u32 orig_pid;
     int home_node;
     char filename[256];
+    int flags;
+    int mode;
 };
 
 struct mattx_link {

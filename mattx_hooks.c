@@ -12,6 +12,8 @@ static void mattx_rpc_worker(struct work_struct *work) {
     memset(&req, 0, sizeof(req));
     req.orig_pid = rpc->orig_pid;
     strncpy(req.filename, rpc->filename, sizeof(req.filename) - 1);
+    req.flags = rpc->flags;
+    req.mode = rpc->mode;
 
     printk(KERN_INFO "MattX:[RPC] Worker started for PID %d. Sending OPEN_REQ to Node %d...\n", rpc->local_pid, rpc->home_node);
     
@@ -53,7 +55,8 @@ static void mattx_rpc_worker(struct work_struct *work) {
                     fd_info->orig_pid = rpc->orig_pid;
                     fd_info->remote_fd = remote_fd;
                     
-                    struct file *fake_file = anon_inode_getfile("mattx_vfs_proxy", &mattx_fops, fd_info, O_WRONLY);
+                    // Use the original flags (filtered to file access modes) to create the fake file
+                    struct file *fake_file = anon_inode_getfile("mattx_vfs_proxy", &mattx_fops, fd_info, rpc->flags & O_ACCMODE);
                     struct file *old_file = NULL;
 
                     if (!IS_ERR(fake_file) && surrogate->files) {
@@ -88,12 +91,35 @@ static void mattx_rpc_worker(struct work_struct *work) {
     kfree(rpc);
 }
 
+struct kretprobe_data {
+    const char __user *filename_ptr;
+    int flags;
+    int mode;
+};
+
 static int entry_handler_openat(struct kretprobe_instance *ri, struct pt_regs *regs) {
     pid_t my_pid = current->pid;
+    struct kretprobe_data *data = (struct kretprobe_data *)ri->data;
 
     if (!is_guest_process(my_pid)) return 0; 
 
-    *((const char __user **)ri->data) = (const char __user *)regs->si;
+    // Extract the original arguments from do_sys_openat2
+    // args: dfd (di), filename (si), open_how (dx)
+    data->filename_ptr = (const char __user *)regs->si;
+    
+    // We need to safely extract flags/mode from the open_how struct pointed to by dx
+    // For simplicity right now we will just use O_RDWR | O_CREAT or similar if we can't extract it
+    // Actually, do_sys_openat2 takes (int dfd, const char __user *filename, struct open_how *how)
+    // Let's copy the open_how struct from user space to get the real flags
+    struct open_how how;
+    if (copy_from_user(&how, (void __user *)regs->dx, sizeof(how)) == 0) {
+        data->flags = how.flags;
+        data->mode = how.mode;
+    } else {
+        data->flags = O_RDWR;
+        data->mode = 0666;
+    }
+
     regs->si = 0; // Sabotage the syscall!
 
     return 0;
@@ -101,7 +127,7 @@ static int entry_handler_openat(struct kretprobe_instance *ri, struct pt_regs *r
 
 static int ret_handler_openat(struct kretprobe_instance *ri, struct pt_regs *regs) {
     pid_t my_pid = current->pid;
-    const char __user *filename_ptr;
+    struct kretprobe_data *data = (struct kretprobe_data *)ri->data;
     char filename[256] = {0};
     int home_node = -1;
     u32 orig_pid = 0;
@@ -109,9 +135,7 @@ static int ret_handler_openat(struct kretprobe_instance *ri, struct pt_regs *reg
 
     if (!is_guest_process(my_pid)) return 0;
 
-    filename_ptr = *((const char __user **)ri->data);
-
-    if (strncpy_from_user(filename, filename_ptr, sizeof(filename) - 1) > 0) {
+    if (strncpy_from_user(filename, data->filename_ptr, sizeof(filename) - 1) > 0) {
         
         spin_lock(&guest_lock);
         for (i = 0; i < guest_count; i++) {
@@ -131,6 +155,8 @@ static int ret_handler_openat(struct kretprobe_instance *ri, struct pt_regs *reg
                 rpc->local_pid = my_pid;
                 rpc->orig_pid = orig_pid;
                 rpc->home_node = home_node;
+                rpc->flags = data->flags;
+                rpc->mode = data->mode;
                 strncpy(rpc->filename, filename, sizeof(rpc->filename) - 1);
 
                 printk(KERN_INFO "MattX:[HOOK] Intercepted open('%s'). Freezing Surrogate %d and escaping to Workqueue...\n", filename, my_pid);
@@ -150,7 +176,7 @@ int mattx_hooks_init(void) {
     openat_kprobe.kp.symbol_name = "do_sys_openat2";
     openat_kprobe.entry_handler = entry_handler_openat;
     openat_kprobe.handler = ret_handler_openat;
-    openat_kprobe.data_size = sizeof(const char __user *); 
+    openat_kprobe.data_size = sizeof(struct kretprobe_data); 
     openat_kprobe.maxactive = 64; 
 
     ret = register_kretprobe(&openat_kprobe);
