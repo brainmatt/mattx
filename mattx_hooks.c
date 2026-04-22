@@ -256,8 +256,8 @@ static int entry_handler_statx(struct kretprobe_instance *ri, struct pt_regs *re
     data->is_wormhole_fd = false;
     data->remote_fd = -1;
 
-    // We only care about fstat-like calls (AT_EMPTY_PATH) on our fake FDs
-    if ((data->flags & AT_EMPTY_PATH) && data->dfd >= 0) {
+    // We intercept any statx call that targets one of our fake FDs
+    if (data->dfd >= 0) {
         struct file *f = fget(data->dfd);
         if (f) {
             if (f->f_op == &mattx_fops) {
