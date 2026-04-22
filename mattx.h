@@ -235,7 +235,7 @@ struct mattx_guest_info {
     void *rpc_read_buf;
     ssize_t rpc_read_bytes;
     loff_t rpc_lseek_res;
-    struct statx rpc_statx_buf;
+    struct statx *rpc_statx_buf;
 };
 
 struct mattx_export_info {

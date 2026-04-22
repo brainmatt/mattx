@@ -697,7 +697,15 @@ static void handle_sys_statx_reply(struct mattx_link *link, struct mattx_header 
         for (i = 0; i < guest_count; i++) {
             if (guest_registry[i].orig_pid == reply->orig_pid && guest_registry[i].home_node == hdr->sender_id) {
                 
-                memcpy(&guest_registry[i].rpc_statx_buf, &reply->statx_buf, sizeof(struct statx));
+                if (reply->error == 0) {
+                    guest_registry[i].rpc_statx_buf = kmalloc(sizeof(struct statx), GFP_ATOMIC);
+                    if (guest_registry[i].rpc_statx_buf) {
+                        memcpy(guest_registry[i].rpc_statx_buf, &reply->statx_buf, sizeof(struct statx));
+                    }
+                } else {
+                    guest_registry[i].rpc_statx_buf = NULL;
+                }
+                
                 guest_registry[i].rpc_done = true;
                 
                 if (guest_registry[i].rpc_wq) {

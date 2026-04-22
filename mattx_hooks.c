@@ -59,14 +59,15 @@ static void mattx_rpc_worker(struct work_struct *work) {
     if (surrogate) {
         if (rpc->is_statx) {
             struct pt_regs *regs = task_pt_regs(surrogate);
-            struct statx statx_buf;
+            struct statx *statx_buf = NULL;
             bool success = false;
 
             spin_lock(&guest_lock);
             for (i = 0; i < guest_count; i++) {
                 if (guest_registry[i].local_pid == rpc->local_pid) {
-                    memcpy(&statx_buf, &guest_registry[i].rpc_statx_buf, sizeof(struct statx));
-                    success = true;
+                    statx_buf = guest_registry[i].rpc_statx_buf;
+                    guest_registry[i].rpc_statx_buf = NULL; // Take ownership
+                    success = (statx_buf != NULL);
                     break;
                 }
             }
@@ -74,13 +75,14 @@ static void mattx_rpc_worker(struct work_struct *work) {
 
             if (success) {
                 if (surrogate->mm) kthread_use_mm(surrogate->mm);
-                if (copy_to_user(rpc->statx_buffer, &statx_buf, sizeof(struct statx))) {
+                if (copy_to_user(rpc->statx_buffer, statx_buf, sizeof(struct statx))) {
                     regs->ax = -EFAULT;
                 } else {
                     regs->ax = 0; // Success!
                 }
                 if (surrogate->mm) kthread_unuse_mm(surrogate->mm);
                 
+                kfree(statx_buf); // Free the memory we took ownership of
                 printk(KERN_INFO "MattX:[RPC] Illusion Complete! Wrote statx to Surrogate %d\n", rpc->local_pid);
             } else {
                 regs->ax = -EBADF;
