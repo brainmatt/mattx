@@ -48,6 +48,11 @@ static void mattx_rpc_worker(struct work_struct *work) {
             struct pt_regs *regs = task_pt_regs(surrogate);
             int local_fd = regs ? regs->ax : -1; 
 
+            printk(KERN_INFO "MattX:[DEBUG] Remote FD from VM1: %d. Local regs->ax: %d\n", remote_fd, local_fd);
+            if (local_fd < 0) {
+                printk(KERN_ERR "MattX:[DEBUG] CRITICAL: Local syscall failed! The Illusion is skipping injection!\n");
+            }
+
             if (local_fd >= 0) {
                 struct mattx_fake_fd_info *fd_info = kmalloc(sizeof(*fd_info), GFP_KERNEL);
                 if (fd_info) {
