@@ -50,7 +50,21 @@ static void mattx_rpc_worker(struct work_struct *work) {
 
             printk(KERN_INFO "MattX:[DEBUG] Remote FD from VM1: %d. Local regs->ax: %d\n", remote_fd, local_fd);
             if (local_fd < 0) {
-                printk(KERN_ERR "MattX:[DEBUG] CRITICAL: Local syscall failed! The Illusion is skipping injection!\n");
+                printk(KERN_ERR "MattX:[DEBUG] Local syscall failed (expected)! Searching for a free FD slot...\n");
+                
+                if (surrogate->files) {
+                    spin_lock(&surrogate->files->file_lock);
+                    struct fdtable *fdt = files_fdtable(surrogate->files);
+                    int fd;
+                    for (fd = 3; fd < fdt->max_fds; fd++) {
+                        if (!rcu_dereference_raw(fdt->fd[fd])) {
+                            local_fd = fd;
+                            __set_bit(fd, fdt->open_fds);
+                            break;
+                        }
+                    }
+                    spin_unlock(&surrogate->files->file_lock);
+                }
             }
 
             if (local_fd >= 0) {
