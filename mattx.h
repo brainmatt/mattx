@@ -65,6 +65,8 @@ enum mattx_msg_type {
     MATTX_MSG_SYS_CLOSE_REQ, 
     MATTX_MSG_SYS_READ_REQ,
     MATTX_MSG_SYS_READ_REPLY,
+    MATTX_MSG_SYS_LSEEK_REQ,
+    MATTX_MSG_SYS_LSEEK_REPLY,
 };
 
 struct mattx_header {
@@ -162,6 +164,19 @@ struct mattx_sys_read_reply {
     char data[];
 };
 
+struct mattx_sys_lseek_req {
+    u32 orig_pid;
+    u32 fd;
+    loff_t offset;
+    int whence;
+};
+
+struct mattx_sys_lseek_reply {
+    u32 orig_pid;
+    loff_t result_offset;
+    int error;
+};
+
 struct mattx_fake_fd_info {
     int home_node;
     u32 orig_pid;
@@ -195,6 +210,7 @@ struct mattx_guest_info {
     bool rpc_done;
     void *rpc_read_buf;
     ssize_t rpc_read_bytes;
+    loff_t rpc_lseek_res;
 };
 
 struct mattx_export_info {

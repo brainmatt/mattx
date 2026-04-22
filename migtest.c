@@ -43,9 +43,22 @@ int main() {
             if (hosts_fp != NULL) {
                 char hosts_buf[256] = {0};
                 if (fscanf(hosts_fp, "%255s", hosts_buf) == 1) {
-                    printf("[Worker %d] /etc/hosts read: %s\n", getpid(), hosts_buf);
+                    printf("[Worker %d] /etc/hosts read 1: %s\n", getpid(), hosts_buf);
                     fflush(stdout);
                 }
+                
+                // Jump 10 bytes forward using fseek
+                if (fseek(hosts_fp, 10, SEEK_SET) == 0) {
+                    char hosts_buf2[256] = {0};
+                    if (fscanf(hosts_fp, "%255s", hosts_buf2) == 1) {
+                        printf("[Worker %d] /etc/hosts read 2 (after seek): %s\n", getpid(), hosts_buf2);
+                        fflush(stdout);
+                    }
+                } else {
+                    printf("[Worker %d] WARNING: fseek failed!\n", getpid());
+                    fflush(stdout);
+                }
+                
                 fclose(hosts_fp);
             }
 
