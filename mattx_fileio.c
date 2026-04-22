@@ -742,7 +742,9 @@ static void handle_sys_statx_req(struct mattx_link *link, struct mattx_header *h
                 old_cred = override_creds(deputy->cred);
             }
 
-            err = vfs_getattr(&file->f_path, &stat, req->mask, req->flags);
+            // Clean the flags! vfs_getattr only tolerates the sync flags when called directly on a struct path.
+            // Other flags like AT_EMPTY_PATH will cause an immediate -EINVAL or -EPERM!
+            err = vfs_getattr(&file->f_path, &stat, req->mask, req->flags & AT_STATX_SYNC_TYPE);
             reply.error = err;
             
             if (deputy) {
