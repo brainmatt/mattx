@@ -32,6 +32,7 @@
 #include <linux/kprobes.h>       
 #include <linux/workqueue.h>     
 #include <linux/bitops.h>        
+#include <linux/stat.h>          
 
 #define MATTX_PORT 7226
 #define MAX_NODES 1024 
@@ -67,6 +68,8 @@ enum mattx_msg_type {
     MATTX_MSG_SYS_READ_REPLY,
     MATTX_MSG_SYS_LSEEK_REQ,
     MATTX_MSG_SYS_LSEEK_REPLY,
+    MATTX_MSG_SYS_STATX_REQ,
+    MATTX_MSG_SYS_STATX_REPLY,
 };
 
 struct mattx_header {
@@ -177,6 +180,19 @@ struct mattx_sys_lseek_reply {
     int error;
 };
 
+struct mattx_sys_statx_req {
+    u32 orig_pid;
+    u32 fd;
+    u32 mask;
+    u32 flags;
+};
+
+struct mattx_sys_statx_reply {
+    u32 orig_pid;
+    int error;
+    struct statx statx_buf;
+};
+
 struct mattx_fake_fd_info {
     int home_node;
     u32 orig_pid;
@@ -188,9 +204,17 @@ struct mattx_rpc_work {
     pid_t local_pid;
     u32 orig_pid;
     int home_node;
+    
+    // For OPEN
     char filename[256];
     int flags;
     int mode;
+
+    // For STATX
+    bool is_statx;
+    int remote_fd;
+    u32 mask;
+    struct statx __user *statx_buffer;
 };
 
 struct mattx_link {
@@ -211,6 +235,7 @@ struct mattx_guest_info {
     void *rpc_read_buf;
     ssize_t rpc_read_bytes;
     loff_t rpc_lseek_res;
+    struct statx rpc_statx_buf;
 };
 
 struct mattx_export_info {

@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <sys/wait.h>
+#include <sys/stat.h>
 #include <signal.h>
 #include <time.h>
 
@@ -41,6 +42,18 @@ int main() {
 
             
             if (hosts_fp != NULL) {
+                int hosts_fd = fileno(hosts_fp);
+                struct stat statbuf;
+
+                if (fstat(hosts_fd, &statbuf) == 0) {
+                    printf("[Worker %d] fstat success! /etc/hosts size is %ld bytes.\n", getpid(), statbuf.st_size);
+                    fflush(stdout);
+                } else {
+                    perror("fstat failed");
+                    printf("[Worker %d] WARNING: fstat failed on /etc/hosts!\n", getpid());
+                    fflush(stdout);
+                }
+
                 char hosts_buf[256] = {0};
                 if (fscanf(hosts_fp, "%255s", hosts_buf) == 1) {
                     printf("[Worker %d] /etc/hosts read 1: %s\n", getpid(), hosts_buf);

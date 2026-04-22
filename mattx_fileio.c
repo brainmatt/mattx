@@ -576,6 +576,92 @@ static void handle_sys_lseek_req(struct mattx_link *link, struct mattx_header *h
     }
 }
 
+static void handle_sys_statx_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    if (payload) {
+        struct mattx_sys_statx_req *req = (struct mattx_sys_statx_req *)payload;
+        struct task_struct *deputy = NULL;
+        struct file *file = NULL;
+        int i;
+        struct mattx_sys_statx_reply reply;
+        
+        reply.orig_pid = req->orig_pid;
+        reply.error = -EBADF;
+        memset(&reply.statx_buf, 0, sizeof(reply.statx_buf));
+
+        printk(KERN_INFO "MattX:[WORMHOLE] Received STATX req for FD %u from Node %u\n", req->fd, hdr->sender_id);
+
+        if (req->fd >= 1000) {
+            int slot = req->fd - 1000;
+            spin_lock(&export_lock);
+            for (i = 0; i < export_count; i++) {
+                if (export_registry[i].orig_pid == req->orig_pid) {
+                    if (slot < MAX_FDS && export_registry[i].remote_files[slot]) {
+                        file = export_registry[i].remote_files[slot];
+                        get_file(file); 
+                    }
+                    break;
+                }
+            }
+            spin_unlock(&export_lock);
+        } else {
+            rcu_read_lock();
+            deputy = pid_task(find_vpid(req->orig_pid), PIDTYPE_PID);
+            if (deputy) get_task_struct(deputy);
+            rcu_read_unlock();
+            
+            if (deputy) {
+                struct files_struct *files = deputy->files;
+                if (files) {
+                    spin_lock(&files->file_lock);
+                    struct fdtable *fdt = files_fdtable(files);
+                    if (req->fd < fdt->max_fds) {
+                        file = rcu_dereference_raw(fdt->fd[req->fd]);
+                        if (file) get_file(file); 
+                    }
+                    spin_unlock(&files->file_lock);
+                }
+                put_task_struct(deputy);
+            }
+        }
+        
+        if (file) {
+            struct kstat stat;
+            int err = vfs_getattr(&file->f_path, &stat, req->mask, req->flags);
+            reply.error = err;
+            if (err == 0) {
+                reply.statx_buf.stx_mask = stat.result_mask;
+                reply.statx_buf.stx_blksize = stat.blksize;
+                reply.statx_buf.stx_attributes = stat.attributes;
+                reply.statx_buf.stx_nlink = stat.nlink;
+                reply.statx_buf.stx_uid = from_kuid_munged(current_user_ns(), stat.uid);
+                reply.statx_buf.stx_gid = from_kgid_munged(current_user_ns(), stat.gid);
+                reply.statx_buf.stx_mode = stat.mode;
+                reply.statx_buf.stx_ino = stat.ino;
+                reply.statx_buf.stx_size = stat.size;
+                reply.statx_buf.stx_blocks = stat.blocks;
+                reply.statx_buf.stx_attributes_mask = stat.attributes_mask;
+                reply.statx_buf.stx_atime.tv_sec = stat.atime.tv_sec;
+                reply.statx_buf.stx_atime.tv_nsec = stat.atime.tv_nsec;
+                reply.statx_buf.stx_btime.tv_sec = stat.btime.tv_sec;
+                reply.statx_buf.stx_btime.tv_nsec = stat.btime.tv_nsec;
+                reply.statx_buf.stx_ctime.tv_sec = stat.ctime.tv_sec;
+                reply.statx_buf.stx_ctime.tv_nsec = stat.ctime.tv_nsec;
+                reply.statx_buf.stx_mtime.tv_sec = stat.mtime.tv_sec;
+                reply.statx_buf.stx_mtime.tv_nsec = stat.mtime.tv_nsec;
+                reply.statx_buf.stx_rdev_major = MAJOR(stat.rdev);
+                reply.statx_buf.stx_rdev_minor = MINOR(stat.rdev);
+                reply.statx_buf.stx_dev_major = MAJOR(stat.dev);
+                reply.statx_buf.stx_dev_minor = MINOR(stat.dev);
+            }
+            fput(file); 
+        }
+        
+        if (cluster_map[hdr->sender_id]) {
+            mattx_comm_send(cluster_map[hdr->sender_id], MATTX_MSG_SYS_STATX_REPLY, &reply, sizeof(reply));
+        }
+    }
+}
+
 static void handle_sys_lseek_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
     if (payload) {
         struct mattx_sys_lseek_reply *reply = (struct mattx_sys_lseek_reply *)payload;
@@ -600,6 +686,30 @@ static void handle_sys_lseek_reply(struct mattx_link *link, struct mattx_header 
     }
 }
 
+static void handle_sys_statx_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    if (payload) {
+        struct mattx_sys_statx_reply *reply = (struct mattx_sys_statx_reply *)payload;
+        int i;
+
+        printk(KERN_INFO "MattX:[RPC] Received STATX_REPLY for Orig PID %u. Error: %d\n", reply->orig_pid, reply->error);
+
+        spin_lock(&guest_lock);
+        for (i = 0; i < guest_count; i++) {
+            if (guest_registry[i].orig_pid == reply->orig_pid && guest_registry[i].home_node == hdr->sender_id) {
+                
+                memcpy(&guest_registry[i].rpc_statx_buf, &reply->statx_buf, sizeof(struct statx));
+                guest_registry[i].rpc_done = true;
+                
+                if (guest_registry[i].rpc_wq) {
+                    wake_up_interruptible(guest_registry[i].rpc_wq);
+                }
+                break;
+            }
+        }
+        spin_unlock(&guest_lock);
+    }
+}
+
 void mattx_fileio_init_handlers(void) {
     mattx_register_handler(MATTX_MSG_SYSCALL_FWD, handle_syscall_fwd);
     mattx_register_handler(MATTX_MSG_SYS_OPEN_REQ, handle_sys_open_req);
@@ -609,6 +719,8 @@ void mattx_fileio_init_handlers(void) {
     mattx_register_handler(MATTX_MSG_SYS_READ_REPLY, handle_sys_read_reply);
     mattx_register_handler(MATTX_MSG_SYS_LSEEK_REQ, handle_sys_lseek_req);
     mattx_register_handler(MATTX_MSG_SYS_LSEEK_REPLY, handle_sys_lseek_reply);
+    mattx_register_handler(MATTX_MSG_SYS_STATX_REQ, handle_sys_statx_req);
+    mattx_register_handler(MATTX_MSG_SYS_STATX_REPLY, handle_sys_statx_reply);
     printk(KERN_INFO "MattX: [FILEIO] Network handlers registered.\n");
 }
 
