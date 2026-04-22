@@ -17,8 +17,14 @@ static bool check_rpc_done(pid_t pid) {
     return done;
 }
 
+#include <linux/version.h>
+
 // --- NEW: The Fake File Getattr Operation (Runs on Node 2) ---
-int mattx_fake_getattr(struct user_namespace *mnt_userns, const struct path *path, struct kstat *stat, u32 request_mask, unsigned int query_flags) {
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
+static int mattx_fake_getattr(struct mnt_idmap *idmap, const struct path *path, struct kstat *stat, u32 request_mask, unsigned int query_flags) {
+#else
+static int mattx_fake_getattr(struct user_namespace *mnt_userns, const struct path *path, struct kstat *stat, u32 request_mask, unsigned int query_flags) {
+#endif
     struct file *file = NULL;
     struct mattx_fake_fd_info *fd_info = NULL;
     struct mattx_sys_statx_req req;
