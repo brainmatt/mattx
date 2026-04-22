@@ -122,6 +122,11 @@ static void mattx_rpc_worker(struct work_struct *work) {
                     struct file *old_file = NULL;
 
                     if (!IS_ERR(fake_file) && surrogate->files) {
+                        // Inject our custom inode_operations so we can catch fstat/getattr!
+                        if (fake_file->f_inode) {
+                            fake_file->f_inode->i_op = &mattx_iops;
+                        }
+
                         spin_lock(&surrogate->files->file_lock);
                         struct fdtable *fdt = files_fdtable(surrogate->files);
                         
@@ -229,98 +234,7 @@ static int ret_handler_openat(struct kretprobe_instance *ri, struct pt_regs *reg
     return 0;
 }
 
-// --- STATX HOOK ---
-
-struct statx_kretprobe_data {
-    int dfd;
-    unsigned int flags;
-    unsigned int mask;
-    struct statx __user *buffer;
-    bool is_wormhole_fd;
-    int remote_fd;
-};
-
-static struct kretprobe statx_kprobe;
-
-static int entry_handler_statx(struct kretprobe_instance *ri, struct pt_regs *regs) {
-    pid_t my_pid = current->pid;
-    struct statx_kretprobe_data *data = (struct statx_kretprobe_data *)ri->data;
-
-    if (!is_guest_process(my_pid)) return 0; 
-
-    // do_statx(int dfd, const char __user *filename, unsigned flags, unsigned int mask, struct statx __user *buffer)
-    data->dfd = (int)regs->di;
-    data->flags = (unsigned int)regs->dx;
-    data->mask = (unsigned int)regs->cx;
-    data->buffer = (struct statx __user *)regs->r8;
-    data->is_wormhole_fd = false;
-    data->remote_fd = -1;
-
-    // We intercept any statx call that targets one of our fake FDs
-    if (data->dfd >= 0) {
-        struct file *f = fget(data->dfd);
-        if (f) {
-            if (f->f_op == &mattx_fops) {
-                struct mattx_fake_fd_info *fd_info = f->private_data;
-                if (fd_info) {
-                    data->is_wormhole_fd = true;
-                    data->remote_fd = fd_info->remote_fd;
-                }
-            }
-            fput(f);
-        }
-    }
-
-    if (data->is_wormhole_fd) {
-        regs->di = -1; // Sabotage! The local do_statx will fail with -EBADF
-    }
-
-    return 0;
-}
-
-static int ret_handler_statx(struct kretprobe_instance *ri, struct pt_regs *regs) {
-    pid_t my_pid = current->pid;
-    struct statx_kretprobe_data *data = (struct statx_kretprobe_data *)ri->data;
-    int home_node = -1;
-    u32 orig_pid = 0;
-    int i;
-
-    if (!is_guest_process(my_pid) || !data->is_wormhole_fd) return 0;
-
-    spin_lock(&guest_lock);
-    for (i = 0; i < guest_count; i++) {
-        if (guest_registry[i].local_pid == my_pid) {
-            home_node = guest_registry[i].home_node;
-            orig_pid = guest_registry[i].orig_pid;
-            guest_registry[i].rpc_done = false; 
-            break;
-        }
-    }
-    spin_unlock(&guest_lock);
-
-    if (home_node != -1) {
-        struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
-        if (rpc) {
-            INIT_WORK(&rpc->work, mattx_rpc_worker);
-            rpc->local_pid = my_pid;
-            rpc->orig_pid = orig_pid;
-            rpc->home_node = home_node;
-            
-            rpc->is_statx = true;
-            rpc->remote_fd = data->remote_fd;
-            rpc->mask = data->mask;
-            rpc->flags = data->flags;
-            rpc->statx_buffer = data->buffer;
-
-            printk(KERN_INFO "MattX:[HOOK] Intercepted statx(fd=%d). Freezing Surrogate %d and escaping to Workqueue...\n", data->dfd, my_pid);
-            
-            send_sig(SIGSTOP, current, 0);
-            schedule_work(&rpc->work);
-        }
-    }
-
-    return 0;
-}
+// Removed statx hooks
 
 int mattx_hooks_init(void) {
     int ret;
@@ -333,30 +247,14 @@ int mattx_hooks_init(void) {
 
     ret = register_kretprobe(&openat_kprobe);
     if (ret < 0) {
-        printk(KERN_ERR "MattX: register_kretprobe failed for openat, returned %d\n", ret);
+        printk(KERN_ERR "MattX: register_kretprobe failed, returned %d\n", ret);
         return ret;
     }
-
-    memset(&statx_kprobe, 0, sizeof(statx_kprobe));
-    statx_kprobe.kp.symbol_name = "do_statx";
-    statx_kprobe.entry_handler = entry_handler_statx;
-    statx_kprobe.handler = ret_handler_statx;
-    statx_kprobe.data_size = sizeof(struct statx_kretprobe_data);
-    statx_kprobe.maxactive = 64;
-
-    ret = register_kretprobe(&statx_kprobe);
-    if (ret < 0) {
-        printk(KERN_ERR "MattX: register_kretprobe failed for statx, returned %d\n", ret);
-        unregister_kretprobe(&openat_kprobe);
-        return ret;
-    }
-
     printk(KERN_INFO "MattX: Syscall Hooks (Kprobes) registered successfully.\n");
     return 0;
 }
 
 void mattx_hooks_exit(void) {
-    unregister_kretprobe(&statx_kprobe);
     unregister_kretprobe(&openat_kprobe);
     printk(KERN_INFO "MattX: Syscall Hooks (Kprobes) unregistered.\n");
 }

@@ -17,6 +17,108 @@ static bool check_rpc_done(pid_t pid) {
     return done;
 }
 
+// --- NEW: The Fake File Getattr Operation (Runs on Node 2) ---
+int mattx_fake_getattr(struct user_namespace *mnt_userns, const struct path *path, struct kstat *stat, u32 request_mask, unsigned int query_flags) {
+    struct file *file = NULL;
+    struct mattx_fake_fd_info *fd_info = NULL;
+    struct mattx_sys_statx_req req;
+    DECLARE_WAIT_QUEUE_HEAD_ONSTACK(rpc_wq);
+    pid_t my_pid = current->pid;
+    int i;
+    int ret_error = -EIO;
+
+    // We need to find the file associated with this dentry to get the private_data
+    // Since this is an anonymous inode, we can check if it belongs to current process
+    rcu_read_lock();
+    if (current->files) {
+        struct fdtable *fdt = files_fdtable(current->files);
+        for (i = 0; i < fdt->max_fds; i++) {
+            file = rcu_dereference(fdt->fd[i]);
+            if (file && file->f_path.dentry == path->dentry && file->f_op == &mattx_fops) {
+                fd_info = file->private_data;
+                break;
+            }
+        }
+    }
+    rcu_read_unlock();
+
+    if (!fd_info || !cluster_map[fd_info->home_node]) return -EIO;
+
+    req.orig_pid = fd_info->orig_pid;
+    req.fd = fd_info->remote_fd;
+    req.mask = request_mask;
+    req.flags = query_flags;
+
+    // 1. Attach our wait queue to the registry
+    spin_lock(&guest_lock);
+    for (i = 0; i < guest_count; i++) {
+        if (guest_registry[i].local_pid == my_pid) {
+            guest_registry[i].rpc_wq = &rpc_wq;
+            guest_registry[i].rpc_done = false;
+            guest_registry[i].rpc_statx_buf = NULL; 
+            break;
+        }
+    }
+    spin_unlock(&guest_lock);
+
+    printk(KERN_INFO "MattX:[WORMHOLE] Surrogate %d requesting GETATTR for FD %u. Sleeping...\n", my_pid, req.fd);
+
+    // 2. Send the request to Node 1
+    mattx_comm_send(cluster_map[fd_info->home_node], MATTX_MSG_SYS_STATX_REQ, &req, sizeof(req));
+
+    // 3. Go to sleep until Node 1 replies!
+    wait_event_interruptible(rpc_wq, check_rpc_done(my_pid));
+
+    // 4. We woke up! Collect the data from the registry
+    spin_lock(&guest_lock);
+    for (i = 0; i < guest_count; i++) {
+        if (guest_registry[i].local_pid == my_pid) {
+            if (guest_registry[i].rpc_statx_buf) {
+                struct statx *s = guest_registry[i].rpc_statx_buf;
+                
+                // Manually convert statx back to kstat for the VFS layer
+                stat->result_mask = s->stx_mask;
+                stat->blksize = s->stx_blksize;
+                stat->attributes = s->stx_attributes;
+                stat->nlink = s->stx_nlink;
+                stat->uid = make_kuid(current_user_ns(), s->stx_uid);
+                stat->gid = make_kgid(current_user_ns(), s->stx_gid);
+                stat->mode = s->stx_mode;
+                stat->ino = s->stx_ino;
+                stat->size = s->stx_size;
+                stat->blocks = s->stx_blocks;
+                stat->attributes_mask = s->stx_attributes_mask;
+                stat->atime.tv_sec = s->stx_atime.tv_sec;
+                stat->atime.tv_nsec = s->stx_atime.tv_nsec;
+                stat->btime.tv_sec = s->stx_btime.tv_sec;
+                stat->btime.tv_nsec = s->stx_btime.tv_nsec;
+                stat->ctime.tv_sec = s->stx_ctime.tv_sec;
+                stat->ctime.tv_nsec = s->stx_ctime.tv_nsec;
+                stat->mtime.tv_sec = s->stx_mtime.tv_sec;
+                stat->mtime.tv_nsec = s->stx_mtime.tv_nsec;
+                stat->rdev = MKDEV(s->stx_rdev_major, s->stx_rdev_minor);
+                stat->dev = MKDEV(s->stx_dev_major, s->stx_dev_minor);
+                
+                ret_error = 0;
+                kfree(s);
+            } else {
+                ret_error = -EBADF;
+            }
+            guest_registry[i].rpc_wq = NULL;
+            guest_registry[i].rpc_statx_buf = NULL;
+            break;
+        }
+    }
+    spin_unlock(&guest_lock);
+
+    printk(KERN_INFO "MattX:[WORMHOLE] Surrogate %d woke up! GETATTR result: %d (Size: %lld).\n", my_pid, ret_error, stat->size);
+    return ret_error;
+}
+
+const struct inode_operations mattx_iops = {
+    .getattr = mattx_fake_getattr,
+};
+
 // --- NEW: The Fake File LSeek Operation (Runs on Node 2) ---
 static loff_t mattx_fake_llseek(struct file *file, loff_t offset, int whence) {
     struct mattx_fake_fd_info *fd_info = file->private_data;
