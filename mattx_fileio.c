@@ -734,8 +734,22 @@ static void handle_sys_statx_req(struct mattx_link *link, struct mattx_header *h
         
         if (file) {
             struct kstat stat;
-            int err = vfs_getattr(&file->f_path, &stat, req->mask, req->flags);
+            int err;
+            const struct cred *old_cred = NULL;
+            
+            if (deputy) {
+                if (deputy->mm) kthread_use_mm(deputy->mm);
+                old_cred = override_creds(deputy->cred);
+            }
+
+            err = vfs_getattr(&file->f_path, &stat, req->mask, req->flags);
             reply.error = err;
+            
+            if (deputy) {
+                revert_creds(old_cred);
+                if (deputy->mm) kthread_unuse_mm(deputy->mm);
+            }
+
             if (err == 0) {
                 reply.statx_buf.stx_mask = stat.result_mask;
                 reply.statx_buf.stx_blksize = stat.blksize;
