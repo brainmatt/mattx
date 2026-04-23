@@ -229,8 +229,8 @@ static int entry_handler_dup(struct kretprobe_instance *ri, struct pt_regs *regs
 
     data->oldfd = (int)regs->di;
     
-    // In sys_dup2, the second arg is in si. In sys_dup, it's ignored but we default to -1 (dynamic alloc)
-    if (ri->rp == &dup2_kprobe.kp) {
+    // Check which kprobe triggered this by using the standard kernel helper
+    if (get_kretprobe(ri) == &dup2_kprobe) {
         data->newfd = (int)regs->si;
     } else {
         data->newfd = -1;
