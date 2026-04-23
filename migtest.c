@@ -54,6 +54,24 @@ int main() {
                     fflush(stdout);
                 }
 
+                // TEST DUP2
+                int cloned_fd = dup(hosts_fd);
+                if (cloned_fd >= 0) {
+                    printf("[Worker %d] DUP success! Cloned FD %d -> New FD %d\n", getpid(), hosts_fd, cloned_fd);
+                    fflush(stdout);
+                    
+                    // Try to read from the clone to prove it works
+                    char clone_buf[256] = {0};
+                    if (read(cloned_fd, clone_buf, 10) > 0) {
+                        printf("[Worker %d] Read from cloned FD: %10s\n", getpid(), clone_buf);
+                        fflush(stdout);
+                    }
+                    close(cloned_fd);
+                } else {
+                    printf("[Worker %d] WARNING: DUP failed!\n", getpid());
+                    fflush(stdout);
+                }
+
                 char hosts_buf[256] = {0};
                 if (fscanf(hosts_fp, "%255s", hosts_buf) == 1) {
                     printf("[Worker %d] /etc/hosts read 1: %s\n", getpid(), hosts_buf);

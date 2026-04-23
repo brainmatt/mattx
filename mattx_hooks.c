@@ -9,16 +9,17 @@ static void mattx_rpc_worker(struct work_struct *work) {
     int remote_fd = -1;
     
     if (rpc->is_statx) {
-        struct mattx_sys_statx_req req;
+        // ... (statx logic, removed here since we deleted statx kprobe)
+    } else if (rpc->is_dup) {
+        struct mattx_sys_dup_req req;
         memset(&req, 0, sizeof(req));
         req.orig_pid = rpc->orig_pid;
-        req.fd = rpc->remote_fd;
-        req.mask = rpc->mask;
-        req.flags = rpc->flags;
+        req.old_remote_fd = rpc->remote_fd;
+        req.new_local_fd = rpc->new_local_fd;
 
-        printk(KERN_INFO "MattX:[RPC] Worker started for PID %d. Sending STATX_REQ to Node %d...\n", rpc->local_pid, rpc->home_node);
+        printk(KERN_INFO "MattX:[RPC] Worker started for PID %d. Sending DUP_REQ to Node %d...\n", rpc->local_pid, rpc->home_node);
         if (cluster_map[rpc->home_node]) {
-            mattx_comm_send(cluster_map[rpc->home_node], MATTX_MSG_SYS_STATX_REQ, &req, sizeof(req));
+            mattx_comm_send(cluster_map[rpc->home_node], MATTX_MSG_SYS_DUP_REQ, &req, sizeof(req));
         }
     } else {
         struct mattx_sys_open_req req;
@@ -58,35 +59,7 @@ static void mattx_rpc_worker(struct work_struct *work) {
 
     if (surrogate) {
         if (rpc->is_statx) {
-            struct pt_regs *regs = task_pt_regs(surrogate);
-            struct statx *statx_buf = NULL;
-            bool success = false;
-
-            spin_lock(&guest_lock);
-            for (i = 0; i < guest_count; i++) {
-                if (guest_registry[i].local_pid == rpc->local_pid) {
-                    statx_buf = guest_registry[i].rpc_statx_buf;
-                    guest_registry[i].rpc_statx_buf = NULL; // Take ownership
-                    success = (statx_buf != NULL);
-                    break;
-                }
-            }
-            spin_unlock(&guest_lock);
-
-            if (success) {
-                if (surrogate->mm) kthread_use_mm(surrogate->mm);
-                if (copy_to_user(rpc->statx_buffer, statx_buf, sizeof(struct statx))) {
-                    regs->ax = -EFAULT;
-                } else {
-                    regs->ax = 0; // Success!
-                }
-                if (surrogate->mm) kthread_unuse_mm(surrogate->mm);
-                
-                kfree(statx_buf); // Free the memory we took ownership of
-                printk(KERN_INFO "MattX:[RPC] Illusion Complete! Wrote statx to Surrogate %d\n", rpc->local_pid);
-            } else {
-                regs->ax = -EBADF;
-            }
+            // (Removed statx block since we deleted it)
         } else if (remote_fd >= 0) {
             struct pt_regs *regs = task_pt_regs(surrogate);
             int local_fd = regs ? regs->ax : -1; 
@@ -236,6 +209,109 @@ static int ret_handler_openat(struct kretprobe_instance *ri, struct pt_regs *reg
 
 // Removed statx hooks
 
+// --- DUP HOOK ---
+
+struct dup_kretprobe_data {
+    int oldfd;
+    int newfd;
+    bool is_wormhole_fd;
+    int old_remote_fd;
+};
+
+static struct kretprobe dup_kprobe;
+static struct kretprobe dup2_kprobe;
+
+static int entry_handler_dup(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    pid_t my_pid = current->pid;
+    struct dup_kretprobe_data *data = (struct dup_kretprobe_data *)ri->data;
+
+    if (!is_guest_process(my_pid)) return 0;
+
+    data->oldfd = (int)regs->di;
+    
+    // In sys_dup2, the second arg is in si. In sys_dup, it's ignored but we default to -1 (dynamic alloc)
+    if (ri->rp == &dup2_kprobe.kp) {
+        data->newfd = (int)regs->si;
+    } else {
+        data->newfd = -1;
+    }
+    
+    data->is_wormhole_fd = false;
+    data->old_remote_fd = -1;
+
+    if (data->oldfd >= 0) {
+        struct file *f = fget(data->oldfd);
+        if (f) {
+            if (f->f_op == &mattx_fops) {
+                struct mattx_fake_fd_info *fd_info = f->private_data;
+                if (fd_info) {
+                    data->is_wormhole_fd = true;
+                    data->old_remote_fd = fd_info->remote_fd;
+                }
+            }
+            fput(f);
+        }
+    }
+
+    if (data->is_wormhole_fd) {
+        regs->di = -1; // Sabotage! The local dup will fail with -EBADF
+    }
+
+    return 0;
+}
+
+static int ret_handler_dup(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    pid_t my_pid = current->pid;
+    struct dup_kretprobe_data *data = (struct dup_kretprobe_data *)ri->data;
+    int home_node = -1;
+    u32 orig_pid = 0;
+    int i;
+
+    if (!is_guest_process(my_pid) || !data->is_wormhole_fd) return 0;
+
+    spin_lock(&guest_lock);
+    for (i = 0; i < guest_count; i++) {
+        if (guest_registry[i].local_pid == my_pid) {
+            home_node = guest_registry[i].home_node;
+            orig_pid = guest_registry[i].orig_pid;
+            guest_registry[i].rpc_done = false; 
+            break;
+        }
+    }
+    spin_unlock(&guest_lock);
+
+    if (home_node != -1) {
+        struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
+        if (rpc) {
+            INIT_WORK(&rpc->work, mattx_rpc_worker);
+            rpc->local_pid = my_pid;
+            rpc->orig_pid = orig_pid;
+            rpc->home_node = home_node;
+            
+            rpc->is_dup = true;
+            rpc->remote_fd = data->old_remote_fd;
+            rpc->new_local_fd = data->newfd;
+            
+            // We need to pass valid flags/mode to open a new fake file proxy later in mattx_rpc_worker
+            struct file *f = fget(data->oldfd);
+            if (f) {
+                rpc->flags = f->f_flags;
+                fput(f);
+            } else {
+                rpc->flags = O_RDWR;
+            }
+            rpc->mode = 0666;
+
+            printk(KERN_INFO "MattX:[HOOK] Intercepted dup(fd=%d). Freezing Surrogate %d and escaping to Workqueue...\n", data->oldfd, my_pid);
+            
+            send_sig(SIGSTOP, current, 0);
+            schedule_work(&rpc->work);
+        }
+    }
+
+    return 0;
+}
+
 int mattx_hooks_init(void) {
     int ret;
     memset(&openat_kprobe, 0, sizeof(openat_kprobe));
@@ -250,11 +326,38 @@ int mattx_hooks_init(void) {
         printk(KERN_ERR "MattX: register_kretprobe failed, returned %d\n", ret);
         return ret;
     }
+
+    memset(&dup_kprobe, 0, sizeof(dup_kprobe));
+    dup_kprobe.kp.symbol_name = "sys_dup";
+    dup_kprobe.entry_handler = entry_handler_dup;
+    dup_kprobe.handler = ret_handler_dup;
+    dup_kprobe.data_size = sizeof(struct dup_kretprobe_data);
+    dup_kprobe.maxactive = 64;
+
+    ret = register_kretprobe(&dup_kprobe);
+    if (ret < 0) {
+        printk(KERN_ERR "MattX: register_kretprobe failed for dup, returned %d\n", ret);
+    }
+
+    memset(&dup2_kprobe, 0, sizeof(dup2_kprobe));
+    dup2_kprobe.kp.symbol_name = "sys_dup2";
+    dup2_kprobe.entry_handler = entry_handler_dup;
+    dup2_kprobe.handler = ret_handler_dup;
+    dup2_kprobe.data_size = sizeof(struct dup_kretprobe_data);
+    dup2_kprobe.maxactive = 64;
+
+    ret = register_kretprobe(&dup2_kprobe);
+    if (ret < 0) {
+        printk(KERN_ERR "MattX: register_kretprobe failed for dup2, returned %d\n", ret);
+    }
+
     printk(KERN_INFO "MattX: Syscall Hooks (Kprobes) registered successfully.\n");
     return 0;
 }
 
 void mattx_hooks_exit(void) {
+    unregister_kretprobe(&dup2_kprobe);
+    unregister_kretprobe(&dup_kprobe);
     unregister_kretprobe(&openat_kprobe);
     printk(KERN_INFO "MattX: Syscall Hooks (Kprobes) unregistered.\n");
 }

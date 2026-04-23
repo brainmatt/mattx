@@ -786,6 +786,108 @@ static void handle_sys_statx_req(struct mattx_link *link, struct mattx_header *h
     }
 }
 
+static void handle_sys_dup_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    if (payload) {
+        struct mattx_sys_dup_req *req = (struct mattx_sys_dup_req *)payload;
+        struct task_struct *deputy = NULL;
+        struct file *file = NULL;
+        int i;
+        struct mattx_sys_dup_reply reply;
+        
+        reply.orig_pid = req->orig_pid;
+        reply.new_remote_fd = -EBADF;
+        reply.error = -EBADF;
+
+        printk(KERN_INFO "MattX:[WORMHOLE] Received DUP req for Remote FD %u from Node %u\n", req->old_remote_fd, hdr->sender_id);
+
+        if (req->old_remote_fd >= 1000) {
+            int slot = req->old_remote_fd - 1000;
+            spin_lock(&export_lock);
+            for (i = 0; i < export_count; i++) {
+                if (export_registry[i].orig_pid == req->orig_pid) {
+                    if (slot < MAX_FDS && export_registry[i].remote_files[slot]) {
+                        file = export_registry[i].remote_files[slot];
+                        get_file(file); 
+                        
+                        // It's an exported file! We need to find an empty slot in our export registry for the clone.
+                        int j;
+                        for (j = 0; j < MAX_FDS; j++) {
+                            if (export_registry[i].remote_files[j] == NULL) {
+                                export_registry[i].remote_files[j] = file;
+                                reply.new_remote_fd = j + 1000;
+                                reply.error = 0;
+                                printk(KERN_INFO "MattX:[WORMHOLE] Duplicated Exported FD %u to %d\n", req->old_remote_fd, reply.new_remote_fd);
+                                break;
+                            }
+                        }
+                        if (reply.new_remote_fd < 0) {
+                            fput(file); // No space left
+                            reply.error = -EMFILE;
+                        }
+                    }
+                    break;
+                }
+            }
+            spin_unlock(&export_lock);
+        } else {
+            // It's a real file descriptor on the Deputy!
+            rcu_read_lock();
+            deputy = pid_task(find_vpid(req->orig_pid), PIDTYPE_PID);
+            if (deputy) get_task_struct(deputy);
+            rcu_read_unlock();
+            
+            if (deputy) {
+                struct files_struct *files = deputy->files;
+                if (files) {
+                    spin_lock(&files->file_lock);
+                    struct fdtable *fdt = files_fdtable(files);
+                    if (req->old_remote_fd < fdt->max_fds) {
+                        file = rcu_dereference_raw(fdt->fd[req->old_remote_fd]);
+                        if (file) {
+                            get_file(file); 
+                            
+                            // Let's allocate a real new FD on the Deputy!
+                            int new_fd = req->new_local_fd;
+                            if (new_fd < 0) {
+                                // Dynamic dup() -> Find first free slot
+                                int j;
+                                for (j = 3; j < fdt->max_fds; j++) {
+                                    if (!rcu_dereference_raw(fdt->fd[j])) {
+                                        new_fd = j;
+                                        break;
+                                    }
+                                }
+                            }
+
+                            if (new_fd >= 0 && new_fd < fdt->max_fds) {
+                                // Overwrite the slot if dup2() requested an existing open one
+                                struct file *old_target = rcu_dereference_raw(fdt->fd[new_fd]);
+                                if (old_target) {
+                                    fput(old_target);
+                                }
+                                rcu_assign_pointer(fdt->fd[new_fd], file);
+                                __set_bit(new_fd, fdt->open_fds);
+                                reply.new_remote_fd = new_fd;
+                                reply.error = 0;
+                                printk(KERN_INFO "MattX:[WORMHOLE] Duplicated Deputy FD %u to %d\n", req->old_remote_fd, reply.new_remote_fd);
+                            } else {
+                                fput(file);
+                                reply.error = -EMFILE;
+                            }
+                        }
+                    }
+                    spin_unlock(&files->file_lock);
+                }
+                put_task_struct(deputy);
+            }
+        }
+        
+        if (cluster_map[hdr->sender_id]) {
+            mattx_comm_send(cluster_map[hdr->sender_id], MATTX_MSG_SYS_DUP_REPLY, &reply, sizeof(reply));
+        }
+    }
+}
+
 static void handle_sys_lseek_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
     if (payload) {
         struct mattx_sys_lseek_reply *reply = (struct mattx_sys_lseek_reply *)payload;
@@ -842,6 +944,28 @@ static void handle_sys_statx_reply(struct mattx_link *link, struct mattx_header 
     }
 }
 
+static void handle_sys_dup_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    if (payload) {
+        struct mattx_sys_dup_reply *reply = (struct mattx_sys_dup_reply *)payload;
+        int i;
+
+        printk(KERN_INFO "MattX:[RPC] Received DUP_REPLY for Orig PID %u. New Remote FD: %d\n", reply->orig_pid, reply->new_remote_fd);
+
+        spin_lock(&guest_lock);
+        for (i = 0; i < guest_count; i++) {
+            if (guest_registry[i].orig_pid == reply->orig_pid && guest_registry[i].home_node == hdr->sender_id) {
+                guest_registry[i].rpc_remote_fd = reply->new_remote_fd;
+                guest_registry[i].rpc_done = true;
+                if (guest_registry[i].rpc_wq) {
+                    wake_up_interruptible(guest_registry[i].rpc_wq);
+                }
+                break;
+            }
+        }
+        spin_unlock(&guest_lock);
+    }
+}
+
 void mattx_fileio_init_handlers(void) {
     mattx_register_handler(MATTX_MSG_SYSCALL_FWD, handle_syscall_fwd);
     mattx_register_handler(MATTX_MSG_SYS_OPEN_REQ, handle_sys_open_req);
@@ -853,6 +977,8 @@ void mattx_fileio_init_handlers(void) {
     mattx_register_handler(MATTX_MSG_SYS_LSEEK_REPLY, handle_sys_lseek_reply);
     mattx_register_handler(MATTX_MSG_SYS_STATX_REQ, handle_sys_statx_req);
     mattx_register_handler(MATTX_MSG_SYS_STATX_REPLY, handle_sys_statx_reply);
+    mattx_register_handler(MATTX_MSG_SYS_DUP_REQ, handle_sys_dup_req);
+    mattx_register_handler(MATTX_MSG_SYS_DUP_REPLY, handle_sys_dup_reply);
     printk(KERN_INFO "MattX: [FILEIO] Network handlers registered.\n");
 }
 

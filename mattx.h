@@ -70,6 +70,8 @@ enum mattx_msg_type {
     MATTX_MSG_SYS_LSEEK_REPLY,
     MATTX_MSG_SYS_STATX_REQ,
     MATTX_MSG_SYS_STATX_REPLY,
+    MATTX_MSG_SYS_DUP_REQ,
+    MATTX_MSG_SYS_DUP_REPLY,
 };
 
 struct mattx_header {
@@ -193,6 +195,18 @@ struct mattx_sys_statx_reply {
     struct statx statx_buf;
 };
 
+struct mattx_sys_dup_req {
+    u32 orig_pid;
+    u32 old_remote_fd;
+    u32 new_local_fd; // -1 if dynamic dup, else specific fd for dup2/dup3
+};
+
+struct mattx_sys_dup_reply {
+    u32 orig_pid;
+    int new_remote_fd;
+    int error;
+};
+
 struct mattx_fake_fd_info {
     int home_node;
     u32 orig_pid;
@@ -215,6 +229,10 @@ struct mattx_rpc_work {
     int remote_fd;
     u32 mask;
     struct statx __user *statx_buffer;
+
+    // For DUP
+    bool is_dup;
+    int new_local_fd; // -1 if just dup()
 };
 
 struct mattx_link {
