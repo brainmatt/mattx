@@ -109,14 +109,21 @@ int main() {
             fprintf(testfile, "[Worker %d] Hello from the MattX Cluster! (Tick: %d).\n", getpid(), counter);
             fflush(testfile);
 
-            // TEST FSYNC
-            int test_fd = fileno(testfile);
-            if (fsync(test_fd) == 0) {
-                printf("[Worker %d] FSYNC success! Data committed to disk.\n", getpid());
-            } else {
-                perror("fsync failed");
+            // TEST FSYNC - Open a new writeable file to test Wormhole FSYNC
+            FILE *sync_fp = fopen("/tmp/mattx-sync.log", "a");
+            if (sync_fp != NULL) {
+                fprintf(sync_fp, "[Worker %d] Sync Tick: %d\n", getpid(), counter);
+                fflush(sync_fp); // Flushes glibc buffer to kernel
+                
+                int sync_fd = fileno(sync_fp);
+                if (fsync(sync_fd) == 0) {
+                    printf("[Worker %d] WORMHOLE FSYNC success! Data committed to VM1 disk.\n", getpid());
+                } else {
+                    printf("[Worker %d] WARNING: WORMHOLE FSYNC failed!\n", getpid());
+                }
+                fflush(stdout);
+                fclose(sync_fp);
             }
-            fflush(stdout);
 
         }
 	    fclose(testfile);
