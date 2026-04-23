@@ -21,6 +21,30 @@ static void mattx_rpc_worker(struct work_struct *work) {
         if (cluster_map[rpc->home_node]) {
             mattx_comm_send(cluster_map[rpc->home_node], MATTX_MSG_SYS_DUP_REQ, &req, sizeof(req));
         }
+    } else if (rpc->is_socket) {
+        struct mattx_sys_socket_req req;
+        memset(&req, 0, sizeof(req));
+        req.orig_pid = rpc->orig_pid;
+        req.domain = rpc->domain;
+        req.type = rpc->type;
+        req.protocol = rpc->protocol;
+
+        printk(KERN_INFO "MattX:[RPC] Worker started for PID %d. Sending SOCKET_REQ to Node %d...\n", rpc->local_pid, rpc->home_node);
+        if (cluster_map[rpc->home_node]) {
+            mattx_comm_send(cluster_map[rpc->home_node], MATTX_MSG_SYS_SOCKET_REQ, &req, sizeof(req));
+        }
+    } else if (rpc->is_connect) {
+        struct mattx_sys_connect_req req;
+        memset(&req, 0, sizeof(req));
+        req.orig_pid = rpc->orig_pid;
+        req.fd = rpc->remote_fd;
+        req.addrlen = rpc->addrlen;
+        memcpy(&req.addr, &rpc->addr, rpc->addrlen);
+
+        printk(KERN_INFO "MattX:[RPC] Worker started for PID %d. Sending CONNECT_REQ to Node %d...\n", rpc->local_pid, rpc->home_node);
+        if (cluster_map[rpc->home_node]) {
+            mattx_comm_send(cluster_map[rpc->home_node], MATTX_MSG_SYS_CONNECT_REQ, &req, sizeof(req));
+        }
     } else {
         struct mattx_sys_open_req req;
         memset(&req, 0, sizeof(req));
@@ -60,6 +84,27 @@ static void mattx_rpc_worker(struct work_struct *work) {
     if (surrogate) {
         if (rpc->is_statx) {
             // (Removed statx block since we deleted it)
+        } else if (rpc->is_connect) {
+            struct pt_regs *regs = task_pt_regs(surrogate);
+            int error = -1;
+            bool success = false;
+
+            spin_lock(&guest_lock);
+            for (i = 0; i < guest_count; i++) {
+                if (guest_registry[i].local_pid == rpc->local_pid) {
+                    error = guest_registry[i].rpc_fsync_res; // We reused this field for connect errors
+                    success = true;
+                    break;
+                }
+            }
+            spin_unlock(&guest_lock);
+
+            if (success) {
+                regs->ax = error;
+                printk(KERN_INFO "MattX:[RPC] Illusion Complete! CONNECT returned %d to Surrogate %d\n", error, rpc->local_pid);
+            } else {
+                regs->ax = -EBADF;
+            }
         } else if (remote_fd >= 0) {
             struct pt_regs *regs = task_pt_regs(surrogate);
             int local_fd = regs ? regs->ax : -1; 
@@ -319,6 +364,175 @@ static int ret_handler_dup(struct kretprobe_instance *ri, struct pt_regs *regs) 
     return 0;
 }
 
+// --- SOCKET HOOK ---
+struct socket_kretprobe_data {
+    int domain;
+    int type;
+    int protocol;
+};
+
+static struct kretprobe socket_kprobe;
+
+static int entry_handler_socket(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    pid_t my_pid = current->pid;
+    struct socket_kretprobe_data *data = (struct socket_kretprobe_data *)ri->data;
+
+    if (!is_guest_process(my_pid)) return 0; 
+    if (!config_migrate_network_io) return 0;
+
+    // sys_socket(int family, int type, int protocol)
+    data->domain = (int)regs->di;
+    data->type = (int)regs->si;
+    data->protocol = (int)regs->dx;
+
+    regs->di = -1; // Sabotage! The local sys_socket will fail with -EAFNOSUPPORT
+
+    return 0;
+}
+
+static int ret_handler_socket(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    pid_t my_pid = current->pid;
+    struct socket_kretprobe_data *data = (struct socket_kretprobe_data *)ri->data;
+    int home_node = -1;
+    u32 orig_pid = 0;
+    int i;
+
+    if (!is_guest_process(my_pid) || !config_migrate_network_io) return 0;
+
+    spin_lock(&guest_lock);
+    for (i = 0; i < guest_count; i++) {
+        if (guest_registry[i].local_pid == my_pid) {
+            home_node = guest_registry[i].home_node;
+            orig_pid = guest_registry[i].orig_pid;
+            guest_registry[i].rpc_done = false; 
+            break;
+        }
+    }
+    spin_unlock(&guest_lock);
+
+    if (home_node != -1) {
+        struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
+        if (rpc) {
+            INIT_WORK(&rpc->work, mattx_rpc_worker);
+            rpc->local_pid = my_pid;
+            rpc->orig_pid = orig_pid;
+            rpc->home_node = home_node;
+            
+            rpc->is_socket = true;
+            rpc->domain = data->domain;
+            rpc->type = data->type;
+            rpc->protocol = data->protocol;
+
+            // Fake an O_RDWR open so mattx_vfs_proxy is fully featured
+            rpc->flags = O_RDWR;
+
+            printk(KERN_INFO "MattX:[HOOK] Intercepted socket(domain=%d). Freezing Surrogate %d and escaping to Workqueue...\n", data->domain, my_pid);
+            
+            send_sig(SIGSTOP, current, 0);
+            schedule_work(&rpc->work);
+        }
+    }
+
+    return 0;
+}
+
+// --- CONNECT HOOK ---
+struct connect_kretprobe_data {
+    int fd;
+    struct sockaddr_storage addr;
+    int addrlen;
+    bool is_wormhole_fd;
+    int remote_fd;
+};
+
+static struct kretprobe connect_kprobe;
+
+static int entry_handler_connect(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    pid_t my_pid = current->pid;
+    struct connect_kretprobe_data *data = (struct connect_kretprobe_data *)ri->data;
+
+    if (!is_guest_process(my_pid)) return 0; 
+    if (!config_migrate_network_io) return 0;
+
+    // sys_connect(int fd, struct sockaddr __user *uservaddr, int addrlen)
+    data->fd = (int)regs->di;
+    data->addrlen = (int)regs->dx;
+    data->is_wormhole_fd = false;
+    data->remote_fd = -1;
+
+    // Safely copy the sockaddr struct from user space to kernel space
+    if (data->addrlen > 0 && data->addrlen <= sizeof(struct sockaddr_storage)) {
+        if (copy_from_user(&data->addr, (void __user *)regs->si, data->addrlen)) {
+            data->addrlen = 0;
+        }
+    } else {
+        data->addrlen = 0;
+    }
+
+    if (data->fd >= 0) {
+        struct file *f = fget(data->fd);
+        if (f) {
+            if (f->f_op == &mattx_fops) {
+                struct mattx_fake_fd_info *fd_info = f->private_data;
+                if (fd_info) {
+                    data->is_wormhole_fd = true;
+                    data->remote_fd = fd_info->remote_fd;
+                }
+            }
+            fput(f);
+        }
+    }
+
+    if (data->is_wormhole_fd) {
+        regs->di = -1; // Sabotage! The local sys_connect will fail
+    }
+
+    return 0;
+}
+
+static int ret_handler_connect(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    pid_t my_pid = current->pid;
+    struct connect_kretprobe_data *data = (struct connect_kretprobe_data *)ri->data;
+    int home_node = -1;
+    u32 orig_pid = 0;
+    int i;
+
+    if (!is_guest_process(my_pid) || !config_migrate_network_io || !data->is_wormhole_fd) return 0;
+
+    spin_lock(&guest_lock);
+    for (i = 0; i < guest_count; i++) {
+        if (guest_registry[i].local_pid == my_pid) {
+            home_node = guest_registry[i].home_node;
+            orig_pid = guest_registry[i].orig_pid;
+            guest_registry[i].rpc_done = false; 
+            break;
+        }
+    }
+    spin_unlock(&guest_lock);
+
+    if (home_node != -1) {
+        struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
+        if (rpc) {
+            INIT_WORK(&rpc->work, mattx_rpc_worker);
+            rpc->local_pid = my_pid;
+            rpc->orig_pid = orig_pid;
+            rpc->home_node = home_node;
+            
+            rpc->is_connect = true;
+            rpc->remote_fd = data->remote_fd;
+            rpc->addrlen = data->addrlen;
+            memcpy(&rpc->addr, &data->addr, data->addrlen);
+
+            printk(KERN_INFO "MattX:[HOOK] Intercepted connect(fd=%d). Freezing Surrogate %d and escaping to Workqueue...\n", data->fd, my_pid);
+            
+            send_sig(SIGSTOP, current, 0);
+            schedule_work(&rpc->work);
+        }
+    }
+
+    return 0;
+}
+
 int mattx_hooks_init(void) {
     int ret;
     memset(&openat_kprobe, 0, sizeof(openat_kprobe));
@@ -358,11 +572,37 @@ int mattx_hooks_init(void) {
         printk(KERN_ERR "MattX: register_kretprobe failed for dup2, returned %d\n", ret);
     }
 
+    memset(&socket_kprobe, 0, sizeof(socket_kprobe));
+    socket_kprobe.kp.symbol_name = "__x64_sys_socket";
+    socket_kprobe.entry_handler = entry_handler_socket;
+    socket_kprobe.handler = ret_handler_socket;
+    socket_kprobe.data_size = sizeof(struct socket_kretprobe_data);
+    socket_kprobe.maxactive = 64;
+
+    ret = register_kretprobe(&socket_kprobe);
+    if (ret < 0) {
+        printk(KERN_ERR "MattX: register_kretprobe failed for socket, returned %d\n", ret);
+    }
+
+    memset(&connect_kprobe, 0, sizeof(connect_kprobe));
+    connect_kprobe.kp.symbol_name = "__x64_sys_connect";
+    connect_kprobe.entry_handler = entry_handler_connect;
+    connect_kprobe.handler = ret_handler_connect;
+    connect_kprobe.data_size = sizeof(struct connect_kretprobe_data);
+    connect_kprobe.maxactive = 64;
+
+    ret = register_kretprobe(&connect_kprobe);
+    if (ret < 0) {
+        printk(KERN_ERR "MattX: register_kretprobe failed for connect, returned %d\n", ret);
+    }
+
     printk(KERN_INFO "MattX: Syscall Hooks (Kprobes) registered successfully.\n");
     return 0;
 }
 
 void mattx_hooks_exit(void) {
+    unregister_kretprobe(&connect_kprobe);
+    unregister_kretprobe(&socket_kprobe);
     unregister_kretprobe(&dup2_kprobe);
     unregister_kretprobe(&dup_kprobe);
     unregister_kretprobe(&openat_kprobe);

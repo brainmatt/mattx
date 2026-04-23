@@ -1012,6 +1012,144 @@ static void handle_sys_fsync_req(struct mattx_link *link, struct mattx_header *h
     }
 }
 
+static void handle_sys_socket_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    if (payload) {
+        struct mattx_sys_socket_req *req = (struct mattx_sys_socket_req *)payload;
+        struct mattx_sys_socket_reply reply;
+        struct socket *sock = NULL;
+        struct task_struct *deputy = NULL;
+        int remote_fd = -1;
+        int i, j;
+
+        printk(KERN_INFO "MattX:[NETWORK] Received SOCKET request from Node %u (domain: %d, type: %d, protocol: %d)\n", 
+               hdr->sender_id, req->domain, req->type, req->protocol);
+
+        rcu_read_lock();
+        deputy = pid_task(find_vpid(req->orig_pid), PIDTYPE_PID);
+        if (deputy) get_task_struct(deputy);
+        rcu_read_unlock();
+
+        if (deputy) {
+            const struct cred *old_cred;
+            if (deputy->mm) kthread_use_mm(deputy->mm);
+            old_cred = override_creds(deputy->cred);
+
+            // Create the real socket on VM1
+            int err = sock_create(req->domain, req->type, req->protocol, &sock);
+            
+            revert_creds(old_cred);
+            if (deputy->mm) kthread_unuse_mm(deputy->mm);
+
+            if (err < 0) {
+                printk(KERN_ERR "MattX:[NETWORK] Failed to create socket on Home Node (err: %d)\n", err);
+                reply.error = err;
+            } else {
+                // Map the newly created socket to a file and store it in the export registry
+                struct file *filp = sock_alloc_file(sock, 0, NULL);
+                if (IS_ERR(filp)) {
+                    sock_release(sock);
+                    reply.error = PTR_ERR(filp);
+                } else {
+                    spin_lock(&export_lock);
+                    for (i = 0; i < export_count; i++) {
+                        if (export_registry[i].orig_pid == req->orig_pid) {
+                            for (j = 0; j < MAX_FDS; j++) {
+                                if (export_registry[i].remote_files[j] == NULL) {
+                                    export_registry[i].remote_files[j] = filp;
+                                    remote_fd = j + 1000; 
+                                    break;
+                                }
+                            }
+                            break;
+                        }
+                    }
+                    spin_unlock(&export_lock);
+                    
+                    if (remote_fd == -1) {
+                        fput(filp); 
+                        reply.error = -ENFILE;
+                    } else {
+                        reply.error = 0;
+                    }
+                }
+            }
+            put_task_struct(deputy);
+        } else {
+            reply.error = -ESRCH;
+        }
+
+        reply.orig_pid = req->orig_pid;
+        reply.remote_fd = remote_fd;
+
+        if (cluster_map[hdr->sender_id]) {
+            mattx_comm_send(cluster_map[hdr->sender_id], MATTX_MSG_SYS_SOCKET_REPLY, &reply, sizeof(reply));
+        }
+    }
+}
+
+static void handle_sys_connect_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    if (payload) {
+        struct mattx_sys_connect_req *req = (struct mattx_sys_connect_req *)payload;
+        struct mattx_sys_connect_reply reply;
+        struct task_struct *deputy = NULL;
+        struct file *file = NULL;
+        int i;
+
+        reply.orig_pid = req->orig_pid;
+        reply.error = -EBADF;
+
+        printk(KERN_INFO "MattX:[NETWORK] Received CONNECT request for FD %u from Node %u\n", req->fd, hdr->sender_id);
+
+        if (req->fd >= 1000) {
+            int slot = req->fd - 1000;
+            spin_lock(&export_lock);
+            for (i = 0; i < export_count; i++) {
+                if (export_registry[i].orig_pid == req->orig_pid) {
+                    if (slot < MAX_FDS && export_registry[i].remote_files[slot]) {
+                        file = export_registry[i].remote_files[slot];
+                        get_file(file); 
+                    }
+                    break;
+                }
+            }
+            spin_unlock(&export_lock);
+        }
+
+        if (file) {
+            struct socket *sock = sock_from_file(file);
+            if (sock) {
+                const struct cred *old_cred = NULL;
+                
+                rcu_read_lock();
+                deputy = pid_task(find_vpid(req->orig_pid), PIDTYPE_PID);
+                if (deputy) get_task_struct(deputy);
+                rcu_read_unlock();
+
+                if (deputy) {
+                    if (deputy->mm) kthread_use_mm(deputy->mm);
+                    old_cred = override_creds(deputy->cred);
+                }
+
+                // Execute the connect operation on the real socket!
+                reply.error = sock->ops->connect(sock, (struct sockaddr *)&req->addr, req->addrlen, file->f_flags);
+
+                if (deputy) {
+                    revert_creds(old_cred);
+                    if (deputy->mm) kthread_unuse_mm(deputy->mm);
+                    put_task_struct(deputy);
+                }
+            } else {
+                reply.error = -ENOTSOCK;
+            }
+            fput(file); 
+        }
+        
+        if (cluster_map[hdr->sender_id]) {
+            mattx_comm_send(cluster_map[hdr->sender_id], MATTX_MSG_SYS_CONNECT_REPLY, &reply, sizeof(reply));
+        }
+    }
+}
+
 static void handle_sys_lseek_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
     if (payload) {
         struct mattx_sys_lseek_reply *reply = (struct mattx_sys_lseek_reply *)payload;
@@ -1112,6 +1250,51 @@ static void handle_sys_fsync_reply(struct mattx_link *link, struct mattx_header 
     }
 }
 
+static void handle_sys_socket_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    if (payload) {
+        struct mattx_sys_socket_reply *reply = (struct mattx_sys_socket_reply *)payload;
+        int i;
+
+        printk(KERN_INFO "MattX:[RPC] Received SOCKET_REPLY for Orig PID %u. Remote FD: %d\n", reply->orig_pid, reply->remote_fd);
+
+        spin_lock(&guest_lock);
+        for (i = 0; i < guest_count; i++) {
+            if (guest_registry[i].orig_pid == reply->orig_pid && guest_registry[i].home_node == hdr->sender_id) {
+                guest_registry[i].rpc_remote_fd = reply->remote_fd;
+                guest_registry[i].rpc_done = true;
+                if (guest_registry[i].rpc_wq) {
+                    wake_up_interruptible(guest_registry[i].rpc_wq);
+                }
+                break;
+            }
+        }
+        spin_unlock(&guest_lock);
+    }
+}
+
+static void handle_sys_connect_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    if (payload) {
+        struct mattx_sys_connect_reply *reply = (struct mattx_sys_connect_reply *)payload;
+        int i;
+
+        printk(KERN_INFO "MattX:[RPC] Received CONNECT_REPLY for Orig PID %u. Error: %d\n", reply->orig_pid, reply->error);
+
+        spin_lock(&guest_lock);
+        for (i = 0; i < guest_count; i++) {
+            if (guest_registry[i].orig_pid == reply->orig_pid && guest_registry[i].home_node == hdr->sender_id) {
+                // We reuse rpc_fsync_res to store generic error codes for now to save space
+                guest_registry[i].rpc_fsync_res = reply->error;
+                guest_registry[i].rpc_done = true;
+                if (guest_registry[i].rpc_wq) {
+                    wake_up_interruptible(guest_registry[i].rpc_wq);
+                }
+                break;
+            }
+        }
+        spin_unlock(&guest_lock);
+    }
+}
+
 void mattx_fileio_init_handlers(void) {
     mattx_register_handler(MATTX_MSG_SYSCALL_FWD, handle_syscall_fwd);
     mattx_register_handler(MATTX_MSG_SYS_OPEN_REQ, handle_sys_open_req);
@@ -1127,6 +1310,10 @@ void mattx_fileio_init_handlers(void) {
     mattx_register_handler(MATTX_MSG_SYS_DUP_REPLY, handle_sys_dup_reply);
     mattx_register_handler(MATTX_MSG_SYS_FSYNC_REQ, handle_sys_fsync_req);
     mattx_register_handler(MATTX_MSG_SYS_FSYNC_REPLY, handle_sys_fsync_reply);
+    mattx_register_handler(MATTX_MSG_SYS_SOCKET_REQ, handle_sys_socket_req);
+    mattx_register_handler(MATTX_MSG_SYS_SOCKET_REPLY, handle_sys_socket_reply);
+    mattx_register_handler(MATTX_MSG_SYS_CONNECT_REQ, handle_sys_connect_req);
+    mattx_register_handler(MATTX_MSG_SYS_CONNECT_REPLY, handle_sys_connect_reply);
     printk(KERN_INFO "MattX: [FILEIO] Network handlers registered.\n");
 }
 

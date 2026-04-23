@@ -3,6 +3,9 @@
 #include <unistd.h>
 #include <sys/wait.h>
 #include <sys/stat.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 #include <signal.h>
 #include <time.h>
 
@@ -124,6 +127,26 @@ int main() {
                 fflush(stdout);
                 fclose(sync_fp);
             }
+
+            // TEST NETWORK SOCKET CONNECT
+            int sock = socket(AF_INET, SOCK_STREAM, 0);
+            if (sock >= 0) {
+                struct sockaddr_in serv_addr;
+                serv_addr.sin_family = AF_INET;
+                serv_addr.sin_port = htons(80);
+                inet_pton(AF_INET, "1.1.1.1", &serv_addr.sin_addr); // Try connecting to Cloudflare DNS
+
+                if (connect(sock, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) == 0) {
+                    printf("[Worker %d] WORMHOLE CONNECT success! TCP Socket established on VM1.\n", getpid());
+                } else {
+                    printf("[Worker %d] WARNING: WORMHOLE CONNECT failed!\n", getpid());
+                }
+                close(sock);
+            } else {
+                printf("[Worker %d] WARNING: WORMHOLE SOCKET creation failed!\n", getpid());
+            }
+
+            fflush(stdout);
 
         }
 	    fclose(testfile);

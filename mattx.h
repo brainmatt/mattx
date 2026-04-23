@@ -74,6 +74,10 @@ enum mattx_msg_type {
     MATTX_MSG_SYS_DUP_REPLY,
     MATTX_MSG_SYS_FSYNC_REQ,
     MATTX_MSG_SYS_FSYNC_REPLY,
+    MATTX_MSG_SYS_SOCKET_REQ,
+    MATTX_MSG_SYS_SOCKET_REPLY,
+    MATTX_MSG_SYS_CONNECT_REQ,
+    MATTX_MSG_SYS_CONNECT_REPLY,
 };
 
 struct mattx_header {
@@ -222,6 +226,31 @@ struct mattx_sys_fsync_reply {
     int error;
 };
 
+struct mattx_sys_socket_req {
+    u32 orig_pid;
+    int domain;
+    int type;
+    int protocol;
+};
+
+struct mattx_sys_socket_reply {
+    u32 orig_pid;
+    int remote_fd;
+    int error;
+};
+
+struct mattx_sys_connect_req {
+    u32 orig_pid;
+    u32 fd;
+    struct sockaddr_storage addr;
+    int addrlen;
+};
+
+struct mattx_sys_connect_reply {
+    u32 orig_pid;
+    int error;
+};
+
 struct mattx_fake_fd_info {
     int home_node;
     u32 orig_pid;
@@ -248,6 +277,17 @@ struct mattx_rpc_work {
     // For DUP
     bool is_dup;
     int new_local_fd; // -1 if just dup()
+    
+    // For SOCKET
+    bool is_socket;
+    int domain;
+    int type;
+    int protocol;
+
+    // For CONNECT
+    bool is_connect;
+    struct sockaddr_storage addr;
+    int addrlen;
 };
 
 struct mattx_link {
