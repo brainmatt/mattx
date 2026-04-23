@@ -78,6 +78,62 @@ sequenceDiagram
 ```
 ***
 
+## 🕳️ The VFS Wormhole (Syscall Routing Architecture)
+
+To maintain the perfect illusion of a Single System Image, a migrated process (Surrogate) must retain access to the exact filesystem, file descriptors, and standard I/O streams of its Home Node. This is achieved via the "Wormhole"—a combination of Kprobes and custom Virtual File System (VFS) operations.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Surrogate as Surrogate (VM2)
+    participant VM2_K as VM2 Kernel
+    participant VM1_K as VM1 Kernel (Home)
+
+    rect rgb(230, 230, 250)
+    Note over Surrogate, VM1_K: 1. The Intercept (openat / dup) via Kprobes
+    Surrogate->>VM2_K: open("/etc/hosts", O_RDONLY)
+    Note over VM2_K: Kretprobe catches do_sys_openat2<br/>Sabotage syscall & Freeze Surrogate
+    VM2_K->>VM1_K: MATTX_MSG_SYS_OPEN_REQ
+    Note over VM1_K: override_creds(Deputy)<br/>Execute filp_open()
+    VM1_K-->>VM2_K: MATTX_MSG_SYS_OPEN_REPLY (Remote FD)
+    Note over VM2_K: Create "mattx_vfs_proxy" file<br/>Inject into Surrogate FD Table
+    VM2_K-->>Surrogate: Return Local FD
+    end
+
+    rect rgb(200, 240, 200)
+    Note over Surrogate, VM1_K: 2. Standard I/O (read, write, lseek, fsync) via mattx_fops
+    Surrogate->>VM2_K: read(local_fd) / write() / lseek() / fsync()
+    Note over VM2_K: VFS triggers mattx_fake_read/write<br/>Freeze Surrogate
+    VM2_K->>VM1_K: MATTX_MSG_SYS_READ_REQ (Remote FD)
+    Note over VM1_K: override_creds(Deputy)<br/>Execute kernel_read() / vfs_fsync
+    VM1_K-->>VM2_K: MATTX_MSG_SYS_READ_REPLY (Data)
+    Note over VM2_K: Wake Surrogate
+    VM2_K-->>Surrogate: Return Data / Offset
+    end
+
+    rect rgb(250, 220, 220)
+    Note over Surrogate, VM1_K: 3. The Reflection (fstat / getattr) via mattx_iops
+    Surrogate->>VM2_K: fstat(local_fd, &statbuf)
+    Note over VM2_K: VFS triggers mattx_fake_getattr<br/>Freeze Surrogate
+    VM2_K->>VM1_K: MATTX_MSG_SYS_STATX_REQ (Remote FD)
+    Note over VM1_K: override_creds(Deputy)<br/>Execute vfs_getattr()
+    VM1_K-->>VM2_K: MATTX_MSG_SYS_STATX_REPLY (kstat data)
+    Note over VM2_K: Format struct statx<br/>copy_to_user(&statbuf)
+    VM2_K-->>Surrogate: Return 0 (Success)
+    end
+```
+
+### Wormhole Methods Detailed Description
+*   **`open` / `openat`**: Caught using `kretprobe` on `do_sys_openat2`. The syscall is sabotaged locally on VM2 to prevent empty files from being created. The request is sent to VM1, which opens the file using the Deputy's credentials. VM2 then injects a ghost file (`anon_inode_getfile`) into the Surrogate's file descriptor table, attached to our custom `mattx_fops`.
+*   **`read` / `write`**: Hooked natively via `mattx_fops.read` and `.write`. Data is intercepted at the VFS layer, chunked if necessary, and pumped over TCP to VM1 where `kernel_read` or `kernel_write` is executed on the true file descriptor.
+*   **`lseek` (The Navigator)**: Hooked via `mattx_fops.llseek`. We cannot seek locally because VM2 does not know the true size of the file. The seek is evaluated on VM1, and the resulting absolute offset is returned to VM2.
+*   **`stat` / `fstat` / `statx` (The Reflection)**: Hooked via `mattx_iops.getattr` on our ghost inode. When the Surrogate queries file metadata, VM1 performs `vfs_getattr` and sends the real Ext4/XFS filesystem attributes (size, permissions, timestamps). VM2 copies this directly into the Surrogate's memory buffer.
+*   **`dup` / `dup2` (The Cloner)**: Caught using `kretprobe` on `__x64_sys_dup` and `sys_dup2`. VM1 explicitly duplicates its kernel `struct file *` reference so that if the Surrogate closes one of the cloned file descriptors, the actual Wormhole connection to the other descriptor is not severed.
+*   **`fsync` / `fdatasync` (The Synchronizer)**: Hooked via `mattx_fops.fsync`. Forces VM1 to execute `vfs_fsync_range` against the physical disk to guarantee data permanence, then relays the success code back to VM2.
+*   **`close`**: Hooked via `mattx_fops.release`. VM2 sends a `CLOSE_REQ` so VM1 can drop its reference count on the true file descriptor, properly freeing resources across the cluster.
+
+***
+
 
 ## 📂 File: mattx_main.c
 *This file acts as the central nervous system of the module, handling initialization, the Netlink bridge to user-space, and the global registries.*
@@ -119,15 +175,32 @@ sequenceDiagram
 
 ---
 
-## 📂 File: mattx_comm.c
-*The networking and VFS routing subsystem. This is where data moves across the cluster and where the Illusion is maintained.*
+## 📂 File: mattx_hooks.c
+*The Kprobe interception subsystem. It catches system calls before the local VFS can process them.*
 
-### Function: mattx_fake_write
-*   **Declared in:** Static to mattx_comm.c
+### Function: entry_handler_openat / entry_handler_dup
+*   **Declared in:** Static to mattx_hooks.c
+*   **Subsystem:** System Call Hijacking
+*   **Usage:** To intercept file opening and file descriptor cloning on the Surrogate.
+*   **Detailed Description:** Uses Linux Kretprobes on `do_sys_openat2`, `__x64_sys_dup`, and `__x64_sys_dup2`. When triggered by a Guest Process, it extracts the arguments, sabotages the local syscall by forcing an invalid argument into the registers (preventing local file creation), freezes the Surrogate with `SIGSTOP`, and schedules an RPC worker to send the request to the Home Node.
+
+## 📂 File: mattx_fileio.c
+*The VFS Proxy subsystem. It maintains the "Ghost Files" and handles the distributed File I/O RPCs.*
+
+### Function: mattx_fake_read / mattx_fake_write / mattx_fake_llseek / mattx_fake_fsync
+*   **Declared in:** Static to mattx_fileio.c
 *   **Subsystem:** VFS Proxy (The Wormhole)
-*   **Usage:** To intercept `stdout` and `stderr` from a Surrogate and tunnel it back to the Home Node.
-*   **Detailed Description:** This is a custom Virtual File System `write` operation. When the Surrogate calls `printf`, the kernel routes the text here. The function looks up the Surrogate's Home Node, packages the text into a `MATTX_MSG_SYSCALL_FWD` packet, and shoots it across the TCP socket.
-*   **Background:** openMosix intercepted the global syscall table to achieve this. We use a much safer, modern approach: injecting "Fake FDs" into the process's file table that point directly to this function.
+*   **Usage:** Custom `file_operations` attached to anonymous inodes on VM2.
+*   **Detailed Description:** Intercepts standard read/write/seek/sync operations. Routes them over TCP, puts the Surrogate to sleep on a Wait Queue, and seamlessly returns the fetched data or offset to user-space when VM1 replies.
+
+### Function: mattx_fake_getattr
+*   **Declared in:** Static to mattx_fileio.c
+*   **Subsystem:** The Reflection (Metadata Spoofing)
+*   **Usage:** Custom `inode_operations` attached to ghost files. Intercepts `fstat` and `statx` calls.
+*   **Detailed Description:** Asks VM1 for the real physical file metadata, and dynamically unpacks the results into the Surrogate's memory buffer, bypassing the local VM2 kernel's dummy attributes.
+
+## 📂 File: mattx_comm.c
+*The networking subsystem. This is where data moves across the cluster.*
 
 ### Function: mattx_handle_message
 *   **Declared in:** Static to mattx_comm.c
