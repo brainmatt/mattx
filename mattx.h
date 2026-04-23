@@ -78,6 +78,10 @@ enum mattx_msg_type {
     MATTX_MSG_SYS_SOCKET_REPLY,
     MATTX_MSG_SYS_CONNECT_REQ,
     MATTX_MSG_SYS_CONNECT_REPLY,
+    MATTX_MSG_SYS_BIND_REQ,
+    MATTX_MSG_SYS_BIND_REPLY,
+    MATTX_MSG_SYS_LISTEN_REQ,
+    MATTX_MSG_SYS_LISTEN_REPLY,
 };
 
 struct mattx_header {
@@ -251,6 +255,29 @@ struct mattx_sys_connect_reply {
     int error;
 };
 
+struct mattx_sys_bind_req {
+    u32 orig_pid;
+    u32 fd;
+    struct sockaddr_storage addr;
+    int addrlen;
+};
+
+struct mattx_sys_bind_reply {
+    u32 orig_pid;
+    int error;
+};
+
+struct mattx_sys_listen_req {
+    u32 orig_pid;
+    u32 fd;
+    int backlog;
+};
+
+struct mattx_sys_listen_reply {
+    u32 orig_pid;
+    int error;
+};
+
 struct mattx_fake_fd_info {
     int home_node;
     u32 orig_pid;
@@ -284,10 +311,15 @@ struct mattx_rpc_work {
     int type;
     int protocol;
 
-    // For CONNECT
+    // For CONNECT / BIND
     bool is_connect;
+    bool is_bind;
     struct sockaddr_storage addr;
     int addrlen;
+
+    // For LISTEN
+    bool is_listen;
+    int backlog;
 };
 
 struct mattx_link {

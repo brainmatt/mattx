@@ -1295,6 +1295,154 @@ static void handle_sys_connect_reply(struct mattx_link *link, struct mattx_heade
     }
 }
 
+static void handle_sys_bind_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    if (payload) {
+        struct mattx_sys_bind_req *req = (struct mattx_sys_bind_req *)payload;
+        struct mattx_sys_bind_reply reply;
+        struct task_struct *deputy = NULL;
+        struct file *file = NULL;
+        int i;
+
+        reply.orig_pid = req->orig_pid;
+        reply.error = -EBADF;
+
+        printk(KERN_INFO "MattX:[NETWORK] Received BIND request for FD %u from Node %u\n", req->fd, hdr->sender_id);
+
+        if (req->fd >= 1000) {
+            int slot = req->fd - 1000;
+            spin_lock(&export_lock);
+            for (i = 0; i < export_count; i++) {
+                if (export_registry[i].orig_pid == req->orig_pid) {
+                    if (slot < MAX_FDS && export_registry[i].remote_files[slot]) {
+                        file = export_registry[i].remote_files[slot];
+                        get_file(file); 
+                    }
+                    break;
+                }
+            }
+            spin_unlock(&export_lock);
+        }
+
+        if (file) {
+            struct socket *sock = sock_from_file(file);
+            if (sock && sock->ops && sock->ops->bind) {
+                const struct cred *old_cred = NULL;
+                
+                rcu_read_lock();
+                deputy = pid_task(find_vpid(req->orig_pid), PIDTYPE_PID);
+                if (deputy) get_task_struct(deputy);
+                rcu_read_unlock();
+
+                if (deputy) {
+                    if (deputy->mm) kthread_use_mm(deputy->mm);
+                    old_cred = override_creds(deputy->cred);
+                }
+
+                reply.error = sock->ops->bind(sock, (struct sockaddr *)&req->addr, req->addrlen);
+
+                if (deputy) {
+                    revert_creds(old_cred);
+                    if (deputy->mm) kthread_unuse_mm(deputy->mm);
+                    put_task_struct(deputy);
+                }
+            } else {
+                reply.error = -ENOTSOCK;
+            }
+            fput(file); 
+        }
+        
+        if (cluster_map[hdr->sender_id]) {
+            mattx_comm_send(cluster_map[hdr->sender_id], MATTX_MSG_SYS_BIND_REPLY, &reply, sizeof(reply));
+        }
+    }
+}
+
+static void handle_sys_listen_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    if (payload) {
+        struct mattx_sys_listen_req *req = (struct mattx_sys_listen_req *)payload;
+        struct mattx_sys_listen_reply reply;
+        struct task_struct *deputy = NULL;
+        struct file *file = NULL;
+        int i;
+
+        reply.orig_pid = req->orig_pid;
+        reply.error = -EBADF;
+
+        printk(KERN_INFO "MattX:[NETWORK] Received LISTEN request for FD %u from Node %u\n", req->fd, hdr->sender_id);
+
+        if (req->fd >= 1000) {
+            int slot = req->fd - 1000;
+            spin_lock(&export_lock);
+            for (i = 0; i < export_count; i++) {
+                if (export_registry[i].orig_pid == req->orig_pid) {
+                    if (slot < MAX_FDS && export_registry[i].remote_files[slot]) {
+                        file = export_registry[i].remote_files[slot];
+                        get_file(file); 
+                    }
+                    break;
+                }
+            }
+            spin_unlock(&export_lock);
+        }
+
+        if (file) {
+            struct socket *sock = sock_from_file(file);
+            if (sock && sock->ops && sock->ops->listen) {
+                const struct cred *old_cred = NULL;
+                
+                rcu_read_lock();
+                deputy = pid_task(find_vpid(req->orig_pid), PIDTYPE_PID);
+                if (deputy) get_task_struct(deputy);
+                rcu_read_unlock();
+
+                if (deputy) {
+                    if (deputy->mm) kthread_use_mm(deputy->mm);
+                    old_cred = override_creds(deputy->cred);
+                }
+
+                reply.error = sock->ops->listen(sock, req->backlog);
+
+                if (deputy) {
+                    revert_creds(old_cred);
+                    if (deputy->mm) kthread_unuse_mm(deputy->mm);
+                    put_task_struct(deputy);
+                }
+            } else {
+                reply.error = -ENOTSOCK;
+            }
+            fput(file); 
+        }
+        
+        if (cluster_map[hdr->sender_id]) {
+            mattx_comm_send(cluster_map[hdr->sender_id], MATTX_MSG_SYS_LISTEN_REPLY, &reply, sizeof(reply));
+        }
+    }
+}
+
+static void handle_sys_generic_int_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    // We can reuse this logic for bind, listen, connect, fsync since they all return an integer
+    // The payload structs happen to have 'orig_pid' and 'error' in the exact same memory layout
+    if (payload) {
+        struct mattx_sys_connect_reply *reply = (struct mattx_sys_connect_reply *)payload;
+        int i;
+
+        printk(KERN_INFO "MattX:[RPC] Received Integer REPLY (Err: %d) for Orig PID %u\n", reply->error, reply->orig_pid);
+
+        spin_lock(&guest_lock);
+        for (i = 0; i < guest_count; i++) {
+            if (guest_registry[i].orig_pid == reply->orig_pid && guest_registry[i].home_node == hdr->sender_id) {
+                guest_registry[i].rpc_fsync_res = reply->error;
+                guest_registry[i].rpc_done = true;
+                if (guest_registry[i].rpc_wq) {
+                    wake_up_interruptible(guest_registry[i].rpc_wq);
+                }
+                break;
+            }
+        }
+        spin_unlock(&guest_lock);
+    }
+}
+
 void mattx_fileio_init_handlers(void) {
     mattx_register_handler(MATTX_MSG_SYSCALL_FWD, handle_syscall_fwd);
     mattx_register_handler(MATTX_MSG_SYS_OPEN_REQ, handle_sys_open_req);
@@ -1313,7 +1461,11 @@ void mattx_fileio_init_handlers(void) {
     mattx_register_handler(MATTX_MSG_SYS_SOCKET_REQ, handle_sys_socket_req);
     mattx_register_handler(MATTX_MSG_SYS_SOCKET_REPLY, handle_sys_socket_reply);
     mattx_register_handler(MATTX_MSG_SYS_CONNECT_REQ, handle_sys_connect_req);
-    mattx_register_handler(MATTX_MSG_SYS_CONNECT_REPLY, handle_sys_connect_reply);
+    mattx_register_handler(MATTX_MSG_SYS_CONNECT_REPLY, handle_sys_generic_int_reply);
+    mattx_register_handler(MATTX_MSG_SYS_BIND_REQ, handle_sys_bind_req);
+    mattx_register_handler(MATTX_MSG_SYS_BIND_REPLY, handle_sys_generic_int_reply);
+    mattx_register_handler(MATTX_MSG_SYS_LISTEN_REQ, handle_sys_listen_req);
+    mattx_register_handler(MATTX_MSG_SYS_LISTEN_REPLY, handle_sys_generic_int_reply);
     printk(KERN_INFO "MattX: [FILEIO] Network handlers registered.\n");
 }
 

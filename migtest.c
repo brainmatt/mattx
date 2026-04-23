@@ -146,6 +146,31 @@ int main() {
                 printf("[Worker %d] WARNING: WORMHOLE SOCKET creation failed!\n", getpid());
             }
 
+            // TEST NETWORK SOCKET BIND & LISTEN
+            int srv_sock = socket(AF_INET, SOCK_STREAM, 0);
+            if (srv_sock >= 0) {
+                struct sockaddr_in srv_addr;
+                srv_addr.sin_family = AF_INET;
+                // Rotate ports slightly to avoid TIME_WAIT conflicts if we run this loop fast
+                srv_addr.sin_port = htons(8080 + (counter % 1000)); 
+                srv_addr.sin_addr.s_addr = INADDR_ANY;
+
+                if (bind(srv_sock, (struct sockaddr *)&srv_addr, sizeof(srv_addr)) == 0) {
+                    printf("[Worker %d] WORMHOLE BIND success! Bound to port %d on VM1.\n", getpid(), ntohs(srv_addr.sin_port));
+                    
+                    if (listen(srv_sock, 5) == 0) {
+                        printf("[Worker %d] WORMHOLE LISTEN success! Listening on VM1.\n", getpid());
+                    } else {
+                        printf("[Worker %d] WARNING: WORMHOLE LISTEN failed!\n", getpid());
+                    }
+                } else {
+                    printf("[Worker %d] WARNING: WORMHOLE BIND failed!\n", getpid());
+                }
+                close(srv_sock);
+            } else {
+                printf("[Worker %d] WARNING: WORMHOLE SERVER SOCKET creation failed!\n", getpid());
+            }
+
             fflush(stdout);
 
         }
