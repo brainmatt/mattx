@@ -18,16 +18,21 @@ bool balancer_enabled = true;
 u32 my_node_id = 0; 
 u32 my_ip_addr = 0;
 
-enum { MATTX_ATTR_UNSPEC, MATTX_ATTR_NODE_ID, MATTX_ATTR_IPV4_ADDR, MATTX_ATTR_STUB_PID, MATTX_ATTR_BLUEPRINT, MATTX_ATTR_MY_NODE_ID, MATTX_ATTR_LOCAL_IP, __MATTX_ATTR_MAX };
+bool config_migrate_file_io = true;
+bool config_migrate_network_io = true;
+
+enum { MATTX_ATTR_UNSPEC, MATTX_ATTR_NODE_ID, MATTX_ATTR_IPV4_ADDR, MATTX_ATTR_STUB_PID, MATTX_ATTR_BLUEPRINT, MATTX_ATTR_MY_NODE_ID, MATTX_ATTR_LOCAL_IP, MATTX_ATTR_CONFIG_FILE_IO, MATTX_ATTR_CONFIG_NET_IO, __MATTX_ATTR_MAX };
 #define MATTX_ATTR_MAX (__MATTX_ATTR_MAX - 1)
 
-enum { MATTX_CMD_UNSPEC, MATTX_CMD_NODE_JOIN, MATTX_CMD_NODE_LEAVE, MATTX_CMD_HIJACK_ME, MATTX_CMD_GET_BLUEPRINT, MATTX_CMD_SET_LOCAL_IP, __MATTX_CMD_MAX };
+enum { MATTX_CMD_UNSPEC, MATTX_CMD_NODE_JOIN, MATTX_CMD_NODE_LEAVE, MATTX_CMD_HIJACK_ME, MATTX_CMD_GET_BLUEPRINT, MATTX_CMD_SET_LOCAL_IP, MATTX_CMD_SET_CONFIG, __MATTX_CMD_MAX };
 #define MATTX_CMD_MAX (__MATTX_CMD_MAX - 1)
 
 static const struct nla_policy mattx_genl_policy[MATTX_ATTR_MAX + 1] = {[MATTX_ATTR_NODE_ID] = { .type = NLA_U32 },[MATTX_ATTR_IPV4_ADDR] = { .type = NLA_U32 },
     [MATTX_ATTR_STUB_PID] = { .type = NLA_U32 },
     [MATTX_ATTR_BLUEPRINT] = { .type = NLA_BINARY },[MATTX_ATTR_MY_NODE_ID] = { .type = NLA_U32 },
     [MATTX_ATTR_LOCAL_IP] = { .type = NLA_U32 }, 
+    [MATTX_ATTR_CONFIG_FILE_IO] = { .type = NLA_U8 },
+    [MATTX_ATTR_CONFIG_NET_IO] = { .type = NLA_U8 },
 };
 
 static int mattx_nl_cmd_node_join(struct sk_buff *skb, struct genl_info *info) {
@@ -122,12 +127,27 @@ static int mattx_nl_cmd_set_local_ip(struct sk_buff *skb, struct genl_info *info
     return 0;
 }
 
+static int mattx_nl_cmd_set_config(struct sk_buff *skb, struct genl_info *info) {
+    if (info->attrs[MATTX_ATTR_CONFIG_FILE_IO]) {
+        config_migrate_file_io = nla_get_u8(info->attrs[MATTX_ATTR_CONFIG_FILE_IO]) ? true : false;
+    }
+    if (info->attrs[MATTX_ATTR_CONFIG_NET_IO]) {
+        config_migrate_network_io = nla_get_u8(info->attrs[MATTX_ATTR_CONFIG_NET_IO]) ? true : false;
+    }
+
+    printk(KERN_INFO "MattX: Configuration Updated - FileIO: %s, NetworkIO: %s\n",
+           config_migrate_file_io ? "TRUE" : "FALSE",
+           config_migrate_network_io ? "TRUE" : "FALSE");
+    return 0;
+}
+
 static const struct genl_ops mattx_genl_ops[] = {
     { .cmd = MATTX_CMD_NODE_JOIN, .policy = mattx_genl_policy, .doit = mattx_nl_cmd_node_join },
     { .cmd = MATTX_CMD_NODE_LEAVE, .policy = mattx_genl_policy, .doit = mattx_nl_cmd_node_leave },
-    { .cmd = MATTX_CMD_GET_BLUEPRINT, .policy = mattx_genl_policy, .doit = mattx_nl_cmd_get_blueprint },
     { .cmd = MATTX_CMD_HIJACK_ME, .policy = mattx_genl_policy, .doit = mattx_nl_cmd_hijack_me },
+    { .cmd = MATTX_CMD_GET_BLUEPRINT, .policy = mattx_genl_policy, .doit = mattx_nl_cmd_get_blueprint },
     { .cmd = MATTX_CMD_SET_LOCAL_IP, .policy = mattx_genl_policy, .doit = mattx_nl_cmd_set_local_ip }, 
+    { .cmd = MATTX_CMD_SET_CONFIG, .policy = mattx_genl_policy, .doit = mattx_nl_cmd_set_config },
 };
 
 struct genl_family mattx_genl_family = {

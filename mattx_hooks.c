@@ -186,6 +186,13 @@ static int ret_handler_openat(struct kretprobe_instance *ri, struct pt_regs *reg
         spin_unlock(&guest_lock);
 
         if (home_node != -1) {
+            if (!config_migrate_file_io) {
+                // Local Breakout! 🏎️
+                // User disabled File I/O Wormhole routing. Let the Surrogate execute
+                // openat locally on the remote node's native filesystem!
+                return 0;
+            }
+
             struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
             if (rpc) {
                 INIT_WORK(&rpc->work, mattx_rpc_worker);

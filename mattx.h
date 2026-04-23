@@ -303,6 +303,10 @@ extern bool balancer_enabled;
 extern u32 my_node_id; 
 extern u32 my_ip_addr; 
 
+// Configuration Toggles
+extern bool config_migrate_file_io;
+extern bool config_migrate_network_io;
+
 int mattx_comm_send(struct mattx_link *link, u32 type, void *data, u32 len);
 struct mattx_link* mattx_comm_connect(__be32 ip_addr, int node_id);
 void mattx_comm_disconnect(int node_id);

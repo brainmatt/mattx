@@ -18,10 +18,10 @@
 #define DEFAULT_IFACE "eth0"
 
 // NEW: Added MATTX_ATTR_LOCAL_IP and MATTX_CMD_SET_LOCAL_IP
-enum { MATTX_ATTR_UNSPEC, MATTX_ATTR_NODE_ID, MATTX_ATTR_IPV4_ADDR, MATTX_ATTR_STUB_PID, MATTX_ATTR_BLUEPRINT, MATTX_ATTR_MY_NODE_ID, MATTX_ATTR_LOCAL_IP, __MATTX_ATTR_MAX };
+enum { MATTX_ATTR_UNSPEC, MATTX_ATTR_NODE_ID, MATTX_ATTR_IPV4_ADDR, MATTX_ATTR_STUB_PID, MATTX_ATTR_BLUEPRINT, MATTX_ATTR_MY_NODE_ID, MATTX_ATTR_LOCAL_IP, MATTX_ATTR_CONFIG_FILE_IO, MATTX_ATTR_CONFIG_NET_IO, __MATTX_ATTR_MAX };
 #define MATTX_ATTR_MAX (__MATTX_ATTR_MAX - 1)
 
-enum { MATTX_CMD_UNSPEC, MATTX_CMD_NODE_JOIN, MATTX_CMD_NODE_LEAVE, MATTX_CMD_HIJACK_ME, MATTX_CMD_GET_BLUEPRINT, MATTX_CMD_SET_LOCAL_IP, __MATTX_CMD_MAX };
+enum { MATTX_CMD_UNSPEC, MATTX_CMD_NODE_JOIN, MATTX_CMD_NODE_LEAVE, MATTX_CMD_HIJACK_ME, MATTX_CMD_GET_BLUEPRINT, MATTX_CMD_SET_LOCAL_IP, MATTX_CMD_SET_CONFIG, __MATTX_CMD_MAX };
 #define MATTX_CMD_MAX (__MATTX_CMD_MAX - 1)
 
 struct mattx_config {
@@ -29,6 +29,8 @@ struct mattx_config {
     char group[INET_ADDRSTRLEN];
     int port;
     uint32_t node_id;
+    uint8_t migrate_file_io;
+    uint8_t migrate_net_io;
 };
 
 struct mattx_beacon {
@@ -75,6 +77,25 @@ void register_local_ip(uint32_t ip_addr) {
         printf("ERROR: Failed to register local IP with kernel.\n");
     } else {
         printf("SUCCESS: Registered local IP %s with kernel.\n", inet_ntoa(*(struct in_addr*)&ip_addr));
+    }
+    fflush(stdout);
+    nlmsg_free(msg);
+}
+
+void register_config_to_kernel() {
+    struct nl_msg *msg;
+    
+    if (mattx_family_id < 0) return;
+
+    msg = nlmsg_alloc();
+    genlmsg_put(msg, NL_AUTO_PORT, NL_AUTO_SEQ, mattx_family_id, 0, 0, MATTX_CMD_SET_CONFIG, 1);
+    nla_put_u8(msg, MATTX_ATTR_CONFIG_FILE_IO, config.migrate_file_io);
+    nla_put_u8(msg, MATTX_ATTR_CONFIG_NET_IO, config.migrate_net_io);
+
+    if (nl_send_auto(nl_sock, msg) < 0) {
+        printf("ERROR: Failed to push configuration to kernel.\n");
+    } else {
+        printf("SUCCESS: Pushed configuration to kernel (FileIO: %d, NetIO: %d)\n", config.migrate_file_io, config.migrate_net_io);
     }
     fflush(stdout);
     nlmsg_free(msg);
@@ -137,21 +158,35 @@ uint32_t get_interface_ip(const char *iface) {
 }
 
 void load_config() {
+    // Set defaults
+    strcpy(config.interface, DEFAULT_IFACE);
+    strcpy(config.group, DEFAULT_GROUP);
+    config.port = DEFAULT_PORT;
+    config.node_id = 0;
+    config.migrate_file_io = 1;
+    config.migrate_net_io = 1;
+
     FILE *fp = fopen(CONFIG_FILE, "r");
     if (!fp) {
-        strcpy(config.interface, DEFAULT_IFACE);
-        strcpy(config.group, DEFAULT_GROUP);
-        config.port = DEFAULT_PORT;
-        config.node_id = 0;
         return;
     }
     char line[256];
+    char temp_val[32];
     while (fgets(line, sizeof(line), fp)) {
         if (line[0] == '#' || line[0] == '\n') continue;
         if (sscanf(line, "INTERFACE=%s", config.interface)) continue;
         if (sscanf(line, "MULTICAST_GROUP=%s", config.group)) continue;
         if (sscanf(line, "PORT=%d", &config.port)) continue;
         if (sscanf(line, "NODE_ID=%u", &config.node_id)) continue;
+        
+        if (sscanf(line, "MIGRATE_FILE_IO=%s", temp_val)) {
+            if (strcmp(temp_val, "false") == 0 || strcmp(temp_val, "0") == 0) config.migrate_file_io = 0;
+            continue;
+        }
+        if (sscanf(line, "MIGRATE_NETWORK_IO=%s", temp_val)) {
+            if (strcmp(temp_val, "false") == 0 || strcmp(temp_val, "0") == 0) config.migrate_net_io = 0;
+            continue;
+        }
     }
     fclose(fp);
     if (config.node_id == 0) config.node_id = generate_node_id(config.interface);
@@ -195,6 +230,9 @@ int main() {
     // --- NEW: Tell the kernel our IP address right away! ---
     uint32_t my_ip = get_interface_ip(config.interface);
     register_local_ip(my_ip);
+    
+    // Push the configuration settings into the kernel
+    register_config_to_kernel();
 
     s = socket(AF_INET, SOCK_DGRAM, 0);
     int reuse = 1;
