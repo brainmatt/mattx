@@ -385,7 +385,7 @@ static int entry_handler_socket(struct kretprobe_instance *ri, struct pt_regs *r
     data->type = (int)regs->si;
     data->protocol = (int)regs->dx;
 
-    regs->di = -1; // Sabotage! The local sys_socket will fail with -EAFNOSUPPORT
+    regs->di = -1; // Sabotage! The local __sys_socket will fail with -EAFNOSUPPORT
 
     return 0;
 }
@@ -484,7 +484,7 @@ static int entry_handler_connect(struct kretprobe_instance *ri, struct pt_regs *
     }
 
     if (data->is_wormhole_fd) {
-        regs->di = -1; // Sabotage! The local sys_connect will fail
+        regs->di = -1; // Sabotage! The local __sys_connect will fail
     }
 
     return 0;
@@ -573,7 +573,7 @@ int mattx_hooks_init(void) {
     }
 
     memset(&socket_kprobe, 0, sizeof(socket_kprobe));
-    socket_kprobe.kp.symbol_name = "__x64_sys_socket";
+    socket_kprobe.kp.symbol_name = "__sys_socket";
     socket_kprobe.entry_handler = entry_handler_socket;
     socket_kprobe.handler = ret_handler_socket;
     socket_kprobe.data_size = sizeof(struct socket_kretprobe_data);
@@ -585,7 +585,7 @@ int mattx_hooks_init(void) {
     }
 
     memset(&connect_kprobe, 0, sizeof(connect_kprobe));
-    connect_kprobe.kp.symbol_name = "__x64_sys_connect";
+    connect_kprobe.kp.symbol_name = "__sys_connect";
     connect_kprobe.entry_handler = entry_handler_connect;
     connect_kprobe.handler = ret_handler_connect;
     connect_kprobe.data_size = sizeof(struct connect_kretprobe_data);
