@@ -72,6 +72,8 @@ enum mattx_msg_type {
     MATTX_MSG_SYS_STATX_REPLY,
     MATTX_MSG_SYS_DUP_REQ,
     MATTX_MSG_SYS_DUP_REPLY,
+    MATTX_MSG_SYS_FSYNC_REQ,
+    MATTX_MSG_SYS_FSYNC_REPLY,
 };
 
 struct mattx_header {
@@ -207,6 +209,19 @@ struct mattx_sys_dup_reply {
     int error;
 };
 
+struct mattx_sys_fsync_req {
+    u32 orig_pid;
+    u32 fd;
+    loff_t start;
+    loff_t end;
+    int datasync;
+};
+
+struct mattx_sys_fsync_reply {
+    u32 orig_pid;
+    int error;
+};
+
 struct mattx_fake_fd_info {
     int home_node;
     u32 orig_pid;
@@ -254,6 +269,7 @@ struct mattx_guest_info {
     ssize_t rpc_read_bytes;
     loff_t rpc_lseek_res;
     struct statx *rpc_statx_buf;
+    int rpc_fsync_res;
 };
 
 struct mattx_export_info {

@@ -181,6 +181,58 @@ static loff_t mattx_fake_llseek(struct file *file, loff_t offset, int whence) {
     return ret_offset;
 }
 
+// --- NEW: The Fake File FSync Operation (Runs on Node 2) ---
+static int mattx_fake_fsync(struct file *file, loff_t start, loff_t end, int datasync) {
+    struct mattx_fake_fd_info *fd_info = file->private_data;
+    struct mattx_sys_fsync_req req;
+    DECLARE_WAIT_QUEUE_HEAD_ONSTACK(rpc_wq);
+    pid_t my_pid = current->pid;
+    int i;
+    int ret_error = -EIO;
+
+    if (!fd_info || !cluster_map[fd_info->home_node]) return -EIO;
+
+    req.orig_pid = fd_info->orig_pid;
+    req.fd = fd_info->remote_fd;
+    req.start = start;
+    req.end = end;
+    req.datasync = datasync;
+
+    // 1. Attach our wait queue to the registry
+    spin_lock(&guest_lock);
+    for (i = 0; i < guest_count; i++) {
+        if (guest_registry[i].local_pid == my_pid) {
+            guest_registry[i].rpc_wq = &rpc_wq;
+            guest_registry[i].rpc_done = false;
+            guest_registry[i].rpc_fsync_res = -1;
+            break;
+        }
+    }
+    spin_unlock(&guest_lock);
+
+    printk(KERN_INFO "MattX:[WORMHOLE] Surrogate %d requesting FSYNC for FD %u. Sleeping...\n", my_pid, req.fd);
+
+    // 2. Send the request to Node 1
+    mattx_comm_send(cluster_map[fd_info->home_node], MATTX_MSG_SYS_FSYNC_REQ, &req, sizeof(req));
+
+    // 3. Go to sleep until Node 1 replies!
+    wait_event_interruptible(rpc_wq, check_rpc_done(my_pid));
+
+    // 4. We woke up! Collect the data from the registry
+    spin_lock(&guest_lock);
+    for (i = 0; i < guest_count; i++) {
+        if (guest_registry[i].local_pid == my_pid) {
+            ret_error = guest_registry[i].rpc_fsync_res;
+            guest_registry[i].rpc_wq = NULL;
+            break;
+        }
+    }
+    spin_unlock(&guest_lock);
+
+    printk(KERN_INFO "MattX:[WORMHOLE] Surrogate %d woke up! FSYNC result: %d.\n", my_pid, ret_error);
+    return ret_error;
+}
+
 // --- NEW: The Fake File Read Operation (Runs on Node 2) ---
 static ssize_t mattx_fake_read(struct file *file, char __user *buf, size_t count, loff_t *pos) {
     struct mattx_fake_fd_info *fd_info = file->private_data;
@@ -304,6 +356,7 @@ static int mattx_fake_release(struct inode *inode, struct file *file) {
 
 const struct file_operations mattx_fops = {
     .llseek = mattx_fake_llseek,
+    .fsync = mattx_fake_fsync,
     .read = mattx_fake_read,
     .write = mattx_fake_write,
     .release = mattx_fake_release, 
@@ -888,6 +941,77 @@ static void handle_sys_dup_req(struct mattx_link *link, struct mattx_header *hdr
     }
 }
 
+static void handle_sys_fsync_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    if (payload) {
+        struct mattx_sys_fsync_req *req = (struct mattx_sys_fsync_req *)payload;
+        struct task_struct *deputy = NULL;
+        struct file *file = NULL;
+        int i;
+        struct mattx_sys_fsync_reply reply;
+        
+        reply.orig_pid = req->orig_pid;
+        reply.error = -EBADF;
+
+        printk(KERN_INFO "MattX:[WORMHOLE] Received FSYNC req for FD %u from Node %u\n", req->fd, hdr->sender_id);
+
+        if (req->fd >= 1000) {
+            int slot = req->fd - 1000;
+            spin_lock(&export_lock);
+            for (i = 0; i < export_count; i++) {
+                if (export_registry[i].orig_pid == req->orig_pid) {
+                    if (slot < MAX_FDS && export_registry[i].remote_files[slot]) {
+                        file = export_registry[i].remote_files[slot];
+                        get_file(file); 
+                    }
+                    break;
+                }
+            }
+            spin_unlock(&export_lock);
+        } else {
+            rcu_read_lock();
+            deputy = pid_task(find_vpid(req->orig_pid), PIDTYPE_PID);
+            if (deputy) get_task_struct(deputy);
+            rcu_read_unlock();
+            
+            if (deputy) {
+                struct files_struct *files = deputy->files;
+                if (files) {
+                    spin_lock(&files->file_lock);
+                    struct fdtable *fdt = files_fdtable(files);
+                    if (req->fd < fdt->max_fds) {
+                        file = rcu_dereference_raw(fdt->fd[req->fd]);
+                        if (file) get_file(file); 
+                    }
+                    spin_unlock(&files->file_lock);
+                }
+                put_task_struct(deputy);
+            }
+        }
+        
+        if (file) {
+            const struct cred *old_cred = NULL;
+            
+            if (deputy) {
+                if (deputy->mm) kthread_use_mm(deputy->mm);
+                old_cred = override_creds(deputy->cred);
+            }
+
+            reply.error = vfs_fsync_range(file, req->start, req->end, req->datasync);
+            
+            if (deputy) {
+                revert_creds(old_cred);
+                if (deputy->mm) kthread_unuse_mm(deputy->mm);
+            }
+
+            fput(file); 
+        }
+        
+        if (cluster_map[hdr->sender_id]) {
+            mattx_comm_send(cluster_map[hdr->sender_id], MATTX_MSG_SYS_FSYNC_REPLY, &reply, sizeof(reply));
+        }
+    }
+}
+
 static void handle_sys_lseek_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
     if (payload) {
         struct mattx_sys_lseek_reply *reply = (struct mattx_sys_lseek_reply *)payload;
@@ -966,6 +1090,28 @@ static void handle_sys_dup_reply(struct mattx_link *link, struct mattx_header *h
     }
 }
 
+static void handle_sys_fsync_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    if (payload) {
+        struct mattx_sys_fsync_reply *reply = (struct mattx_sys_fsync_reply *)payload;
+        int i;
+
+        printk(KERN_INFO "MattX:[RPC] Received FSYNC_REPLY for Orig PID %u. Error: %d\n", reply->orig_pid, reply->error);
+
+        spin_lock(&guest_lock);
+        for (i = 0; i < guest_count; i++) {
+            if (guest_registry[i].orig_pid == reply->orig_pid && guest_registry[i].home_node == hdr->sender_id) {
+                guest_registry[i].rpc_fsync_res = reply->error;
+                guest_registry[i].rpc_done = true;
+                if (guest_registry[i].rpc_wq) {
+                    wake_up_interruptible(guest_registry[i].rpc_wq);
+                }
+                break;
+            }
+        }
+        spin_unlock(&guest_lock);
+    }
+}
+
 void mattx_fileio_init_handlers(void) {
     mattx_register_handler(MATTX_MSG_SYSCALL_FWD, handle_syscall_fwd);
     mattx_register_handler(MATTX_MSG_SYS_OPEN_REQ, handle_sys_open_req);
@@ -979,6 +1125,8 @@ void mattx_fileio_init_handlers(void) {
     mattx_register_handler(MATTX_MSG_SYS_STATX_REPLY, handle_sys_statx_reply);
     mattx_register_handler(MATTX_MSG_SYS_DUP_REQ, handle_sys_dup_req);
     mattx_register_handler(MATTX_MSG_SYS_DUP_REPLY, handle_sys_dup_reply);
+    mattx_register_handler(MATTX_MSG_SYS_FSYNC_REQ, handle_sys_fsync_req);
+    mattx_register_handler(MATTX_MSG_SYS_FSYNC_REPLY, handle_sys_fsync_reply);
     printk(KERN_INFO "MattX: [FILEIO] Network handlers registered.\n");
 }
 

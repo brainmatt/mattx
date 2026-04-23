@@ -107,7 +107,16 @@ int main() {
                  return 1;
             }
             fprintf(testfile, "[Worker %d] Hello from the MattX Cluster! (Tick: %d).\n", getpid(), counter);
-	        fflush(testfile);
+            fflush(testfile);
+
+            // TEST FSYNC
+            int test_fd = fileno(testfile);
+            if (fsync(test_fd) == 0) {
+                printf("[Worker %d] FSYNC success! Data committed to disk.\n", getpid());
+            } else {
+                perror("fsync failed");
+            }
+            fflush(stdout);
 
         }
 	    fclose(testfile);
