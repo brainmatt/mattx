@@ -328,7 +328,7 @@ int mattx_hooks_init(void) {
     }
 
     memset(&dup_kprobe, 0, sizeof(dup_kprobe));
-    dup_kprobe.kp.symbol_name = "sys_dup";
+    dup_kprobe.kp.symbol_name = "__x64_sys_dup";
     dup_kprobe.entry_handler = entry_handler_dup;
     dup_kprobe.handler = ret_handler_dup;
     dup_kprobe.data_size = sizeof(struct dup_kretprobe_data);
@@ -340,7 +340,7 @@ int mattx_hooks_init(void) {
     }
 
     memset(&dup2_kprobe, 0, sizeof(dup2_kprobe));
-    dup2_kprobe.kp.symbol_name = "sys_dup2";
+    dup2_kprobe.kp.symbol_name = "__x64_sys_dup2";
     dup2_kprobe.entry_handler = entry_handler_dup;
     dup2_kprobe.handler = ret_handler_dup;
     dup2_kprobe.data_size = sizeof(struct dup_kretprobe_data);
