@@ -9,7 +9,7 @@ Born from the spiritual heritage of the legendary **openMosix** project, MattX b
 *   **Transparent Live Migration:** Teleport running, CPU-bound user-space applications across physical nodes with zero modifications to the application code.
 *   **Zero-Config Auto-Discovery:** Nodes dynamically find each other using UDP Multicast beacons. No static IP maps or complex orchestration required.
 *   **Autonomous Load Balancing:** The MattX kernel module continuously exchanges fixed-point CPU load metrics. When a node becomes overloaded, it automatically hunts for the heaviest CPU-bound task and migrates it to the least-loaded peer.
-*   **The VFS Wormhole (Syscall Routing):** Migrated processes maintain their connection to the Home Node. Standard I/O (like `stdout` and `stderr`) is intercepted via dynamically injected "Fake FDs" and tunneled back to the user's original terminal.
+*   **The VFS Wormhole (Syscall Routing):** Migrated processes maintain their connection to the Home Node's filesystem. We intercept and route VFS operations across the cluster seamlessly, providing a perfect "Illusion" that the process never left home. Currently supports: `open/openat`, `read`, `write`, `close`, `lseek`, `stat/fstat/statx`, `dup/dup2`, and `fsync/fdatasync`.
 *   **Modern Kernel Native:** Built for Linux 6.x. It safely navigates modern kernel protections, utilizing the Maple Tree (`VMA_ITERATOR`) for memory mapping, `access_process_vm` for safe memory injection, and RCU locks for process hunting.
 *   **Distributed Lifecycle Management:** Perfect symmetry. If a migrated process exits on a remote node, the home node cleans up. If a user `kill`s the origin process on the home node, an "Assassination Order" is sent to instantly terminate the remote surrogate.
 
@@ -27,6 +27,12 @@ When a process is migrated from Node A (Home) to Node B (Remote):
 2.  **Spawn & Carve:** Node B receives the blueprint and spawns `mattx-stub`. The stub carves the exact memory holes needed and expands its File Descriptor table.
 3.  **The Data Pump:** Node A safely streams the physical memory pages over TCP. Node B injects them directly into the stub's carved memory.
 4.  **The Awakening:** Node B overwrites the stub's CPU registers, applies the original user credentials, renames the process, injects the VFS Proxy FDs, and sends `SIGCONT`. The process resumes execution exactly where it left off.
+
+### The File I/O Illusion (The Wormhole)
+To trick migrated applications into believing they are still on their Home Node, MattX dynamically creates proxy file descriptors (`anon_inode_getfile`) using custom Virtual File System (VFS) operations.
+* **Networked Syscalls:** File operations like `read`, `write`, `lseek`, and `fsync` trigger RPC calls over TCP. VM2 forwards the request, VM1 executes the native kernel operation (e.g., `vfs_llseek`, `kernel_read`, `vfs_fsync_range`) on the true file descriptor, and sends the exact result back.
+* **The Reflection (`statx`):** Metadata requests are intercepted and faithfully reconstructed across the network, accurately spoofing permissions, sizes, and timestamps.
+* **The Cloner (`dup2`):** When a Surrogate duplicates a proxy file descriptor, MattX coordinates with the Home Node to duplicate the underlying kernel references, ensuring the Wormhole handles complex pipe structures flawlessly.
 
 ## 🛠️ Getting Started
 
