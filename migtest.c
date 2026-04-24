@@ -123,7 +123,7 @@ int main() {
                 if (fsync(sync_fd) == 0) {
                     printf("[Worker %d] WORMHOLE FSYNC success! Data committed to VM1 disk.\n", getpid());
                 } else {
-                    printf("[Worker %d] WARNING: WORMHOLE FSYNC failed! Errno: %d\n", getpid(), errno);
+                    printf("[Worker %d] WARNING: WORMHOLE FSYNC failed! Errno: %d (%s)\n", getpid(), errno, strerror(errno));
                 }
                 fflush(stdout);
                 fclose(sync_fp);
@@ -140,11 +140,11 @@ int main() {
                 if (connect(sock, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) == 0) {
                     printf("[Worker %d] WORMHOLE CONNECT success! TCP Socket established on VM1.\n", getpid());
                 } else {
-                    printf("[Worker %d] WARNING: WORMHOLE CONNECT failed! Errno: %d\n", getpid(), errno);
+                    printf("[Worker %d] WARNING: WORMHOLE CONNECT failed! Errno: %d (%s)\n", getpid(), errno, strerror(errno));
                 }
                 close(sock);
             } else {
-                printf("[Worker %d] WARNING: WORMHOLE SOCKET creation failed! Errno: %d\n", getpid(), errno);
+                printf("[Worker %d] WARNING: WORMHOLE SOCKET creation failed! Errno: %d (%s)\n", getpid(), errno, strerror(errno));
             }
 
             // TEST NETWORK SOCKET BIND & LISTEN
@@ -156,20 +156,21 @@ int main() {
                 srv_addr.sin_port = htons(8080 + (counter % 1000)); 
                 srv_addr.sin_addr.s_addr = INADDR_ANY;
 
-                if (bind(srv_sock, (struct sockaddr *)&srv_addr, sizeof(srv_addr)) == 0) {
-                    printf("[Worker %d] WORMHOLE BIND success! Bound to port %d on VM1.\n", getpid(), ntohs(srv_addr.sin_port));
+                int bind_res = bind(srv_sock, (struct sockaddr *)&srv_addr, sizeof(srv_addr));
+                if (bind_res < 0) {
+                    printf("[Worker %d] WARNING: WORMHOLE BIND failed! Errno: %d (%s)\n", getpid(), errno, strerror(errno));
+                } else {
+                    printf("[Worker %d] WORMHOLE BIND success! Bound to port %d on VM1. Bind returned %d\n", getpid(), ntohs(srv_addr.sin_port), bind_res);
                     
                     if (listen(srv_sock, 5) == 0) {
                         printf("[Worker %d] WORMHOLE LISTEN success! Listening on VM1.\n", getpid());
                     } else {
-                        printf("[Worker %d] WARNING: WORMHOLE LISTEN failed! Errno: %d\n", getpid(), errno);
+                        printf("[Worker %d] WARNING: WORMHOLE LISTEN failed! Errno: %d (%s)\n", getpid(), errno, strerror(errno));
                     }
-                } else {
-                    printf("[Worker %d] WARNING: WORMHOLE BIND failed! Errno: %d\n", getpid(), errno);
                 }
                 close(srv_sock);
             } else {
-                printf("[Worker %d] WARNING: WORMHOLE SERVER SOCKET creation failed! Errno: %d\n", getpid(), errno);
+                printf("[Worker %d] WARNING: WORMHOLE SERVER SOCKET creation failed! Errno: %d (%s)\n", getpid(), errno, strerror(errno));
             }
 
             fflush(stdout);
