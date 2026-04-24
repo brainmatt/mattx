@@ -8,6 +8,7 @@
 #include <arpa/inet.h>
 #include <signal.h>
 #include <time.h>
+#include <errno.h>
 
 pid_t child_pid = -1;
 
