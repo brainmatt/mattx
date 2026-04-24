@@ -162,12 +162,13 @@ int main() {
                 if (bind_res < 0) {
                     printf("[Worker %d] WARNING: WORMHOLE BIND failed! Errno: %d (%s)\n", getpid(), errno, strerror(errno));
                 } else {
-                    printf("[Worker %d] WORMHOLE BIND success! Bound to port %d on VM1. Bind returned %d\n", getpid(), ntohs(srv_addr.sin_port), bind_res);
-                    
-                    if (listen(srv_sock, 5) == 0) {
-                        printf("[Worker %d] WORMHOLE LISTEN success! Listening on VM1.\n", getpid());
-                    } else {
+                    printf("[Worker %d] WORMHOLE BIND success! Bound to port %d on VM1. (Return value: %d)\n", getpid(), ntohs(srv_addr.sin_port), bind_res);
+
+                    int listen_res = listen(srv_sock, 5);
+                    if (listen_res < 0) {
                         printf("[Worker %d] WARNING: WORMHOLE LISTEN failed! Errno: %d (%s)\n", getpid(), errno, strerror(errno));
+                    } else {
+                        printf("[Worker %d] WORMHOLE LISTEN success! Listening on VM1. (Return value: %d)\n", getpid(), listen_res);
                     }
                 }
                 close(srv_sock);
