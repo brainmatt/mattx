@@ -107,7 +107,8 @@ static void mattx_rpc_worker(struct work_struct *work) {
     if (surrogate) {
         if (rpc->is_statx) {
             // (Removed statx block since we deleted it)
-        } else if (rpc->is_connect) {
+        // --- FIXED: Group ALL FD-Operating Syscalls together! ---
+        } else if (rpc->is_connect || rpc->is_bind || rpc->is_listen) {
             struct pt_regs *regs = task_pt_regs(surrogate);
             int error = -1;
             bool success = false;
@@ -115,7 +116,8 @@ static void mattx_rpc_worker(struct work_struct *work) {
             spin_lock(&guest_lock);
             for (i = 0; i < guest_count; i++) {
                 if (guest_registry[i].local_pid == rpc->local_pid) {
-                    error = guest_registry[i].rpc_fsync_res; // We reused this field for connect errors
+                    // We reused rpc_fsync_res to store the generic integer reply from VM1
+                    error = guest_registry[i].rpc_fsync_res; 
                     success = true;
                     break;
                 }
@@ -123,16 +125,20 @@ static void mattx_rpc_worker(struct work_struct *work) {
             spin_unlock(&guest_lock);
 
             if (success) {
+                // Shove the return code (e.g., 0) directly into RAX! No Fake FDs allocated!
                 regs->ax = error;
                 printk(KERN_INFO "MattX:[RPC] Illusion Complete! Networking syscall returned %d to Surrogate %d\n", error, rpc->local_pid);
             } else {
                 regs->ax = -EBADF;
             }
+            
+        // --- FD-Creating Syscalls (open, socket, dup) fall through here! ---
         } else if (remote_fd >= 0) {
             struct pt_regs *regs = task_pt_regs(surrogate);
             int local_fd = regs ? regs->ax : -1; 
 
             printk(KERN_INFO "MattX:[DEBUG] Remote FD from VM1: %d. Local regs->ax: %d\n", remote_fd, local_fd);
+
             if (local_fd < 0) {
                 printk(KERN_ERR "MattX:[DEBUG] Local syscall failed (expected)! Searching for a free FD slot...\n");
                 
