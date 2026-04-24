@@ -69,24 +69,57 @@ static int mattx_receiver_loop(void *data) {
     return 0;
 }
 
+
+// Global Mutex to prevent TCP stream collisions! ---
+static DEFINE_MUTEX(mattx_send_mutex);
+
 int mattx_comm_send(struct mattx_link *link, u32 type, void *data, u32 len) {
     struct msghdr msg = {0};
-    struct kvec iov[2];
-    struct mattx_header hdr;
-    int err;
+    struct kvec iov;
+    struct mattx_header *hdr;
+    int total_len = sizeof(struct mattx_header) + len;
+    int sent = 0;
+    int ret;
+    char *buf;
 
-    hdr.magic = MATTX_MAGIC;
-    hdr.type = type;
-    hdr.length = len;
-    hdr.sender_id = my_node_id;
+    // 1. Allocate a single, contiguous buffer for the entire packet
+    buf = kvmalloc(total_len, GFP_KERNEL);
+    if (!buf) return -ENOMEM;
 
-    iov[0].iov_base = &hdr;
-    iov[0].iov_len = sizeof(hdr);
-    iov[1].iov_base = data;
-    iov[1].iov_len = len;
+    // 2. Pack the header
+    hdr = (struct mattx_header *)buf;
+    hdr->magic = MATTX_MAGIC;
+    hdr->type = type;
+    hdr->length = len;
+    hdr->sender_id = my_node_id;
 
-    err = kernel_sendmsg(link->sock, &msg, iov, 2, sizeof(hdr) + len);
-    return err;
+    // 3. Pack the payload right behind the header
+    if (len > 0 && data) {
+        memcpy(buf + sizeof(struct mattx_header), data, len);
+    }
+
+    // 4. LOCK THE SOCKET! No other thread can send until we are done.
+    mutex_lock(&mattx_send_mutex);
+    
+    // 5. Loop until every single byte is pushed into the TCP stack
+    while (sent < total_len) {
+        iov.iov_base = buf + sent;
+        iov.iov_len = total_len - sent;
+        
+        ret = kernel_sendmsg(link->sock, &msg, &iov, 1, iov.iov_len);
+        if (ret <= 0) {
+            printk(KERN_ERR "MattX: [COMM] Network send failed! (ret: %d)\n", ret);
+            mutex_unlock(&mattx_send_mutex);
+            kvfree(buf);
+            return ret;
+        }
+        sent += ret;
+    }
+    
+    mutex_unlock(&mattx_send_mutex);
+    
+    kvfree(buf);
+    return sent;
 }
 
 static void mattx_setup_link(struct mattx_link *link) {
