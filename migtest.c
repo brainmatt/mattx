@@ -9,7 +9,9 @@
 #include <signal.h>
 #include <time.h>
 #include <errno.h>
+#include <string.h>
 
+extern int errno;
 pid_t child_pid = -1;
 
 // The Parent catches Ctrl-C and kills the child
