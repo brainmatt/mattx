@@ -1461,7 +1461,7 @@ void mattx_fileio_init_handlers(void) {
     mattx_register_handler(MATTX_MSG_SYS_SOCKET_REQ, handle_sys_socket_req);
     mattx_register_handler(MATTX_MSG_SYS_SOCKET_REPLY, handle_sys_socket_reply);
     mattx_register_handler(MATTX_MSG_SYS_CONNECT_REQ, handle_sys_connect_req);
-    mattx_register_handler(MATTX_MSG_SYS_CONNECT_REPLY, handle_sys_generic_int_reply);
+    mattx_register_handler(MATTX_MSG_SYS_CONNECT_REPLY, handle_sys_connect_reply);
     mattx_register_handler(MATTX_MSG_SYS_BIND_REQ, handle_sys_bind_req);
     mattx_register_handler(MATTX_MSG_SYS_BIND_REPLY, handle_sys_generic_int_reply);
     mattx_register_handler(MATTX_MSG_SYS_LISTEN_REQ, handle_sys_listen_req);
