@@ -41,7 +41,7 @@ int main() {
             fflush(stdout);
 
             FILE *hosts_fp = fopen("/etc/hosts", "r");
-//            FILE *hosts_fp = fopen("/tmp/super.txt", "r");
+            // FILE *hosts_fp = fopen("/tmp/super.txt", "r");
 
             
             if (hosts_fp != NULL) {
@@ -53,7 +53,7 @@ int main() {
                     fflush(stdout);
                 } else {
                     perror("fstat failed");
-                    printf("[Worker %d] WARNING: fstat failed on /etc/hosts!\n", getpid());
+                    printf("[Worker %d] WARNING: fstat failed on /etc/hosts! Errno: %d\n", getpid(), errno);
                     fflush(stdout);
                 }
 
@@ -71,7 +71,7 @@ int main() {
                     }
                     close(cloned_fd);
                 } else {
-                    printf("[Worker %d] WARNING: DUP failed!\n", getpid());
+                    printf("[Worker %d] WARNING: DUP failed! Errno: %d\n", getpid(), errno);
                     fflush(stdout);
                 }
 
@@ -89,7 +89,7 @@ int main() {
                         fflush(stdout);
                     }
                 } else {
-                    printf("[Worker %d] WARNING: fseek failed!\n", getpid());
+                    printf("[Worker %d] WARNING: fseek failed! Errno: %d\n", getpid(), errno);
                     fflush(stdout);
                 }
                 
@@ -122,7 +122,7 @@ int main() {
                 if (fsync(sync_fd) == 0) {
                     printf("[Worker %d] WORMHOLE FSYNC success! Data committed to VM1 disk.\n", getpid());
                 } else {
-                    printf("[Worker %d] WARNING: WORMHOLE FSYNC failed!\n", getpid());
+                    printf("[Worker %d] WARNING: WORMHOLE FSYNC failed! Errno: %d\n", getpid(), errno);
                 }
                 fflush(stdout);
                 fclose(sync_fp);
@@ -139,11 +139,11 @@ int main() {
                 if (connect(sock, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) == 0) {
                     printf("[Worker %d] WORMHOLE CONNECT success! TCP Socket established on VM1.\n", getpid());
                 } else {
-                    printf("[Worker %d] WARNING: WORMHOLE CONNECT failed!\n", getpid());
+                    printf("[Worker %d] WARNING: WORMHOLE CONNECT failed! Errno: %d\n", getpid(), errno);
                 }
                 close(sock);
             } else {
-                printf("[Worker %d] WARNING: WORMHOLE SOCKET creation failed!\n", getpid());
+                printf("[Worker %d] WARNING: WORMHOLE SOCKET creation failed! Errno: %d\n", getpid(), errno);
             }
 
             // TEST NETWORK SOCKET BIND & LISTEN
@@ -161,14 +161,14 @@ int main() {
                     if (listen(srv_sock, 5) == 0) {
                         printf("[Worker %d] WORMHOLE LISTEN success! Listening on VM1.\n", getpid());
                     } else {
-                        printf("[Worker %d] WARNING: WORMHOLE LISTEN failed!\n", getpid());
+                        printf("[Worker %d] WARNING: WORMHOLE LISTEN failed! Errno: %d\n", getpid(), errno);
                     }
                 } else {
-                    printf("[Worker %d] WARNING: WORMHOLE BIND failed!\n", getpid());
+                    printf("[Worker %d] WARNING: WORMHOLE BIND failed! Errno: %d\n", getpid(), errno);
                 }
                 close(srv_sock);
             } else {
-                printf("[Worker %d] WARNING: WORMHOLE SERVER SOCKET creation failed!\n", getpid());
+                printf("[Worker %d] WARNING: WORMHOLE SERVER SOCKET creation failed! Errno: %d\n", getpid(), errno);
             }
 
             fflush(stdout);
