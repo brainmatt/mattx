@@ -82,6 +82,10 @@ enum mattx_msg_type {
     MATTX_MSG_SYS_BIND_REPLY,
     MATTX_MSG_SYS_LISTEN_REQ,
     MATTX_MSG_SYS_LISTEN_REPLY,
+    MATTX_MSG_SYS_SEND_REQ,
+    MATTX_MSG_SYS_SEND_REPLY,
+    MATTX_MSG_SYS_RECV_REQ,
+    MATTX_MSG_SYS_RECV_REPLY,
 };
 
 struct mattx_header {
@@ -106,6 +110,7 @@ struct mattx_cpu_regs {
     uint64_t r15, r14, r13, r12, rbp, rbx, r11, r10;
     uint64_t r9, r8, rax, rcx, rdx, rsi, rdi, orig_rax;
     uint64_t rip, cs, eflags, rsp, ss;
+
 };
 
 struct mattx_migration_req {
@@ -278,6 +283,35 @@ struct mattx_sys_listen_reply {
     int error;
 };
 
+// --- NEW: Send/Recv Payloads ---
+struct mattx_sys_send_req {
+    u32 orig_pid;
+    u32 fd;
+    int flags;
+    size_t len;
+    char data[]; 
+};
+
+struct mattx_sys_send_reply {
+    u32 orig_pid;
+    ssize_t bytes_sent;
+    int error;
+};
+
+struct mattx_sys_recv_req {
+    u32 orig_pid;
+    u32 fd;
+    size_t size;
+    int flags;
+};
+
+struct mattx_sys_recv_reply {
+    u32 orig_pid;
+    ssize_t bytes_recv;
+    int error;
+    char data[];
+};
+
 struct mattx_fake_fd_info {
     int home_node;
     u32 orig_pid;
@@ -320,6 +354,13 @@ struct mattx_rpc_work {
     // For LISTEN
     bool is_listen;
     int backlog;
+
+    // --- Send/Recv Workqueue Fields ---
+    bool is_sendto;
+    bool is_recvfrom;
+    void __user *buff;
+    size_t len;
+    size_t size;    
 };
 
 struct mattx_link {

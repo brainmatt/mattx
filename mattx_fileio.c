@@ -1443,6 +1443,200 @@ static void handle_sys_generic_int_reply(struct mattx_link *link, struct mattx_h
     }
 }
 
+static void handle_sys_send_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    if (payload) {
+        struct mattx_sys_send_req *req = (struct mattx_sys_send_req *)payload;
+        struct mattx_sys_send_reply reply;
+        struct task_struct *deputy = NULL;
+        struct file *file = NULL;
+        int i;
+
+        reply.orig_pid = req->orig_pid;
+        reply.bytes_sent = -EBADF;
+        reply.error = -EBADF;
+
+        if (req->fd >= 1000) {
+            int slot = req->fd - 1000;
+            spin_lock(&export_lock);
+            for (i = 0; i < export_count; i++) {
+                if (export_registry[i].orig_pid == req->orig_pid) {
+                    if (slot < MAX_FDS && export_registry[i].remote_files[slot]) {
+                        file = export_registry[i].remote_files[slot];
+                        get_file(file); 
+                    }
+                    break;
+                }
+            }
+            spin_unlock(&export_lock);
+        }
+
+        if (file) {
+            struct socket *sock = sock_from_file(file);
+            if (sock) {
+                struct msghdr msg = {0};
+                struct kvec iov;
+                const struct cred *old_cred = NULL;
+
+                rcu_read_lock();
+                deputy = pid_task(find_vpid(req->orig_pid), PIDTYPE_PID);
+                if (deputy) get_task_struct(deputy);
+                rcu_read_unlock();
+
+                if (deputy) {
+                    if (deputy->mm) kthread_use_mm(deputy->mm);
+                    old_cred = override_creds(deputy->cred);
+                }
+
+                iov.iov_base = req->data;
+                iov.iov_len = req->len;
+                
+                reply.bytes_sent = kernel_sendmsg(sock, &msg, &iov, 1, req->len);
+                reply.error = (reply.bytes_sent < 0) ? reply.bytes_sent : 0;
+
+                if (deputy) {
+                    revert_creds(old_cred);
+                    if (deputy->mm) kthread_unuse_mm(deputy->mm);
+                    put_task_struct(deputy);
+                }
+            } else {
+                reply.bytes_sent = -ENOTSOCK;
+                reply.error = -ENOTSOCK;
+            }
+            fput(file);
+        }
+
+        if (cluster_map[hdr->sender_id]) {
+            mattx_comm_send(cluster_map[hdr->sender_id], MATTX_MSG_SYS_SEND_REPLY, &reply, sizeof(reply));
+        }
+    }
+}
+
+static void handle_sys_recv_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    if (payload) {
+        struct mattx_sys_recv_req *req = (struct mattx_sys_recv_req *)payload;
+        struct task_struct *deputy = NULL;
+        struct file *file = NULL;
+        int i;
+
+        if (req->fd >= 1000) {
+            int slot = req->fd - 1000;
+            spin_lock(&export_lock);
+            for (i = 0; i < export_count; i++) {
+                if (export_registry[i].orig_pid == req->orig_pid) {
+                    if (slot < MAX_FDS && export_registry[i].remote_files[slot]) {
+                        file = export_registry[i].remote_files[slot];
+                        get_file(file); 
+                    }
+                    break;
+                }
+            }
+            spin_unlock(&export_lock);
+        }
+
+        if (file) {
+            struct socket *sock = sock_from_file(file);
+            if (sock) {
+                struct msghdr msg = {0};
+                struct kvec iov;
+                const struct cred *old_cred = NULL;
+                void *recv_buf = kmalloc(req->size, GFP_KERNEL);
+
+                if (recv_buf) {
+                    rcu_read_lock();
+                    deputy = pid_task(find_vpid(req->orig_pid), PIDTYPE_PID);
+                    if (deputy) get_task_struct(deputy);
+                    rcu_read_unlock();
+
+                    if (deputy) {
+                        if (deputy->mm) kthread_use_mm(deputy->mm);
+                        old_cred = override_creds(deputy->cred);
+                    }
+
+                    iov.iov_base = recv_buf;
+                    iov.iov_len = req->size;
+                    
+                    ssize_t ret = kernel_recvmsg(sock, &msg, &iov, 1, req->size, req->flags);
+
+                    if (deputy) {
+                        revert_creds(old_cred);
+                        if (deputy->mm) kthread_unuse_mm(deputy->mm);
+                        put_task_struct(deputy);
+                    }
+
+                    size_t reply_size = sizeof(struct mattx_sys_recv_reply) + (ret > 0 ? ret : 0);
+                    struct mattx_sys_recv_reply *reply = kmalloc(reply_size, GFP_KERNEL);
+                    if (reply) {
+                        reply->orig_pid = req->orig_pid;
+                        reply->bytes_recv = ret;
+                        reply->error = (ret < 0) ? ret : 0;
+                        if (ret > 0) {
+                            memcpy(reply->data, recv_buf, ret);
+                        }
+                        if (cluster_map[hdr->sender_id]) {
+                            mattx_comm_send(cluster_map[hdr->sender_id], MATTX_MSG_SYS_RECV_REPLY, reply, reply_size);
+                        }
+                        kfree(reply);
+                    }
+                    kfree(recv_buf);
+                }
+            } else {
+                struct mattx_sys_recv_reply reply;
+                reply.orig_pid = req->orig_pid;
+                reply.bytes_recv = -ENOTSOCK;
+                reply.error = -ENOTSOCK;
+                if (cluster_map[hdr->sender_id]) {
+                    mattx_comm_send(cluster_map[hdr->sender_id], MATTX_MSG_SYS_RECV_REPLY, &reply, sizeof(reply));
+                }
+            }
+            fput(file);
+        } else {
+            struct mattx_sys_recv_reply reply;
+            reply.orig_pid = req->orig_pid;
+            reply.bytes_recv = -EBADF;
+            reply.error = -EBADF;
+            if (cluster_map[hdr->sender_id]) {
+                mattx_comm_send(cluster_map[hdr->sender_id], MATTX_MSG_SYS_RECV_REPLY, &reply, sizeof(reply));
+            }
+        }
+    }
+}
+
+static void handle_sys_recv_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    if (payload) {
+        struct mattx_sys_recv_reply *reply = (struct mattx_sys_recv_reply *)payload;
+        int i;
+
+        printk(KERN_INFO "MattX:[RPC] Received RECV_REPLY for Orig PID %u. Bytes recv: %zd\n", reply->orig_pid, reply->bytes_recv);
+
+        spin_lock(&guest_lock);
+        for (i = 0; i < guest_count; i++) {
+            if (guest_registry[i].orig_pid == reply->orig_pid && guest_registry[i].home_node == hdr->sender_id) {
+                
+                guest_registry[i].rpc_read_bytes = reply->bytes_recv; 
+                
+                if (reply->bytes_recv > 0) {
+                    guest_registry[i].rpc_read_buf = kmalloc(reply->bytes_recv, GFP_ATOMIC);
+                    if (guest_registry[i].rpc_read_buf) {
+                        memcpy(guest_registry[i].rpc_read_buf, reply->data, reply->bytes_recv);
+                    } else {
+                        guest_registry[i].rpc_read_bytes = -ENOMEM;
+                    }
+                } else {
+                    guest_registry[i].rpc_read_buf = NULL;
+                }
+
+                guest_registry[i].rpc_done = true;
+                
+                if (guest_registry[i].rpc_wq) {
+                    wake_up_interruptible(guest_registry[i].rpc_wq);
+                }
+                break;
+            }
+        }
+        spin_unlock(&guest_lock);
+    }
+}
+
 void mattx_fileio_init_handlers(void) {
     mattx_register_handler(MATTX_MSG_SYSCALL_FWD, handle_syscall_fwd);
     mattx_register_handler(MATTX_MSG_SYS_OPEN_REQ, handle_sys_open_req);
@@ -1466,6 +1660,11 @@ void mattx_fileio_init_handlers(void) {
     mattx_register_handler(MATTX_MSG_SYS_BIND_REPLY, handle_sys_generic_int_reply);
     mattx_register_handler(MATTX_MSG_SYS_LISTEN_REQ, handle_sys_listen_req);
     mattx_register_handler(MATTX_MSG_SYS_LISTEN_REPLY, handle_sys_generic_int_reply);
+    mattx_register_handler(MATTX_MSG_SYS_SEND_REQ, handle_sys_send_req);
+    mattx_register_handler(MATTX_MSG_SYS_SEND_REPLY, handle_sys_generic_int_reply); // We can reuse the generic int reply for send!
+    mattx_register_handler(MATTX_MSG_SYS_RECV_REQ, handle_sys_recv_req);
+    mattx_register_handler(MATTX_MSG_SYS_RECV_REPLY, handle_sys_recv_reply);
+
     printk(KERN_INFO "MattX: [FILEIO] Network handlers registered.\n");
 }
 

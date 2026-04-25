@@ -68,6 +68,40 @@ static void mattx_rpc_worker(struct work_struct *work) {
         if (cluster_map[rpc->home_node]) {
             mattx_comm_send(cluster_map[rpc->home_node], MATTX_MSG_SYS_LISTEN_REQ, &req, sizeof(req));
         }
+    // SENDTO WORKER ---
+    } else if (rpc->is_sendto) {
+        size_t to_send = min_t(size_t, rpc->len, 4096);
+        size_t payload_size = sizeof(struct mattx_sys_send_req) + to_send;
+        void *payload_buf = kmalloc(payload_size, GFP_KERNEL);
+        
+        if (payload_buf) {
+            struct mattx_sys_send_req *req = (struct mattx_sys_send_req *)payload_buf;
+            req->orig_pid = rpc->orig_pid;
+            req->fd = rpc->remote_fd;
+            req->flags = rpc->flags;
+            req->len = to_send;
+            
+            if (copy_from_user(req->data, rpc->buff, to_send) == 0) {
+                printk(KERN_INFO "MattX:[RPC] Worker sending SEND_REQ to Node %d...\n", rpc->home_node);
+                if (cluster_map[rpc->home_node]) {
+                    mattx_comm_send(cluster_map[rpc->home_node], MATTX_MSG_SYS_SEND_REQ, payload_buf, payload_size);
+                }
+            }
+            kfree(payload_buf);
+        }
+    // RECVFROM WORKER ---
+    } else if (rpc->is_recvfrom) {
+        struct mattx_sys_recv_req req;
+        memset(&req, 0, sizeof(req));
+        req->orig_pid = rpc->orig_pid;
+        req->fd = rpc->remote_fd;
+        req->flags = rpc->flags;
+        req->size = min_t(size_t, rpc->size, 4096);
+        
+        printk(KERN_INFO "MattX:[RPC] Worker sending RECV_REQ to Node %d...\n", rpc->home_node);
+        if (cluster_map[rpc->home_node]) {
+            mattx_comm_send(cluster_map[rpc->home_node], MATTX_MSG_SYS_RECV_REQ, &req, sizeof(req));
+        }        
     } else {
         struct mattx_sys_open_req req;
         memset(&req, 0, sizeof(req));
@@ -108,7 +142,7 @@ static void mattx_rpc_worker(struct work_struct *work) {
         if (rpc->is_statx) {
             // (Removed statx block since we deleted it)
         // --- FIXED: Group ALL FD-Operating Syscalls together! ---
-        } else if (rpc->is_connect || rpc->is_bind || rpc->is_listen) {
+        } else if (rpc->is_connect || rpc->is_bind || rpc->is_listen || rpc->is_sendto) {
             struct pt_regs *regs = task_pt_regs(surrogate);
             int error = -1;
             bool success = false;
@@ -131,7 +165,37 @@ static void mattx_rpc_worker(struct work_struct *work) {
             } else {
                 regs->ax = -EBADF;
             }
+
+        // RECVFROM AWAKENING ---
+        } else if (rpc->is_recvfrom) {
+            struct pt_regs *regs = task_pt_regs(surrogate);
+            ssize_t ret_bytes = -1;
+            void *read_buf = NULL;
+
+            spin_lock(&guest_lock);
+            for (i = 0; i < guest_count; i++) {
+                if (guest_registry[i].local_pid == rpc->local_pid) {
+                    ret_bytes = guest_registry[i].rpc_read_bytes;
+                    read_buf = guest_registry[i].rpc_read_buf;
+                    guest_registry[i].rpc_read_buf = NULL;
+                    break;
+                }
+            }
+            spin_unlock(&guest_lock);
+
+            if (ret_bytes > 0 && read_buf) {
+                if (copy_to_user(rpc->buff, read_buf, ret_bytes)) {
+                    ret_bytes = -EFAULT;
+                }
+            }
             
+            if (read_buf) kfree(read_buf);
+            
+            if (regs) {
+                regs->ax = ret_bytes;
+                printk(KERN_INFO "MattX:[RPC] Illusion Complete! recvfrom returned %zd\n", ret_bytes);
+            }
+
         // --- FD-Creating Syscalls (open, socket, dup) fall through here! ---
         } else if (remote_fd >= 0) {
             struct pt_regs *regs = task_pt_regs(surrogate);
@@ -734,6 +798,188 @@ static int ret_handler_listen(struct kretprobe_instance *ri, struct pt_regs *reg
     return 0;
 }
 
+// SENDTO HOOK ---
+struct sendto_kretprobe_data {
+    int fd;
+    void __user *buff;
+    size_t len;
+    unsigned int flags;
+    bool is_wormhole_fd;
+    int remote_fd;
+};
+
+static struct kretprobe sendto_kprobe;
+
+static int entry_handler_sendto(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    pid_t my_pid = current->pid;
+    struct sendto_kretprobe_data *data = (struct sendto_kretprobe_data *)ri->data;
+
+    if (!is_guest_process(my_pid)) return 0; 
+    if (!config_migrate_network_io) return 0;
+
+    // __sys_sendto(int fd, void __user *buff, size_t len, unsigned int flags, struct sockaddr __user *addr, int addr_len)
+    data->fd = (int)regs->di;
+    data->buff = (void __user *)regs->si;
+    data->len = (size_t)regs->dx;
+    data->flags = (unsigned int)regs->cx;
+    data->is_wormhole_fd = false;
+    data->remote_fd = -1;
+
+    if (data->fd >= 0) {
+        struct file *f = fget(data->fd);
+        if (f) {
+            if (f->f_op == &mattx_fops) {
+                struct mattx_fake_fd_info *fd_info = f->private_data;
+                if (fd_info) {
+                    data->is_wormhole_fd = true;
+                    data->remote_fd = fd_info->remote_fd;
+                }
+            }
+            fput(f);
+        }
+    }
+
+    if (data->is_wormhole_fd) {
+        regs->di = -1; // Sabotage!
+    }
+
+    return 0;
+}
+
+static int ret_handler_sendto(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    pid_t my_pid = current->pid;
+    struct sendto_kretprobe_data *data = (struct sendto_kretprobe_data *)ri->data;
+    int home_node = -1;
+    u32 orig_pid = 0;
+    int i;
+
+    if (!is_guest_process(my_pid) || !config_migrate_network_io || !data->is_wormhole_fd) return 0;
+
+    spin_lock(&guest_lock);
+    for (i = 0; i < guest_count; i++) {
+        if (guest_registry[i].local_pid == my_pid) {
+            home_node = guest_registry[i].home_node;
+            orig_pid = guest_registry[i].orig_pid;
+            guest_registry[i].rpc_done = false; 
+            break;
+        }
+    }
+    spin_unlock(&guest_lock);
+
+    if (home_node != -1) {
+        struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
+        if (rpc) {
+            INIT_WORK(&rpc->work, mattx_rpc_worker);
+            rpc->local_pid = my_pid;
+            rpc->orig_pid = orig_pid;
+            rpc->home_node = home_node;
+            
+            rpc->is_sendto = true;
+            rpc->remote_fd = data->remote_fd;
+            rpc->buff = data->buff;
+            rpc->len = data->len;
+            rpc->flags = data->flags;
+
+            printk(KERN_INFO "MattX:[HOOK] Intercepted sendto(fd=%d). Freezing Surrogate %d...\n", data->fd, my_pid);
+            send_sig(SIGSTOP, current, 0);
+            schedule_work(&rpc->work);
+        }
+    }
+
+    return 0;
+}
+
+// RECVFROM HOOK ---
+struct recvfrom_kretprobe_data {
+    int fd;
+    void __user *ubuf;
+    size_t size;
+    unsigned int flags;
+    bool is_wormhole_fd;
+    int remote_fd;
+};
+
+static struct kretprobe recvfrom_kprobe;
+
+static int entry_handler_recvfrom(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    pid_t my_pid = current->pid;
+    struct recvfrom_kretprobe_data *data = (struct recvfrom_kretprobe_data *)ri->data;
+
+    if (!is_guest_process(my_pid)) return 0; 
+    if (!config_migrate_network_io) return 0;
+
+    // __sys_recvfrom(int fd, void __user *ubuf, size_t size, unsigned int flags, struct sockaddr __user *addr, int __user *addr_len)
+    data->fd = (int)regs->di;
+    data->ubuf = (void __user *)regs->si;
+    data->size = (size_t)regs->dx;
+    data->flags = (unsigned int)regs->cx;
+    data->is_wormhole_fd = false;
+    data->remote_fd = -1;
+
+    if (data->fd >= 0) {
+        struct file *f = fget(data->fd);
+        if (f) {
+            if (f->f_op == &mattx_fops) {
+                struct mattx_fake_fd_info *fd_info = f->private_data;
+                if (fd_info) {
+                    data->is_wormhole_fd = true;
+                    data->remote_fd = fd_info->remote_fd;
+                }
+            }
+            fput(f);
+        }
+    }
+
+    if (data->is_wormhole_fd) {
+        regs->di = -1; // Sabotage!
+    }
+
+    return 0;
+}
+
+static int ret_handler_recvfrom(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    pid_t my_pid = current->pid;
+    struct recvfrom_kretprobe_data *data = (struct recvfrom_kretprobe_data *)ri->data;
+    int home_node = -1;
+    u32 orig_pid = 0;
+    int i;
+
+    if (!is_guest_process(my_pid) || !config_migrate_network_io || !data->is_wormhole_fd) return 0;
+
+    spin_lock(&guest_lock);
+    for (i = 0; i < guest_count; i++) {
+        if (guest_registry[i].local_pid == my_pid) {
+            home_node = guest_registry[i].home_node;
+            orig_pid = guest_registry[i].orig_pid;
+            guest_registry[i].rpc_done = false; 
+            break;
+        }
+    }
+    spin_unlock(&guest_lock);
+
+    if (home_node != -1) {
+        struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
+        if (rpc) {
+            INIT_WORK(&rpc->work, mattx_rpc_worker);
+            rpc->local_pid = my_pid;
+            rpc->orig_pid = orig_pid;
+            rpc->home_node = home_node;
+            
+            rpc->is_recvfrom = true;
+            rpc->remote_fd = data->remote_fd;
+            rpc->buff = data->ubuf;
+            rpc->size = data->size;
+            rpc->flags = data->flags;
+
+            printk(KERN_INFO "MattX:[HOOK] Intercepted recvfrom(fd=%d). Freezing Surrogate %d...\n", data->fd, my_pid);
+            send_sig(SIGSTOP, current, 0);
+            schedule_work(&rpc->work);
+        }
+    }
+
+    return 0;
+}
+
 int mattx_hooks_init(void) {
     int ret;
     memset(&openat_kprobe, 0, sizeof(openat_kprobe));
@@ -817,11 +1063,34 @@ int mattx_hooks_init(void) {
     ret = register_kretprobe(&listen_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for listen, returned %d\n", ret);
 
+    // SENDTO / RECVFROM ---
+    memset(&sendto_kprobe, 0, sizeof(sendto_kprobe));
+    sendto_kprobe.kp.symbol_name = "__sys_sendto";
+    sendto_kprobe.entry_handler = entry_handler_sendto;
+    sendto_kprobe.handler = ret_handler_sendto;
+    sendto_kprobe.data_size = sizeof(struct sendto_kretprobe_data);
+    sendto_kprobe.maxactive = 64;
+
+    ret = register_kretprobe(&sendto_kprobe);
+    if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for sendto, returned %d\n", ret);
+
+    memset(&recvfrom_kprobe, 0, sizeof(recvfrom_kprobe));
+    recvfrom_kprobe.kp.symbol_name = "__sys_recvfrom";
+    recvfrom_kprobe.entry_handler = entry_handler_recvfrom;
+    recvfrom_kprobe.handler = ret_handler_recvfrom;
+    recvfrom_kprobe.data_size = sizeof(struct recvfrom_kretprobe_data);
+    recvfrom_kprobe.maxactive = 64;
+
+    ret = register_kretprobe(&recvfrom_kprobe);
+    if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for recvfrom, returned %d\n", ret);
+
     printk(KERN_INFO "MattX: Syscall Hooks (Kprobes) registered successfully.\n");
     return 0;
 }
 
 void mattx_hooks_exit(void) {
+    unregister_kretprobe(&recvfrom_kprobe);
+    unregister_kretprobe(&sendto_kprobe);
     unregister_kretprobe(&listen_kprobe);
     unregister_kretprobe(&bind_kprobe);
     unregister_kretprobe(&connect_kprobe);
