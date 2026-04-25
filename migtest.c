@@ -39,6 +39,21 @@ int main() {
         int counter = 0;
 	    FILE *testfile = fopen("/tmp/mattx-fd.log", "w");
 
+        // --- UDP WORMHOLE SETUP ---
+        int udp_sock = socket(AF_INET, SOCK_DGRAM, 0);
+        struct sockaddr_in udp_addr;
+        memset(&udp_addr, 0, sizeof(udp_addr));
+        udp_addr.sin_family = AF_INET;
+        udp_addr.sin_port = htons(12345); // Random test port
+        udp_addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+
+        if (bind(udp_sock, (struct sockaddr *)&udp_addr, sizeof(udp_addr)) < 0) {
+            perror("UDP bind failed");
+        } else {
+            printf("[Worker %d] UDP Socket bound to port 12345\n", getpid());
+        }
+
+
         while (1) {
             printf("[Worker %d] Hello from the MattX Cluster! (Tick: %d)\n", getpid(), counter++);
             fflush(stdout);
@@ -176,8 +191,33 @@ int main() {
                 printf("[Worker %d] WARNING: WORMHOLE SERVER SOCKET creation failed! Errno: %d (%s)\n", getpid(), errno, strerror(errno));
             }
 
-            fflush(stdout);
 
+            // --- UDP WORMHOLE TEST ---
+            char send_msg[64];
+            sprintf(send_msg, "Ping from Tick %d", counter);
+            
+            // 1. Test sendto()
+            int sent_bytes = sendto(udp_sock, send_msg, strlen(send_msg), 0, 
+                                    (struct sockaddr *)&udp_addr, sizeof(udp_addr));
+            
+            if (sent_bytes > 0) {
+                char recv_buf[64] = {0};
+                struct sockaddr_in sender_addr;
+                socklen_t sender_len = sizeof(sender_addr);
+                
+                // 2. Test recvfrom()
+                int recv_bytes = recvfrom(udp_sock, recv_buf, sizeof(recv_buf) - 1, 0, 
+                                          (struct sockaddr *)&sender_addr, &sender_len);
+                
+                if (recv_bytes > 0) {
+                    printf("[Worker %d] WORMHOLE NETWORK: Sent %d bytes, Received: '%s'\n", 
+                           getpid(), sent_bytes, recv_buf);
+                } else {
+                    printf("[Worker %d] WORMHOLE NETWORK: recvfrom failed!\n", getpid());
+                }
+            }
+
+            fflush(stdout);
         }
 	    fclose(testfile);
     } else {
