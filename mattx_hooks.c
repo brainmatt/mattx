@@ -93,10 +93,10 @@ static void mattx_rpc_worker(struct work_struct *work) {
     } else if (rpc->is_recvfrom) {
         struct mattx_sys_recv_req req;
         memset(&req, 0, sizeof(req));
-        req->orig_pid = rpc->orig_pid;
-        req->fd = rpc->remote_fd;
-        req->flags = rpc->flags;
-        req->size = min_t(size_t, rpc->size, 4096);
+        req.orig_pid = rpc->orig_pid;
+        req.fd = rpc->remote_fd;
+        req.flags = rpc->flags;
+        req.size = min_t(size_t, rpc->size, 4096);
         
         printk(KERN_INFO "MattX:[RPC] Worker sending RECV_REQ to Node %d...\n", rpc->home_node);
         if (cluster_map[rpc->home_node]) {
