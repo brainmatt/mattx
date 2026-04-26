@@ -1686,12 +1686,17 @@ static void handle_sys_accept_req(struct mattx_link *link, struct mattx_header *
                 // 1. Create the new socket for the incoming connection
                 int err = sock_create(sock->sk->sk_family, sock->type, sock->sk->sk_protocol, &newsock);
                 if (err == 0) {
+                    // --- FIXED: Use the new 6.12 proto_accept_arg struct ---
+                    struct proto_accept_arg accept_arg = {
+                        .flags = req->flags,
+                        .kern = true,
+                    };
+                    
                     newsock->type = sock->type;
                     newsock->ops = sock->ops;
                     
                     // 2. Accept the connection!
-                    err = sock->ops->accept(sock, newsock, req->flags, true);
-                    
+                    err = sock->ops->accept(sock, newsock, &accept_arg);
                     if (err == 0) {
                         // 3. Get the client's IP address
                         if (newsock->ops->getname) {
