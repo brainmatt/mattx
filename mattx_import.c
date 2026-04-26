@@ -78,7 +78,6 @@ static void handle_migrate_done(struct mattx_link *link, struct mattx_header *hd
         regs = task_pt_regs(hijacked_stub_task);
         if (regs) {
             memcpy(regs, &pending_migration->regs, sizeof(struct pt_regs));
-            regs->ax = 0; 
             
             hijacked_stub_task->thread.fsbase = pending_migration->fsbase;
             hijacked_stub_task->thread.gsbase = pending_migration->gsbase;

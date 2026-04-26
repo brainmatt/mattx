@@ -1637,120 +1637,139 @@ static void handle_sys_recv_reply(struct mattx_link *link, struct mattx_header *
     }
 }
 
-static void handle_sys_accept_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
-    if (payload) {
-        struct mattx_sys_accept_req *req = (struct mattx_sys_accept_req *)payload;
-        struct mattx_sys_accept_reply reply;
-        struct task_struct *deputy = NULL;
-        struct file *file = NULL;
-        int i;
+// Background Worker for Accept (Runs on Node 1) ---
+static void mattx_accept_worker(struct work_struct *work) {
+    struct mattx_rpc_work *rpc = container_of(work, struct mattx_rpc_work, work);
+    struct mattx_sys_accept_reply reply;
+    struct file *file = NULL;
+    struct task_struct *deputy = NULL;
+    int remote_fd = -1;
+    int i, j;
 
-        memset(&reply, 0, sizeof(reply));
-        reply.orig_pid = req->orig_pid;
-        reply.remote_fd = -EBADF;
-        reply.error = -EBADF;
+    memset(&reply, 0, sizeof(reply));
+    reply.orig_pid = rpc->orig_pid;
+    reply.remote_fd = -EBADF;
+    reply.error = -EBADF;
 
-        printk(KERN_INFO "MattX:[NETWORK] Received ACCEPT request for FD %u from Node %u\n", req->fd, hdr->sender_id);
+    printk(KERN_INFO "MattX:[RPC] Accept Worker started for Deputy PID %u\n", rpc->orig_pid);
 
-        if (req->fd >= 1000) {
-            int slot = req->fd - 1000;
-            spin_lock(&export_lock);
-            for (i = 0; i < export_count; i++) {
-                if (export_registry[i].orig_pid == req->orig_pid) {
-                    if (slot < MAX_FDS && export_registry[i].remote_files[slot]) {
-                        file = export_registry[i].remote_files[slot];
-                        get_file(file); 
-                    }
-                    break;
+    if (rpc->remote_fd >= 1000) {
+        int slot = rpc->remote_fd - 1000;
+        spin_lock(&export_lock);
+        for (i = 0; i < export_count; i++) {
+            if (export_registry[i].orig_pid == rpc->orig_pid) {
+                if (slot < MAX_FDS && export_registry[i].remote_files[slot]) {
+                    file = export_registry[i].remote_files[slot];
+                    get_file(file); 
                 }
+                break;
             }
-            spin_unlock(&export_lock);
         }
+        spin_unlock(&export_lock);
+    }
 
-        if (file) {
-            struct socket *sock = sock_from_file(file);
-            if (sock && sock->ops && sock->ops->accept) {
-                struct socket *newsock;
-                const struct cred *old_cred = NULL;
+    if (file) {
+        struct socket *sock = sock_from_file(file);
+        if (sock && sock->ops && sock->ops->accept) {
+            struct socket *newsock;
+            const struct cred *old_cred = NULL;
+            
+            rcu_read_lock();
+            deputy = pid_task(find_vpid(rpc->orig_pid), PIDTYPE_PID);
+            if (deputy) get_task_struct(deputy);
+            rcu_read_unlock();
+
+            if (deputy) {
+                if (deputy->mm) kthread_use_mm(deputy->mm);
+                old_cred = override_creds(deputy->cred);
+            }
+
+            int err = sock_create(sock->sk->sk_family, sock->type, sock->sk->sk_protocol, &newsock);
+            if (err == 0) {
+                struct proto_accept_arg accept_arg = {
+                    .flags = rpc->flags,
+                    .kern = true,
+                };
                 
-                rcu_read_lock();
-                deputy = pid_task(find_vpid(req->orig_pid), PIDTYPE_PID);
-                if (deputy) get_task_struct(deputy);
-                rcu_read_unlock();
-
-                if (deputy) {
-                    if (deputy->mm) kthread_use_mm(deputy->mm);
-                    old_cred = override_creds(deputy->cred);
-                }
-
-                // 1. Create the new socket for the incoming connection
-                int err = sock_create(sock->sk->sk_family, sock->type, sock->sk->sk_protocol, &newsock);
+                newsock->type = sock->type;
+                newsock->ops = sock->ops;
+                
+                // THIS WILL SAFELY BLOCK UNTIL A CONNECTION ARRIVES!
+                err = sock->ops->accept(sock, newsock, &accept_arg);
+                
                 if (err == 0) {
-                    // --- FIXED: Use the new 6.12 proto_accept_arg struct ---
-                    struct proto_accept_arg accept_arg = {
-                        .flags = req->flags,
-                        .kern = true,
-                    };
-                    
-                    newsock->type = sock->type;
-                    newsock->ops = sock->ops;
-                    
-                    // 2. Accept the connection!
-                    err = sock->ops->accept(sock, newsock, &accept_arg);
-                    if (err == 0) {
-                        // 3. Get the client's IP address
-                        if (newsock->ops->getname) {
-                            reply.addrlen = newsock->ops->getname(newsock, (struct sockaddr *)&reply.addr, 1);
-                        }
+                    if (newsock->ops->getname) {
+                        reply.addrlen = newsock->ops->getname(newsock, (struct sockaddr *)&reply.addr, 1);
+                    }
 
-                        // 4. Map it to a file and store it in the export registry
-                        struct file *newfilp = sock_alloc_file(newsock, 0, NULL);
-                        if (!IS_ERR(newfilp)) {
-                            spin_lock(&export_lock);
-                            for (i = 0; i < export_count; i++) {
-                                if (export_registry[i].orig_pid == req->orig_pid) {
-                                    for (int j = 0; j < MAX_FDS; j++) {
-                                        if (export_registry[i].remote_files[j] == NULL) {
-                                            export_registry[i].remote_files[j] = newfilp;
-                                            reply.remote_fd = j + 1000; 
-                                            reply.error = 0;
-                                            break;
-                                        }
+                    struct file *newfilp = sock_alloc_file(newsock, 0, NULL);
+                    if (!IS_ERR(newfilp)) {
+                        spin_lock(&export_lock);
+                        for (i = 0; i < export_count; i++) {
+                            if (export_registry[i].orig_pid == rpc->orig_pid) {
+                                for (j = 0; j < MAX_FDS; j++) {
+                                    if (export_registry[i].remote_files[j] == NULL) {
+                                        export_registry[i].remote_files[j] = newfilp;
+                                        reply.remote_fd = j + 1000; 
+                                        reply.error = 0;
+                                        break;
                                     }
-                                    break;
                                 }
+                                break;
                             }
-                            spin_unlock(&export_lock);
-                            
-                            if (reply.remote_fd == -EBADF) {
-                                fput(newfilp);
-                                reply.error = -ENFILE;
-                            }
-                        } else {
-                            sock_release(newsock);
-                            reply.error = PTR_ERR(newfilp);
+                        }
+                        spin_unlock(&export_lock);
+                        
+                        if (reply.remote_fd == -EBADF) {
+                            fput(newfilp);
+                            reply.error = -ENFILE;
                         }
                     } else {
                         sock_release(newsock);
-                        reply.error = err;
+                        reply.error = PTR_ERR(newfilp);
                     }
                 } else {
+                    sock_release(newsock);
                     reply.error = err;
                 }
-
-                if (deputy) {
-                    revert_creds(old_cred);
-                    if (deputy->mm) kthread_unuse_mm(deputy->mm);
-                    put_task_struct(deputy);
-                }
             } else {
-                reply.error = -ENOTSOCK;
+                reply.error = err;
             }
-            fput(file); 
+
+            if (deputy) {
+                revert_creds(old_cred);
+                if (deputy->mm) kthread_unuse_mm(deputy->mm);
+                put_task_struct(deputy);
+            }
+        } else {
+            reply.error = -ENOTSOCK;
         }
+        fput(file); 
+    }
+
+    if (cluster_map[rpc->home_node]) {
+        printk(KERN_INFO "MattX:[RPC] Sending ACCEPT_REPLY (Remote FD: %d) back to Node %u...\n", reply.remote_fd, rpc->home_node);
+        mattx_comm_send(cluster_map[rpc->home_node], MATTX_MSG_SYS_ACCEPT_REPLY, &reply, sizeof(reply));
+    }
+    
+    kfree(rpc);
+}
+
+static void handle_sys_accept_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    if (payload) {
+        struct mattx_sys_accept_req *req = (struct mattx_sys_accept_req *)payload;
         
-        if (cluster_map[hdr->sender_id]) {
-            mattx_comm_send(cluster_map[hdr->sender_id], MATTX_MSG_SYS_ACCEPT_REPLY, &reply, sizeof(reply));
+        printk(KERN_INFO "MattX:[RPC] Received ACCEPT request from Node %u. Escaping to Workqueue...\n", hdr->sender_id);
+
+        // Throw the blocking accept call onto a background worker!
+        struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC);
+        if (rpc) {
+            INIT_WORK(&rpc->work, mattx_accept_worker);
+            rpc->orig_pid = req->orig_pid;
+            rpc->remote_fd = req->fd;
+            rpc->flags = req->flags;
+            rpc->home_node = hdr->sender_id;
+            schedule_work(&rpc->work);
         }
     }
 }
