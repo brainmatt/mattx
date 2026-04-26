@@ -1665,6 +1665,27 @@ static void mattx_accept_worker(struct work_struct *work) {
             }
         }
         spin_unlock(&export_lock);
+    } else {
+        // look up native FDs!
+        rcu_read_lock();
+        deputy = pid_task(find_vpid(rpc->orig_pid), PIDTYPE_PID);
+        if (deputy) get_task_struct(deputy);
+        rcu_read_unlock();
+        
+        if (deputy) {
+            struct files_struct *files = deputy->files;
+            if (files) {
+                spin_lock(&files->file_lock);
+                struct fdtable *fdt = files_fdtable(files);
+                if (rpc->remote_fd < fdt->max_fds) {
+                    file = rcu_dereference_raw(fdt->fd[rpc->remote_fd]);
+                    if (file) get_file(file); 
+                }
+                spin_unlock(&files->file_lock);
+            }
+            put_task_struct(deputy);
+            deputy = NULL; // Reset deputy pointer for the next block!
+        }
     }
 
     if (file) {
