@@ -1691,7 +1691,6 @@ static void mattx_accept_worker(struct work_struct *work) {
     if (file) {
         struct socket *sock = sock_from_file(file);
         if (sock && sock->ops && sock->ops->accept) {
-            struct socket *newsock;
             const struct cred *old_cred = NULL;
             
             rcu_read_lock();
