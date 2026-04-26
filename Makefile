@@ -14,19 +14,28 @@ all: module daemon stub migtest servertest
 module:
 	$(MAKE) -C $(KDIR) M=$(PWD) modules
 
-daemon: mattx_discd.c
-	gcc $(CFLAGS_USER) -o mattx-discd mattx_discd.c $(LDFLAGS_USER) -lpthread
+daemon: sbin/mattx_discd.c
+	gcc $(CFLAGS_USER) -o sbin/mattx-discd sbin/mattx_discd.c $(LDFLAGS_USER) -lpthread
 
-stub: mattx_stub.c
-	gcc $(CFLAGS_USER) -o mattx-stub mattx_stub.c $(LDFLAGS_USER)
+stub: bin/mattx_stub.c
+	gcc $(CFLAGS_USER) -o bin/mattx-stub bin/mattx_stub.c $(LDFLAGS_USER)
 
-migtest: migtest.c
-	gcc -o migtest migtest.c
+migtest: bin/migtest.c
+	gcc -o bin/migtest bin/migtest.c
 
-servertest: servertest.c
-	gcc -o servertest servertest.c
+servertest: bin/servertest.c
+	gcc -o bin/servertest bin/servertest.c
 
 clean:
 	$(MAKE) -C $(KDIR) M=$(PWD) clean
-	rm -f mattx-discd mattx-stub migtest servertest
+	rm -f bin/migtest bin/servertest bin/mattx-stub sbin/mattx-discd
 
+install:
+	sudo rm -f /usr/local/bin/migtest /usr/local/bin/servertest /usr/local/bin/mattx-stub /usr/local/sbin/mattx-discd
+	sudo cp -f bin/migtest /usr/local/bin/migtest
+	sudo cp -f bin/servertest /usr/local/bin/servertest
+	sudo cp -f bin/mattx-stub /usr/local/bin/mattx-stub
+	sudo cp -f sbin/mattx-discd /usr/local/sbin/mattx-discd
+
+uninstall:
+	sudo rm -f /usr/local/bin/migtest /usr/local/bin/servertest /usr/local/bin/mattx-stub /usr/local/sbin/mattx-discd	
