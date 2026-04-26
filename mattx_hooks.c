@@ -128,9 +128,8 @@ static void mattx_rpc_worker(struct work_struct *work) {
         }
     }
 
-    int retries = 50;
     bool done = false;
-    while (!done && retries > 0) {
+    while (!done) {
         msleep(100);
         spin_lock(&guest_lock);
         for (i = 0; i < guest_count; i++) {
@@ -141,7 +140,6 @@ static void mattx_rpc_worker(struct work_struct *work) {
             }
         }
         spin_unlock(&guest_lock);
-        retries--;
     }
 
     struct task_struct *surrogate = NULL;
