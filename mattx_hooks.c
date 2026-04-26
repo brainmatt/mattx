@@ -102,6 +102,18 @@ static void mattx_rpc_worker(struct work_struct *work) {
         if (cluster_map[rpc->home_node]) {
             mattx_comm_send(cluster_map[rpc->home_node], MATTX_MSG_SYS_RECV_REQ, &req, sizeof(req));
         }        
+    // ACCEPT WORKER ---
+    } else if (rpc->is_accept) {
+        struct mattx_sys_accept_req req;
+        memset(&req, 0, sizeof(req));
+        req.orig_pid = rpc->orig_pid;
+        req.fd = rpc->remote_fd;
+        req.flags = rpc->flags;
+
+        printk(KERN_INFO "MattX:[RPC] Worker started for PID %d. Sending ACCEPT_REQ to Node %d...\n", rpc->local_pid, rpc->home_node);
+        if (cluster_map[rpc->home_node]) {
+            mattx_comm_send(cluster_map[rpc->home_node], MATTX_MSG_SYS_ACCEPT_REQ, &req, sizeof(req));
+        }
     } else {
         struct mattx_sys_open_req req;
         memset(&req, 0, sizeof(req));
@@ -196,6 +208,61 @@ static void mattx_rpc_worker(struct work_struct *work) {
                 printk(KERN_INFO "MattX:[RPC] Illusion Complete! recvfrom returned %zd\n", ret_bytes);
             }
 
+        // --- ACCEPT AWAKENING ---
+        } else if (rpc->is_accept) {
+            struct pt_regs *regs = task_pt_regs(surrogate);
+            int local_fd = -1;
+            
+            // If remote_fd is >= 0, VM1 successfully accepted a connection!
+            if (remote_fd >= 0) {
+                struct mattx_fake_fd_info *fd_info = kmalloc(sizeof(*fd_info), GFP_KERNEL);
+                if (fd_info) {
+                    fd_info->home_node = rpc->home_node;
+                    fd_info->orig_pid = rpc->orig_pid;
+                    fd_info->remote_fd = remote_fd;
+                    
+                    struct file *fake_file = anon_inode_getfile("mattx_vfs_proxy", &mattx_fops, fd_info, O_RDWR);
+                    
+                    if (!IS_ERR(fake_file) && surrogate->files) {
+                        spin_lock(&surrogate->files->file_lock);
+                        struct fdtable *fdt = files_fdtable(surrogate->files);
+                        for (int j = 3; j < fdt->max_fds; j++) {
+                            if (!rcu_dereference_raw(fdt->fd[j])) {
+                                rcu_assign_pointer(fdt->fd[j], fake_file);
+                                __set_bit(j, fdt->open_fds);
+                                local_fd = j;
+                                break;
+                            }
+                        }
+                        spin_unlock(&surrogate->files->file_lock);
+                        
+                        if (local_fd >= 0) {
+                            regs->ax = local_fd; // Return the new Local FD!
+                            
+                            // Copy the client's IP address back to user-space if requested
+                            if (rpc->buff && rpc->size) {
+                                int __user *ulen = (int __user *)rpc->size;
+                                int len;
+                                if (get_user(len, ulen) == 0) {
+                                    len = min_t(int, len, guest_registry[0].rpc_fsync_res); // We reuse fsync_res for addrlen
+                                    copy_to_user(rpc->buff, guest_registry[0].rpc_read_buf, len); // We reuse read_buf for the sockaddr
+                                    put_user(len, ulen);
+                                }
+                            }
+                            printk(KERN_INFO "MattX:[RPC] Illusion Complete! Mapped New Remote FD %d to Local FD %d\n", remote_fd, local_fd);
+                        } else {
+                            fput(fake_file);
+                            regs->ax = -EMFILE;
+                        }
+                    } else {
+                        kfree(fd_info);
+                        regs->ax = -ENFILE;
+                    }
+                }
+            } else {
+                // VM1 returned an error (e.g., -EAGAIN for non-blocking sockets)
+                regs->ax = remote_fd; 
+            }            
         // --- FD-Creating Syscalls (open, socket, dup) fall through here! ---
         } else if (remote_fd >= 0) {
             struct pt_regs *regs = task_pt_regs(surrogate);
@@ -980,6 +1047,99 @@ static int ret_handler_recvfrom(struct kretprobe_instance *ri, struct pt_regs *r
     return 0;
 }
 
+// --- ACCEPT HOOK ---
+struct accept_kretprobe_data {
+    int fd;
+    struct sockaddr __user *upeer_sockaddr;
+    int __user *upeer_addrlen;
+    int flags;
+    bool is_wormhole_fd;
+    int remote_fd;
+};
+
+static struct kretprobe accept_kprobe;
+
+static int entry_handler_accept(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    pid_t my_pid = current->pid;
+    struct accept_kretprobe_data *data = (struct accept_kretprobe_data *)ri->data;
+
+    if (!is_guest_process(my_pid)) return 0; 
+    if (!config_migrate_network_io) return 0;
+
+    // __sys_accept4(int fd, struct sockaddr __user *upeer_sockaddr, int __user *upeer_addrlen, int flags)
+    data->fd = (int)regs->di;
+    data->upeer_sockaddr = (struct sockaddr __user *)regs->si;
+    data->upeer_addrlen = (int __user *)regs->dx;
+    data->flags = (int)regs->cx;
+    data->is_wormhole_fd = false;
+    data->remote_fd = -1;
+
+    if (data->fd >= 0) {
+        struct file *f = fget(data->fd);
+        if (f) {
+            if (f->f_op == &mattx_fops) {
+                struct mattx_fake_fd_info *fd_info = f->private_data;
+                if (fd_info) {
+                    data->is_wormhole_fd = true;
+                    data->remote_fd = fd_info->remote_fd;
+                }
+            }
+            fput(f);
+        }
+    }
+
+    if (data->is_wormhole_fd) {
+        regs->di = -1; // Sabotage!
+    }
+
+    return 0;
+}
+
+static int ret_handler_accept(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    pid_t my_pid = current->pid;
+    struct accept_kretprobe_data *data = (struct accept_kretprobe_data *)ri->data;
+    int home_node = -1;
+    u32 orig_pid = 0;
+    int i;
+
+    if (!is_guest_process(my_pid) || !config_migrate_network_io || !data->is_wormhole_fd) return 0;
+
+    spin_lock(&guest_lock);
+    for (i = 0; i < guest_count; i++) {
+        if (guest_registry[i].local_pid == my_pid) {
+            home_node = guest_registry[i].home_node;
+            orig_pid = guest_registry[i].orig_pid;
+            guest_registry[i].rpc_done = false; 
+            break;
+        }
+    }
+    spin_unlock(&guest_lock);
+
+    if (home_node != -1) {
+        struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
+        if (rpc) {
+            INIT_WORK(&rpc->work, mattx_rpc_worker);
+            rpc->local_pid = my_pid;
+            rpc->orig_pid = orig_pid;
+            rpc->home_node = home_node;
+            
+            rpc->is_accept = true;
+            rpc->remote_fd = data->remote_fd;
+            rpc->flags = data->flags;
+            
+            // We save the user-space pointers so we can copy the client IP later!
+            rpc->buff = data->upeer_sockaddr; 
+            rpc->size = (size_t)data->upeer_addrlen; 
+
+            printk(KERN_INFO "MattX:[HOOK] Intercepted accept(fd=%d). Freezing Surrogate %d...\n", data->fd, my_pid);
+            send_sig(SIGSTOP, current, 0);
+            schedule_work(&rpc->work);
+        }
+    }
+
+    return 0;
+}
+
 int mattx_hooks_init(void) {
     int ret;
     memset(&openat_kprobe, 0, sizeof(openat_kprobe));
@@ -1084,11 +1244,22 @@ int mattx_hooks_init(void) {
     ret = register_kretprobe(&recvfrom_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for recvfrom, returned %d\n", ret);
 
+    memset(&accept_kprobe, 0, sizeof(accept_kprobe));
+    accept_kprobe.kp.symbol_name = "__sys_accept4";
+    accept_kprobe.entry_handler = entry_handler_accept;
+    accept_kprobe.handler = ret_handler_accept;
+    accept_kprobe.data_size = sizeof(struct accept_kretprobe_data);
+    accept_kprobe.maxactive = 64;
+    
+    ret = register_kretprobe(&accept_kprobe);
+    if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for accept, returned %d\n", ret);
+
     printk(KERN_INFO "MattX: Syscall Hooks (Kprobes) registered successfully.\n");
     return 0;
 }
 
 void mattx_hooks_exit(void) {
+    unregister_kretprobe(&accept_kprobe);
     unregister_kretprobe(&recvfrom_kprobe);
     unregister_kretprobe(&sendto_kprobe);
     unregister_kretprobe(&listen_kprobe);

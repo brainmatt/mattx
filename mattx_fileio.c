@@ -1637,6 +1637,154 @@ static void handle_sys_recv_reply(struct mattx_link *link, struct mattx_header *
     }
 }
 
+static void handle_sys_accept_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    if (payload) {
+        struct mattx_sys_accept_req *req = (struct mattx_sys_accept_req *)payload;
+        struct mattx_sys_accept_reply reply;
+        struct task_struct *deputy = NULL;
+        struct file *file = NULL;
+        int i;
+
+        memset(&reply, 0, sizeof(reply));
+        reply.orig_pid = req->orig_pid;
+        reply.remote_fd = -EBADF;
+        reply.error = -EBADF;
+
+        printk(KERN_INFO "MattX:[NETWORK] Received ACCEPT request for FD %u from Node %u\n", req->fd, hdr->sender_id);
+
+        if (req->fd >= 1000) {
+            int slot = req->fd - 1000;
+            spin_lock(&export_lock);
+            for (i = 0; i < export_count; i++) {
+                if (export_registry[i].orig_pid == req->orig_pid) {
+                    if (slot < MAX_FDS && export_registry[i].remote_files[slot]) {
+                        file = export_registry[i].remote_files[slot];
+                        get_file(file); 
+                    }
+                    break;
+                }
+            }
+            spin_unlock(&export_lock);
+        }
+
+        if (file) {
+            struct socket *sock = sock_from_file(file);
+            if (sock && sock->ops && sock->ops->accept) {
+                struct socket *newsock;
+                const struct cred *old_cred = NULL;
+                
+                rcu_read_lock();
+                deputy = pid_task(find_vpid(req->orig_pid), PIDTYPE_PID);
+                if (deputy) get_task_struct(deputy);
+                rcu_read_unlock();
+
+                if (deputy) {
+                    if (deputy->mm) kthread_use_mm(deputy->mm);
+                    old_cred = override_creds(deputy->cred);
+                }
+
+                // 1. Create the new socket for the incoming connection
+                int err = sock_create(sock->sk->sk_family, sock->type, sock->sk->sk_protocol, &newsock);
+                if (err == 0) {
+                    newsock->type = sock->type;
+                    newsock->ops = sock->ops;
+                    
+                    // 2. Accept the connection!
+                    err = sock->ops->accept(sock, newsock, req->flags, true);
+                    
+                    if (err == 0) {
+                        // 3. Get the client's IP address
+                        if (newsock->ops->getname) {
+                            reply.addrlen = newsock->ops->getname(newsock, (struct sockaddr *)&reply.addr, 1);
+                        }
+
+                        // 4. Map it to a file and store it in the export registry
+                        struct file *newfilp = sock_alloc_file(newsock, 0, NULL);
+                        if (!IS_ERR(newfilp)) {
+                            spin_lock(&export_lock);
+                            for (i = 0; i < export_count; i++) {
+                                if (export_registry[i].orig_pid == req->orig_pid) {
+                                    for (int j = 0; j < MAX_FDS; j++) {
+                                        if (export_registry[i].remote_files[j] == NULL) {
+                                            export_registry[i].remote_files[j] = newfilp;
+                                            reply.remote_fd = j + 1000; 
+                                            reply.error = 0;
+                                            break;
+                                        }
+                                    }
+                                    break;
+                                }
+                            }
+                            spin_unlock(&export_lock);
+                            
+                            if (reply.remote_fd == -EBADF) {
+                                fput(newfilp);
+                                reply.error = -ENFILE;
+                            }
+                        } else {
+                            sock_release(newsock);
+                            reply.error = PTR_ERR(newfilp);
+                        }
+                    } else {
+                        sock_release(newsock);
+                        reply.error = err;
+                    }
+                } else {
+                    reply.error = err;
+                }
+
+                if (deputy) {
+                    revert_creds(old_cred);
+                    if (deputy->mm) kthread_unuse_mm(deputy->mm);
+                    put_task_struct(deputy);
+                }
+            } else {
+                reply.error = -ENOTSOCK;
+            }
+            fput(file); 
+        }
+        
+        if (cluster_map[hdr->sender_id]) {
+            mattx_comm_send(cluster_map[hdr->sender_id], MATTX_MSG_SYS_ACCEPT_REPLY, &reply, sizeof(reply));
+        }
+    }
+}
+
+static void handle_sys_accept_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    if (payload) {
+        struct mattx_sys_accept_reply *reply = (struct mattx_sys_accept_reply *)payload;
+        int i;
+
+        printk(KERN_INFO "MattX:[RPC] Received ACCEPT_REPLY for Orig PID %u. New Remote FD: %d\n", reply->orig_pid, reply->remote_fd);
+
+        spin_lock(&guest_lock);
+        for (i = 0; i < guest_count; i++) {
+            if (guest_registry[i].orig_pid == reply->orig_pid && guest_registry[i].home_node == hdr->sender_id) {
+                
+                if (reply->error == 0) {
+                    guest_registry[i].rpc_remote_fd = reply->remote_fd;
+                    
+                    // We reuse read_buf to temporarily store the client's IP address
+                    guest_registry[i].rpc_read_buf = kmalloc(reply->addrlen, GFP_ATOMIC);
+                    if (guest_registry[i].rpc_read_buf) {
+                        memcpy(guest_registry[i].rpc_read_buf, &reply->addr, reply->addrlen);
+                        guest_registry[i].rpc_fsync_res = reply->addrlen; // Store the length
+                    }
+                } else {
+                    guest_registry[i].rpc_remote_fd = reply->error; // Pass the error code back
+                }
+                
+                guest_registry[i].rpc_done = true;
+                if (guest_registry[i].rpc_wq) {
+                    wake_up_interruptible(guest_registry[i].rpc_wq);
+                }
+                break;
+            }
+        }
+        spin_unlock(&guest_lock);
+    }
+}
+
 void mattx_fileio_init_handlers(void) {
     mattx_register_handler(MATTX_MSG_SYSCALL_FWD, handle_syscall_fwd);
     mattx_register_handler(MATTX_MSG_SYS_OPEN_REQ, handle_sys_open_req);
@@ -1664,7 +1812,8 @@ void mattx_fileio_init_handlers(void) {
     mattx_register_handler(MATTX_MSG_SYS_SEND_REPLY, handle_sys_generic_int_reply); // We can reuse the generic int reply for send!
     mattx_register_handler(MATTX_MSG_SYS_RECV_REQ, handle_sys_recv_req);
     mattx_register_handler(MATTX_MSG_SYS_RECV_REPLY, handle_sys_recv_reply);
-
+    mattx_register_handler(MATTX_MSG_SYS_ACCEPT_REQ, handle_sys_accept_req);
+    mattx_register_handler(MATTX_MSG_SYS_ACCEPT_REPLY, handle_sys_accept_reply);
     printk(KERN_INFO "MattX: [FILEIO] Network handlers registered.\n");
 }
 

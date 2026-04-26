@@ -86,6 +86,8 @@ enum mattx_msg_type {
     MATTX_MSG_SYS_SEND_REPLY,
     MATTX_MSG_SYS_RECV_REQ,
     MATTX_MSG_SYS_RECV_REPLY,
+    MATTX_MSG_SYS_ACCEPT_REQ,
+    MATTX_MSG_SYS_ACCEPT_REPLY,
 };
 
 struct mattx_header {
@@ -283,7 +285,7 @@ struct mattx_sys_listen_reply {
     int error;
 };
 
-// --- NEW: Send/Recv Payloads ---
+// Send/Recv Payloads ---
 struct mattx_sys_send_req {
     u32 orig_pid;
     u32 fd;
@@ -310,6 +312,20 @@ struct mattx_sys_recv_reply {
     ssize_t bytes_recv;
     int error;
     char data[];
+};
+
+struct mattx_sys_accept_req {
+    u32 orig_pid;
+    u32 fd; // The listening socket
+    int flags;
+};
+
+struct mattx_sys_accept_reply {
+    u32 orig_pid;
+    int remote_fd; // The newly created socket for the connection
+    int error;
+    struct sockaddr_storage addr; // The IP of the client who connected
+    int addrlen;
 };
 
 struct mattx_fake_fd_info {
@@ -361,6 +377,9 @@ struct mattx_rpc_work {
     void __user *buff;
     size_t len;
     size_t size;    
+
+    // For ACCEPT
+    bool is_accept;
 };
 
 struct mattx_link {
