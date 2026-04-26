@@ -1704,8 +1704,6 @@ static void mattx_accept_worker(struct work_struct *work) {
                 old_cred = override_creds(deputy->cred);
             }
 
-
-
             // The Clean Accept ---
             // We do NOT use sock_create here, because it initializes the internal 'sk' struct.
             // inet_accept expects a completely blank socket shell!
