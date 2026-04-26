@@ -1643,7 +1643,6 @@ static void mattx_accept_worker(struct work_struct *work) {
     struct mattx_sys_accept_reply reply;
     struct file *file = NULL;
     struct task_struct *deputy = NULL;
-    int remote_fd = -1;
     int i, j;
 
     memset(&reply, 0, sizeof(reply));
