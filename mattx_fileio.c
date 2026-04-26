@@ -1704,8 +1704,13 @@ static void mattx_accept_worker(struct work_struct *work) {
                 old_cred = override_creds(deputy->cred);
             }
 
-            int err = sock_create(sock->sk->sk_family, sock->type, sock->sk->sk_protocol, &newsock);
-            if (err == 0) {
+
+
+            // The Clean Accept ---
+            // We do NOT use sock_create here, because it initializes the internal 'sk' struct.
+            // inet_accept expects a completely blank socket shell!
+            struct socket *newsock = sock_alloc();
+            if (newsock) {
                 struct proto_accept_arg accept_arg = {
                     .flags = rpc->flags,
                     .kern = true,
@@ -1715,7 +1720,7 @@ static void mattx_accept_worker(struct work_struct *work) {
                 newsock->ops = sock->ops;
                 
                 // THIS WILL SAFELY BLOCK UNTIL A CONNECTION ARRIVES!
-                err = sock->ops->accept(sock, newsock, &accept_arg);
+                int err = sock->ops->accept(sock, newsock, &accept_arg);
                 
                 if (err == 0) {
                     if (newsock->ops->getname) {
@@ -1753,7 +1758,7 @@ static void mattx_accept_worker(struct work_struct *work) {
                     reply.error = err;
                 }
             } else {
-                reply.error = err;
+                reply.error = -ENOMEM;
             }
 
             if (deputy) {
