@@ -36,6 +36,8 @@ install:
 	sudo cp -f bin/servertest /usr/local/bin/servertest
 	sudo cp -f bin/mattx-stub /usr/local/bin/mattx-stub
 	sudo cp -f sbin/mattx-discd /usr/local/sbin/mattx-discd
+	SUDO cp -f bin/mattx-admin /usr/local/bin/mattx-admin
+	chmod +x /usr/local/bin/mattx-admin
 
 uninstall:
-	sudo rm -f /usr/local/bin/migtest /usr/local/bin/servertest /usr/local/bin/mattx-stub /usr/local/sbin/mattx-discd	
+	sudo rm -f /usr/local/bin/migtest /usr/local/bin/servertest /usr/local/bin/mattx-stub /usr/local/sbin/mattx-discd /usr/local/bin/mattx-admins

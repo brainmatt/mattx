@@ -1,0 +1,118 @@
+#!/bin/bash
+# Name: /usr/local/bin/mattx-admin
+# Purpose: MattX adminstration tool 
+# ------------------------------------------------------------------------------
+
+# is this MattX ?
+if [ ! -d /proc/mattx ]; then
+    echo "ERROR: MattX does not appear to be running on this system (no /proc/mattx directory found)" >&2
+    exit 1
+fi
+
+function get_lowest_cpu_node() {
+    local input="$1"
+    local lowest_cpu=999999
+    local lowest_node_id=""
+    
+    # Skip header lines and process data lines
+    echo "$input" | awk '
+    NR > 3 && NF > 0 && !/^Balancer/ && !/^-+$/ {
+        # Extract node ID (first field, remove any parentheses and text after)
+        node_id = $1
+        gsub(/[[:space:]]*\(.*\)/, "", node_id)
+        
+        # Extract CPU Load (third field)
+        cpu_load = $3
+        
+        # Track the lowest CPU load and corresponding node ID
+        if (cpu_load != "" && cpu_load+0 == cpu_load) {
+            if (cpu_load < min_cpu || min_cpu == "") {
+                min_cpu = cpu_load
+                min_node = node_id
+            }
+        }
+    }
+    END {
+        if (min_node != "") {
+            print min_node
+        }
+    }
+    '
+}
+
+
+
+
+case "$1" in
+  status)
+    cat /proc/mattx/nodes
+    ;;
+  migrate)
+    if [ "$3" == "" ]; then
+      echo "Usage: $0 migrate <PID> <NODE_ID>/home/best"
+      exit 1
+    fi
+
+    re='^[0-9]+$'
+    if ! [[ $2 =~ $re ]] ; then
+        echo "error: <PID> is not a number" >&2; exit 1
+    fi
+    if ! [[ $3 =~ $re ]] ; then
+        if [ "$3" != "home" ] && [ "$3" != "best" ]; then
+            echo "error: <NODE_ID> must be a number or 'home' or 'best'" >&2; exit 1
+        fi
+        echo "error: <NODE_ID> must be a number or 'home' or 'best'" >&2; exit 1
+    fi
+
+
+    # if $3 is not "home" or "best"
+    # check that PID is not remote, if it is we call it back home first
+    if [ "$3" != "home" ] && [ "$3" != "best" ]; then
+        pid_node=$(cat /proc/mattx/remote | grep $PID | cut -d: -f2)
+        if [ "$pid_node" != "" ]; then
+            echo "NOTICE: PID $2 is currently remote on node $pid_node, migrating it back home first"
+            echo "migrate $2 home" > /proc/mattx/admin
+            echo "NOTICE: migrating PID $2 to node $3"
+            echo "migrate $2 $3" > /proc/mattx/admin
+        else
+            echo "NOTICE: PID $2 is currently running locally, migrating it to node $3"
+            echo "migrate $2 $3" > /proc/mattx/admin
+        fi
+    elif [ "$3" == "home" ]; then
+        pid_node=$(cat /proc/mattx/remote | grep $PID | cut -d: -f2)
+        if [ "$pid_node" == "" ]; then
+            echo "ERROR: PID $2 is not currently remote, cannot migrate it home" >&2; exit 1
+        else
+            echo "NOTICE: migrating PID $2 back home"
+            echo "migrate $2 home" > /proc/mattx/admin
+            exit 0
+        fi
+    elif [ "$3" == "best" ]; then
+        # check that is not already running on the best node.
+        output=$(cat /proc/mattx/nodes)
+        best_node=$(get_lowest_cpu_node "$output")
+        current_node=$(cat /proc/mattx/remote | grep $PID | cut -d: -f2)
+        if [ "$best_node" == $current_node ]; then
+            echo "NOTICE: PID $2 is currently remote on node $best_node which is already the best node, no migration needed"
+            exit 0
+        elif [ "$current_node" == "" ]; then
+            echo "NOTICE: PID $2 is currently running locally, migrating it to the best node $best_node"
+            echo "migrate $2 $best_node" > /proc/matt
+            exit 0
+        else
+            echo "NOTICE: PID $2 is currently remote on node $pid_node, migrating it back home first"
+            echo "migrate $2 home" > /proc/mattx/admin
+            echo "NOTICE: migrating PID $2 to $best_node"
+            echo "migrate $2 $best_node" > /proc/mattx/admin
+            exit 0
+        fi
+    else
+        echo "Usage: $0 migrate <PID> <NODE_ID>/home/best"
+        exit 1
+    fi
+    ;;
+  *)
+    echo "Usage: $0 {status|migrate}"
+    exit 1
+    ;;
+esac
