@@ -3,4 +3,5 @@
 make clean
 git pull
 m
+make install
 

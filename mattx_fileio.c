@@ -1720,7 +1720,8 @@ static void mattx_accept_worker(struct work_struct *work) {
                 int err = sock->ops->accept(sock, newsock, &accept_arg);
                 if (err == 0) {
                     if (newsock->ops->getname) {
-                        int addr_len = newsock->ops->getname(newsock, (struct sockaddr *)&reply.addr, 1);
+                        // Pass 2 instead of 1 to bypass the strict state check!
+                        int addr_len = newsock->ops->getname(newsock, (struct sockaddr *)&reply.addr, 2);
                         // Only save the length if it's a valid positive number!
                         if (addr_len > 0) {
                             reply.addrlen = addr_len;
