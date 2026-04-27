@@ -1420,15 +1420,14 @@ int mattx_hooks_init(void) {
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for accept, returned %d\n", ret);
 
     memset(&poll_kprobe, 0, sizeof(poll_kprobe));
-    poll_kprobe.kp.symbol_name = "do_sys_poll";
+    poll_kprobe.kp.symbol_name = "__x64_sys_poll";
     poll_kprobe.entry_handler = entry_handler_poll;
     poll_kprobe.handler = ret_handler_poll;
     poll_kprobe.data_size = sizeof(struct poll_kretprobe_data);
     poll_kprobe.maxactive = 64;
-    register_kretprobe(&poll_kprobe);
 
     ret = register_kretprobe(&poll_kprobe);
-    if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for poll, returned %d\n", ret);    
+    if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for poll, returned %d\n", ret);
 
     printk(KERN_INFO "MattX: Syscall Hooks (Kprobes) registered successfully.\n");
     return 0;
