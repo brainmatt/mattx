@@ -244,30 +244,28 @@ static void mattx_rpc_worker(struct work_struct *work) {
                                 void *addr_buf = NULL;
                                 int addr_len = 0;
 
-                                // Safely extract the buffer from the registry
                                 spin_lock(&guest_lock);
                                 for (g_idx = 0; g_idx < guest_count; g_idx++) {
                                     if (guest_registry[g_idx].local_pid == rpc->local_pid) {
                                         addr_len = guest_registry[g_idx].rpc_fsync_res;
                                         addr_buf = guest_registry[g_idx].rpc_read_buf;
-                                        guest_registry[g_idx].rpc_read_buf = NULL; // Take ownership
+                                        guest_registry[g_idx].rpc_read_buf = NULL; 
                                         break;
                                     }
                                 }
                                 spin_unlock(&guest_lock);
 
-                                if (addr_buf && get_user(len, ulen) == 0) {
+                                // Ensure addr_len is > 0 before copying!
+                                if (addr_buf && addr_len > 0 && get_user(len, ulen) == 0) {
                                     len = min_t(int, len, addr_len);
-                                    
-                                    // FIXED: Check the return value to satisfy the compiler!
                                     if (copy_to_user(rpc->buff, addr_buf, len)) {
                                         printk(KERN_WARNING "MattX:[RPC] Failed to copy sockaddr to user!\n");
                                     } else {
-                                        put_user(len, ulen); // Update the length for the user program
+                                        put_user(len, ulen); 
                                     }
                                 }
                                 if (addr_buf) kfree(addr_buf);
-                            }                            
+                            }
 
                             printk(KERN_INFO "MattX:[RPC] Illusion Complete! Mapped New Remote FD %d to Local FD %d\n", remote_fd, local_fd);
                         } else {

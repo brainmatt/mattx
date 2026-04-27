@@ -1722,6 +1722,12 @@ static void mattx_accept_worker(struct work_struct *work) {
                 if (err == 0) {
                     if (newsock->ops->getname) {
                         reply.addrlen = newsock->ops->getname(newsock, (struct sockaddr *)&reply.addr, 1);
+                        // Only save the length if it's a valid positive number!
+                        if (addr_len > 0) {
+                            reply.addrlen = addr_len;
+                        } else {
+                            reply.addrlen = 0;
+                        }                    
                     }
 
                     struct file *newfilp = sock_alloc_file(newsock, 0, NULL);
@@ -1806,18 +1812,22 @@ static void handle_sys_accept_reply(struct mattx_link *link, struct mattx_header
         spin_lock(&guest_lock);
         for (i = 0; i < guest_count; i++) {
             if (guest_registry[i].orig_pid == reply->orig_pid && guest_registry[i].home_node == hdr->sender_id) {
-                
+
                 if (reply->error == 0) {
                     guest_registry[i].rpc_remote_fd = reply->remote_fd;
                     
-                    // We reuse read_buf to temporarily store the client's IP address
-                    guest_registry[i].rpc_read_buf = kmalloc(reply->addrlen, GFP_ATOMIC);
-                    if (guest_registry[i].rpc_read_buf) {
-                        memcpy(guest_registry[i].rpc_read_buf, &reply->addr, reply->addrlen);
-                        guest_registry[i].rpc_fsync_res = reply->addrlen; // Store the length
+                    // Only allocate if addrlen is valid and sane!
+                    if (reply->addrlen > 0 && reply->addrlen <= sizeof(struct sockaddr_storage)) {
+                        guest_registry[i].rpc_read_buf = kmalloc(reply->addrlen, GFP_ATOMIC);
+                        if (guest_registry[i].rpc_read_buf) {
+                            memcpy(guest_registry[i].rpc_read_buf, &reply->addr, reply->addrlen);
+                            guest_registry[i].rpc_fsync_res = reply->addrlen; 
+                        } else {
+                            guest_registry[i].rpc_fsync_res = 0;
+                        }
+                    } else {
+                        guest_registry[i].rpc_fsync_res = 0;
                     }
-                } else {
-                    guest_registry[i].rpc_remote_fd = reply->error; // Pass the error code back
                 }
                 
                 guest_registry[i].rpc_done = true;

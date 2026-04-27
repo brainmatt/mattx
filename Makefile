@@ -38,6 +38,21 @@ install:
 	sudo cp -f sbin/mattx-discd /usr/local/sbin/mattx-discd
 	sudo cp -f bin/mattx-admin /usr/local/bin/mattx-admin
 	sudo chmod +x /usr/local/bin/mattx-admin
+	sudo cp -f mattx.conf /etc/mattx.conf
+	sudo chmod 644 /etc/mattx.conf
+
+	# install the kernel module
+
+	echo "NOTICE: MattX installation complete."
+	echo "Please configure /etc/mattx.conf before running the daemon."
+
+
+
 
 uninstall:
-	sudo rm -f /usr/local/bin/migtest /usr/local/bin/servertest /usr/local/bin/mattx-stub /usr/local/sbin/mattx-discd /usr/local/bin/mattx-admin
+	sudo rm -f /usr/local/bin/migtest
+	sudo rm -f /usr/local/bin/servertest
+	sudo rm -f /usr/local/bin/mattx-stub
+	sudo rm -f /usr/local/sbin/mattx-discd
+	sudo rm -f /usr/local/bin/mattx-admin
+	sudo rm -f /etc/mattx.conf
