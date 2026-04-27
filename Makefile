@@ -31,7 +31,13 @@ clean:
 	rm -f bin/migtest bin/servertest bin/mattx-stub sbin/mattx-discd
 
 install:
-	sudo rm -f /usr/local/bin/migtest /usr/local/bin/servertest /usr/local/bin/mattx-stub /usr/local/sbin/mattx-discd /usr/local/bin/mattx-admin /etc/mattx.conf
+	sudo rm -f /usr/local/bin/migtest
+	sudo rm -f /usr/local/bin/servertest
+	sudo rm -f /usr/local/bin/mattx-stub
+	sudo rm -f /usr/local/sbin/mattx-discd
+	sudo rm -f /usr/local/bin/mattx-admin
+	sudo rm -f /etc/mattx.conf
+	sudo rm -f /etc/systemd/system/mattx.service
 	sudo cp -f bin/migtest /usr/local/bin/migtest
 	sudo cp -f bin/servertest /usr/local/bin/servertest
 	sudo cp -f bin/mattx-stub /usr/local/bin/mattx-stub
@@ -40,6 +46,8 @@ install:
 	sudo chmod +x /usr/local/bin/mattx-admin
 	sudo cp -f etc/mattx.conf /etc/mattx.conf
 	sudo chmod 644 /etc/mattx.conf
+	sudo cp -f init/mattx.service /etc/systemd/system/mattx.service
+
 
 	# install the kernel module
 

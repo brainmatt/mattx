@@ -3,7 +3,7 @@ Description=MattX Cluster Discovery Daemon
 After=network.target mattx.ko
 
 [Service]
-ExecStart=/usr/local/bin/mattx-discd
+ExecStart=/usr/local/sbin/mattx-discd
 Restart=always
 User=root
 
