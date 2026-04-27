@@ -46,7 +46,7 @@ install:
 	sudo chmod +x /usr/local/bin/mattx-admin
 	sudo cp -f etc/mattx.conf /etc/mattx.conf
 	sudo chmod 644 /etc/mattx.conf
-	sudo cp -f init/mattx.service /etc/systemd/system/mattx.service
+	sudo cp -f init/mattx-discd.service /etc/systemd/system/mattx-discd.service
 
 
 	# install the kernel module
