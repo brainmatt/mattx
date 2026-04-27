@@ -1811,18 +1811,22 @@ static void handle_sys_accept_reply(struct mattx_link *link, struct mattx_header
         spin_lock(&guest_lock);
         for (i = 0; i < guest_count; i++) {
             if (guest_registry[i].orig_pid == reply->orig_pid && guest_registry[i].home_node == hdr->sender_id) {
-                
+
                 if (reply->error == 0) {
                     guest_registry[i].rpc_remote_fd = reply->remote_fd;
                     
-                    // We reuse read_buf to temporarily store the client's IP address
-                    guest_registry[i].rpc_read_buf = kmalloc(reply->addrlen, GFP_ATOMIC);
-                    if (guest_registry[i].rpc_read_buf) {
-                        memcpy(guest_registry[i].rpc_read_buf, &reply->addr, reply->addrlen);
-                        guest_registry[i].rpc_fsync_res = reply->addrlen; // Store the length
+                    // FIXED: Only allocate if addrlen is valid and sane!
+                    if (reply->addrlen > 0 && reply->addrlen <= sizeof(struct sockaddr_storage)) {
+                        guest_registry[i].rpc_read_buf = kmalloc(reply->addrlen, GFP_ATOMIC);
+                        if (guest_registry[i].rpc_read_buf) {
+                            memcpy(guest_registry[i].rpc_read_buf, &reply->addr, reply->addrlen);
+                            guest_registry[i].rpc_fsync_res = reply->addrlen; 
+                        } else {
+                            guest_registry[i].rpc_fsync_res = 0;
+                        }
+                    } else {
+                        guest_registry[i].rpc_fsync_res = 0;
                     }
-                } else {
-                    guest_registry[i].rpc_remote_fd = reply->error; // Pass the error code back
                 }
                 
                 guest_registry[i].rpc_done = true;
