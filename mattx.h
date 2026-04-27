@@ -88,6 +88,8 @@ enum mattx_msg_type {
     MATTX_MSG_SYS_RECV_REPLY,
     MATTX_MSG_SYS_ACCEPT_REQ,
     MATTX_MSG_SYS_ACCEPT_REPLY,
+    MATTX_MSG_SYS_POLL_REQ,
+    MATTX_MSG_SYS_POLL_REPLY,
 };
 
 struct mattx_header {
@@ -328,6 +330,28 @@ struct mattx_sys_accept_reply {
     int addrlen;
 };
 
+// Poll Structures
+struct mattx_pollfd {
+    u32 fd;
+    short events;
+    short revents;
+};
+
+struct mattx_sys_poll_req {
+    u32 orig_pid;
+    int nfds;
+    int timeout;
+    struct mattx_pollfd fds[16]; // Max 16 FDs for this prototype
+};
+
+struct mattx_sys_poll_reply {
+    u32 orig_pid;
+    int nfds;
+    int error;
+    int retval; // The number of FDs with events
+    struct mattx_pollfd fds[16];
+};
+
 struct mattx_fake_fd_info {
     int home_node;
     u32 orig_pid;
@@ -380,6 +404,13 @@ struct mattx_rpc_work {
 
     // For ACCEPT
     bool is_accept;
+
+    // For POLL
+    bool is_poll;
+    int nfds;
+    int timeout;
+    struct mattx_pollfd poll_fds[16];
+    void __user *poll_ufds; // Pointer to the user-space array    
 };
 
 struct mattx_link {

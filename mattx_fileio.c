@@ -1,5 +1,6 @@
 #include "mattx.h"
 #include <linux/wait.h>
+#include <linux/poll.h>
 
 // --- The VFS Proxy (Fake FDs) ---
 
@@ -1841,6 +1842,133 @@ static void handle_sys_accept_reply(struct mattx_link *link, struct mattx_header
     }
 }
 
+
+static void mattx_poll_worker(struct work_struct *work) {
+    struct mattx_rpc_work *rpc = container_of(work, struct mattx_rpc_work, work);
+    struct mattx_sys_poll_reply reply;
+    int i;
+    unsigned long expire;
+    bool has_timeout = (rpc->timeout >= 0);
+    
+    memset(&reply, 0, sizeof(reply));
+    reply.orig_pid = rpc->orig_pid;
+    reply.nfds = rpc->nfds;
+    memcpy(reply.fds, rpc->poll_fds, sizeof(struct mattx_pollfd) * rpc->nfds);
+
+    printk(KERN_INFO "MattX:[RPC] Poll Worker started for Deputy PID %u (Timeout: %dms)\n", rpc->orig_pid, rpc->timeout);
+
+    if (has_timeout) {
+        expire = jiffies + msecs_to_jiffies(rpc->timeout);
+    }
+
+    // --- THE LAZY POLL LOOP ---
+    while (1) {
+        int ready_count = 0;
+        bool deputy_alive = false;
+
+        // 1. Check if the Deputy is still alive in the export registry!
+        spin_lock(&export_lock);
+        for (i = 0; i < export_count; i++) {
+            if (export_registry[i].orig_pid == rpc->orig_pid) {
+                deputy_alive = true;
+                
+                // 2. Check every FD in the array
+                for (int j = 0; j < rpc->nfds; j++) {
+                    int remote_fd = reply.fds[j].fd;
+                    if (remote_fd >= 1000) {
+                        int slot = remote_fd - 1000;
+                        if (slot < MAX_FDS && export_registry[i].remote_files[slot]) {
+                            struct file *f = export_registry[i].remote_files[slot];
+                            
+                            // vfs_poll with NULL doesn't sleep, it just returns the current state!
+                            __poll_t mask = vfs_poll(f, NULL);
+                            
+                            reply.fds[j].revents = mask & reply.fds[j].events;
+                            if (reply.fds[j].revents) {
+                                ready_count++;
+                            }
+                        }
+                    }
+                }
+                break;
+            }
+        }
+        spin_unlock(&export_lock);
+
+        if (!deputy_alive) {
+            reply.error = -ESRCH;
+            break;
+        }
+
+        if (ready_count > 0) {
+            reply.retval = ready_count;
+            break;
+        }
+
+        if (has_timeout && time_after(jiffies, expire)) {
+            reply.retval = 0; // Timeout reached, 0 FDs ready
+            break;
+        }
+
+        // Sleep for 10ms and check again!
+        msleep(10);
+    }
+
+    if (cluster_map[rpc->home_node]) {
+        printk(KERN_INFO "MattX:[RPC] Sending POLL_REPLY (Ready: %d) back to Node %u...\n", reply.retval, rpc->home_node);
+        mattx_comm_send(cluster_map[rpc->home_node], MATTX_MSG_SYS_POLL_REPLY, &reply, sizeof(reply));
+    }
+    
+    kfree(rpc);
+}
+
+static void handle_sys_poll_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    if (payload) {
+        struct mattx_sys_poll_req *req = (struct mattx_sys_poll_req *)payload;
+        
+        struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC);
+        if (rpc) {
+            INIT_WORK(&rpc->work, mattx_poll_worker);
+            rpc->orig_pid = req->orig_pid;
+            rpc->home_node = hdr->sender_id;
+            rpc->nfds = req->nfds;
+            rpc->timeout = req->timeout;
+            memcpy(rpc->poll_fds, req->fds, sizeof(struct mattx_pollfd) * req->nfds);
+            schedule_work(&rpc->work);
+        }
+    }
+}
+
+static void handle_sys_poll_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    if (payload) {
+        struct mattx_sys_poll_reply *reply = (struct mattx_sys_poll_reply *)payload;
+        int i;
+
+        printk(KERN_INFO "MattX:[RPC] Received POLL_REPLY for Orig PID %u. Ready FDs: %d\n", reply->orig_pid, reply->retval);
+
+        spin_lock(&guest_lock);
+        for (i = 0; i < guest_count; i++) {
+            if (guest_registry[i].orig_pid == reply->orig_pid && guest_registry[i].home_node == hdr->sender_id) {
+                
+                guest_registry[i].rpc_fsync_res = reply->retval; // Store the return value
+                
+                // Allocate a buffer to hold the updated array and pass it to the worker
+                guest_registry[i].rpc_read_buf = kmalloc(sizeof(struct mattx_sys_poll_reply), GFP_ATOMIC);
+                if (guest_registry[i].rpc_read_buf) {
+                    memcpy(guest_registry[i].rpc_read_buf, reply, sizeof(struct mattx_sys_poll_reply));
+                }
+                
+                guest_registry[i].rpc_done = true;
+                if (guest_registry[i].rpc_wq) {
+                    wake_up_interruptible(guest_registry[i].rpc_wq);
+                }
+                break;
+            }
+        }
+        spin_unlock(&guest_lock);
+    }
+}
+
 void mattx_fileio_init_handlers(void) {
     mattx_register_handler(MATTX_MSG_SYSCALL_FWD, handle_syscall_fwd);
     mattx_register_handler(MATTX_MSG_SYS_OPEN_REQ, handle_sys_open_req);
@@ -1870,6 +1998,8 @@ void mattx_fileio_init_handlers(void) {
     mattx_register_handler(MATTX_MSG_SYS_RECV_REPLY, handle_sys_recv_reply);
     mattx_register_handler(MATTX_MSG_SYS_ACCEPT_REQ, handle_sys_accept_req);
     mattx_register_handler(MATTX_MSG_SYS_ACCEPT_REPLY, handle_sys_accept_reply);
+    mattx_register_handler(MATTX_MSG_SYS_POLL_REQ, handle_sys_poll_req);
+    mattx_register_handler(MATTX_MSG_SYS_POLL_REPLY, handle_sys_poll_reply);
     printk(KERN_INFO "MattX: [FILEIO] Network handlers registered.\n");
 }
 
