@@ -38,7 +38,7 @@ install:
 	sudo cp -f sbin/mattx-discd /usr/local/sbin/mattx-discd
 	sudo cp -f bin/mattx-admin /usr/local/bin/mattx-admin
 	sudo chmod +x /usr/local/bin/mattx-admin
-	sudo cp -f mattx.conf /etc/mattx.conf
+	sudo cp -f etc/mattx.conf /etc/mattx.conf
 	sudo chmod 644 /etc/mattx.conf
 
 	# install the kernel module
