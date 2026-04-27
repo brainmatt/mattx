@@ -31,7 +31,7 @@ clean:
 	rm -f bin/migtest bin/servertest bin/mattx-stub sbin/mattx-discd
 
 install:
-	sudo rm -f /usr/local/bin/migtest /usr/local/bin/servertest /usr/local/bin/mattx-stub /usr/local/sbin/mattx-discd
+	sudo rm -f /usr/local/bin/migtest /usr/local/bin/servertest /usr/local/bin/mattx-stub /usr/local/sbin/mattx-discd /usr/local/bin/mattx-admin
 	sudo cp -f bin/migtest /usr/local/bin/migtest
 	sudo cp -f bin/servertest /usr/local/bin/servertest
 	sudo cp -f bin/mattx-stub /usr/local/bin/mattx-stub
@@ -40,4 +40,4 @@ install:
 	chmod +x /usr/local/bin/mattx-admin
 
 uninstall:
-	sudo rm -f /usr/local/bin/migtest /usr/local/bin/servertest /usr/local/bin/mattx-stub /usr/local/sbin/mattx-discd /usr/local/bin/mattx-admins
+	sudo rm -f /usr/local/bin/migtest /usr/local/bin/servertest /usr/local/bin/mattx-stub /usr/local/sbin/mattx-discd /usr/local/bin/mattx-admin
