@@ -136,7 +136,8 @@ static void handle_migrate_done(struct mattx_link *link, struct mattx_header *hd
                         u32 fd_num = pending_migration->open_fds[i];
                         if (fd_num < fdt->max_fds && fake_files[i] && !IS_ERR(fake_files[i])) {
                             rcu_assign_pointer(fdt->fd[fd_num], fake_files[i]);
-                        }
+                            // Tell the kernel bitmap that this FD is open!
+                            __set_bit(fd_num, fdt->open_fds);                        }
                     }
                     spin_unlock(&hijacked_stub_task->files->file_lock);
                     printk(KERN_INFO "MattX:[IMPORT] Successfully injected %u Fake FDs!\n", pending_migration->fd_count);
