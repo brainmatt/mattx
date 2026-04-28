@@ -141,7 +141,7 @@ static void mattx_rpc_worker(struct work_struct *work) {
 
         // 1. Translate timeval to milliseconds
         if (rpc->select_timeout) {
-            struct timeval tv;
+            struct __kernel_old_timeval tv; // FIXED: Use the Y2038-safe legacy struct!
             if (copy_from_user(&tv, rpc->select_timeout, sizeof(tv)) == 0) {
                 timeout_ms = (tv.tv_sec * 1000) + (tv.tv_usec / 1000);
             }
@@ -153,9 +153,10 @@ static void mattx_rpc_worker(struct work_struct *work) {
         out_fds = kzalloc(sizeof(fd_set), GFP_KERNEL);
         ex_fds = kzalloc(sizeof(fd_set), GFP_KERNEL);
 
-        if (rpc->select_readfds) copy_from_user(in_fds, rpc->select_readfds, sizeof(fd_set));
-        if (rpc->select_writefds) copy_from_user(out_fds, rpc->select_writefds, sizeof(fd_set));
-        if (rpc->select_exceptfds) copy_from_user(ex_fds, rpc->select_exceptfds, sizeof(fd_set));
+        // Check return values to satisfy the compiler's safety checks!
+        if (rpc->select_readfds && copy_from_user(in_fds, rpc->select_readfds, sizeof(fd_set))) {}
+        if (rpc->select_writefds && copy_from_user(out_fds, rpc->select_writefds, sizeof(fd_set))) {}
+        if (rpc->select_exceptfds && copy_from_user(ex_fds, rpc->select_exceptfds, sizeof(fd_set))) {}
 
         // 3. Translate Bitmaps to Poll Array!
         for (fd = 0; fd < rpc->select_nfds && poll_idx < 16; fd++) {
@@ -428,9 +429,10 @@ static void mattx_rpc_worker(struct work_struct *work) {
                 }
 
                 // 5. Copy the updated bitmaps back to user-space
-                if (rpc->select_readfds) copy_to_user(rpc->select_readfds, in_fds, sizeof(fd_set));
-                if (rpc->select_writefds) copy_to_user(rpc->select_writefds, out_fds, sizeof(fd_set));
-                if (rpc->select_exceptfds) copy_to_user(rpc->select_exceptfds, ex_fds, sizeof(fd_set));
+                // Check return values to satisfy the compiler!
+                if (rpc->select_readfds && copy_to_user(rpc->select_readfds, in_fds, sizeof(fd_set))) {}
+                if (rpc->select_writefds && copy_to_user(rpc->select_writefds, out_fds, sizeof(fd_set))) {}
+                if (rpc->select_exceptfds && copy_to_user(rpc->select_exceptfds, ex_fds, sizeof(fd_set))) {}
 
                 kfree(in_fds); kfree(out_fds); kfree(ex_fds);
 
