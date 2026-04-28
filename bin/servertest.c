@@ -6,7 +6,8 @@
 #include <sys/socket.h>
 #include <sys/wait.h>
 #include <signal.h>
-#include <poll.h> // NEW: For the poll() system call
+#include <poll.h>
+#include <errno.h>
 
 #define PORT 8080
 
