@@ -78,6 +78,11 @@ int main() {
             int poll_count = poll(fds, 1, -1);
             
             if (poll_count < 0) {
+                // Ignore EINTR and just try again! ---
+                if (errno == EINTR) {
+                    printf("[Worker %d] Poll interrupted by migration (EINTR). Retrying...\n", getpid());
+                    continue; 
+                }
                 perror("Poll failed");
                 break;
             }
