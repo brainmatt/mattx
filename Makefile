@@ -9,7 +9,7 @@ PWD := $(shell pwd)
 CFLAGS_USER := -Wall -O2 $(shell pkg-config --cflags libnl-3.0 libnl-genl-3.0)
 LDFLAGS_USER := $(shell pkg-config --libs libnl-3.0 libnl-genl-3.0)
 
-all: module daemon stub migtest servertest
+all: module daemon stub migtest servertestpoll servertestselect
 
 module:
 	$(MAKE) -C $(KDIR) M=$(PWD) modules
@@ -23,23 +23,29 @@ stub: bin/mattx_stub.c
 migtest: bin/migtest.c
 	gcc -o bin/migtest bin/migtest.c
 
-servertest: bin/servertest.c
-	gcc -o bin/servertest bin/servertest.c
+servertestpoll: bin/servertestpoll.c
+	gcc -o bin/servertestpoll bin/servertestpoll.c
+
+servertestselect: bin/servertestselect.c
+	gcc -o bin/servertestselect bin/servertestselect.c
+
 
 clean:
 	$(MAKE) -C $(KDIR) M=$(PWD) clean
-	rm -f bin/migtest bin/servertest bin/mattx-stub sbin/mattx-discd
+	rm -f bin/migtest bin/servertestpoll bin/servertestselect bin/mattx-stub sbin/mattx-discd
 
 install:
 	sudo rm -f /usr/local/bin/migtest
-	sudo rm -f /usr/local/bin/servertest
+	sudo rm -f /usr/local/bin/servertestpoll
+	sudo rm -f /usr/local/bin/servertestselect
 	sudo rm -f /usr/local/bin/mattx-stub
 	sudo rm -f /usr/local/sbin/mattx-discd
 	sudo rm -f /usr/local/bin/mattx-admin
 	sudo rm -f /etc/mattx.conf
 	sudo rm -f /etc/systemd/system/mattx.service
 	sudo cp -f bin/migtest /usr/local/bin/migtest
-	sudo cp -f bin/servertest /usr/local/bin/servertest
+	sudo cp -f bin/servertestpoll /usr/local/bin/servertestpoll
+	sudo cp -f bin/servertestselect /usr/local/bin/servertestselect
 	sudo cp -f bin/mattx-stub /usr/local/bin/mattx-stub
 	sudo cp -f sbin/mattx-discd /usr/local/sbin/mattx-discd
 	sudo cp -f bin/mattx-admin /usr/local/bin/mattx-admin
@@ -59,7 +65,8 @@ install:
 
 uninstall:
 	sudo rm -f /usr/local/bin/migtest
-	sudo rm -f /usr/local/bin/servertest
+	sudo rm -f /usr/local/bin/servertestpoll
+	sudo rm -f /usr/local/bin/servertestselect
 	sudo rm -f /usr/local/bin/mattx-stub
 	sudo rm -f /usr/local/sbin/mattx-discd
 	sudo rm -f /usr/local/bin/mattx-admin
