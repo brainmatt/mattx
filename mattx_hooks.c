@@ -129,19 +129,21 @@ static void mattx_rpc_worker(struct work_struct *work) {
             mattx_comm_send(cluster_map[rpc->home_node], MATTX_MSG_SYS_POLL_REQ, &req, sizeof(req));
         }
 
+    // SELECT WORKER (MOST COMPLEX: Need to translate Bitmaps to Poll Array and back!)
     } else if (rpc->is_select) {
         struct mattx_sys_poll_req req;
         fd_set *in_fds = NULL, *out_fds = NULL, *ex_fds = NULL;
         int timeout_ms = -1;
         int poll_idx = 0;
         int fd;
+        struct task_struct *surrogate = NULL;
 
         memset(&req, 0, sizeof(req));
         req.orig_pid = rpc->orig_pid;
 
         // 1. Translate timeval to milliseconds
         if (rpc->select_timeout) {
-            struct __kernel_old_timeval tv; // FIXED: Use the Y2038-safe legacy struct!
+            struct __kernel_old_timeval tv; 
             if (copy_from_user(&tv, rpc->select_timeout, sizeof(tv)) == 0) {
                 timeout_ms = (tv.tv_sec * 1000) + (tv.tv_usec / 1000);
             }
@@ -153,36 +155,49 @@ static void mattx_rpc_worker(struct work_struct *work) {
         out_fds = kzalloc(sizeof(fd_set), GFP_KERNEL);
         ex_fds = kzalloc(sizeof(fd_set), GFP_KERNEL);
 
-        // Check return values to satisfy the compiler's safety checks!
         if (rpc->select_readfds && copy_from_user(in_fds, rpc->select_readfds, sizeof(fd_set))) {}
         if (rpc->select_writefds && copy_from_user(out_fds, rpc->select_writefds, sizeof(fd_set))) {}
         if (rpc->select_exceptfds && copy_from_user(ex_fds, rpc->select_exceptfds, sizeof(fd_set))) {}
 
-        // 3. Translate Bitmaps to Poll Array!
-        for (fd = 0; fd < rpc->select_nfds && poll_idx < 16; fd++) {
-            short events = 0;
-            if (in_fds && test_bit(fd, (unsigned long *)in_fds)) events |= POLLIN;
-            if (out_fds && test_bit(fd, (unsigned long *)out_fds)) events |= POLLOUT;
-            if (ex_fds && test_bit(fd, (unsigned long *)ex_fds)) events |= POLLPRI;
+        // --- FIXED: Look up FDs in the Surrogate's file table, not the kworker's! ---
+        rcu_read_lock();
+        surrogate = pid_task(find_vpid(rpc->local_pid), PIDTYPE_PID);
+        if (surrogate) get_task_struct(surrogate);
+        rcu_read_unlock();
 
-            if (events) {
-                struct file *f = fget(fd);
-                if (f) {
-                    if (f->f_op == &mattx_fops) {
-                        struct mattx_fake_fd_info *fd_info = f->private_data;
-                        if (fd_info) {
-                            req.fds[poll_idx].fd = fd_info->remote_fd;
-                            req.fds[poll_idx].events = events;
-                            
-                            // Secret trick: We save the Local FD in our work struct so we can map it back later!
-                            rpc->poll_fds[poll_idx].fd = fd; 
-                            poll_idx++;
+        if (surrogate) {
+            struct files_struct *files = surrogate->files;
+            if (files) {
+                spin_lock(&files->file_lock);
+                struct fdtable *fdt = files_fdtable(files);
+                
+                // 3. Translate Bitmaps to Poll Array!
+                for (fd = 0; fd < rpc->select_nfds && poll_idx < 16; fd++) {
+                    short events = 0;
+                    if (in_fds && test_bit(fd, (unsigned long *)in_fds)) events |= POLLIN;
+                    if (out_fds && test_bit(fd, (unsigned long *)out_fds)) events |= POLLOUT;
+                    if (ex_fds && test_bit(fd, (unsigned long *)ex_fds)) events |= POLLPRI;
+
+                    if (events && fd < fdt->max_fds) {
+                        struct file *f = rcu_dereference_raw(fdt->fd[fd]);
+                        if (f && f->f_op == &mattx_fops) {
+                            struct mattx_fake_fd_info *fd_info = f->private_data;
+                            if (fd_info) {
+                                req.fds[poll_idx].fd = fd_info->remote_fd;
+                                req.fds[poll_idx].events = events;
+                                
+                                // Secret trick: We save the Local FD in our work struct so we can map it back later!
+                                rpc->poll_fds[poll_idx].fd = fd; 
+                                poll_idx++;
+                            }
                         }
                     }
-                    fput(f);
                 }
+                spin_unlock(&files->file_lock);
             }
+            put_task_struct(surrogate);
         }
+
         req.nfds = poll_idx;
         rpc->nfds = poll_idx; // Save how many we mapped
 
