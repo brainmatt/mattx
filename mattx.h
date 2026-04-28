@@ -411,6 +411,14 @@ struct mattx_rpc_work {
     int timeout;
     struct mattx_pollfd poll_fds[16];
     void __user *poll_ufds; // Pointer to the user-space array    
+
+    // For SELECT ---
+    bool is_select;
+    int select_nfds;
+    void __user *select_readfds;
+    void __user *select_writefds;
+    void __user *select_exceptfds;
+    void __user *select_timeout;
 };
 
 struct mattx_link {

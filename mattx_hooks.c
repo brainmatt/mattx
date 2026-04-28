@@ -128,6 +128,70 @@ static void mattx_rpc_worker(struct work_struct *work) {
         if (cluster_map[rpc->home_node]) {
             mattx_comm_send(cluster_map[rpc->home_node], MATTX_MSG_SYS_POLL_REQ, &req, sizeof(req));
         }
+
+    } else if (rpc->is_select) {
+        struct mattx_sys_poll_req req;
+        fd_set *in_fds = NULL, *out_fds = NULL, *ex_fds = NULL;
+        int timeout_ms = -1;
+        int poll_idx = 0;
+        int fd;
+
+        memset(&req, 0, sizeof(req));
+        req.orig_pid = rpc->orig_pid;
+
+        // 1. Translate timeval to milliseconds
+        if (rpc->select_timeout) {
+            struct timeval tv;
+            if (copy_from_user(&tv, rpc->select_timeout, sizeof(tv)) == 0) {
+                timeout_ms = (tv.tv_sec * 1000) + (tv.tv_usec / 1000);
+            }
+        }
+        req.timeout = timeout_ms;
+
+        // 2. Allocate temporary bitmaps
+        in_fds = kzalloc(sizeof(fd_set), GFP_KERNEL);
+        out_fds = kzalloc(sizeof(fd_set), GFP_KERNEL);
+        ex_fds = kzalloc(sizeof(fd_set), GFP_KERNEL);
+
+        if (rpc->select_readfds) copy_from_user(in_fds, rpc->select_readfds, sizeof(fd_set));
+        if (rpc->select_writefds) copy_from_user(out_fds, rpc->select_writefds, sizeof(fd_set));
+        if (rpc->select_exceptfds) copy_from_user(ex_fds, rpc->select_exceptfds, sizeof(fd_set));
+
+        // 3. Translate Bitmaps to Poll Array!
+        for (fd = 0; fd < rpc->select_nfds && poll_idx < 16; fd++) {
+            short events = 0;
+            if (in_fds && test_bit(fd, (unsigned long *)in_fds)) events |= POLLIN;
+            if (out_fds && test_bit(fd, (unsigned long *)out_fds)) events |= POLLOUT;
+            if (ex_fds && test_bit(fd, (unsigned long *)ex_fds)) events |= POLLPRI;
+
+            if (events) {
+                struct file *f = fget(fd);
+                if (f) {
+                    if (f->f_op == &mattx_fops) {
+                        struct mattx_fake_fd_info *fd_info = f->private_data;
+                        if (fd_info) {
+                            req.fds[poll_idx].fd = fd_info->remote_fd;
+                            req.fds[poll_idx].events = events;
+                            
+                            // Secret trick: We save the Local FD in our work struct so we can map it back later!
+                            rpc->poll_fds[poll_idx].fd = fd; 
+                            poll_idx++;
+                        }
+                    }
+                    fput(f);
+                }
+            }
+        }
+        req.nfds = poll_idx;
+        rpc->nfds = poll_idx; // Save how many we mapped
+
+        kfree(in_fds); kfree(out_fds); kfree(ex_fds);
+
+        printk(KERN_INFO "MattX:[RPC] Translated select() to poll(). Sending POLL_REQ to Node %d...\n", rpc->home_node);
+        if (cluster_map[rpc->home_node]) {
+            mattx_comm_send(cluster_map[rpc->home_node], MATTX_MSG_SYS_POLL_REQ, &req, sizeof(req));
+        }
+
     // OPEN WORKER (DEFAULT FALLBACK)
     } else {
         struct mattx_sys_open_req req;
@@ -324,6 +388,54 @@ static void mattx_rpc_worker(struct work_struct *work) {
                     regs->ax = retval; // Return the number of ready FDs
                     printk(KERN_INFO "MattX:[RPC] Illusion Complete! poll returned %d\n", retval);
                 }
+                kfree(reply_data);
+            } else {
+                regs->ax = -EBADF;
+            }
+
+        // --- SELECT AWAKENING ---
+        } else if (rpc->is_select) {
+            struct pt_regs *regs = task_pt_regs(surrogate);
+            int retval = -EBADF;
+            bool success = false;
+            struct mattx_sys_poll_reply *reply_data = NULL;
+
+            spin_lock(&guest_lock);
+            for (i = 0; i < guest_count; i++) {
+                if (guest_registry[i].local_pid == rpc->local_pid) {
+                    retval = guest_registry[i].rpc_fsync_res; 
+                    reply_data = guest_registry[i].rpc_read_buf; 
+                    guest_registry[i].rpc_read_buf = NULL;
+                    success = true;
+                    break;
+                }
+            }
+            spin_unlock(&guest_lock);
+
+            if (success && reply_data) {
+                fd_set *in_fds = kzalloc(sizeof(fd_set), GFP_KERNEL);
+                fd_set *out_fds = kzalloc(sizeof(fd_set), GFP_KERNEL);
+                fd_set *ex_fds = kzalloc(sizeof(fd_set), GFP_KERNEL);
+
+                // 4. Translate Poll Array back to Bitmaps!
+                for (int j = 0; j < reply_data->nfds; j++) {
+                    int local_fd = rpc->poll_fds[j].fd; // We saved the local FD here earlier!
+                    short revents = reply_data->fds[j].revents;
+
+                    if (revents & (POLLIN | POLLERR | POLLHUP)) __set_bit(local_fd, (unsigned long *)in_fds);
+                    if (revents & (POLLOUT | POLLERR | POLLHUP)) __set_bit(local_fd, (unsigned long *)out_fds);
+                    if (revents & (POLLPRI | POLLERR | POLLHUP)) __set_bit(local_fd, (unsigned long *)ex_fds);
+                }
+
+                // 5. Copy the updated bitmaps back to user-space
+                if (rpc->select_readfds) copy_to_user(rpc->select_readfds, in_fds, sizeof(fd_set));
+                if (rpc->select_writefds) copy_to_user(rpc->select_writefds, out_fds, sizeof(fd_set));
+                if (rpc->select_exceptfds) copy_to_user(rpc->select_exceptfds, ex_fds, sizeof(fd_set));
+
+                kfree(in_fds); kfree(out_fds); kfree(ex_fds);
+
+                regs->ax = retval;
+                printk(KERN_INFO "MattX:[RPC] Illusion Complete! select() returned %d\n", retval);
                 kfree(reply_data);
             } else {
                 regs->ax = -EBADF;
@@ -1304,6 +1416,80 @@ static int ret_handler_poll(struct kretprobe_instance *ri, struct pt_regs *regs)
     return 0;
 }
 
+// --- SELECT HOOK ---
+struct select_kretprobe_data {
+    int n;
+    void __user *inp;
+    void __user *outp;
+    void __user *exp;
+    void __user *tvp;
+};
+
+static struct kretprobe select_kprobe;
+
+static int entry_handler_select(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    pid_t my_pid = current->pid;
+    struct select_kretprobe_data *data = (struct select_kretprobe_data *)ri->data;
+
+    if (!is_guest_process(my_pid)) return 0; 
+    if (!config_migrate_network_io) return 0;
+
+    // __x64_sys_select(int n, fd_set __user *inp, fd_set __user *outp, fd_set __user *exp, struct timeval __user *tvp)
+    data->n = (int)regs->di;
+    data->inp = (void __user *)regs->si;
+    data->outp = (void __user *)regs->dx;
+    data->exp = (void __user *)regs->cx;
+    data->tvp = (void __user *)regs->r8;
+
+    regs->di = -1; // Sabotage! Force -EBADF so the local syscall aborts instantly
+
+    return 0;
+}
+
+static int ret_handler_select(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    pid_t my_pid = current->pid;
+    struct select_kretprobe_data *data = (struct select_kretprobe_data *)ri->data;
+    int home_node = -1;
+    u32 orig_pid = 0;
+    int i;
+
+    if (!is_guest_process(my_pid) || !config_migrate_network_io) return 0;
+
+    spin_lock(&guest_lock);
+    for (i = 0; i < guest_count; i++) {
+        if (guest_registry[i].local_pid == my_pid) {
+            home_node = guest_registry[i].home_node;
+            orig_pid = guest_registry[i].orig_pid;
+            guest_registry[i].rpc_done = false; 
+            break;
+        }
+    }
+    spin_unlock(&guest_lock);
+
+    if (home_node != -1) {
+        struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
+        if (rpc) {
+            INIT_WORK(&rpc->work, mattx_rpc_worker);
+            rpc->local_pid = my_pid;
+            rpc->orig_pid = orig_pid;
+            rpc->home_node = home_node;
+            
+            rpc->is_select = true;
+            rpc->select_nfds = data->n;
+            rpc->select_readfds = data->inp;
+            rpc->select_writefds = data->outp;
+            rpc->select_exceptfds = data->exp;
+            rpc->select_timeout = data->tvp;
+
+            printk(KERN_INFO "MattX:[HOOK] Intercepted select(). Freezing Surrogate %d...\n", my_pid);
+            send_sig(SIGSTOP, current, 0);
+            schedule_work(&rpc->work);
+        }
+    }
+
+    return 0;
+}
+
 
 int mattx_hooks_init(void) {
     int ret;
@@ -1429,11 +1615,22 @@ int mattx_hooks_init(void) {
     ret = register_kretprobe(&poll_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for poll, returned %d\n", ret);
 
+    memset(&select_kprobe, 0, sizeof(select_kprobe));
+    select_kprobe.kp.symbol_name = "__x64_sys_select";
+    select_kprobe.entry_handler = entry_handler_select;
+    select_kprobe.handler = ret_handler_select;
+    select_kprobe.data_size = sizeof(struct select_kretprobe_data);
+    select_kprobe.maxactive = 64;
+    
+    ret = register_kretprobe(&select_kprobe);
+    if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for select, returned %d\n", ret);
+
     printk(KERN_INFO "MattX: Syscall Hooks (Kprobes) registered successfully.\n");
     return 0;
 }
 
 void mattx_hooks_exit(void) {
+    unregister_kretprobe(&select_kprobe);
     unregister_kretprobe(&poll_kprobe);
     unregister_kretprobe(&accept_kprobe);
     unregister_kretprobe(&recvfrom_kprobe);
