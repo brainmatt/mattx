@@ -197,6 +197,14 @@ static void handle_return_blueprint(struct mattx_link *link, struct mattx_header
                     unsigned long flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED;
                     unsigned long ret_addr;
 
+                    // The vDSO Protector ---
+                    // Only carve out memory for Writable regions (Stack, Heap, Data).
+                    // Leave Read-Only code (.text) and kernel pages ([vdso]) completely intact!
+                    if (vma_flags & VM_WRITE) {
+                        unsigned long prot = PROT_READ | PROT_WRITE | PROT_EXEC;
+                        unsigned long flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED;
+                        unsigned long ret_addr;
+
                     ret_addr = vm_mmap(NULL, start, len, prot, flags, 0);
                     if (IS_ERR_VALUE(ret_addr)) {
                         printk(KERN_ERR "MattX:[IMPORT] Failed to carve VMA at 0x%lx (err: %ld)\n", start, ret_addr);
