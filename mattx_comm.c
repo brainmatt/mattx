@@ -1,6 +1,6 @@
 #include "mattx.h"
 
-// An array of function pointers, indexed by the message type (up to 256 types)
+// --- The Dispatch Table ---
 static mattx_msg_handler_fn msg_handlers[256] = {NULL};
 
 void mattx_register_handler(u32 type, mattx_msg_handler_fn handler) {
@@ -22,41 +22,66 @@ static void mattx_handle_message(struct mattx_link *link, struct mattx_header *h
     }
 }
 
+// --- NEW: The Bulletproof TCP Reader ---
+static int mattx_recv_exact(struct socket *sock, void *buf, size_t len) {
+    struct msghdr msg = {0};
+    struct kvec iov;
+    int received = 0;
+    int ret;
+
+    while (received < len) {
+        iov.iov_base = buf + received;
+        iov.iov_len = len - received;
+        
+        ret = kernel_recvmsg(sock, &msg, &iov, 1, iov.iov_len, MSG_WAITALL);
+        if (ret <= 0) {
+            return ret; 
+        }
+        received += ret;
+    }
+    return received;
+}
+
 static int mattx_receiver_loop(void *data) {
     struct mattx_link *link = (struct mattx_link *)data;
-    struct msghdr msg = {0};
-    struct kvec iov[1];
     struct mattx_header hdr;
-    int len;
+    int ret;
     void *payload = NULL;
 
     while (!kthread_should_stop()) {
-        iov[0].iov_base = &hdr;
-        iov[0].iov_len = sizeof(struct mattx_header);
-        
-        len = kernel_recvmsg(link->sock, &msg, iov, 1, sizeof(struct mattx_header), 0);
-        if (len <= 0) break; 
+        // 1. Read exact header
+        ret = mattx_recv_exact(link->sock, &hdr, sizeof(struct mattx_header));
+        if (ret <= 0) {
+            if (ret < 0 && ret != -ERESTARTSYS && ret != -EINTR)
+                printk(KERN_ERR "MattX: [COMM] Socket error on Node %d (ret: %d)\n", link->node_id, ret);
+            break; 
+        }
 
+        // 2. Validate Magic
         if (hdr.magic != MATTX_MAGIC) {
-            printk(KERN_ERR "MattX: [COMM] FATAL: Stream out of sync! Invalid magic: 0x%x\n", hdr.magic);
+            printk(KERN_ERR "MattX:[COMM] FATAL: Stream out of sync! Invalid magic: 0x%x\n", hdr.magic);
             break;
         }
 
+        // 3. Validate Length
         if (hdr.length > MATTX_MAX_PAYLOAD) {
             printk(KERN_ERR "MattX:[COMM] FATAL: Payload too large (%u bytes).\n", hdr.length);
             break;
         }
 
+        // 4. Read exact payload
         if (hdr.length > 0) {
             payload = kvmalloc(hdr.length, GFP_KERNEL);
-            if (payload) {
-                iov[0].iov_base = payload;
-                iov[0].iov_len = hdr.length;
-                
-                int payload_len = kernel_recvmsg(link->sock, &msg, iov, 1, hdr.length, MSG_WAITALL);
-                if (payload_len != hdr.length) {
-                    printk(KERN_ERR "MattX: [COMM] Short read on payload! Expected %u, got %d\n", hdr.length, payload_len);
-                }
+            if (!payload) {
+                printk(KERN_ERR "MattX: [COMM] FATAL: OOM allocating payload (%u bytes)\n", hdr.length);
+                break;
+            }
+            
+            ret = mattx_recv_exact(link->sock, payload, hdr.length);
+            if (ret <= 0) {
+                printk(KERN_ERR "MattX: [COMM] Socket error during payload read (ret: %d)\n", ret);
+                kvfree(payload);
+                break;
             }
         }
         
@@ -66,11 +91,12 @@ static int mattx_receiver_loop(void *data) {
             payload = NULL; 
         }
     }
+    
+    printk(KERN_INFO "MattX: [COMM] Receiver thread exiting for Node %d\n", link->node_id);
     return 0;
 }
 
-
-// Global Mutex to prevent TCP stream collisions! ---
+// --- NEW: Global Mutex to prevent TCP stream collisions! ---
 static DEFINE_MUTEX(mattx_send_mutex);
 
 int mattx_comm_send(struct mattx_link *link, u32 type, void *data, u32 len) {
@@ -108,7 +134,7 @@ int mattx_comm_send(struct mattx_link *link, u32 type, void *data, u32 len) {
         
         ret = kernel_sendmsg(link->sock, &msg, &iov, 1, iov.iov_len);
         if (ret <= 0) {
-            printk(KERN_ERR "MattX: [COMM] Network send failed! (ret: %d)\n", ret);
+            printk(KERN_ERR "MattX:[COMM] Network send failed! (ret: %d)\n", ret);
             mutex_unlock(&mattx_send_mutex);
             kvfree(buf);
             return ret;
