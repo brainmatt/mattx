@@ -177,6 +177,7 @@ void mattx_send_vma_data(void) {
     int total_pages = 0;
     int sent_pages = 0;
     int skipped_pages = 0;
+    int network_errors = 0;
 
     if (!local_migration_req || !migrating_task || migrating_target_node == -1) return;
     if (!cluster_map[migrating_target_node]) return;
@@ -186,15 +187,16 @@ void mattx_send_vma_data(void) {
     for (int i = 0; i < local_migration_req->vma_count; i++) {
         unsigned long start = local_migration_req->vmas[i].vm_start;
         unsigned long end = local_migration_req->vmas[i].vm_end;
+        unsigned long vma_flags = local_migration_req->vmas[i].vm_flags; // Declared here!
         unsigned long curr = start;
-
-        // The Smart Return Optimization ---
+        
+        // --- The Smart Return Optimization ---
         // If we are returning to the Home Node, the Deputy already has the Read-Only code!
         // We only need to send back the memory that could have changed (VM_WRITE).
         if (is_returning && !(vma_flags & VM_WRITE)) {
             continue; // Skip this VMA entirely!
         }
-
+        
         while (curr < end) {
             u32 chunk_size = PAGE_SIZE;
             if (curr + chunk_size > end) chunk_size = end - curr;
@@ -215,8 +217,14 @@ void mattx_send_vma_data(void) {
                         p_page_hdr->length = bytes_read;
 
                         memcpy(payload_buf + sizeof(struct mattx_page_header), page_buf, bytes_read);
-                        mattx_comm_send(cluster_map[migrating_target_node], MATTX_MSG_PAGE_TRANSFER, payload_buf, payload_size);
-                        sent_pages++;
+                        
+                        int send_res = mattx_comm_send(cluster_map[migrating_target_node], MATTX_MSG_PAGE_TRANSFER, payload_buf, payload_size);
+                        if (send_res < payload_size) {
+                            network_errors++;
+                        } else {
+                            sent_pages++;
+                        }
+                        
                         kfree(payload_buf);
                     }
                 } else {
@@ -228,7 +236,8 @@ void mattx_send_vma_data(void) {
         }
     }
     
-    printk(KERN_INFO "MattX:[MIGRATE] Pipeline stats: %d total, %d sent, %d skipped\n", total_pages, sent_pages, skipped_pages);
+    printk(KERN_INFO "MattX:[MIGRATE] Pipeline stats: %d total, %d sent, %d skipped, %d net errors\n", 
+           total_pages, sent_pages, skipped_pages, network_errors);
            
     if (is_returning) {
         printk(KERN_INFO "MattX:[MIGRATE] Return pipeline complete. Sending RETURN_DONE signal.\n");
