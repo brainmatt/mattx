@@ -187,7 +187,14 @@ void mattx_send_vma_data(void) {
         unsigned long start = local_migration_req->vmas[i].vm_start;
         unsigned long end = local_migration_req->vmas[i].vm_end;
         unsigned long curr = start;
-        
+
+        // The Smart Return Optimization ---
+        // If we are returning to the Home Node, the Deputy already has the Read-Only code!
+        // We only need to send back the memory that could have changed (VM_WRITE).
+        if (is_returning && !(vma_flags & VM_WRITE)) {
+            continue; // Skip this VMA entirely!
+        }
+
         while (curr < end) {
             u32 chunk_size = PAGE_SIZE;
             if (curr + chunk_size > end) chunk_size = end - curr;
