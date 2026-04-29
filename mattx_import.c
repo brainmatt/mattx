@@ -193,10 +193,8 @@ static void handle_return_blueprint(struct mattx_link *link, struct mattx_header
                 for (i = 0; i < pending_migration->vma_count; i++) {
                     unsigned long start = pending_migration->vmas[i].vm_start;
                     unsigned long len = pending_migration->vmas[i].vm_end - start;
-                    unsigned long prot = PROT_READ | PROT_WRITE | PROT_EXEC;
-                    unsigned long flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED;
-                    unsigned long ret_addr;
-
+                    unsigned long vma_flags = pending_migration->vmas[i].vm_flags;
+                    
                     // The vDSO Protector ---
                     // Only carve out memory for Writable regions (Stack, Heap, Data).
                     // Leave Read-Only code (.text) and kernel pages ([vdso]) completely intact!
@@ -205,13 +203,14 @@ static void handle_return_blueprint(struct mattx_link *link, struct mattx_header
                         unsigned long flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED;
                         unsigned long ret_addr;
 
-                    ret_addr = vm_mmap(NULL, start, len, prot, flags, 0);
-                    if (IS_ERR_VALUE(ret_addr)) {
-                        printk(KERN_ERR "MattX:[IMPORT] Failed to carve VMA at 0x%lx (err: %ld)\n", start, ret_addr);
+                        ret_addr = vm_mmap(NULL, start, len, prot, flags, 0);
+                        if (IS_ERR_VALUE(ret_addr)) {
+                            printk(KERN_ERR "MattX:[IMPORT] Failed to carve VMA at 0x%lx (err: %ld)\n", start, ret_addr);
+                        }
                     }
                 }
                 kthread_unuse_mm(deputy->mm);
-                printk(KERN_INFO "MattX:[IMPORT] Successfully carved %u VMAs into Deputy!\n", pending_migration->vma_count);
+                printk(KERN_INFO "MattX:[IMPORT] Successfully carved Writable VMAs into Deputy!\n");
             }
 
             printk(KERN_INFO "MattX:[IMPORT] Sending READY_FOR_DATA signal to Node %d...\n", pending_source_node);
