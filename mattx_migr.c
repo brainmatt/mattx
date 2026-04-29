@@ -67,7 +67,6 @@ void mattx_capture_and_send_state(struct task_struct *task, int target_node) {
     size_t max_payload_size;
     size_t actual_payload_size;
     int vma_count = 0;
-    int retries = 50;
     unsigned char rip_buf[8] = {0}; 
 
     is_returning = false; 
@@ -163,7 +162,6 @@ void mattx_capture_and_return_state(struct task_struct *task, u32 orig_pid, int 
     size_t max_payload_size;
     size_t actual_payload_size;
     int vma_count = 0;
-    int retries = 50;
 
     is_returning = true; 
 
