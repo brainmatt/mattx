@@ -1,9 +1,62 @@
 #include "mattx.h"
+#include <linux/task_work.h>   // For task_work_add
+#include <linux/completion.h>  // For wait_for_completion
 
 static struct mattx_migration_req *local_migration_req = NULL;
 static struct task_struct *migrating_task = NULL;
 static int migrating_target_node = -1;
 static bool is_returning = false; 
+
+// --- NEW: The Syscall Drainer ---
+
+struct mattx_drain_ctx {
+    struct callback_head cb;
+    struct completion done;
+};
+
+// This function runs INSIDE the target process, right at the user-space boundary!
+static void mattx_drain_callback(struct callback_head *cb) {
+    struct mattx_drain_ctx *ctx = container_of(cb, struct mattx_drain_ctx, cb);
+    
+    // 1. Tell the migrator thread that we have safely reached the boundary
+    complete(&ctx->done);
+    
+    // 2. Put ourselves into a deep, stable freeze
+    set_current_state(TASK_STOPPED);
+    schedule();
+}
+
+static void mattx_freeze_task_safely(struct task_struct *task) {
+    struct mattx_drain_ctx ctx;
+    int ret;
+
+    // If the task is already stopped (e.g., waiting in our RPC Wormhole), it's already stable!
+    if (READ_ONCE(task->__state) & __TASK_STOPPED) {
+        printk(KERN_INFO "MattX:[DRAIN] PID %d is already stopped and stable.\n", task->pid);
+        return;
+    }
+
+    init_completion(&ctx.done);
+    init_task_work(&ctx.cb, mattx_drain_callback);
+
+    // TWA_SIGNAL safely interrupts sleeping syscalls and forces the callback to run
+    ret = task_work_add(task, &ctx.cb, TWA_SIGNAL);
+    if (ret == 0) {
+        printk(KERN_INFO "MattX:[DRAIN] Injected Task Work into PID %d. Waiting for stable state...\n", task->pid);
+        wait_for_completion(&ctx.done);
+        printk(KERN_INFO "MattX:[DRAIN] PID %d is now stable and frozen at the user-space boundary!\n", task->pid);
+    } else {
+        // Fallback just in case the process is exiting or refusing task work
+        printk(KERN_WARNING "MattX:[DRAIN] task_work_add failed for PID %d. Falling back to SIGSTOP.\n", task->pid);
+        send_sig(SIGSTOP, task, 0);
+        
+        int retries = 50;
+        while (!(READ_ONCE(task->__state) & __TASK_STOPPED) && retries > 0) {
+            msleep(10);
+            retries--;
+        }
+    }
+}
 
 void mattx_capture_and_send_state(struct task_struct *task, int target_node) {
     struct pt_regs *regs;
@@ -25,12 +78,8 @@ void mattx_capture_and_send_state(struct task_struct *task, int target_node) {
 
     printk(KERN_INFO "MattX:[EXTRACT] Initiating state capture for PID %d (%s)...\n", task->pid, task->comm);
 
-    send_sig(SIGSTOP, task, 0);
-    
-    while (!(READ_ONCE(task->__state) & __TASK_STOPPED) && retries > 0) {
-        msleep(10);
-        retries--;
-    }
+    // Use the Jedi Master Pivot!
+    mattx_freeze_task_safely(task);
 
     req->orig_pid = task->pid;
     
@@ -124,12 +173,8 @@ void mattx_capture_and_return_state(struct task_struct *task, u32 orig_pid, int 
 
     printk(KERN_INFO "MattX:[EXTRACT] Initiating RETURN state capture for Surrogate PID %d...\n", task->pid);
 
-    send_sig(SIGSTOP, task, 0);
-    
-    while (!(READ_ONCE(task->__state) & __TASK_STOPPED) && retries > 0) {
-        msleep(10);
-        retries--;
-    }
+    // Use the Jedi Master Pivot!
+    mattx_freeze_task_safely(task);
 
     req->orig_pid = orig_pid;
 

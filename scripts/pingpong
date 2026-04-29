@@ -1,20 +1,22 @@
 #!/bin/bash
 
 PID=$1
+NODEID=$2
+LOOP=0
 
-if [ "$PID" == "" ]; then
-	echo "usage: $0 <pid>"
+if [ "$PID" == "" ] || [ "$NODEID" == "" ]; then
+	echo "usage: $0 <pid> <node_id>"
 	exit
 fi
 
 while true; do 
-
-	echo "migrating foward"
-	echo "migrate $PID 814" > /proc/mattx/admin
-	sleep 10
-	echo "migrating backwards"
+	LOOP=$(( LOOP + 1))
+	echo "migrating foward - migration: $LOOP"
+	echo "migrate $PID $NODEID" > /proc/mattx/admin
+	sleep 5 
+	LOOP=$(( LOOP + 1))
+	echo "migrating backwards - migration $LOOP"
 	echo "migrate $PID home" > /proc/mattx/admin
-	sleep 10
+	sleep 5 
 done
-
 
