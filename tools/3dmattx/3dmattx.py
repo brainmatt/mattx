@@ -1,4 +1,5 @@
 from flask import Flask, jsonify
+from flask import render_template
 import re
 
 app = Flask(__name__)
@@ -52,6 +53,10 @@ def parse_mattx_nodes():
     
     return nodes
 
+@app.route('/')
+def 3dmattx():
+    return render_template('index.html')
+
 @app.route('/mattx', methods=['GET'])
 def mattx():
     """API endpoint to retrieve MattX cluster node information"""
@@ -61,6 +66,7 @@ def mattx():
         return jsonify(nodes_data), 404
     
     return jsonify({"mattx": nodes_data})
+
 
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0', port=5000)
