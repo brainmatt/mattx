@@ -441,6 +441,8 @@ struct mattx_guest_info {
     loff_t rpc_lseek_res;
     struct statx *rpc_statx_buf;
     int rpc_fsync_res;
+    bool is_migrating; // The Migration Lock!
+
 };
 
 struct mattx_export_info {

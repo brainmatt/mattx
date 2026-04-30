@@ -523,8 +523,26 @@ static void mattx_rpc_worker(struct work_struct *work) {
             }
         }
 
-        printk(KERN_INFO "MattX:[RPC] Worker finished for PID %d. Waking Surrogate...\n", rpc->local_pid);
-        send_sig(SIGCONT, surrogate, 0);
+        // The Migration Lock Check ---
+        bool safe_to_wake = true;
+        spin_lock(&guest_lock);
+        for (i = 0; i < guest_count; i++) {
+            if (guest_registry[i].local_pid == rpc->local_pid) {
+                if (guest_registry[i].is_migrating) {
+                    safe_to_wake = false;
+                }
+                break;
+            }
+        }
+        spin_unlock(&guest_lock);
+
+        if (safe_to_wake) {
+            printk(KERN_INFO "MattX:[RPC] Worker finished for PID %d. Waking Surrogate...\n", rpc->local_pid);
+            send_sig(SIGCONT, surrogate, 0);
+        } else {
+            printk(KERN_INFO "MattX:[RPC] Worker finished, but Surrogate %d is migrating! Leaving it frozen.\n", rpc->local_pid);
+        }
+        
         put_task_struct(surrogate);
     }
 

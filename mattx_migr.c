@@ -173,6 +173,16 @@ void mattx_capture_and_return_state(struct task_struct *task, u32 orig_pid, int 
 
     is_returning = true; 
 
+    // Lock the process so RPC workers don't wake it up! ---
+    spin_lock(&guest_lock);
+    for (int i = 0; i < guest_count; i++) {
+        if (guest_registry[i].local_pid == task->pid) {
+            guest_registry[i].is_migrating = true;
+            break;
+        }
+    }
+    spin_unlock(&guest_lock);  
+      
     max_payload_size = sizeof(struct mattx_migration_req) + (MAX_VMAS * sizeof(struct mattx_vma_info));
     req = kzalloc(max_payload_size, GFP_KERNEL);
     if (!req) return;
