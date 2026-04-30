@@ -25,6 +25,17 @@ void add_guest_process(pid_t local_pid, u32 orig_pid, int home_node) {
         guest_registry[guest_count].local_pid = local_pid;
         guest_registry[guest_count].orig_pid = orig_pid;
         guest_registry[guest_count].home_node = home_node;
+
+        //Exorcise the ghosts! Clean up dirty memory from previous guests ---
+        guest_registry[guest_count].is_migrating = false;
+        guest_registry[guest_count].rpc_wq = NULL;
+        guest_registry[guest_count].rpc_done = false;
+        guest_registry[guest_count].rpc_read_buf = NULL;
+        guest_registry[guest_count].rpc_read_bytes = 0;
+        guest_registry[guest_count].rpc_lseek_res = 0;
+        guest_registry[guest_count].rpc_statx_buf = NULL;
+        guest_registry[guest_count].rpc_fsync_res = 0;
+
         guest_count++;
     } else {
         printk(KERN_WARNING "MattX: [REGISTRY] Guest registry is full!\n");
