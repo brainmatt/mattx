@@ -140,6 +140,20 @@ static void handle_kill_surrogate(struct mattx_link *link, struct mattx_header *
     }
 }
 
+bool is_rpc_pending(pid_t pid) {
+    bool pending = false;
+    spin_lock(&guest_lock);
+    for (int i = 0; i < guest_count; i++) {
+        if (guest_registry[i].local_pid == pid) {
+            // If rpc_wq is not NULL, the process is currently waiting for Node 1!
+            pending = (guest_registry[i].rpc_wq != NULL);
+            break;
+        }
+    }
+    spin_unlock(&guest_lock);
+    return pending;
+}
+
 void mattx_guest_init_handlers(void) {
     mattx_register_handler(MATTX_MSG_PROCESS_EXIT, handle_process_exit);
     mattx_register_handler(MATTX_MSG_KILL_SURROGATE, handle_kill_surrogate);

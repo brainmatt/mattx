@@ -30,23 +30,31 @@ static void mattx_freeze_task_safely(struct task_struct *task) {
     struct mattx_drain_ctx ctx;
     int ret;
 
-    // If the task is already stopped (e.g., waiting in our RPC Wormhole), it's already stable!
-    if (READ_ONCE(task->__state) & __TASK_STOPPED) {
-        printk(KERN_INFO "MattX:[DRAIN] PID %d is already stopped and stable.\n", task->pid);
-        return;
+    // --- NEW: Wait for any open RPC Wormholes to close! ---
+    while (is_rpc_pending(task->pid)) {
+        printk_once(KERN_INFO "MattX:[DRAIN] Waiting for RPC Wormhole to close for PID %d...\n", task->pid);
+        msleep(50);
     }
+
+    // We REMOVED the old TASK_STOPPED check here, because if it was stopped by an RPC, 
+    // it wasn't at the user-space boundary! We must force it through the Task Work.
 
     init_completion(&ctx.done);
     init_task_work(&ctx.cb, mattx_drain_callback);
 
-    // TWA_SIGNAL safely interrupts sleeping syscalls and forces the callback to run
     ret = task_work_add(task, &ctx.cb, TWA_SIGNAL);
     if (ret == 0) {
         printk(KERN_INFO "MattX:[DRAIN] Injected Task Work into PID %d. Waiting for stable state...\n", task->pid);
+        
+        // If the task was stopped by something else (like job control), we must nudge it 
+        // so it wakes up and executes our Task Work!
+        if (READ_ONCE(task->__state) & __TASK_STOPPED) {
+            send_sig(SIGCONT, task, 0);
+        }
+        
         wait_for_completion(&ctx.done);
         printk(KERN_INFO "MattX:[DRAIN] PID %d is now stable and frozen at the user-space boundary!\n", task->pid);
     } else {
-        // Fallback just in case the process is exiting or refusing task work
         printk(KERN_WARNING "MattX:[DRAIN] task_work_add failed for PID %d. Falling back to SIGSTOP.\n", task->pid);
         send_sig(SIGSTOP, task, 0);
         

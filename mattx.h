@@ -488,6 +488,7 @@ void mattx_capture_and_return_state(struct task_struct *task, u32 orig_pid, int 
 void mattx_send_vma_data(void); 
 
 bool is_guest_process(pid_t pid);
+bool is_rpc_pending(pid_t pid); // Check if a Wormhole is open!
 void add_guest_process(pid_t local_pid, u32 orig_pid, int home_node);
 void remove_guest_process(int index);
 
