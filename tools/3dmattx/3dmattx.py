@@ -54,7 +54,7 @@ def parse_mattx_nodes():
     return nodes
 
 @app.route('/')
-def mattx():
+def webroot():
     return render_template('index.html')
 
 @app.route('/mattx', methods=['GET'])
