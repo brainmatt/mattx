@@ -178,6 +178,7 @@
             boardSize = calculateBoardSize(nodes.length);
             const squareSize = 8 / boardSize; // Keep overall board size static at 8x8
             const maxHeight = 2 * squareSize;
+            const minHeight = 0.1; // Minimal height for empty bars
             
             // Calculate load range
             const minLoad = 2000;
@@ -219,12 +220,14 @@
                         square.userData.nodeInfo = nodeInfo;
                         square.userData.hasData = true;
                     } else {
-                        square.userData.currentHeight = 0;
-                        square.userData.targetHeight = 0;
+                        // Empty bars have minimal height
+                        square.userData.currentHeight = minHeight;
+                        square.userData.targetHeight = minHeight;
                         square.userData.hasData = false;
                     }
 
                     square.userData.maxHeight = maxHeight;
+                    square.userData.minHeight = minHeight;
                     square.userData.minLoad = minLoad;
                     square.userData.maxLoad = maxLoad;
 
@@ -246,6 +249,7 @@
             const maxLoad = 3000;
             const loadRange = maxLoad - minLoad;
             const maxHeight = 2 * (8 / boardSize);
+            const minHeight = 0.1;
 
             squares.forEach((squareObj, index) => {
                 const square = squareObj.mesh;
@@ -254,8 +258,10 @@
                     const normalizedLoad = Math.max(0, (cpuLoad - minLoad) / loadRange);
                     square.userData.targetHeight = normalizedLoad * maxHeight;
                     square.userData.nodeInfo = nodes[index];
+                    square.userData.hasData = true;
                 } else {
-                    square.userData.targetHeight = 0;
+                    square.userData.targetHeight = minHeight;
+                    square.userData.hasData = false;
                 }
             });
         }
@@ -358,23 +364,17 @@
             squares.forEach((squareObj) => {
                 const square = squareObj.mesh;
                 
-                if (square.userData.hasData) {
-                    // Smoothly interpolate to target height
-                    const diff = square.userData.targetHeight - square.userData.currentHeight;
-                    if (Math.abs(diff) > 0.01) {
-                        square.userData.currentHeight += diff * 0.1; // Smooth transition
-                    } else {
-                        square.userData.currentHeight = square.userData.targetHeight;
-                    }
-                    
-                    const finalHeight = square.userData.currentHeight;
-                    square.scale.y = finalHeight;
-                    square.position.y = finalHeight / 2;
+                // Smoothly interpolate to target height
+                const diff = square.userData.targetHeight - square.userData.currentHeight;
+                if (Math.abs(diff) > 0.01) {
+                    square.userData.currentHeight += diff * 0.1; // Smooth transition
                 } else {
-                    // Empty bars stay at 0
-                    square.scale.y = 0;
-                    square.position.y = 0;
+                    square.userData.currentHeight = square.userData.targetHeight;
                 }
+                
+                const finalHeight = square.userData.currentHeight;
+                square.scale.y = finalHeight;
+                square.position.y = finalHeight / 2;
             });
 
             // Raycasting for hover detection
