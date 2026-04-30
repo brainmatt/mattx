@@ -172,7 +172,7 @@
         // Create chessboard with nodes
         function createChessboard(nodes) {
             // Clear previous squares
-            squares.forEach(square => scene.remove(square.mesh));
+            squares.forEach(squareObj => scene.remove(squareObj.mesh));
             squares = [];
 
             boardSize = calculateBoardSize(nodes.length);
@@ -180,7 +180,6 @@
             const maxHeight = 2 * squareSize;
             
             // Calculate load range
-            const cpuLoads = nodes.map(n => parseInt(n.cpuload));
             const minLoad = 2000;
             const maxLoad = 3000;
             const loadRange = maxLoad - minLoad;
@@ -215,51 +214,50 @@
                     if (hasData) {
                         const cpuLoad = parseInt(nodeInfo.cpuload);
                         const normalizedLoad = Math.max(0, (cpuLoad - minLoad) / loadRange);
+                        square.userData.currentHeight = normalizedLoad * maxHeight;
                         square.userData.targetHeight = normalizedLoad * maxHeight;
                         square.userData.nodeInfo = nodeInfo;
                         square.userData.hasData = true;
                     } else {
+                        square.userData.currentHeight = 0;
                         square.userData.targetHeight = 0;
                         square.userData.hasData = false;
                     }
 
                     square.userData.maxHeight = maxHeight;
-                    square.userData.phase = Math.random() * Math.PI * 2;
-                    square.userData.frequency = 0.01 + Math.random() * 0.02;
+                    square.userData.minLoad = minLoad;
+                    square.userData.maxLoad = maxLoad;
 
                     square.castShadow = true;
                     square.receiveShadow = true;
 
                     scene.add(square);
-
-                    // Create text label if has data
-                    if (hasData) {
-                        const canvas = document.createElement('canvas');
-                        canvas.width = 256;
-                        canvas.height = 256;
-                        const ctx = canvas.getContext('2d');
-                        ctx.fillStyle = 'white';
-                        ctx.font = 'bold 100px Arial';
-                        ctx.textAlign = 'center';
-                        ctx.textBaseline = 'middle';
-                        ctx.fillText(nodeInfo.nodeid, 128, 128);
-
-                        const texture = new THREE.CanvasTexture(canvas);
-                        const spriteMaterial = new THREE.SpriteMaterial({ map: texture });
-                        const sprite = new THREE.Sprite(spriteMaterial);
-                        sprite.scale.set(squareSize * 0.8, squareSize * 0.8, 1);
-                        sprite.position.copy(square.position);
-                        sprite.userData.barMesh = square;
-                        scene.add(sprite);
-                        square.userData.label = sprite;
-                    }
-
                     squares.push({ mesh: square, row, col });
                 }
             }
 
             $('#loading').hide();
             $('#node-count').text('Nodes: ' + nodes.length);
+        }
+
+        // Update bar heights based on new data
+        function updateBarHeights(nodes) {
+            const minLoad = 2000;
+            const maxLoad = 3000;
+            const loadRange = maxLoad - minLoad;
+            const maxHeight = 2 * (8 / boardSize);
+
+            squares.forEach((squareObj, index) => {
+                const square = squareObj.mesh;
+                if (index < nodes.length) {
+                    const cpuLoad = parseInt(nodes[index].cpuload);
+                    const normalizedLoad = Math.max(0, (cpuLoad - minLoad) / loadRange);
+                    square.userData.targetHeight = normalizedLoad * maxHeight;
+                    square.userData.nodeInfo = nodes[index];
+                } else {
+                    square.userData.targetHeight = 0;
+                }
+            });
         }
 
         // Fetch node data
@@ -270,8 +268,15 @@
                 dataType: 'json',
                 success: function(data) {
                     if (data.mattx && data.mattx.length > 0) {
-                        nodeData = data.mattx;
-                        createChessboard(nodeData);
+                        if (nodeData.length === 0) {
+                            // First time - create chessboard
+                            nodeData = data.mattx;
+                            createChessboard(nodeData);
+                        } else {
+                            // Update heights
+                            nodeData = data.mattx;
+                            updateBarHeights(nodeData);
+                        }
                     }
                 },
                 error: function(err) {
@@ -349,20 +354,26 @@
 
             camera.position.add(velocity);
 
-            // Update bars
+            // Update bars - smooth transition to target height
             squares.forEach((squareObj) => {
                 const square = squareObj.mesh;
+                
                 if (square.userData.hasData) {
-                    const heightValue = (Math.sin(time * 0.02 + square.userData.phase) + 1) / 2;
-                    const finalHeight = Math.max(0, heightValue * square.userData.targetHeight);
+                    // Smoothly interpolate to target height
+                    const diff = square.userData.targetHeight - square.userData.currentHeight;
+                    if (Math.abs(diff) > 0.01) {
+                        square.userData.currentHeight += diff * 0.1; // Smooth transition
+                    } else {
+                        square.userData.currentHeight = square.userData.targetHeight;
+                    }
+                    
+                    const finalHeight = square.userData.currentHeight;
                     square.scale.y = finalHeight;
                     square.position.y = finalHeight / 2;
-
-                    // Update label position
-                    if (square.userData.label) {
-                        square.userData.label.position.copy(square.position);
-                        square.userData.label.position.y = finalHeight + 0.5;
-                    }
+                } else {
+                    // Empty bars stay at 0
+                    square.scale.y = 0;
+                    square.position.y = 0;
                 }
             });
 
