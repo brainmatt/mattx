@@ -1,0 +1,437 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D Node Monitoring Visualization</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #000;
+            font-family: Arial, sans-serif;
+        }
+        canvas {
+            display: block;
+        }
+        #info {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            color: #fff;
+            font-size: 14px;
+            background: rgba(0, 0, 0, 0.8);
+            padding: 15px;
+            border-radius: 5px;
+            max-width: 300px;
+            line-height: 1.6;
+        }
+        #speed-display {
+            position: absolute;
+            bottom: 10px;
+            left: 10px;
+            color: #00ff00;
+            font-size: 12px;
+            background: rgba(0, 0, 0, 0.8);
+            padding: 10px;
+            border-radius: 5px;
+            font-family: monospace;
+        }
+        #node-popup {
+            position: fixed;
+            background: rgba(0, 0, 0, 0.95);
+            color: #00ff00;
+            border: 2px solid #00ff00;
+            padding: 15px;
+            border-radius: 5px;
+            font-family: monospace;
+            font-size: 12px;
+            display: none;
+            z-index: 1000;
+            pointer-events: none;
+            white-space: nowrap;
+        }
+        #node-popup p {
+            margin: 5px 0;
+            line-height: 1.4;
+        }
+        #loading {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            color: #fff;
+            font-size: 20px;
+            background: rgba(0, 0, 0, 0.8);
+            padding: 20px;
+            border-radius: 5px;
+        }
+    </style>
+</head>
+<body>
+    <div id="loading">Loading node data...</div>
+    <div id="info">
+        <p><strong>3D Node Monitoring</strong></p>
+        <p><strong>WASD</strong> - Move forward/back/strafe</p>
+        <p><strong>SPACE/CTRL</strong> - Move up/down</p>
+        <p><strong>SHIFT</strong> - Speed boost</p>
+        <p><strong>Mouse</strong> - Look around</p>
+        <p><strong>Click</strong> - Lock/unlock mouse</p>
+        <p id="node-count">Nodes: 0</p>
+    </div>
+    <div id="speed-display">
+        <p>Speed: <span id="speed-value">0.00</span></p>
+        <p>Position: <span id="pos-x">0</span>, <span id="pos-y">0</span>, <span id="pos-z">0</span></p>
+    </div>
+    <div id="node-popup"></div>
+
+    <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+
+    <script>
+        let scene, camera, renderer;
+        let squares = [];
+        let nodeData = [];
+        let raycaster, mouse;
+        let selectedBar = null;
+        let boardSize = 8;
+
+        // Scene setup
+        function initScene() {
+            scene = new THREE.Scene();
+            
+            // Create starfield background
+            const starsGeometry = new THREE.BufferGeometry();
+            const starCount = 1000;
+            const positions = new Float32Array(starCount * 3);
+            
+            for (let i = 0; i < starCount * 3; i += 3) {
+                positions[i] = (Math.random() - 0.5) * 500;
+                positions[i + 1] = (Math.random() - 0.5) * 500;
+                positions[i + 2] = (Math.random() - 0.5) * 500;
+            }
+            
+            starsGeometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+            const starsMaterial = new THREE.PointsMaterial({
+                color: 0xffffff,
+                size: 0.7,
+                sizeAttenuation: true
+            });
+            const stars = new THREE.Points(starsGeometry, starsMaterial);
+            scene.add(stars);
+
+            // Add nebula spheres
+            const nebulaSphereGeometry = new THREE.IcosahedronGeometry(100, 4);
+            const nebulaMaterial = new THREE.MeshBasicMaterial({
+                color: 0x0a0a2e,
+                wireframe: false
+            });
+            const nebulaSphere = new THREE.Mesh(nebulaSphereGeometry, nebulaMaterial);
+            nebulaSphere.position.z = -200;
+            scene.add(nebulaSphere);
+
+            const nebulaSphere2 = new THREE.Mesh(nebulaSphereGeometry, nebulaMaterial);
+            nebulaSphere2.position.set(150, -100, -250);
+            scene.add(nebulaSphere2);
+
+            camera = new THREE.PerspectiveCamera(
+                75,
+                window.innerWidth / window.innerHeight,
+                0.1,
+                10000
+            );
+            camera.position.set(15, 12, 15);
+
+            renderer = new THREE.WebGLRenderer({ antialias: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.shadowMap.enabled = true;
+            renderer.fog = new THREE.Fog(0x000000, 300, 500);
+            document.body.appendChild(renderer.domElement);
+
+            // Lighting
+            const ambientLight = new THREE.AmbientLight(0xffffff, 0.4);
+            scene.add(ambientLight);
+
+            const directionalLight = new THREE.DirectionalLight(0xffffff, 0.8);
+            directionalLight.position.set(20, 30, 20);
+            directionalLight.castShadow = true;
+            directionalLight.shadow.mapSize.width = 2048;
+            directionalLight.shadow.mapSize.height = 2048;
+            scene.add(directionalLight);
+
+            // Raycaster for mouse interaction
+            raycaster = new THREE.Raycaster();
+            mouse = new THREE.Vector2();
+        }
+
+        // Calculate board size based on node count
+        function calculateBoardSize(nodeCount) {
+            return Math.ceil(Math.sqrt(nodeCount));
+        }
+
+        // Create chessboard with nodes
+        function createChessboard(nodes) {
+            // Clear previous squares
+            squares.forEach(square => scene.remove(square.mesh));
+            squares = [];
+
+            boardSize = calculateBoardSize(nodes.length);
+            const squareSize = 8 / boardSize; // Keep overall board size static at 8x8
+            const maxHeight = 2 * squareSize;
+            
+            // Calculate load range
+            const cpuLoads = nodes.map(n => parseInt(n.cpuload));
+            const minLoad = 2000;
+            const maxLoad = 3000;
+            const loadRange = maxLoad - minLoad;
+
+            for (let row = 0; row < boardSize; row++) {
+                for (let col = 0; col < boardSize; col++) {
+                    const index = row * boardSize + col;
+
+                    // Determine if this bar should have data
+                    let hasData = index < nodes.length;
+                    let nodeInfo = hasData ? nodes[index] : null;
+
+                    // Calculate gradient color (light blue to dark blue)
+                    const diagonalProgress = ((col + row) / (boardSize * 2 - 2)) || 0;
+                    const color = new THREE.Color().setHSL(0.6, 0.7, 0.7 - diagonalProgress * 0.4);
+
+                    // Create bar
+                    const geometry = new THREE.BoxGeometry(squareSize * 0.9, 1, squareSize * 0.9);
+                    const material = new THREE.MeshStandardMaterial({ 
+                        color: color,
+                        roughness: 0.3,
+                        metalness: 0.2,
+                        emissive: color,
+                        emissiveIntensity: 0.2
+                    });
+                    const square = new THREE.Mesh(geometry, material);
+
+                    square.position.x = (col - boardSize / 2) * squareSize;
+                    square.position.z = (row - boardSize / 2) * squareSize;
+                    square.position.y = 0;
+
+                    if (hasData) {
+                        const cpuLoad = parseInt(nodeInfo.cpuload);
+                        const normalizedLoad = Math.max(0, (cpuLoad - minLoad) / loadRange);
+                        square.userData.targetHeight = normalizedLoad * maxHeight;
+                        square.userData.nodeInfo = nodeInfo;
+                        square.userData.hasData = true;
+                    } else {
+                        square.userData.targetHeight = 0;
+                        square.userData.hasData = false;
+                    }
+
+                    square.userData.maxHeight = maxHeight;
+                    square.userData.phase = Math.random() * Math.PI * 2;
+                    square.userData.frequency = 0.01 + Math.random() * 0.02;
+
+                    square.castShadow = true;
+                    square.receiveShadow = true;
+
+                    scene.add(square);
+
+                    // Create text label if has data
+                    if (hasData) {
+                        const canvas = document.createElement('canvas');
+                        canvas.width = 256;
+                        canvas.height = 256;
+                        const ctx = canvas.getContext('2d');
+                        ctx.fillStyle = 'white';
+                        ctx.font = 'bold 100px Arial';
+                        ctx.textAlign = 'center';
+                        ctx.textBaseline = 'middle';
+                        ctx.fillText(nodeInfo.nodeid, 128, 128);
+
+                        const texture = new THREE.CanvasTexture(canvas);
+                        const spriteMaterial = new THREE.SpriteMaterial({ map: texture });
+                        const sprite = new THREE.Sprite(spriteMaterial);
+                        sprite.scale.set(squareSize * 0.8, squareSize * 0.8, 1);
+                        sprite.position.copy(square.position);
+                        sprite.userData.barMesh = square;
+                        scene.add(sprite);
+                        square.userData.label = sprite;
+                    }
+
+                    squares.push({ mesh: square, row, col });
+                }
+            }
+
+            $('#loading').hide();
+            $('#node-count').text('Nodes: ' + nodes.length);
+        }
+
+        // Fetch node data
+        function fetchNodeData() {
+            $.ajax({
+                url: 'http://localhost:5000/mattx',
+                type: 'GET',
+                dataType: 'json',
+                success: function(data) {
+                    if (data.mattx && data.mattx.length > 0) {
+                        nodeData = data.mattx;
+                        createChessboard(nodeData);
+                    }
+                },
+                error: function(err) {
+                    console.error('Error fetching node data:', err);
+                }
+            });
+        }
+
+        // First-person camera controller
+        const keys = {};
+        let mouseX = 0;
+        let mouseY = 0;
+        let isMouseLocked = false;
+
+        document.addEventListener('keydown', (e) => {
+            keys[e.key.toLowerCase()] = true;
+        });
+
+        document.addEventListener('keyup', (e) => {
+            keys[e.key.toLowerCase()] = false;
+        });
+
+        document.addEventListener('mousemove', (e) => {
+            if (isMouseLocked) {
+                mouseX += e.movementX * 0.003;
+                mouseY += e.movementY * 0.003;
+                mouseY = Math.max(-Math.PI / 2, Math.min(Math.PI / 2, mouseY));
+            }
+
+            // Store mouse position for raycasting
+            mouse.x = (e.clientX / window.innerWidth) * 2 - 1;
+            mouse.y = -(e.clientY / window.innerHeight) * 2 + 1;
+        });
+
+        document.addEventListener('click', () => {
+            if (document.pointerLockElement === renderer.domElement) {
+                document.exitPointerLock();
+                isMouseLocked = false;
+            } else {
+                renderer.domElement.requestPointerLock();
+                isMouseLocked = true;
+            }
+        });
+
+        // Movement
+        const moveSpeed = 0.3;
+        const boostMultiplier = 2.5;
+        const velocity = new THREE.Vector3();
+
+        // Animation loop
+        let time = 0;
+
+        function animate() {
+            requestAnimationFrame(animate);
+            time += 1;
+
+            // Camera rotation
+            const euler = new THREE.Euler(mouseY, mouseX, 0, 'YXZ');
+            camera.quaternion.setFromEuler(euler);
+
+            // Movement
+            const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(camera.quaternion);
+            const right = new THREE.Vector3(1, 0, 0).applyQuaternion(camera.quaternion);
+            const up = new THREE.Vector3(0, 1, 0);
+
+            velocity.set(0, 0, 0);
+            const currentSpeed = keys['shift'] ? moveSpeed * boostMultiplier : moveSpeed;
+
+            if (keys['w']) velocity.add(forward.multiplyScalar(currentSpeed));
+            if (keys['s']) velocity.add(forward.multiplyScalar(-currentSpeed));
+            if (keys['a']) velocity.add(right.multiplyScalar(-currentSpeed));
+            if (keys['d']) velocity.add(right.multiplyScalar(currentSpeed));
+            if (keys[' ']) velocity.add(up.multiplyScalar(currentSpeed));
+            if (keys['control']) velocity.add(up.multiplyScalar(-currentSpeed));
+
+            camera.position.add(velocity);
+
+            // Update bars
+            squares.forEach((squareObj) => {
+                const square = squareObj.mesh;
+                if (square.userData.hasData) {
+                    const heightValue = (Math.sin(time * 0.02 + square.userData.phase) + 1) / 2;
+                    const finalHeight = Math.max(0, heightValue * square.userData.targetHeight);
+                    square.scale.y = finalHeight;
+                    square.position.y = finalHeight / 2;
+
+                    // Update label position
+                    if (square.userData.label) {
+                        square.userData.label.position.copy(square.position);
+                        square.userData.label.position.y = finalHeight + 0.5;
+                    }
+                }
+            });
+
+            // Raycasting for hover detection
+            raycaster.setFromCamera(mouse, camera);
+            const intersects = raycaster.intersectObjects(squares.map(s => s.mesh));
+
+            if (intersects.length > 0) {
+                const hoveredMesh = intersects[0].object;
+                if (hoveredMesh.userData.hasData) {
+                    selectedBar = hoveredMesh;
+                    showNodePopup(hoveredMesh.userData.nodeInfo);
+                } else {
+                    selectedBar = null;
+                    $('#node-popup').hide();
+                }
+            } else {
+                selectedBar = null;
+                $('#node-popup').hide();
+            }
+
+            // HUD
+            const speed = velocity.length();
+            document.getElementById('speed-value').textContent = speed.toFixed(2);
+            document.getElementById('pos-x').textContent = camera.position.x.toFixed(1);
+            document.getElementById('pos-y').textContent = camera.position.y.toFixed(1);
+            document.getElementById('pos-z').textContent = camera.position.z.toFixed(1);
+
+            renderer.render(scene, camera);
+        }
+
+        // Show node popup on hover
+        function showNodePopup(nodeInfo) {
+            const popup = $('#node-popup');
+            popup.html(`
+                <p><strong>Node ID:</strong> ${nodeInfo.nodeid}</p>
+                <p><strong>IP Address:</strong> ${nodeInfo.ipaddress}</p>
+                <p><strong>CPU Load:</strong> ${nodeInfo.cpuload}</p>
+                <p><strong>Free Memory:</strong> ${nodeInfo.memfree}</p>
+            `);
+            popup.show();
+            popup.css({
+                left: (event.clientX + 10) + 'px',
+                top: (event.clientY + 10) + 'px'
+            });
+        }
+
+        // Mouse move for popup positioning
+        $(document).mousemove(function(e) {
+            if (selectedBar) {
+                $('#node-popup').css({
+                    left: (e.clientX + 10) + 'px',
+                    top: (e.clientY + 10) + 'px'
+                });
+            }
+        });
+
+        // Handle window resize
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        // Initialize and start
+        initScene();
+        fetchNodeData();
+        setInterval(fetchNodeData, 5000);
+        animate();
+    </script>
+</body>
+</html>
