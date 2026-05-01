@@ -40,6 +40,90 @@ static int mattxfs_root_iterate(struct file *file, struct dir_context *ctx) {
 }
 
 // --- 2. The 'cd' Command (Inode Lookup) ---
+// Path Building Magic ---
+static int get_node_id_from_dentry(struct dentry *dentry) {
+    struct dentry *parent = dentry;
+    int node_id = -1;
+    
+    // Walk up the tree until we find the folder right below the root (e.g., "709")
+    while (!IS_ROOT(parent->d_parent)) {
+        parent = parent->d_parent;
+    }
+    kstrtoint(parent->d_name.name, 10, &node_id);
+    return node_id;
+}
+
+static void get_remote_path_from_dentry(struct dentry *dentry, char *buf, int buflen) {
+    char *p = buf + buflen - 1;
+    struct dentry *curr = dentry;
+    *p = '\0';
+    
+    // Walk up the tree and prepend folder names until we hit the Node ID folder
+    while (!IS_ROOT(curr->d_parent)) {
+        int len = curr->d_name.len;
+        p -= len;
+        memcpy(p, curr->d_name.name, len);
+        p--;
+        *p = '/';
+        curr = curr->d_parent;
+    }
+    if (*p == '\0') { *(--p) = '/'; }
+    memmove(buf, p, buf + buflen - p);
+}
+
+// Forward declaration for the remote directory operations
+static const struct inode_operations mattxfs_remote_iops;
+
+// The Remote Lookup (The RPC Bridge) ---
+static struct dentry *mattxfs_remote_lookup(struct inode *dir, struct dentry *dentry, unsigned int flags) {
+    char path_buf[256];
+    struct kstat stat;
+    struct inode *inode;
+    int node_id;
+    int err;
+
+    node_id = get_node_id_from_dentry(dentry);
+    get_remote_path_from_dentry(dentry, path_buf, sizeof(path_buf));
+
+    // Ask mattx.ko to fetch the file metadata over the network!
+    err = mattx_rpc_vfs_getattr(node_id, path_buf, &stat);
+    
+    if (err) {
+        // File doesn't exist on the remote node
+        return NULL; 
+    }
+
+    // The file exists! Create a virtual inode for it.
+    inode = new_inode(dir->i_sb);
+    if (!inode) return ERR_PTR(-ENOMEM);
+
+    inode->i_ino = stat.ino;
+    inode->i_mode = stat.mode;
+    inode->i_size = stat.size;
+    inode->i_blocks = stat.blocks;
+    inode->i_uid = stat.uid;
+    inode->i_gid = stat.gid;
+    simple_inode_init_ts(inode);
+
+    // If it's a directory, attach our lookup operations so we can keep exploring!
+    if (S_ISDIR(stat.mode)) {
+        inode->i_op = &mattxfs_remote_iops;
+        inode->i_fop = &simple_dir_operations; // We will replace this with remote readdir later
+        set_nlink(inode, 2);
+    } else {
+        // It's a regular file
+        set_nlink(inode, 1);
+    }
+
+    d_add(dentry, inode);
+    return NULL;
+}
+
+static const struct inode_operations mattxfs_remote_iops = {
+    .lookup = mattxfs_remote_lookup,
+};
+
+// the Root Lookup ---
 static struct dentry *mattxfs_root_lookup(struct inode *dir, struct dentry *dentry, unsigned int flags) {
     int nodes[64];
     int count, i;
@@ -47,11 +131,8 @@ static struct dentry *mattxfs_root_lookup(struct inode *dir, struct dentry *dent
     bool found = false;
     struct inode *inode;
 
-    // Convert the requested folder name (e.g., "709") into an integer
-    if (kstrtoint(dentry->d_name.name, 10, &target_node) != 0)
-        return NULL;
+    if (kstrtoint(dentry->d_name.name, 10, &target_node) != 0) return NULL;
 
-    // Check if that node actually exists in the cluster
     count = mattx_get_active_nodes(nodes, 64);
     for (i = 0; i < count; i++) {
         if (nodes[i] == target_node) {
@@ -60,24 +141,20 @@ static struct dentry *mattxfs_root_lookup(struct inode *dir, struct dentry *dent
         }
     }
 
-    if (!found)
-        return NULL; // Folder doesn't exist!
+    if (!found) return NULL; 
 
-    // The node exists! Create a new inode in memory to represent this folder.
     inode = new_inode(dir->i_sb);
-    if (!inode)
-        return ERR_PTR(-ENOMEM);
+    if (!inode) return ERR_PTR(-ENOMEM);
 
     inode->i_ino = target_node + 1000;
     inode->i_mode = S_IFDIR | 0755;
     simple_inode_init_ts(inode);
     
-    // For now, the node folders are just empty directories
-    inode->i_op = &simple_dir_inode_operations;
+    // Attach the REMOTE operations to the Node folder! ---
+    inode->i_op = &mattxfs_remote_iops;
     inode->i_fop = &simple_dir_operations;
     set_nlink(inode, 2);
 
-    // Attach the new inode to the dentry
     d_add(dentry, inode);
     return NULL;
 }
