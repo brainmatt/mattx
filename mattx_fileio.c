@@ -2001,7 +2001,7 @@ static bool mattx_filldir(struct dir_context *ctx, const char *name, int namlen,
     struct mattx_readdir_ctx *mctx = container_of(ctx, struct mattx_readdir_ctx, ctx);
     struct mattx_vfs_readdir_reply *reply = mctx->reply;
 
-    if (reply->entry_count >= 40) return false; // Buffer is full, stop reading!
+    if (reply->entry_count >= 20) return false; // Buffer is full, stop reading!
 
     if (namlen > 63) namlen = 63; // Truncate long names for the prototype
     
