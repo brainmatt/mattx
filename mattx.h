@@ -92,6 +92,8 @@ enum mattx_msg_type {
     MATTX_MSG_SYS_POLL_REPLY,
     MATTX_MSG_VFS_GETATTR_REQ,
     MATTX_MSG_VFS_GETATTR_REPLY,
+    MATTX_MSG_VFS_READDIR_REQ,
+    MATTX_MSG_VFS_READDIR_REPLY,
 };
 
 struct mattx_header {
@@ -470,6 +472,26 @@ struct mattx_vfs_getattr_reply {
     u32 nlink;
 };
 
+struct mattx_dirent {
+    u64 ino;
+    u8 type;
+    char name[64]; // Max 63 chars + null terminator for our prototype
+};
+
+struct mattx_vfs_readdir_req {
+    u64 req_id;
+    u64 offset;
+    char path[256];
+};
+
+struct mattx_vfs_readdir_reply {
+    u64 req_id;
+    int error;
+    u64 new_offset;
+    u32 entry_count;
+    struct mattx_dirent entries[40]; // Send up to 40 files per packet (~3KB)
+};
+
 // This defines the standard signature for all message handlers
 typedef void (*mattx_msg_handler_fn)(struct mattx_link *link, struct mattx_header *hdr, void *payload);
 
@@ -537,6 +559,7 @@ extern const struct inode_operations mattx_iops;
 // API for MattXFS ---
 int mattx_get_active_nodes(int *node_array, int max_nodes);
 int mattx_rpc_vfs_getattr(int node_id, const char *path, struct kstat *stat_out);
+int mattx_rpc_vfs_readdir(int node_id, const char *path, u64 *offset, struct mattx_dirent *entries, u32 *out_count);
 
 #endif // MATTX_H
 

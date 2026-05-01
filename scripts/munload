@@ -1,4 +1,5 @@
 #!/bin/bash
 
+sudo rmmod mattxfs
 sudo rmmod mattx
 

@@ -2,3 +2,6 @@
 
 sudo rmmod mattx 2> /dev/null
 sudo insmod mattx.ko
+
+sudo rmmod mattxfs 2> /dev/null
+sudo insmod mattxfs/mattxfs.ko

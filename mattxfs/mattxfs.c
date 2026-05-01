@@ -1,60 +1,31 @@
 #include <linux/module.h>
 #include <linux/fs.h>
 #include <linux/pagemap.h>
-#include "../mattx.h" // Include the shared header to get the API!
+#include "../mattx.h" 
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Matthias Rechenburg & AI Copilot");
-MODULE_DESCRIPTION("MattX SSI Filesystem (MFS) - Phase 19");
+MODULE_DESCRIPTION("MattX SSI Filesystem (MFS) - Phase 20");
 
 #define MATTXFS_MAGIC 0x4D415454
 
-// --- 1. The 'ls' Command (Directory Iteration) ---
-static int mattxfs_root_iterate(struct file *file, struct dir_context *ctx) {
-    int nodes[64];
-    int count, i;
-    char name[16];
+// Forward declarations for the remote operations
+static const struct inode_operations mattxfs_remote_iops;
+static const struct file_operations mattxfs_remote_dir_fops;
 
-    // Emit the standard "." and ".." directories
-    if (!dir_emit_dots(file, ctx))
-        return 0;
-
-    // Ask mattx.ko who is currently connected!
-    count = mattx_get_active_nodes(nodes, 64);
-
-    for (i = 0; i < count; i++) {
-        // ctx->pos keeps track of where 'ls' is in the list. 
-        // 0 is ".", 1 is "..", so our nodes start at pos 2.
-        if (ctx->pos <= i + 2) {
-            snprintf(name, sizeof(name), "%d", nodes[i]);
-            
-            // Emit the folder name to user-space! 
-            // We use (nodes[i] + 1000) as a dummy inode number for now.
-            if (!dir_emit(ctx, name, strlen(name), nodes[i] + 1000, DT_DIR))
-                return 0;
-            
-            ctx->pos++;
-        }
-    }
-    return 0;
-}
-
-// --- 2. The 'cd' Command (Inode Lookup) ---
-// Path Building Magic ---
+// --- Path Building Magic ---
 static int get_node_id_from_dentry(struct dentry *dentry) {
     struct dentry *parent = dentry;
     int node_id = -1;
     
-    // Walk up the tree until we find the folder right below the root (e.g., "709")
     while (!IS_ROOT(parent->d_parent)) {
         parent = parent->d_parent;
     }
-
-    // Check the return value to satisfy the compiler! ---
+    
     if (kstrtoint(parent->d_name.name, 10, &node_id) != 0) {
-        return -1; // If it's not a valid number, return -1
+        return -1; 
     }
-
+    
     return node_id;
 }
 
@@ -63,7 +34,6 @@ static void get_remote_path_from_dentry(struct dentry *dentry, char *buf, int bu
     struct dentry *curr = dentry;
     *p = '\0';
     
-    // Walk up the tree and prepend folder names until we hit the Node ID folder
     while (!IS_ROOT(curr->d_parent)) {
         int len = curr->d_name.len;
         p -= len;
@@ -76,10 +46,39 @@ static void get_remote_path_from_dentry(struct dentry *dentry, char *buf, int bu
     memmove(buf, p, buf + buflen - p);
 }
 
-// Forward declaration for the remote directory operations
-static const struct inode_operations mattxfs_remote_iops;
+// ============================================================================
+// LEVEL 2: THE REMOTE OPERATIONS (Browsing inside a Node)
+// ============================================================================
 
-// The Remote Lookup (The RPC Bridge) ---
+static int mattxfs_remote_iterate(struct file *file, struct dir_context *ctx) {
+    struct dentry *dentry = file->f_path.dentry;
+    char path_buf[256];
+    struct mattx_dirent entries[40];
+    u32 count = 0;
+    int node_id;
+    int err;
+    int i;
+
+    node_id = get_node_id_from_dentry(dentry);
+    get_remote_path_from_dentry(dentry, path_buf, sizeof(path_buf));
+
+    // Ask mattx.ko to fetch the directory contents!
+    u64 offset = ctx->pos;
+    err = mattx_rpc_vfs_readdir(node_id, path_buf, &offset, entries, &count);
+    
+    if (err) return err;
+
+    // Emit the files to the user's terminal!
+    for (i = 0; i < count; i++) {
+        if (!dir_emit(ctx, entries[i].name, strlen(entries[i].name), entries[i].ino, entries[i].type)) {
+            break; // Terminal buffer is full
+        }
+    }
+    
+    ctx->pos = offset; 
+    return 0;
+}
+
 static struct dentry *mattxfs_remote_lookup(struct inode *dir, struct dentry *dentry, unsigned int flags) {
     char path_buf[256];
     struct kstat stat;
@@ -94,11 +93,9 @@ static struct dentry *mattxfs_remote_lookup(struct inode *dir, struct dentry *de
     err = mattx_rpc_vfs_getattr(node_id, path_buf, &stat);
     
     if (err) {
-        // File doesn't exist on the remote node
-        return NULL; 
+        return NULL; // File doesn't exist on the remote node
     }
 
-    // The file exists! Create a virtual inode for it.
     inode = new_inode(dir->i_sb);
     if (!inode) return ERR_PTR(-ENOMEM);
 
@@ -110,13 +107,11 @@ static struct dentry *mattxfs_remote_lookup(struct inode *dir, struct dentry *de
     inode->i_gid = stat.gid;
     simple_inode_init_ts(inode);
 
-    // If it's a directory, attach our lookup operations so we can keep exploring!
     if (S_ISDIR(stat.mode)) {
         inode->i_op = &mattxfs_remote_iops;
-        inode->i_fop = &simple_dir_operations; // We will replace this with remote readdir later
+        inode->i_fop = &mattxfs_remote_dir_fops; 
         set_nlink(inode, 2);
     } else {
-        // It's a regular file
         set_nlink(inode, 1);
     }
 
@@ -124,11 +119,44 @@ static struct dentry *mattxfs_remote_lookup(struct inode *dir, struct dentry *de
     return NULL;
 }
 
-static const struct inode_operations mattxfs_remote_iops = {
-    .lookup = mattxfs_remote_lookup,
+static const struct file_operations mattxfs_remote_dir_fops = {
+    .read           = generic_read_dir,
+    .iterate_shared = mattxfs_remote_iterate, 
+    .llseek         = generic_file_llseek,
 };
 
-// the Root Lookup ---
+static const struct inode_operations mattxfs_remote_iops = {
+    .lookup         = mattxfs_remote_lookup,  
+};
+
+
+// ============================================================================
+// LEVEL 1: THE ROOT OPERATIONS (Browsing /mattxfs/)
+// ============================================================================
+
+static int mattxfs_root_iterate(struct file *file, struct dir_context *ctx) {
+    int nodes[64];
+    int count, i;
+    char name[16];
+
+    if (!dir_emit_dots(file, ctx))
+        return 0;
+
+    count = mattx_get_active_nodes(nodes, 64);
+
+    for (i = 0; i < count; i++) {
+        if (ctx->pos <= i + 2) {
+            snprintf(name, sizeof(name), "%d", nodes[i]);
+            
+            if (!dir_emit(ctx, name, strlen(name), nodes[i] + 1000, DT_DIR))
+                return 0;
+            
+            ctx->pos++;
+        }
+    }
+    return 0;
+}
+
 static struct dentry *mattxfs_root_lookup(struct inode *dir, struct dentry *dentry, unsigned int flags) {
     int nodes[64];
     int count, i;
@@ -136,7 +164,8 @@ static struct dentry *mattxfs_root_lookup(struct inode *dir, struct dentry *dent
     bool found = false;
     struct inode *inode;
 
-    if (kstrtoint(dentry->d_name.name, 10, &target_node) != 0) return NULL;
+    if (kstrtoint(dentry->d_name.name, 10, &target_node) != 0)
+        return NULL;
 
     count = mattx_get_active_nodes(nodes, 64);
     for (i = 0; i < count; i++) {
@@ -146,34 +175,40 @@ static struct dentry *mattxfs_root_lookup(struct inode *dir, struct dentry *dent
         }
     }
 
-    if (!found) return NULL; 
+    if (!found)
+        return NULL; 
 
     inode = new_inode(dir->i_sb);
-    if (!inode) return ERR_PTR(-ENOMEM);
+    if (!inode)
+        return ERR_PTR(-ENOMEM);
 
     inode->i_ino = target_node + 1000;
     inode->i_mode = S_IFDIR | 0755;
     simple_inode_init_ts(inode);
     
-    // Attach the REMOTE operations to the Node folder! ---
+    // When we create a Node folder, we attach the REMOTE operations to it!
+    // This means anything inside this folder uses the network.
     inode->i_op = &mattxfs_remote_iops;
-    inode->i_fop = &simple_dir_operations;
+    inode->i_fop = &mattxfs_remote_dir_fops;
     set_nlink(inode, 2);
 
     d_add(dentry, inode);
     return NULL;
 }
 
-// --- 3. Wire up the Custom Operations ---
 static const struct file_operations mattxfs_root_fops = {
     .read           = generic_read_dir,
-    .iterate_shared = mattxfs_root_iterate, // Hook 'ls'
+    .iterate_shared = mattxfs_root_iterate, 
     .llseek         = generic_file_llseek,
 };
 
 static const struct inode_operations mattxfs_root_iops = {
-    .lookup         = mattxfs_root_lookup,  // Hook 'cd'
+    .lookup         = mattxfs_root_lookup,  
 };
+
+// ============================================================================
+// FILESYSTEM MOUNT & INIT
+// ============================================================================
 
 static const struct super_operations mattxfs_s_ops = {
     .statfs         = simple_statfs,
@@ -197,7 +232,6 @@ static int mattxfs_fill_super(struct super_block *sb, void *data, int silent) {
     inode->i_mode = S_IFDIR | 0755; 
     simple_inode_init_ts(inode); 
 
-    // --- FIXED: Apply our custom operations to the Root Inode! ---
     inode->i_op = &mattxfs_root_iops;
     inode->i_fop = &mattxfs_root_fops;
 

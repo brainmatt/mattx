@@ -1981,11 +1981,40 @@ struct vfs_rpc_ctx {
     int error;
     struct kstat stat;
     bool in_use;
+    struct mattx_dirent *dirents;
+    u32 dirent_count;
+    u64 new_offset;
+    bool in_use;
 };
 
 static struct vfs_rpc_ctx vfs_rpc_registry[MAX_VFS_RPC];
 static DEFINE_SPINLOCK(vfs_rpc_lock);
 static u64 next_req_id = 1;
+
+// This context helps us catch the filenames as the kernel reads the local disk
+struct mattx_readdir_ctx {
+    struct dir_context ctx;
+    struct mattx_vfs_readdir_reply *reply;
+};
+
+// The kernel calls this for every file it finds on the hard drive!
+static bool mattx_filldir(struct dir_context *ctx, const char *name, int namlen, loff_t offset, u64 ino, unsigned int d_type) {
+    struct mattx_readdir_ctx *mctx = container_of(ctx, struct mattx_readdir_ctx, ctx);
+    struct mattx_vfs_readdir_reply *reply = mctx->reply;
+
+    if (reply->entry_count >= 40) return false; // Buffer is full, stop reading!
+
+    if (namlen > 63) namlen = 63; // Truncate long names for the prototype
+    
+    reply->entries[reply->entry_count].ino = ino;
+    reply->entries[reply->entry_count].type = d_type;
+    memcpy(reply->entries[reply->entry_count].name, name, namlen);
+    reply->entries[reply->entry_count].name[namlen] = '\0';
+    
+    reply->entry_count++;
+    reply->new_offset = offset; // Remember where we stopped
+    return true;
+}
 
 // --- API FOR MATTXFS.KO ---
 int mattx_rpc_vfs_getattr(int node_id, const char *path, struct kstat *stat_out) {
@@ -2046,6 +2075,77 @@ int mattx_rpc_vfs_getattr(int node_id, const char *path, struct kstat *stat_out)
     return err;
 }
 EXPORT_SYMBOL(mattx_rpc_vfs_getattr);
+
+// --- API FOR MATTXFS.KO ---
+int mattx_rpc_vfs_readdir(int node_id, const char *path, u64 *offset, struct mattx_dirent *entries, u32 *out_count) {
+    int i, slot = -1;
+    u64 req_id;
+    struct mattx_vfs_readdir_req req;
+
+    // --- The Local Fast-Path! ---
+    if (node_id == my_node_id) {
+        struct file *f = filp_open(path, O_RDONLY | O_DIRECTORY, 0);
+        if (IS_ERR(f)) return PTR_ERR(f);
+        
+        struct mattx_vfs_readdir_reply local_reply;
+        memset(&local_reply, 0, sizeof(local_reply));
+        
+        struct mattx_readdir_ctx mctx = {
+            .ctx.actor = mattx_filldir,
+            .ctx.pos = *offset,
+            .reply = &local_reply,
+        };
+        
+        iterate_dir(f, &mctx.ctx);
+        
+        *offset = mctx.ctx.pos;
+        *out_count = local_reply.entry_count;
+        memcpy(entries, local_reply.entries, local_reply.entry_count * sizeof(struct mattx_dirent));
+        
+        fput(f);
+        return 0;
+    }
+
+    if (!cluster_map[node_id]) return -ENOTCONN;
+
+    spin_lock(&vfs_rpc_lock);
+    for (i = 0; i < MAX_VFS_RPC; i++) {
+        if (!vfs_rpc_registry[i].in_use) {
+            slot = i;
+            vfs_rpc_registry[i].in_use = true;
+            req_id = next_req_id++;
+            vfs_rpc_registry[i].req_id = req_id;
+            vfs_rpc_registry[i].done = false;
+            vfs_rpc_registry[i].dirents = entries; // Point to MattXFS's buffer
+            init_waitqueue_head(&vfs_rpc_registry[i].wq);
+            break;
+        }
+    }
+    spin_unlock(&vfs_rpc_lock);
+
+    if (slot == -1) return -EBUSY;
+
+    req.req_id = req_id;
+    req.offset = *offset;
+    strncpy(req.path, path, sizeof(req.path) - 1);
+    mattx_comm_send(cluster_map[node_id], MATTX_MSG_VFS_READDIR_REQ, &req, sizeof(req));
+
+    wait_event_interruptible(vfs_rpc_registry[slot].wq, vfs_rpc_registry[slot].done);
+
+    int err = vfs_rpc_registry[slot].error;
+    if (err == 0) {
+        *offset = vfs_rpc_registry[slot].new_offset;
+        *out_count = vfs_rpc_registry[slot].dirent_count;
+    }
+
+    spin_lock(&vfs_rpc_lock);
+    vfs_rpc_registry[slot].in_use = false;
+    spin_unlock(&vfs_rpc_lock);
+
+    return err;
+}
+EXPORT_SYMBOL(mattx_rpc_vfs_readdir);
+
 
 // --- NETWORK HANDLERS ---
 
@@ -2112,6 +2212,62 @@ static void handle_vfs_getattr_reply(struct mattx_link *link, struct mattx_heade
     }
 }
 
+static void handle_vfs_readdir_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    if (payload) {
+        struct mattx_vfs_readdir_req *req = payload;
+        struct mattx_vfs_readdir_reply reply;
+        struct file *f;
+
+        memset(&reply, 0, sizeof(reply));
+        reply.req_id = req->req_id;
+
+        f = filp_open(req->path, O_RDONLY | O_DIRECTORY, 0);
+        if (!IS_ERR(f)) {
+            struct mattx_readdir_ctx mctx = {
+                .ctx.actor = mattx_filldir,
+                .ctx.pos = req->offset,
+                .reply = &reply,
+            };
+            
+            iterate_dir(f, &mctx.ctx);
+            reply.new_offset = mctx.ctx.pos;
+            fput(f);
+            reply.error = 0;
+        } else {
+            reply.error = PTR_ERR(f);
+        }
+
+        if (cluster_map[hdr->sender_id]) {
+            mattx_comm_send(cluster_map[hdr->sender_id], MATTX_MSG_VFS_READDIR_REPLY, &reply, sizeof(reply));
+        }
+    }
+}
+
+static void handle_vfs_readdir_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    if (payload) {
+        struct mattx_vfs_readdir_reply *reply = payload;
+        int i;
+
+        spin_lock(&vfs_rpc_lock);
+        for (i = 0; i < MAX_VFS_RPC; i++) {
+            if (vfs_rpc_registry[i].in_use && vfs_rpc_registry[i].req_id == reply->req_id) {
+                vfs_rpc_registry[i].error = reply->error;
+                if (reply->error == 0) {
+                    vfs_rpc_registry[i].new_offset = reply->new_offset;
+                    vfs_rpc_registry[i].dirent_count = reply->entry_count;
+                    if (vfs_rpc_registry[i].dirents && reply->entry_count > 0) {
+                        memcpy(vfs_rpc_registry[i].dirents, reply->entries, reply->entry_count * sizeof(struct mattx_dirent));
+                    }
+                }
+                vfs_rpc_registry[i].done = true;
+                wake_up_interruptible(&vfs_rpc_registry[i].wq);
+                break;
+            }
+        }
+        spin_unlock(&vfs_rpc_lock);
+    }
+}
+
 void mattx_fileio_init_handlers(void) {
     mattx_register_handler(MATTX_MSG_SYSCALL_FWD, handle_syscall_fwd);
     mattx_register_handler(MATTX_MSG_SYS_OPEN_REQ, handle_sys_open_req);
@@ -2145,6 +2301,8 @@ void mattx_fileio_init_handlers(void) {
     mattx_register_handler(MATTX_MSG_SYS_POLL_REPLY, handle_sys_poll_reply);
     mattx_register_handler(MATTX_MSG_VFS_GETATTR_REQ, handle_vfs_getattr_req);
     mattx_register_handler(MATTX_MSG_VFS_GETATTR_REPLY, handle_vfs_getattr_reply);
+    mattx_register_handler(MATTX_MSG_VFS_READDIR_REQ, handle_vfs_readdir_req);
+    mattx_register_handler(MATTX_MSG_VFS_READDIR_REPLY, handle_vfs_readdir_reply);
 
     printk(KERN_INFO "MattX: [FILEIO] Network handlers registered.\n");
 }
