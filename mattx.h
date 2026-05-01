@@ -514,5 +514,8 @@ void mattx_fileio_init_handlers(void);
 extern const struct file_operations mattx_fops; 
 extern const struct inode_operations mattx_iops;
 
+// API for MattXFS ---
+int mattx_get_active_nodes(int *node_array, int max_nodes);
+
 #endif // MATTX_H
 

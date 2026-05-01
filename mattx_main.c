@@ -154,6 +154,25 @@ struct genl_family mattx_genl_family = {
     .name = "MATTX", .version = 1, .maxattr = MATTX_ATTR_MAX, .ops = mattx_genl_ops, .n_ops = ARRAY_SIZE(mattx_genl_ops),
 };
 
+// API for MattXFS ---
+int mattx_get_active_nodes(int *node_array, int max_nodes) {
+    int count = 0;
+    int i;
+    
+    for (i = 0; i < MAX_NODES && count < max_nodes; i++) {
+        if (cluster_map[i] && cluster_map[i]->node_id != -1) {
+            node_array[count++] = cluster_map[i]->node_id;
+        }
+    }
+    
+    if (count < max_nodes && my_node_id != 0) {
+        node_array[count++] = my_node_id;
+    }
+    
+    return count;
+}
+EXPORT_SYMBOL(mattx_get_active_nodes); 
+
 static int __init mattx_init(void) { 
     int rc = genl_register_family(&mattx_genl_family);
     if (rc) return rc;
