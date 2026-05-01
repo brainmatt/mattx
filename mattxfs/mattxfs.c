@@ -65,7 +65,9 @@ static int mattxfs_remote_iterate(struct file *file, struct dir_context *ctx) {
     // Ask mattx.ko to fetch the directory contents!
     u64 offset = ctx->pos;
     err = mattx_rpc_vfs_readdir(node_id, path_buf, &offset, entries, &count);
-    
+
+    printk(KERN_INFO "MattX:[ITERATE] err %d count %d bytes.\n", err, count);
+
     if (err) return err;
 
     // Emit the files to the user's terminal!
