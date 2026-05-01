@@ -138,8 +138,8 @@ static int mattx_nl_cmd_set_config(struct sk_buff *skb, struct genl_info *info) 
         config_migrate_network_io = nla_get_u8(info->attrs[MATTX_ATTR_CONFIG_NET_IO]) ? true : false;
     }
     if (info->attrs[MATTX_ATTR_MATTXFS_ENABLED]) {
-        config_mattxfs_enabled = nla_get_u8(info->attrs[MATTX_ATTR_MATTXFS_ENABLED]);
-        printk(KERN_INFO "MattX:[NL] MattXFS Overlay Mode Enabled: %s\n", config_mattxfs_enabled ? "YES" : "NO");
+        config_mattxfs_enabled = nla_get_u8(info->attrs[MATTX_ATTR_MATTXFS_ENABLED]) ? true : false;
+        printk(KERN_INFO "MattX:[NL] MattXFS Overlay Mode Enabled: %s\n", config_mattxfs_enabled ? "TRUE" : "FALSE");
     }
 
     printk(KERN_INFO "MattX: Configuration Updated - FileIO: %s, NetworkIO: %s, MattXFS: %s\n",

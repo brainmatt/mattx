@@ -1993,6 +1993,18 @@ int mattx_rpc_vfs_getattr(int node_id, const char *path, struct kstat *stat_out)
     u64 req_id;
     struct mattx_vfs_getattr_req req;
 
+    // The Local Fast-Path! ---
+    if (node_id == my_node_id) {
+        struct path local_path;
+        int err = kern_path(path, LOOKUP_FOLLOW, &local_path);
+        if (!err) {
+            err = vfs_getattr(&local_path, stat_out, STATX_BASIC_STATS, AT_STATX_SYNC_AS_STAT);
+            path_put(&local_path);
+        }
+        return err;
+    }
+
+    // If it's not local, it must be a connected remote node!
     if (!cluster_map[node_id]) return -ENOTCONN;
 
     // 1. Find an empty slot and generate a Request ID
