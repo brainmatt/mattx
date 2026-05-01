@@ -1,13 +1,12 @@
 obj-m += mattxfs.o
 
 KDIR := /lib/modules/$(shell uname -r)/build
-PWD := $(shell pwd)
-
-# NEW: Tell the linker where to find mattx.ko's exported symbols!
-KBUILD_EXTRA_SYMBOLS := $(PWD)/../Module.symvers
+# Use absolute path for the current directory
+MY_DIR := $(shell pwd)
 
 all:
-	$(MAKE) -C $(KDIR) M=$(PWD) modules
+	# Pass the exact, absolute path to the parent Module.symvers
+	$(MAKE) -C $(KDIR) M=$(MY_DIR) KBUILD_EXTRA_SYMBOLS="$(MY_DIR)/../Module.symvers" modules
 
 clean:
-	$(MAKE) -C $(KDIR) M=$(PWD) clean
+	$(MAKE) -C $(KDIR) M=$(MY_DIR) clean
