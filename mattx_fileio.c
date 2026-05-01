@@ -1984,7 +1984,6 @@ struct vfs_rpc_ctx {
     struct mattx_dirent *dirents;
     u32 dirent_count;
     u64 new_offset;
-    bool in_use;
 };
 
 static struct vfs_rpc_ctx vfs_rpc_registry[MAX_VFS_RPC];
