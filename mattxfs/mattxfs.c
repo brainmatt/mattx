@@ -49,7 +49,12 @@ static int get_node_id_from_dentry(struct dentry *dentry) {
     while (!IS_ROOT(parent->d_parent)) {
         parent = parent->d_parent;
     }
-    kstrtoint(parent->d_name.name, 10, &node_id);
+
+    // Check the return value to satisfy the compiler! ---
+    if (kstrtoint(parent->d_name.name, 10, &node_id) != 0) {
+        return -1; // If it's not a valid number, return -1
+    }
+
     return node_id;
 }
 
