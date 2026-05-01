@@ -13,6 +13,8 @@ all: module daemon stub migtest servertestpoll servertestselect
 
 module:
 	$(MAKE) -C $(KDIR) M=$(PWD) modules
+	# mattxfs
+	cd mattxfs && $(MAKE) && cd -
 
 daemon: sbin/mattx_discd.c
 	gcc $(CFLAGS_USER) -o sbin/mattx-discd sbin/mattx_discd.c $(LDFLAGS_USER) -lpthread
