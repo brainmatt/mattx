@@ -29,6 +29,8 @@ servertestpoll: bin/servertestpoll.c
 servertestselect: bin/servertestselect.c
 	gcc -o bin/servertestselect bin/servertestselect.c
 
+mattxfs:
+	cd mattxfs && make && cd ..
 
 clean:
 	$(MAKE) -C $(KDIR) M=$(PWD) clean
