@@ -20,8 +20,10 @@ u32 my_ip_addr = 0;
 
 bool config_migrate_file_io = true;
 bool config_migrate_network_io = true;
+bool config_mattxfs_enabled = true; // Default to true
+EXPORT_SYMBOL(config_mattxfs_enabled);
 
-enum { MATTX_ATTR_UNSPEC, MATTX_ATTR_NODE_ID, MATTX_ATTR_IPV4_ADDR, MATTX_ATTR_STUB_PID, MATTX_ATTR_BLUEPRINT, MATTX_ATTR_MY_NODE_ID, MATTX_ATTR_LOCAL_IP, MATTX_ATTR_CONFIG_FILE_IO, MATTX_ATTR_CONFIG_NET_IO, __MATTX_ATTR_MAX };
+enum { MATTX_ATTR_UNSPEC, MATTX_ATTR_NODE_ID, MATTX_ATTR_IPV4_ADDR, MATTX_ATTR_STUB_PID, MATTX_ATTR_BLUEPRINT, MATTX_ATTR_MY_NODE_ID, MATTX_ATTR_LOCAL_IP, MATTX_ATTR_CONFIG_FILE_IO, MATTX_ATTR_CONFIG_NET_IO, MATTX_ATTR_MATTXFS_ENABLED, __MATTX_ATTR_MAX };
 #define MATTX_ATTR_MAX (__MATTX_ATTR_MAX - 1)
 
 enum { MATTX_CMD_UNSPEC, MATTX_CMD_NODE_JOIN, MATTX_CMD_NODE_LEAVE, MATTX_CMD_HIJACK_ME, MATTX_CMD_GET_BLUEPRINT, MATTX_CMD_SET_LOCAL_IP, MATTX_CMD_SET_CONFIG, __MATTX_CMD_MAX };
@@ -33,6 +35,7 @@ static const struct nla_policy mattx_genl_policy[MATTX_ATTR_MAX + 1] = {[MATTX_A
     [MATTX_ATTR_LOCAL_IP] = { .type = NLA_U32 }, 
     [MATTX_ATTR_CONFIG_FILE_IO] = { .type = NLA_U8 },
     [MATTX_ATTR_CONFIG_NET_IO] = { .type = NLA_U8 },
+    [MATTX_ATTR_MATTXFS_ENABLED] = { .type = NLA_U8 },
 };
 
 static int mattx_nl_cmd_node_join(struct sk_buff *skb, struct genl_info *info) {
@@ -134,10 +137,15 @@ static int mattx_nl_cmd_set_config(struct sk_buff *skb, struct genl_info *info) 
     if (info->attrs[MATTX_ATTR_CONFIG_NET_IO]) {
         config_migrate_network_io = nla_get_u8(info->attrs[MATTX_ATTR_CONFIG_NET_IO]) ? true : false;
     }
+    if (info->attrs[MATTX_ATTR_MATTXFS_ENABLED]) {
+        config_mattxfs_enabled = nla_get_u8(info->attrs[MATTX_ATTR_MATTXFS_ENABLED]);
+        printk(KERN_INFO "MattX:[NL] MattXFS Overlay Mode Enabled: %s\n", config_mattxfs_enabled ? "YES" : "NO");
+    }
 
-    printk(KERN_INFO "MattX: Configuration Updated - FileIO: %s, NetworkIO: %s\n",
+    printk(KERN_INFO "MattX: Configuration Updated - FileIO: %s, NetworkIO: %s, MattXFS: %s\n",
            config_migrate_file_io ? "TRUE" : "FALSE",
-           config_migrate_network_io ? "TRUE" : "FALSE");
+           config_migrate_network_io ? "TRUE" : "FALSE",
+           config_mattxfs_enabled ? "TRUE" : "FALSE");
     return 0;
 }
 

@@ -90,6 +90,8 @@ enum mattx_msg_type {
     MATTX_MSG_SYS_ACCEPT_REPLY,
     MATTX_MSG_SYS_POLL_REQ,
     MATTX_MSG_SYS_POLL_REPLY,
+    MATTX_MSG_VFS_GETATTR_REQ,
+    MATTX_MSG_VFS_GETATTR_REPLY,
 };
 
 struct mattx_header {
@@ -451,6 +453,23 @@ struct mattx_export_info {
     struct file *remote_files[MAX_FDS]; 
 };
 
+struct mattx_vfs_getattr_req {
+    u64 req_id;
+    char path[256];
+};
+
+struct mattx_vfs_getattr_reply {
+    u64 req_id;
+    int error;
+    u32 mode;
+    u64 size;
+    u64 blocks;
+    u32 blksize;
+    u32 uid;
+    u32 gid;
+    u32 nlink;
+};
+
 // This defines the standard signature for all message handlers
 typedef void (*mattx_msg_handler_fn)(struct mattx_link *link, struct mattx_header *hdr, void *payload);
 
@@ -475,6 +494,7 @@ extern spinlock_t export_lock;
 extern bool balancer_enabled;
 extern u32 my_node_id; 
 extern u32 my_ip_addr; 
+extern bool config_mattxfs_enabled; // The MattxFs Feature Flag
 
 // Configuration Toggles
 extern bool config_migrate_file_io;
@@ -516,6 +536,7 @@ extern const struct inode_operations mattx_iops;
 
 // API for MattXFS ---
 int mattx_get_active_nodes(int *node_array, int max_nodes);
+int mattx_rpc_vfs_getattr(int node_id, const char *path, struct kstat *stat_out);
 
 #endif // MATTX_H
 

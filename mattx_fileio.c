@@ -1,6 +1,7 @@
 #include "mattx.h"
 #include <linux/wait.h>
 #include <linux/poll.h>
+#include <linux/namei.h> // For kern_path
 
 // --- The VFS Proxy (Fake FDs) ---
 
@@ -1969,6 +1970,136 @@ static void handle_sys_poll_reply(struct mattx_link *link, struct mattx_header *
     }
 }
 
+
+// --- VFS RPC Registry ---
+// This allows mattxfs.ko to sleep while waiting for network replies
+#define MAX_VFS_RPC 64
+struct vfs_rpc_ctx {
+    u64 req_id;
+    wait_queue_head_t wq;
+    bool done;
+    int error;
+    struct kstat stat;
+    bool in_use;
+};
+
+static struct vfs_rpc_ctx vfs_rpc_registry[MAX_VFS_RPC];
+static DEFINE_SPINLOCK(vfs_rpc_lock);
+static u64 next_req_id = 1;
+
+// --- API FOR MATTXFS.KO ---
+int mattx_rpc_vfs_getattr(int node_id, const char *path, struct kstat *stat_out) {
+    int i, slot = -1;
+    u64 req_id;
+    struct mattx_vfs_getattr_req req;
+
+    if (!cluster_map[node_id]) return -ENOTCONN;
+
+    // 1. Find an empty slot and generate a Request ID
+    spin_lock(&vfs_rpc_lock);
+    for (i = 0; i < MAX_VFS_RPC; i++) {
+        if (!vfs_rpc_registry[i].in_use) {
+            slot = i;
+            vfs_rpc_registry[i].in_use = true;
+            req_id = next_req_id++;
+            vfs_rpc_registry[i].req_id = req_id;
+            vfs_rpc_registry[i].done = false;
+            init_waitqueue_head(&vfs_rpc_registry[i].wq);
+            break;
+        }
+    }
+    spin_unlock(&vfs_rpc_lock);
+
+    if (slot == -1) return -EBUSY;
+
+    // 2. Send the request
+    req.req_id = req_id;
+    strncpy(req.path, path, sizeof(req.path) - 1);
+    mattx_comm_send(cluster_map[node_id], MATTX_MSG_VFS_GETATTR_REQ, &req, sizeof(req));
+
+    // 3. Sleep until the reply arrives!
+    wait_event_interruptible(vfs_rpc_registry[slot].wq, vfs_rpc_registry[slot].done);
+
+    // 4. Collect the results
+    int err = vfs_rpc_registry[slot].error;
+    if (err == 0 && stat_out) {
+        *stat_out = vfs_rpc_registry[slot].stat;
+    }
+
+    // 5. Free the slot
+    spin_lock(&vfs_rpc_lock);
+    vfs_rpc_registry[slot].in_use = false;
+    spin_unlock(&vfs_rpc_lock);
+
+    return err;
+}
+EXPORT_SYMBOL(mattx_rpc_vfs_getattr);
+
+// --- NETWORK HANDLERS ---
+
+// Node 2 receives the request, reads its local hard drive, and replies!
+static void handle_vfs_getattr_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    if (payload) {
+        struct mattx_vfs_getattr_req *req = payload;
+        struct mattx_vfs_getattr_reply reply;
+        struct path path;
+        struct kstat stat;
+        int err;
+
+        memset(&reply, 0, sizeof(reply));
+        reply.req_id = req->req_id;
+
+        // Safely look up the file on the local Ext4 disk
+        err = kern_path(req->path, LOOKUP_FOLLOW, &path);
+        if (!err) {
+            err = vfs_getattr(&path, &stat, STATX_BASIC_STATS, AT_STATX_SYNC_AS_STAT);
+            if (!err) {
+                reply.mode = stat.mode;
+                reply.size = stat.size;
+                reply.blocks = stat.blocks;
+                reply.blksize = stat.blksize;
+                reply.uid = from_kuid_munged(current_user_ns(), stat.uid);
+                reply.gid = from_kgid_munged(current_user_ns(), stat.gid);
+                reply.nlink = stat.nlink;
+            }
+            path_put(&path);
+        }
+        reply.error = err;
+
+        if (cluster_map[hdr->sender_id]) {
+            mattx_comm_send(cluster_map[hdr->sender_id], MATTX_MSG_VFS_GETATTR_REPLY, &reply, sizeof(reply));
+        }
+    }
+}
+
+// Node 1 receives the reply and wakes up the sleeping MattXFS thread!
+static void handle_vfs_getattr_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    if (payload) {
+        struct mattx_vfs_getattr_reply *reply = payload;
+        int i;
+
+        spin_lock(&vfs_rpc_lock);
+        for (i = 0; i < MAX_VFS_RPC; i++) {
+            if (vfs_rpc_registry[i].in_use && vfs_rpc_registry[i].req_id == reply->req_id) {
+                vfs_rpc_registry[i].error = reply->error;
+                if (reply->error == 0) {
+                    vfs_rpc_registry[i].stat.mode = reply->mode;
+                    vfs_rpc_registry[i].stat.size = reply->size;
+                    vfs_rpc_registry[i].stat.blocks = reply->blocks;
+                    vfs_rpc_registry[i].stat.blksize = reply->blksize;
+                    vfs_rpc_registry[i].stat.uid = make_kuid(current_user_ns(), reply->uid);
+                    vfs_rpc_registry[i].stat.gid = make_kgid(current_user_ns(), reply->gid);
+                    vfs_rpc_registry[i].stat.nlink = reply->nlink;
+                }
+                vfs_rpc_registry[i].done = true;
+                wake_up_interruptible(&vfs_rpc_registry[i].wq);
+                break;
+            }
+        }
+        spin_unlock(&vfs_rpc_lock);
+    }
+}
+
 void mattx_fileio_init_handlers(void) {
     mattx_register_handler(MATTX_MSG_SYSCALL_FWD, handle_syscall_fwd);
     mattx_register_handler(MATTX_MSG_SYS_OPEN_REQ, handle_sys_open_req);
@@ -2000,6 +2131,9 @@ void mattx_fileio_init_handlers(void) {
     mattx_register_handler(MATTX_MSG_SYS_ACCEPT_REPLY, handle_sys_accept_reply);
     mattx_register_handler(MATTX_MSG_SYS_POLL_REQ, handle_sys_poll_req);
     mattx_register_handler(MATTX_MSG_SYS_POLL_REPLY, handle_sys_poll_reply);
+    mattx_register_handler(MATTX_MSG_VFS_GETATTR_REQ, handle_vfs_getattr_req);
+    mattx_register_handler(MATTX_MSG_VFS_GETATTR_REPLY, handle_vfs_getattr_reply);
+
     printk(KERN_INFO "MattX: [FILEIO] Network handlers registered.\n");
 }
 

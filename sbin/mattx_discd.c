@@ -17,8 +17,7 @@
 #define DEFAULT_PORT 7225
 #define DEFAULT_IFACE "eth0"
 
-// NEW: Added MATTX_ATTR_LOCAL_IP and MATTX_CMD_SET_LOCAL_IP
-enum { MATTX_ATTR_UNSPEC, MATTX_ATTR_NODE_ID, MATTX_ATTR_IPV4_ADDR, MATTX_ATTR_STUB_PID, MATTX_ATTR_BLUEPRINT, MATTX_ATTR_MY_NODE_ID, MATTX_ATTR_LOCAL_IP, MATTX_ATTR_CONFIG_FILE_IO, MATTX_ATTR_CONFIG_NET_IO, __MATTX_ATTR_MAX };
+enum { MATTX_ATTR_UNSPEC, MATTX_ATTR_NODE_ID, MATTX_ATTR_IPV4_ADDR, MATTX_ATTR_STUB_PID, MATTX_ATTR_BLUEPRINT, MATTX_ATTR_MY_NODE_ID, MATTX_ATTR_LOCAL_IP, MATTX_ATTR_CONFIG_FILE_IO, MATTX_ATTR_CONFIG_NET_IO, MATTX_ATTR_MATTXFS_ENABLED, __MATTX_ATTR_MAX };
 #define MATTX_ATTR_MAX (__MATTX_ATTR_MAX - 1)
 
 enum { MATTX_CMD_UNSPEC, MATTX_CMD_NODE_JOIN, MATTX_CMD_NODE_LEAVE, MATTX_CMD_HIJACK_ME, MATTX_CMD_GET_BLUEPRINT, MATTX_CMD_SET_LOCAL_IP, MATTX_CMD_SET_CONFIG, __MATTX_CMD_MAX };
@@ -31,6 +30,7 @@ struct mattx_config {
     uint32_t node_id;
     uint8_t migrate_file_io;
     uint8_t migrate_net_io;
+    uint8_t mattxfs_enabled;
 };
 
 struct mattx_beacon {
@@ -63,7 +63,7 @@ int init_netlink() {
     return 0;
 }
 
-// --- NEW: Tell the kernel our IP address ---
+// Tell the kernel our IP address ---
 void register_local_ip(uint32_t ip_addr) {
     struct nl_msg *msg;
     
@@ -91,11 +91,12 @@ void register_config_to_kernel() {
     genlmsg_put(msg, NL_AUTO_PORT, NL_AUTO_SEQ, mattx_family_id, 0, 0, MATTX_CMD_SET_CONFIG, 1);
     nla_put_u8(msg, MATTX_ATTR_CONFIG_FILE_IO, config.migrate_file_io);
     nla_put_u8(msg, MATTX_ATTR_CONFIG_NET_IO, config.migrate_net_io);
+    nla_put_u8(msg, MATTX_ATTR_MATTXFS_ENABLED, config.mattxfs_enabled);
 
     if (nl_send_auto(nl_sock, msg) < 0) {
         printf("ERROR: Failed to push configuration to kernel.\n");
     } else {
-        printf("SUCCESS: Pushed configuration to kernel (FileIO: %d, NetIO: %d)\n", config.migrate_file_io, config.migrate_net_io);
+        printf("SUCCESS: Pushed configuration to kernel (FileIO: %d, NetIO: %d, MATTXFS: %d)\n", config.migrate_file_io, config.migrate_net_io, config.mattxfs_enabled);
     }
     fflush(stdout);
     nlmsg_free(msg);
@@ -165,6 +166,7 @@ void load_config() {
     config.node_id = 0;
     config.migrate_file_io = 1;
     config.migrate_net_io = 1;
+    config.mattxfs_enabled = 1; // Default to true
 
     FILE *fp = fopen(CONFIG_FILE, "r");
     if (!fp) {
@@ -185,6 +187,10 @@ void load_config() {
         }
         if (sscanf(line, "MIGRATE_NETWORK_IO=%s", temp_val)) {
             if (strcmp(temp_val, "false") == 0 || strcmp(temp_val, "0") == 0) config.migrate_net_io = 0;
+            continue;
+        }
+        if (sscanf(line, "MATTXFS_ENABLED=%s", temp_val)) {
+            if (strcmp(temp_val, "false") == 0 || strcmp(temp_val, "0") == 0) config.mattxfs_enabled = 0;
             continue;
         }
     }

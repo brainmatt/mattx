@@ -561,6 +561,9 @@ static int entry_handler_openat(struct kretprobe_instance *ri, struct pt_regs *r
 
     if (!is_guest_process(my_pid)) return 0; 
 
+    // The Bypass! ---
+    if (config_mattxfs_enabled) return 0; 
+
     // Extract the original arguments from do_sys_openat2
     // args: dfd (di), filename (si), open_how (dx)
     data->filename_ptr = (const char __user *)regs->si;
@@ -651,6 +654,8 @@ static int entry_handler_dup(struct kretprobe_instance *ri, struct pt_regs *regs
     struct dup_kretprobe_data *data = (struct dup_kretprobe_data *)ri->data;
 
     if (!is_guest_process(my_pid)) return 0;
+
+    if (config_mattxfs_enabled) return 0; // Bypass!
 
     data->oldfd = (int)regs->di;
     
