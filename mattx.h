@@ -489,7 +489,7 @@ struct mattx_vfs_readdir_reply {
     int error;
     u64 new_offset;
     u32 entry_count;
-    struct mattx_dirent entries[40]; // Send up to 40 files per packet (~3KB)
+    struct mattx_dirent entries[20]; // Send up to 20 files per packet (< ~2KB)
 };
 
 // This defines the standard signature for all message handlers

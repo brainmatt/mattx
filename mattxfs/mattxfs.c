@@ -53,7 +53,7 @@ static void get_remote_path_from_dentry(struct dentry *dentry, char *buf, int bu
 static int mattxfs_remote_iterate(struct file *file, struct dir_context *ctx) {
     struct dentry *dentry = file->f_path.dentry;
     char path_buf[256];
-    struct mattx_dirent entries[40];
+    struct mattx_dirent entries[20];
     u32 count = 0;
     int node_id;
     int err;
