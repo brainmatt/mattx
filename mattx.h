@@ -101,6 +101,10 @@ enum mattx_msg_type {
     MATTX_MSG_VFS_WRITE_REQ,
     MATTX_MSG_VFS_WRITE_REPLY,
     MATTX_MSG_VFS_CLOSE_REQ,
+    MATTX_MSG_VFS_LSEEK_REQ,
+    MATTX_MSG_VFS_LSEEK_REPLY,
+    MATTX_MSG_VFS_FSYNC_REQ,
+    MATTX_MSG_VFS_FSYNC_REPLY,
 };
 
 struct mattx_header {
@@ -545,6 +549,33 @@ struct mattx_vfs_close_req {
     int remote_fd;
 };
 
+struct mattx_vfs_lseek_req {
+    u64 req_id;
+    int remote_fd;
+    loff_t offset;
+    int whence;
+};
+
+struct mattx_vfs_lseek_reply {
+    u64 req_id;
+    loff_t offset;
+    int error;
+};
+
+struct mattx_vfs_fsync_req {
+    u64 req_id;
+    int remote_fd;
+    loff_t start;
+    loff_t end;
+    int datasync;
+};
+
+struct mattx_vfs_fsync_reply {
+    u64 req_id;
+    int error;
+};
+
+
 // This defines the standard signature for all message handlers
 typedef void (*mattx_msg_handler_fn)(struct mattx_link *link, struct mattx_header *hdr, void *payload);
 
@@ -617,6 +648,8 @@ int mattx_rpc_vfs_open(int node_id, const char *path, int flags, int mode, int *
 ssize_t mattx_rpc_vfs_read(int node_id, int remote_fd, void *buf, size_t count, loff_t *pos);
 ssize_t mattx_rpc_vfs_write(int node_id, int remote_fd, const void *buf, size_t count, loff_t *pos);
 void mattx_rpc_vfs_close(int node_id, int remote_fd);
+loff_t mattx_rpc_vfs_llseek(int node_id, int remote_fd, loff_t offset, int whence);
+int mattx_rpc_vfs_fsync(int node_id, int remote_fd, loff_t start, loff_t end, int datasync);
 
 #endif // MATTX_H
 

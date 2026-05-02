@@ -1992,6 +1992,7 @@ struct vfs_rpc_ctx {
     int remote_fd;
     ssize_t bytes_rw;
     void *data_buf;
+    loff_t ret_offset;
 
     bool in_use;    
 };
@@ -2161,7 +2162,7 @@ int mattx_rpc_vfs_readdir(int node_id, const char *path, u64 *offset, struct mat
 }
 EXPORT_SYMBOL(mattx_rpc_vfs_readdir);
 
-// --- API FOR MATTXFS.KO (OPEN, READ, WRITE, CLOSE) ---
+// --- API FOR MATTXFS.KO (OPEN, READ, WRITE, LSEEK, FSYNC, CLOSE) ---
 
 int mattx_rpc_vfs_open(int node_id, const char *path, int flags, int mode, int *remote_fd) {
     int i, slot = -1;
@@ -2301,6 +2302,95 @@ ssize_t mattx_rpc_vfs_write(int node_id, int remote_fd, const void *buf, size_t 
     return bytes_written;
 }
 EXPORT_SYMBOL(mattx_rpc_vfs_write);
+
+loff_t mattx_rpc_vfs_llseek(int node_id, int remote_fd, loff_t offset, int whence) {
+    int i, slot = -1;
+    u64 req_id;
+    struct mattx_vfs_lseek_req req;
+    loff_t ret_offset = -EIO;
+
+    if (!cluster_map[node_id]) return -ENOTCONN;
+
+    spin_lock(&vfs_rpc_lock);
+    for (i = 0; i < MAX_VFS_RPC; i++) {
+        if (!vfs_rpc_registry[i].in_use) {
+            slot = i;
+            vfs_rpc_registry[i].in_use = true;
+            req_id = next_req_id++;
+            vfs_rpc_registry[i].req_id = req_id;
+            vfs_rpc_registry[i].done = false;
+            init_waitqueue_head(&vfs_rpc_registry[i].wq);
+            break;
+        }
+    }
+    spin_unlock(&vfs_rpc_lock);
+
+    if (slot == -1) return -EBUSY;
+
+    req.req_id = req_id;
+    req.remote_fd = remote_fd;
+    req.offset = offset;
+    req.whence = whence;
+    mattx_comm_send(cluster_map[node_id], MATTX_MSG_VFS_LSEEK_REQ, &req, sizeof(req));
+
+    wait_event_interruptible(vfs_rpc_registry[slot].wq, vfs_rpc_registry[slot].done);
+
+    if (vfs_rpc_registry[slot].error == 0) {
+        ret_offset = vfs_rpc_registry[slot].ret_offset;
+    } else {
+        ret_offset = vfs_rpc_registry[slot].error;
+    }
+
+    spin_lock(&vfs_rpc_lock);
+    vfs_rpc_registry[slot].in_use = false;
+    spin_unlock(&vfs_rpc_lock);
+
+    return ret_offset;
+}
+EXPORT_SYMBOL(mattx_rpc_vfs_llseek);
+
+int mattx_rpc_vfs_fsync(int node_id, int remote_fd, loff_t start, loff_t end, int datasync) {
+    int i, slot = -1;
+    u64 req_id;
+    struct mattx_vfs_fsync_req req;
+    int err = -EIO;
+
+    if (!cluster_map[node_id]) return -ENOTCONN;
+
+    spin_lock(&vfs_rpc_lock);
+    for (i = 0; i < MAX_VFS_RPC; i++) {
+        if (!vfs_rpc_registry[i].in_use) {
+            slot = i;
+            vfs_rpc_registry[i].in_use = true;
+            req_id = next_req_id++;
+            vfs_rpc_registry[i].req_id = req_id;
+            vfs_rpc_registry[i].done = false;
+            init_waitqueue_head(&vfs_rpc_registry[i].wq);
+            break;
+        }
+    }
+    spin_unlock(&vfs_rpc_lock);
+
+    if (slot == -1) return -EBUSY;
+
+    req.req_id = req_id;
+    req.remote_fd = remote_fd;
+    req.start = start;
+    req.end = end;
+    req.datasync = datasync;
+    mattx_comm_send(cluster_map[node_id], MATTX_MSG_VFS_FSYNC_REQ, &req, sizeof(req));
+
+    wait_event_interruptible(vfs_rpc_registry[slot].wq, vfs_rpc_registry[slot].done);
+
+    err = vfs_rpc_registry[slot].error;
+
+    spin_lock(&vfs_rpc_lock);
+    vfs_rpc_registry[slot].in_use = false;
+    spin_unlock(&vfs_rpc_lock);
+
+    return err;
+}
+EXPORT_SYMBOL(mattx_rpc_vfs_fsync);
 
 void mattx_rpc_vfs_close(int node_id, int remote_fd) {
     struct mattx_vfs_close_req req;
@@ -2602,6 +2692,103 @@ static void handle_vfs_write_reply(struct mattx_link *link, struct mattx_header 
     }
 }
 
+static void handle_vfs_lseek_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    if (payload) {
+        struct mattx_vfs_lseek_req *req = payload;
+        struct mattx_vfs_lseek_reply reply;
+        struct file *f = NULL;
+
+        memset(&reply, 0, sizeof(reply));
+        reply.req_id = req->req_id;
+        reply.error = -EBADF;
+
+        spin_lock(&mfs_file_lock);
+        if (req->remote_fd < MAX_FDS && mfs_open_files[req->remote_fd]) {
+            f = mfs_open_files[req->remote_fd];
+            get_file(f);
+        }
+        spin_unlock(&mfs_file_lock);
+
+        if (f) {
+            loff_t res = vfs_llseek(f, req->offset, req->whence);
+            if (res < 0) {
+                reply.error = res;
+            } else {
+                reply.error = 0;
+                reply.offset = res;
+            }
+            fput(f);
+        }
+
+        if (cluster_map[hdr->sender_id]) {
+            mattx_comm_send(cluster_map[hdr->sender_id], MATTX_MSG_VFS_LSEEK_REPLY, &reply, sizeof(reply));
+        }
+    }
+}
+
+static void handle_vfs_lseek_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    if (payload) {
+        struct mattx_vfs_lseek_reply *reply = payload;
+        int i;
+        spin_lock(&vfs_rpc_lock);
+        for (i = 0; i < MAX_VFS_RPC; i++) {
+            if (vfs_rpc_registry[i].in_use && vfs_rpc_registry[i].req_id == reply->req_id) {
+                vfs_rpc_registry[i].error = reply->error;
+                vfs_rpc_registry[i].ret_offset = reply->offset;
+                vfs_rpc_registry[i].done = true;
+                wake_up_interruptible(&vfs_rpc_registry[i].wq);
+                break;
+            }
+        }
+        spin_unlock(&vfs_rpc_lock);
+    }
+}
+
+static void handle_vfs_fsync_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    if (payload) {
+        struct mattx_vfs_fsync_req *req = payload;
+        struct mattx_vfs_fsync_reply reply;
+        struct file *f = NULL;
+
+        memset(&reply, 0, sizeof(reply));
+        reply.req_id = req->req_id;
+        reply.error = -EBADF;
+
+        spin_lock(&mfs_file_lock);
+        if (req->remote_fd < MAX_FDS && mfs_open_files[req->remote_fd]) {
+            f = mfs_open_files[req->remote_fd];
+            get_file(f);
+        }
+        spin_unlock(&mfs_file_lock);
+
+        if (f) {
+            reply.error = vfs_fsync_range(f, req->start, req->end, req->datasync);
+            fput(f);
+        }
+
+        if (cluster_map[hdr->sender_id]) {
+            mattx_comm_send(cluster_map[hdr->sender_id], MATTX_MSG_VFS_FSYNC_REPLY, &reply, sizeof(reply));
+        }
+    }
+}
+
+static void handle_vfs_fsync_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    if (payload) {
+        struct mattx_vfs_fsync_reply *reply = payload;
+        int i;
+        spin_lock(&vfs_rpc_lock);
+        for (i = 0; i < MAX_VFS_RPC; i++) {
+            if (vfs_rpc_registry[i].in_use && vfs_rpc_registry[i].req_id == reply->req_id) {
+                vfs_rpc_registry[i].error = reply->error;
+                vfs_rpc_registry[i].done = true;
+                wake_up_interruptible(&vfs_rpc_registry[i].wq);
+                break;
+            }
+        }
+        spin_unlock(&vfs_rpc_lock);
+    }
+}
+
 static void handle_vfs_close_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
     if (payload) {
         struct mattx_vfs_close_req *req = payload;
@@ -2656,6 +2843,10 @@ void mattx_fileio_init_handlers(void) {
     mattx_register_handler(MATTX_MSG_VFS_WRITE_REQ, handle_vfs_write_req);
     mattx_register_handler(MATTX_MSG_VFS_WRITE_REPLY, handle_vfs_write_reply);
     mattx_register_handler(MATTX_MSG_VFS_CLOSE_REQ, handle_vfs_close_req);
+    mattx_register_handler(MATTX_MSG_VFS_LSEEK_REQ, handle_vfs_lseek_req);
+    mattx_register_handler(MATTX_MSG_VFS_LSEEK_REPLY, handle_vfs_lseek_reply);
+    mattx_register_handler(MATTX_MSG_VFS_FSYNC_REQ, handle_vfs_fsync_req);
+    mattx_register_handler(MATTX_MSG_VFS_FSYNC_REPLY, handle_vfs_fsync_reply);
 
     printk(KERN_INFO "MattX: [FILEIO] Network handlers registered.\n");
 }

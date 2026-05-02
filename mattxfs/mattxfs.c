@@ -119,6 +119,30 @@ static ssize_t mattxfs_remote_file_write(struct file *file, const char __user *b
     return bytes_written;
 }
 
+static loff_t mattxfs_remote_file_llseek(struct file *file, loff_t offset, int whence) {
+    struct mattxfs_file_info *fi = file->private_data;
+    loff_t res;
+
+    if (!fi) return -EIO;
+
+    res = mattx_rpc_vfs_llseek(fi->node_id, fi->remote_fd, offset, whence);
+    
+    // If the seek succeeded on the remote node, update our local VFS pointer!
+    if (res >= 0) {
+        file->f_pos = res;
+    }
+    
+    return res;
+}
+
+static int mattxfs_remote_file_fsync(struct file *file, loff_t start, loff_t end, int datasync) {
+    struct mattxfs_file_info *fi = file->private_data;
+
+    if (!fi) return -EIO;
+
+    return mattx_rpc_vfs_fsync(fi->node_id, fi->remote_fd, start, end, datasync);
+}
+
 static int mattxfs_remote_file_release(struct inode *inode, struct file *file) {
     struct mattxfs_file_info *fi = file->private_data;
     if (fi) {
@@ -134,7 +158,8 @@ static const struct file_operations mattxfs_remote_file_fops = {
     .read    = mattxfs_remote_file_read,
     .write   = mattxfs_remote_file_write,
     .release = mattxfs_remote_file_release,
-    .llseek  = generic_file_llseek,
+    .llseek  = mattxfs_remote_file_llseek,
+    .fsync   = mattxfs_remote_file_fsync,
 };
 
 // ============================================================================
