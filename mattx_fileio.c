@@ -2949,8 +2949,10 @@ void mattx_fileio_init_handlers(void) {
 
 
 // Cleanup all open files to prevent shutdown hangs! ---
+// -> Safe cleanup without sleeping inside spinlocks! ---
 void mattx_fileio_exit(void) {
     int i, j;
+    struct file *f;
 
     printk(KERN_INFO "MattX: [FILEIO] Purging all open files...\n");
 
@@ -2958,8 +2960,11 @@ void mattx_fileio_exit(void) {
     spin_lock(&mfs_file_lock);
     for (i = 0; i < MAX_FDS; i++) {
         if (mfs_open_files[i]) {
-            fput(mfs_open_files[i]);
+            f = mfs_open_files[i];
             mfs_open_files[i] = NULL;
+            spin_unlock(&mfs_file_lock);
+            fput(f); // Safe to sleep here!
+            spin_lock(&mfs_file_lock);
         }
     }
     spin_unlock(&mfs_file_lock);
@@ -2969,8 +2974,11 @@ void mattx_fileio_exit(void) {
     for (i = 0; i < export_count; i++) {
         for (j = 0; j < MAX_FDS; j++) {
             if (export_registry[i].remote_files[j]) {
-                fput(export_registry[i].remote_files[j]);
+                f = export_registry[i].remote_files[j];
                 export_registry[i].remote_files[j] = NULL;
+                spin_unlock(&export_lock);
+                fput(f); // Safe to sleep here!
+                spin_lock(&export_lock);
             }
         }
     }
