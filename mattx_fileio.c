@@ -1980,10 +1980,15 @@ struct vfs_rpc_ctx {
     bool done;
     int error;
     struct kstat stat;
-    bool in_use;
     struct mattx_dirent *dirents;
     u32 dirent_count;
     u64 new_offset;
+
+    int remote_fd;
+    ssize_t bytes_rw;
+    void *data_buf;
+
+    bool in_use;    
 };
 
 static struct vfs_rpc_ctx vfs_rpc_registry[MAX_VFS_RPC];
@@ -2151,6 +2156,156 @@ int mattx_rpc_vfs_readdir(int node_id, const char *path, u64 *offset, struct mat
 }
 EXPORT_SYMBOL(mattx_rpc_vfs_readdir);
 
+// --- API FOR MATTXFS.KO (OPEN, READ, WRITE, CLOSE) ---
+
+int mattx_rpc_vfs_open(int node_id, const char *path, int flags, int mode, int *remote_fd) {
+    int i, slot = -1;
+    u64 req_id;
+    struct mattx_vfs_open_req req;
+
+    if (node_id == my_node_id) {
+        // Local fast-path omitted for brevity in this prototype step.
+        // We will force it over the network to test the RPC bridge!
+    }
+
+    if (!cluster_map[node_id]) return -ENOTCONN;
+
+    spin_lock(&vfs_rpc_lock);
+    for (i = 0; i < MAX_VFS_RPC; i++) {
+        if (!vfs_rpc_registry[i].in_use) {
+            slot = i;
+            vfs_rpc_registry[i].in_use = true;
+            req_id = next_req_id++;
+            vfs_rpc_registry[i].req_id = req_id;
+            vfs_rpc_registry[i].done = false;
+            init_waitqueue_head(&vfs_rpc_registry[i].wq);
+            break;
+        }
+    }
+    spin_unlock(&vfs_rpc_lock);
+
+    if (slot == -1) return -EBUSY;
+
+    req.req_id = req_id;
+    req.flags = flags;
+    req.mode = mode;
+    strncpy(req.path, path, sizeof(req.path) - 1);
+    mattx_comm_send(cluster_map[node_id], MATTX_MSG_VFS_OPEN_REQ, &req, sizeof(req));
+
+    wait_event_interruptible(vfs_rpc_registry[slot].wq, vfs_rpc_registry[slot].done);
+
+    int err = vfs_rpc_registry[slot].error;
+    if (err == 0) *remote_fd = vfs_rpc_registry[slot].remote_fd;
+
+    spin_lock(&vfs_rpc_lock);
+    vfs_rpc_registry[slot].in_use = false;
+    spin_unlock(&vfs_rpc_lock);
+
+    return err;
+}
+EXPORT_SYMBOL(mattx_rpc_vfs_open);
+
+ssize_t mattx_rpc_vfs_read(int node_id, int remote_fd, void *buf, size_t count, loff_t *pos) {
+    int i, slot = -1;
+    u64 req_id;
+    struct mattx_vfs_read_req req;
+    ssize_t bytes_read = -EIO;
+
+    if (!cluster_map[node_id]) return -ENOTCONN;
+
+    spin_lock(&vfs_rpc_lock);
+    for (i = 0; i < MAX_VFS_RPC; i++) {
+        if (!vfs_rpc_registry[i].in_use) {
+            slot = i;
+            vfs_rpc_registry[i].in_use = true;
+            req_id = next_req_id++;
+            vfs_rpc_registry[i].req_id = req_id;
+            vfs_rpc_registry[i].done = false;
+            vfs_rpc_registry[i].data_buf = buf; // Point to the user's buffer!
+            init_waitqueue_head(&vfs_rpc_registry[i].wq);
+            break;
+        }
+    }
+    spin_unlock(&vfs_rpc_lock);
+
+    if (slot == -1) return -EBUSY;
+
+    req.req_id = req_id;
+    req.remote_fd = remote_fd;
+    req.count = count;
+    req.pos = *pos;
+    mattx_comm_send(cluster_map[node_id], MATTX_MSG_VFS_READ_REQ, &req, sizeof(req));
+
+    wait_event_interruptible(vfs_rpc_registry[slot].wq, vfs_rpc_registry[slot].done);
+
+    bytes_read = vfs_rpc_registry[slot].bytes_rw;
+    if (bytes_read > 0) *pos += bytes_read; // Advance the file position!
+
+    spin_lock(&vfs_rpc_lock);
+    vfs_rpc_registry[slot].in_use = false;
+    spin_unlock(&vfs_rpc_lock);
+
+    return bytes_read;
+}
+EXPORT_SYMBOL(mattx_rpc_vfs_read);
+
+ssize_t mattx_rpc_vfs_write(int node_id, int remote_fd, const void *buf, size_t count, loff_t *pos) {
+    int i, slot = -1;
+    u64 req_id;
+    size_t payload_size = sizeof(struct mattx_vfs_write_req) + count;
+    struct mattx_vfs_write_req *req = kmalloc(payload_size, GFP_KERNEL);
+    ssize_t bytes_written = -EIO;
+
+    if (!req) return -ENOMEM;
+    if (!cluster_map[node_id]) { kfree(req); return -ENOTCONN; }
+
+    spin_lock(&vfs_rpc_lock);
+    for (i = 0; i < MAX_VFS_RPC; i++) {
+        if (!vfs_rpc_registry[i].in_use) {
+            slot = i;
+            vfs_rpc_registry[i].in_use = true;
+            req_id = next_req_id++;
+            vfs_rpc_registry[i].req_id = req_id;
+            vfs_rpc_registry[i].done = false;
+            init_waitqueue_head(&vfs_rpc_registry[i].wq);
+            break;
+        }
+    }
+    spin_unlock(&vfs_rpc_lock);
+
+    if (slot == -1) { kfree(req); return -EBUSY; }
+
+    req->req_id = req_id;
+    req->remote_fd = remote_fd;
+    req->count = count;
+    req->pos = *pos;
+    memcpy(req->data, buf, count); // Copy the data to send
+
+    mattx_comm_send(cluster_map[node_id], MATTX_MSG_VFS_WRITE_REQ, req, payload_size);
+    kfree(req);
+
+    wait_event_interruptible(vfs_rpc_registry[slot].wq, vfs_rpc_registry[slot].done);
+
+    bytes_written = vfs_rpc_registry[slot].bytes_rw;
+    if (bytes_written > 0) *pos += bytes_written;
+
+    spin_lock(&vfs_rpc_lock);
+    vfs_rpc_registry[slot].in_use = false;
+    spin_unlock(&vfs_rpc_lock);
+
+    return bytes_written;
+}
+EXPORT_SYMBOL(mattx_rpc_vfs_write);
+
+void mattx_rpc_vfs_close(int node_id, int remote_fd) {
+    struct mattx_vfs_close_req req;
+    if (cluster_map[node_id]) {
+        req.remote_fd = remote_fd;
+        mattx_comm_send(cluster_map[node_id], MATTX_MSG_VFS_CLOSE_REQ, &req, sizeof(req));
+    }
+}
+EXPORT_SYMBOL(mattx_rpc_vfs_close);
+
 
 // --- NETWORK HANDLERS ---
 
@@ -2277,6 +2432,183 @@ static void handle_vfs_readdir_reply(struct mattx_link *link, struct mattx_heade
     }
 }
 
+// --- VFS NETWORK HANDLERS ---
+
+static void handle_vfs_open_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    if (payload) {
+        struct mattx_vfs_open_req *req = payload;
+        struct mattx_vfs_open_reply reply;
+        struct file *f;
+        int i, fd_slot = -1;
+
+        memset(&reply, 0, sizeof(reply));
+        reply.req_id = req->req_id;
+
+        f = filp_open(req->path, req->flags, req->mode);
+        if (!IS_ERR(f)) {
+            spin_lock(&mfs_file_lock);
+            for (i = 0; i < MAX_FDS; i++) {
+                if (mfs_open_files[i] == NULL) {
+                    mfs_open_files[i] = f;
+                    fd_slot = i;
+                    break;
+                }
+            }
+            spin_unlock(&mfs_file_lock);
+
+            if (fd_slot != -1) {
+                reply.remote_fd = fd_slot;
+                reply.error = 0;
+            } else {
+                fput(f);
+                reply.error = -ENFILE;
+            }
+        } else {
+            reply.error = PTR_ERR(f);
+        }
+
+        if (cluster_map[hdr->sender_id]) {
+            mattx_comm_send(cluster_map[hdr->sender_id], MATTX_MSG_VFS_OPEN_REPLY, &reply, sizeof(reply));
+        }
+    }
+}
+
+static void handle_vfs_open_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    if (payload) {
+        struct mattx_vfs_open_reply *reply = payload;
+        int i;
+        spin_lock(&vfs_rpc_lock);
+        for (i = 0; i < MAX_VFS_RPC; i++) {
+            if (vfs_rpc_registry[i].in_use && vfs_rpc_registry[i].req_id == reply->req_id) {
+                vfs_rpc_registry[i].error = reply->error;
+                vfs_rpc_registry[i].remote_fd = reply->remote_fd;
+                vfs_rpc_registry[i].done = true;
+                wake_up_interruptible(&vfs_rpc_registry[i].wq);
+                break;
+            }
+        }
+        spin_unlock(&vfs_rpc_lock);
+    }
+}
+
+static void handle_vfs_read_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    if (payload) {
+        struct mattx_vfs_read_req *req = payload;
+        struct file *f = NULL;
+        
+        spin_lock(&mfs_file_lock);
+        if (req->remote_fd < MAX_FDS && mfs_open_files[req->remote_fd]) {
+            f = mfs_open_files[req->remote_fd];
+            get_file(f);
+        }
+        spin_unlock(&mfs_file_lock);
+
+        if (f) {
+            void *read_buf = kmalloc(req->count, GFP_KERNEL);
+            if (read_buf) {
+                loff_t pos = req->pos;
+                ssize_t ret = kernel_read(f, read_buf, req->count, &pos);
+                
+                size_t reply_size = sizeof(struct mattx_vfs_read_reply) + (ret > 0 ? ret : 0);
+                struct mattx_vfs_read_reply *reply = kmalloc(reply_size, GFP_KERNEL);
+                if (reply) {
+                    reply->req_id = req->req_id;
+                    reply->bytes_read = ret;
+                    reply->error = (ret < 0) ? ret : 0;
+                    if (ret > 0) memcpy(reply->data, read_buf, ret);
+                    
+                    if (cluster_map[hdr->sender_id]) {
+                        mattx_comm_send(cluster_map[hdr->sender_id], MATTX_MSG_VFS_READ_REPLY, reply, reply_size);
+                    }
+                    kfree(reply);
+                }
+                kfree(read_buf);
+            }
+            fput(f);
+        }
+    }
+}
+
+static void handle_vfs_read_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    if (payload) {
+        struct mattx_vfs_read_reply *reply = payload;
+        int i;
+        spin_lock(&vfs_rpc_lock);
+        for (i = 0; i < MAX_VFS_RPC; i++) {
+            if (vfs_rpc_registry[i].in_use && vfs_rpc_registry[i].req_id == reply->req_id) {
+                vfs_rpc_registry[i].bytes_rw = reply->bytes_read;
+                if (reply->bytes_read > 0 && vfs_rpc_registry[i].data_buf) {
+                    memcpy(vfs_rpc_registry[i].data_buf, reply->data, reply->bytes_read);
+                }
+                vfs_rpc_registry[i].done = true;
+                wake_up_interruptible(&vfs_rpc_registry[i].wq);
+                break;
+            }
+        }
+        spin_unlock(&vfs_rpc_lock);
+    }
+}
+
+static void handle_vfs_write_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    if (payload) {
+        struct mattx_vfs_write_req *req = payload;
+        struct mattx_vfs_write_reply reply;
+        struct file *f = NULL;
+        
+        memset(&reply, 0, sizeof(reply));
+        reply.req_id = req->req_id;
+        reply.bytes_written = -EBADF;
+
+        spin_lock(&mfs_file_lock);
+        if (req->remote_fd < MAX_FDS && mfs_open_files[req->remote_fd]) {
+            f = mfs_open_files[req->remote_fd];
+            get_file(f);
+        }
+        spin_unlock(&mfs_file_lock);
+
+        if (f) {
+            loff_t pos = req->pos;
+            reply.bytes_written = kernel_write(f, req->data, req->count, &pos);
+            reply.error = (reply.bytes_written < 0) ? reply.bytes_written : 0;
+            fput(f);
+        }
+
+        if (cluster_map[hdr->sender_id]) {
+            mattx_comm_send(cluster_map[hdr->sender_id], MATTX_MSG_VFS_WRITE_REPLY, &reply, sizeof(reply));
+        }
+    }
+}
+
+static void handle_vfs_write_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    if (payload) {
+        struct mattx_vfs_write_reply *reply = payload;
+        int i;
+        spin_lock(&vfs_rpc_lock);
+        for (i = 0; i < MAX_VFS_RPC; i++) {
+            if (vfs_rpc_registry[i].in_use && vfs_rpc_registry[i].req_id == reply->req_id) {
+                vfs_rpc_registry[i].bytes_rw = reply->bytes_written;
+                vfs_rpc_registry[i].error = reply->error;
+                vfs_rpc_registry[i].done = true;
+                wake_up_interruptible(&vfs_rpc_registry[i].wq);
+                break;
+            }
+        }
+        spin_unlock(&vfs_rpc_lock);
+    }
+}
+
+static void handle_vfs_close_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    if (payload) {
+        struct mattx_vfs_close_req *req = payload;
+        spin_lock(&mfs_file_lock);
+        if (req->remote_fd < MAX_FDS && mfs_open_files[req->remote_fd]) {
+            fput(mfs_open_files[req->remote_fd]);
+            mfs_open_files[req->remote_fd] = NULL;
+        }
+        spin_unlock(&mfs_file_lock);
+    }
+}
+
 void mattx_fileio_init_handlers(void) {
     mattx_register_handler(MATTX_MSG_SYSCALL_FWD, handle_syscall_fwd);
     mattx_register_handler(MATTX_MSG_SYS_OPEN_REQ, handle_sys_open_req);
@@ -2312,6 +2644,13 @@ void mattx_fileio_init_handlers(void) {
     mattx_register_handler(MATTX_MSG_VFS_GETATTR_REPLY, handle_vfs_getattr_reply);
     mattx_register_handler(MATTX_MSG_VFS_READDIR_REQ, handle_vfs_readdir_req);
     mattx_register_handler(MATTX_MSG_VFS_READDIR_REPLY, handle_vfs_readdir_reply);
+    mattx_register_handler(MATTX_MSG_VFS_OPEN_REQ, handle_vfs_open_req);
+    mattx_register_handler(MATTX_MSG_VFS_OPEN_REPLY, handle_vfs_open_reply);
+    mattx_register_handler(MATTX_MSG_VFS_READ_REQ, handle_vfs_read_req);
+    mattx_register_handler(MATTX_MSG_VFS_READ_REPLY, handle_vfs_read_reply);
+    mattx_register_handler(MATTX_MSG_VFS_WRITE_REQ, handle_vfs_write_req);
+    mattx_register_handler(MATTX_MSG_VFS_WRITE_REPLY, handle_vfs_write_reply);
+    mattx_register_handler(MATTX_MSG_VFS_CLOSE_REQ, handle_vfs_close_req);
 
     printk(KERN_INFO "MattX: [FILEIO] Network handlers registered.\n");
 }

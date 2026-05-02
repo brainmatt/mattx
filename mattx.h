@@ -94,6 +94,13 @@ enum mattx_msg_type {
     MATTX_MSG_VFS_GETATTR_REPLY,
     MATTX_MSG_VFS_READDIR_REQ,
     MATTX_MSG_VFS_READDIR_REPLY,
+    MATTX_MSG_VFS_OPEN_REQ,
+    MATTX_MSG_VFS_OPEN_REPLY,
+    MATTX_MSG_VFS_READ_REQ,
+    MATTX_MSG_VFS_READ_REPLY,
+    MATTX_MSG_VFS_WRITE_REQ,
+    MATTX_MSG_VFS_WRITE_REPLY,
+    MATTX_MSG_VFS_CLOSE_REQ,
 };
 
 struct mattx_header {
@@ -493,6 +500,51 @@ struct mattx_vfs_readdir_reply {
     struct mattx_dirent entries[20]; // block of 20 dir entries
 };
 
+struct mattx_vfs_open_req {
+    u64 req_id;
+    int flags;
+    int mode;
+    char path[256];
+};
+
+struct mattx_vfs_open_reply {
+    u64 req_id;
+    int remote_fd;
+    int error;
+};
+
+struct mattx_vfs_read_req {
+    u64 req_id;
+    int remote_fd;
+    size_t count;
+    loff_t pos;
+};
+
+struct mattx_vfs_read_reply {
+    u64 req_id;
+    ssize_t bytes_read;
+    int error;
+    char data[]; 
+};
+
+struct mattx_vfs_write_req {
+    u64 req_id;
+    int remote_fd;
+    size_t count;
+    loff_t pos;
+    char data[]; 
+};
+
+struct mattx_vfs_write_reply {
+    u64 req_id;
+    ssize_t bytes_written;
+    int error;
+};
+
+struct mattx_vfs_close_req {
+    int remote_fd;
+};
+
 // This defines the standard signature for all message handlers
 typedef void (*mattx_msg_handler_fn)(struct mattx_link *link, struct mattx_header *hdr, void *payload);
 
@@ -561,6 +613,10 @@ extern const struct inode_operations mattx_iops;
 int mattx_get_active_nodes(int *node_array, int max_nodes);
 int mattx_rpc_vfs_getattr(int node_id, const char *path, struct kstat *stat_out);
 int mattx_rpc_vfs_readdir(int node_id, const char *path, u64 *offset, struct mattx_dirent *entries, u32 *out_count);
+int mattx_rpc_vfs_open(int node_id, const char *path, int flags, int mode, int *remote_fd);
+ssize_t mattx_rpc_vfs_read(int node_id, int remote_fd, void *buf, size_t count, loff_t *pos);
+ssize_t mattx_rpc_vfs_write(int node_id, int remote_fd, const void *buf, size_t count, loff_t *pos);
+void mattx_rpc_vfs_close(int node_id, int remote_fd);
 
 #endif // MATTX_H
 

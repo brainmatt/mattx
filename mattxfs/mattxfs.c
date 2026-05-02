@@ -13,7 +13,7 @@ MODULE_DESCRIPTION("MattX SSI Filesystem (MFS) - Phase 20");
 static const struct inode_operations mattxfs_remote_iops;
 static const struct file_operations mattxfs_remote_dir_fops;
 
-// --- Path Building Magic ---
+// 1: Path Building Magic ---
 static int get_node_id_from_dentry(struct dentry *dentry) {
     struct dentry *parent = dentry;
     int node_id = -1;
@@ -46,8 +46,99 @@ static void get_remote_path_from_dentry(struct dentry *dentry, char *buf, int bu
     memmove(buf, p, buf + buflen - p);
 }
 
+
+// 2: The Remote File Operations (Read/Write/Close) ---
+struct mattxfs_file_info {
+    int node_id;
+    int remote_fd;
+};
+
+static int mattxfs_remote_file_open(struct inode *inode, struct file *file) {
+    struct dentry *dentry = file->f_path.dentry;
+    char path_buf[256];
+    int node_id = get_node_id_from_dentry(dentry);
+    int remote_fd = -1;
+    int err;
+
+    get_remote_path_from_dentry(dentry, path_buf, sizeof(path_buf));
+
+    err = mattx_rpc_vfs_open(node_id, path_buf, file->f_flags, inode->i_mode, &remote_fd);
+    if (err == 0) {
+        struct mattxfs_file_info *fi = kzalloc(sizeof(*fi), GFP_KERNEL);
+        if (!fi) {
+            mattx_rpc_vfs_close(node_id, remote_fd);
+            return -ENOMEM;
+        }
+        fi->node_id = node_id;
+        fi->remote_fd = remote_fd;
+        file->private_data = fi;
+    }
+    return err;
+}
+
+static ssize_t mattxfs_remote_file_read(struct file *file, char __user *buf, size_t count, loff_t *pos) {
+    struct mattxfs_file_info *fi = file->private_data;
+    void *kbuf;
+    ssize_t bytes_read;
+
+    if (!fi) return -EIO;
+
+    kbuf = kvmalloc(count, GFP_KERNEL);
+    if (!kbuf) return -ENOMEM;
+
+    bytes_read = mattx_rpc_vfs_read(fi->node_id, fi->remote_fd, kbuf, count, pos);
+    
+    if (bytes_read > 0) {
+        if (copy_to_user(buf, kbuf, bytes_read)) {
+            bytes_read = -EFAULT;
+        }
+    }
+    
+    kvfree(kbuf);
+    return bytes_read;
+}
+
+static ssize_t mattxfs_remote_file_write(struct file *file, const char __user *buf, size_t count, loff_t *pos) {
+    struct mattxfs_file_info *fi = file->private_data;
+    void *kbuf;
+    ssize_t bytes_written;
+
+    if (!fi) return -EIO;
+
+    kbuf = kvmalloc(count, GFP_KERNEL);
+    if (!kbuf) return -ENOMEM;
+
+    if (copy_from_user(kbuf, buf, count)) {
+        kvfree(kbuf);
+        return -EFAULT;
+    }
+
+    bytes_written = mattx_rpc_vfs_write(fi->node_id, fi->remote_fd, kbuf, count, pos);
+    
+    kvfree(kbuf);
+    return bytes_written;
+}
+
+static int mattxfs_remote_file_release(struct inode *inode, struct file *file) {
+    struct mattxfs_file_info *fi = file->private_data;
+    if (fi) {
+        mattx_rpc_vfs_close(fi->node_id, fi->remote_fd);
+        kfree(fi);
+    }
+    return 0;
+}
+
+// Wire them up!
+static const struct file_operations mattxfs_remote_file_fops = {
+    .open    = mattxfs_remote_file_open,
+    .read    = mattxfs_remote_file_read,
+    .write   = mattxfs_remote_file_write,
+    .release = mattx_remote_file_release,
+    .llseek  = generic_file_llseek,
+};
+
 // ============================================================================
-// LEVEL 2: THE REMOTE OPERATIONS (Browsing inside a Node)
+// LEVEL 3: THE REMOTE OPERATIONS (Browsing inside a Node)
 // ============================================================================
 
 static int mattxfs_remote_iterate(struct file *file, struct dir_context *ctx) {
@@ -121,6 +212,8 @@ static struct dentry *mattxfs_remote_lookup(struct inode *dir, struct dentry *de
         inode->i_fop = &mattxfs_remote_dir_fops; 
         set_nlink(inode, 2);
     } else {
+        // Give regular files the ability to be read and written! ---
+        inode->i_fop = &mattxfs_remote_file_fops;
         set_nlink(inode, 1);
     }
 
