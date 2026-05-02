@@ -344,7 +344,7 @@ static const struct inode_operations mattxfs_root_iops = {
 
 static const struct super_operations mattxfs_s_ops = {
     .statfs         = simple_statfs,
-    .drop_inode     = always_delete_inode, // Force VFS to delete inodes on unmount!
+    .drop_inode     = generic_delete_inode,
 };
 
 static int mattxfs_fill_super(struct super_block *sb, void *data, int silent) {
