@@ -636,6 +636,7 @@ void mattx_import_init_handlers(void);
 void mattx_migr_init_handlers(void);
 void mattx_guest_init_handlers(void);
 void mattx_fileio_init_handlers(void);
+void mattx_fileio_exit(void); // The Cleanup function!
 
 extern const struct file_operations mattx_fops; 
 extern const struct inode_operations mattx_iops;

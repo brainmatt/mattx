@@ -2947,3 +2947,35 @@ void mattx_fileio_init_handlers(void) {
     printk(KERN_INFO "MattX: [FILEIO] Network handlers registered.\n");
 }
 
+
+// Cleanup all open files to prevent shutdown hangs! ---
+void mattx_fileio_exit(void) {
+    int i, j;
+
+    printk(KERN_INFO "MattX: [FILEIO] Purging all open files...\n");
+
+    // 1. Clean up MFS open files
+    spin_lock(&mfs_file_lock);
+    for (i = 0; i < MAX_FDS; i++) {
+        if (mfs_open_files[i]) {
+            fput(mfs_open_files[i]);
+            mfs_open_files[i] = NULL;
+        }
+    }
+    spin_unlock(&mfs_file_lock);
+
+    // 2. Clean up Export Registry files
+    spin_lock(&export_lock);
+    for (i = 0; i < export_count; i++) {
+        for (j = 0; j < MAX_FDS; j++) {
+            if (export_registry[i].remote_files[j]) {
+                fput(export_registry[i].remote_files[j]);
+                export_registry[i].remote_files[j] = NULL;
+            }
+        }
+    }
+    export_count = 0;
+    spin_unlock(&export_lock);
+    
+    printk(KERN_INFO "MattX: [FILEIO] File purge complete.\n");
+}

@@ -215,8 +215,8 @@ static void __exit mattx_exit(void) {
     if (listener_thread) kthread_stop(listener_thread);
     
     mattx_proc_exit();
-    
     mattx_hooks_exit();
+    mattx_fileio_exit();
     
     for (i = 0; i < MAX_NODES; i++) mattx_comm_disconnect(i);
     if (pending_migration) kvfree(pending_migration);
