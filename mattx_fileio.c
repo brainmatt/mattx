@@ -19,9 +19,14 @@ static bool check_rpc_done(pid_t pid) {
     return done;
 }
 
+// Global File Table for MattXFS ---
+// This holds the real files opened on behalf of remote MattXFS clients
+static struct file *mfs_open_files[MAX_FDS];
+static DEFINE_SPINLOCK(mfs_file_lock);
+
 #include <linux/version.h>
 
-// --- NEW: The Fake File Getattr Operation (Runs on Node 2) ---
+// The Fake File Getattr Operation (Runs on Node 2) ---
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
 static int mattx_fake_getattr(struct mnt_idmap *idmap, const struct path *path, struct kstat *stat, u32 request_mask, unsigned int query_flags) {
 #else

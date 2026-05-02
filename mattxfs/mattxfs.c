@@ -133,7 +133,7 @@ static const struct file_operations mattxfs_remote_file_fops = {
     .open    = mattxfs_remote_file_open,
     .read    = mattxfs_remote_file_read,
     .write   = mattxfs_remote_file_write,
-    .release = mattx_remote_file_release,
+    .release = mattxfs_remote_file_release,
     .llseek  = generic_file_llseek,
 };
 
