@@ -2162,16 +2162,35 @@ int mattx_rpc_vfs_readdir(int node_id, const char *path, u64 *offset, struct mat
 }
 EXPORT_SYMBOL(mattx_rpc_vfs_readdir);
 
-// --- API FOR MATTXFS.KO (OPEN, READ, WRITE, LSEEK, FSYNC, CLOSE) ---
+
+// --- API FOR MATTXFS.KO (OPEN, READ, WRITE, CLOSE, LSEEK, FSYNC) ---
 
 int mattx_rpc_vfs_open(int node_id, const char *path, int flags, int mode, int *remote_fd) {
     int i, slot = -1;
     u64 req_id;
     struct mattx_vfs_open_req req;
 
+    // --- NEW: The Local Fast-Path! ---
     if (node_id == my_node_id) {
-        // Local fast-path omitted for brevity in this prototype step.
-        // We will force it over the network to test the RPC bridge!
+        struct file *f = filp_open(path, flags, mode);
+        if (IS_ERR(f)) return PTR_ERR(f);
+        
+        spin_lock(&mfs_file_lock);
+        for (i = 0; i < MAX_FDS; i++) {
+            if (mfs_open_files[i] == NULL) {
+                mfs_open_files[i] = f;
+                *remote_fd = i;
+                slot = i;
+                break;
+            }
+        }
+        spin_unlock(&mfs_file_lock);
+        
+        if (slot == -1) {
+            fput(f);
+            return -ENFILE;
+        }
+        return 0;
     }
 
     if (!cluster_map[node_id]) return -ENOTCONN;
@@ -2217,6 +2236,22 @@ ssize_t mattx_rpc_vfs_read(int node_id, int remote_fd, void *buf, size_t count, 
     struct mattx_vfs_read_req req;
     ssize_t bytes_read = -EIO;
 
+    // --- NEW: The Local Fast-Path! ---
+    if (node_id == my_node_id) {
+        struct file *f = NULL;
+        spin_lock(&mfs_file_lock);
+        if (remote_fd < MAX_FDS && mfs_open_files[remote_fd]) {
+            f = mfs_open_files[remote_fd];
+            get_file(f);
+        }
+        spin_unlock(&mfs_file_lock);
+        
+        if (!f) return -EBADF;
+        bytes_read = kernel_read(f, buf, count, pos);
+        fput(f);
+        return bytes_read;
+    }
+
     if (!cluster_map[node_id]) return -ENOTCONN;
 
     spin_lock(&vfs_rpc_lock);
@@ -2227,7 +2262,7 @@ ssize_t mattx_rpc_vfs_read(int node_id, int remote_fd, void *buf, size_t count, 
             req_id = next_req_id++;
             vfs_rpc_registry[i].req_id = req_id;
             vfs_rpc_registry[i].done = false;
-            vfs_rpc_registry[i].data_buf = buf; // Point to the user's buffer!
+            vfs_rpc_registry[i].data_buf = buf; 
             init_waitqueue_head(&vfs_rpc_registry[i].wq);
             break;
         }
@@ -2245,7 +2280,7 @@ ssize_t mattx_rpc_vfs_read(int node_id, int remote_fd, void *buf, size_t count, 
     wait_event_interruptible(vfs_rpc_registry[slot].wq, vfs_rpc_registry[slot].done);
 
     bytes_read = vfs_rpc_registry[slot].bytes_rw;
-    if (bytes_read > 0) *pos += bytes_read; // Advance the file position!
+    if (bytes_read > 0) *pos += bytes_read; 
 
     spin_lock(&vfs_rpc_lock);
     vfs_rpc_registry[slot].in_use = false;
@@ -2263,6 +2298,24 @@ ssize_t mattx_rpc_vfs_write(int node_id, int remote_fd, const void *buf, size_t 
     ssize_t bytes_written = -EIO;
 
     if (!req) return -ENOMEM;
+
+    // --- NEW: The Local Fast-Path! ---
+    if (node_id == my_node_id) {
+        struct file *f = NULL;
+        spin_lock(&mfs_file_lock);
+        if (remote_fd < MAX_FDS && mfs_open_files[remote_fd]) {
+            f = mfs_open_files[remote_fd];
+            get_file(f);
+        }
+        spin_unlock(&mfs_file_lock);
+        
+        if (!f) { kfree(req); return -EBADF; }
+        bytes_written = kernel_write(f, buf, count, pos);
+        fput(f);
+        kfree(req);
+        return bytes_written;
+    }
+
     if (!cluster_map[node_id]) { kfree(req); return -ENOTCONN; }
 
     spin_lock(&vfs_rpc_lock);
@@ -2285,7 +2338,7 @@ ssize_t mattx_rpc_vfs_write(int node_id, int remote_fd, const void *buf, size_t 
     req->remote_fd = remote_fd;
     req->count = count;
     req->pos = *pos;
-    memcpy(req->data, buf, count); // Copy the data to send
+    memcpy(req->data, buf, count); 
 
     mattx_comm_send(cluster_map[node_id], MATTX_MSG_VFS_WRITE_REQ, req, payload_size);
     kfree(req);
@@ -2308,6 +2361,22 @@ loff_t mattx_rpc_vfs_llseek(int node_id, int remote_fd, loff_t offset, int whenc
     u64 req_id;
     struct mattx_vfs_lseek_req req;
     loff_t ret_offset = -EIO;
+
+    // --- NEW: The Local Fast-Path! ---
+    if (node_id == my_node_id) {
+        struct file *f = NULL;
+        spin_lock(&mfs_file_lock);
+        if (remote_fd < MAX_FDS && mfs_open_files[remote_fd]) {
+            f = mfs_open_files[remote_fd];
+            get_file(f);
+        }
+        spin_unlock(&mfs_file_lock);
+        
+        if (!f) return -EBADF;
+        ret_offset = vfs_llseek(f, offset, whence);
+        fput(f);
+        return ret_offset;
+    }
 
     if (!cluster_map[node_id]) return -ENOTCONN;
 
@@ -2355,6 +2424,22 @@ int mattx_rpc_vfs_fsync(int node_id, int remote_fd, loff_t start, loff_t end, in
     struct mattx_vfs_fsync_req req;
     int err = -EIO;
 
+    // --- NEW: The Local Fast-Path! ---
+    if (node_id == my_node_id) {
+        struct file *f = NULL;
+        spin_lock(&mfs_file_lock);
+        if (remote_fd < MAX_FDS && mfs_open_files[remote_fd]) {
+            f = mfs_open_files[remote_fd];
+            get_file(f);
+        }
+        spin_unlock(&mfs_file_lock);
+        
+        if (!f) return -EBADF;
+        err = vfs_fsync_range(f, start, end, datasync);
+        fput(f);
+        return err;
+    }
+
     if (!cluster_map[node_id]) return -ENOTCONN;
 
     spin_lock(&vfs_rpc_lock);
@@ -2393,6 +2478,17 @@ int mattx_rpc_vfs_fsync(int node_id, int remote_fd, loff_t start, loff_t end, in
 EXPORT_SYMBOL(mattx_rpc_vfs_fsync);
 
 void mattx_rpc_vfs_close(int node_id, int remote_fd) {
+    // --- NEW: The Local Fast-Path! ---
+    if (node_id == my_node_id) {
+        spin_lock(&mfs_file_lock);
+        if (remote_fd < MAX_FDS && mfs_open_files[remote_fd]) {
+            fput(mfs_open_files[remote_fd]);
+            mfs_open_files[remote_fd] = NULL;
+        }
+        spin_unlock(&mfs_file_lock);
+        return;
+    }
+
     struct mattx_vfs_close_req req;
     if (cluster_map[node_id]) {
         req.remote_fd = remote_fd;

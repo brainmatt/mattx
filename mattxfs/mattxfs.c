@@ -218,7 +218,9 @@ static struct dentry *mattxfs_remote_lookup(struct inode *dir, struct dentry *de
     err = mattx_rpc_vfs_getattr(node_id, path_buf, &stat);
     
     if (err) {
-        return NULL; // File doesn't exist on the remote node
+        // Create a Negative Dentry! ---
+        d_add(dentry, NULL);
+        return NULL; 
     }
 
     inode = new_inode(dir->i_sb);
@@ -302,8 +304,11 @@ static struct dentry *mattxfs_root_lookup(struct inode *dir, struct dentry *dent
         }
     }
 
-    if (!found)
+    if (!found) {
+        // Create a Negative Dentry so the VFS doesn't leak memory! ---
+        d_add(dentry, NULL);
         return NULL; 
+    }
 
     inode = new_inode(dir->i_sb);
     if (!inode)
