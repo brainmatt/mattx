@@ -53,7 +53,7 @@ static void get_remote_path_from_dentry(struct dentry *dentry, char *buf, int bu
 static int mattxfs_remote_iterate(struct file *file, struct dir_context *ctx) {
     struct dentry *dentry = file->f_path.dentry;
     char path_buf[256];
-    struct mattx_dirent entries[40];
+    struct mattx_dirent *entries; // Pointer instead of array
     u32 count = 0;
     int node_id;
     int err;
@@ -62,22 +62,29 @@ static int mattxfs_remote_iterate(struct file *file, struct dir_context *ctx) {
     node_id = get_node_id_from_dentry(dentry);
     get_remote_path_from_dentry(dentry, path_buf, sizeof(path_buf));
 
-    // Ask mattx.ko to fetch the directory contents!
+    // Allocate on the Heap to save the stack!
+    entries = kvmalloc_array(20, sizeof(struct mattx_dirent), GFP_KERNEL);
+    if (!entries) return -ENOMEM;
+
     u64 offset = ctx->pos;
     err = mattx_rpc_vfs_readdir(node_id, path_buf, &offset, entries, &count);
+    
+    if (err) {
+        kvfree(entries);
+        return err;
+    }
 
-    printk(KERN_INFO "MattX:[ITERATE] err %d count %d bytes.\n", err, count);
-
-    if (err) return err;
-
-    // Emit the files to the user's terminal!
     for (i = 0; i < count; i++) {
+        // Tell 'ls' the exact offset of the file we are emitting!
+        ctx->pos = entries[i].offset;
         if (!dir_emit(ctx, entries[i].name, strlen(entries[i].name), entries[i].ino, entries[i].type)) {
-            break; // Terminal buffer is full
+            kvfree(entries);
+            return 0; // Terminal buffer is full, stop here. ctx->pos is correct!
         }
     }
     
-    ctx->pos = offset; 
+    ctx->pos = offset; // Update to the final offset for the next batch
+    kvfree(entries);
     return 0;
 }
 

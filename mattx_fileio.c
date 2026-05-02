@@ -1997,23 +1997,25 @@ struct mattx_readdir_ctx {
 };
 
 // The kernel calls this for every file it finds on the hard drive!
+// 1. Update the filldir actor to save the offset:
 static bool mattx_filldir(struct dir_context *ctx, const char *name, int namlen, loff_t offset, u64 ino, unsigned int d_type) {
     struct mattx_readdir_ctx *mctx = container_of(ctx, struct mattx_readdir_ctx, ctx);
     struct mattx_vfs_readdir_reply *reply = mctx->reply;
 
-    if (reply->entry_count >= 40) return false; // Buffer is full, stop reading!
+    if (reply->entry_count >= 20) return false; 
 
-    if (namlen > 63) namlen = 63; // Truncate long names for the prototype
+    if (namlen > 63) namlen = 63; 
     
     reply->entries[reply->entry_count].ino = ino;
+    reply->entries[reply->entry_count].offset = offset; // FIXED: Save the offset!
     reply->entries[reply->entry_count].type = d_type;
     memcpy(reply->entries[reply->entry_count].name, name, namlen);
     reply->entries[reply->entry_count].name[namlen] = '\0';
     
     reply->entry_count++;
-    reply->new_offset = offset; // Remember where we stopped
     return true;
 }
+
 
 // --- API FOR MATTXFS.KO ---
 int mattx_rpc_vfs_getattr(int node_id, const char *path, struct kstat *stat_out) {
@@ -2086,21 +2088,25 @@ int mattx_rpc_vfs_readdir(int node_id, const char *path, u64 *offset, struct mat
         struct file *f = filp_open(path, O_RDONLY | O_DIRECTORY, 0);
         if (IS_ERR(f)) return PTR_ERR(f);
         
-        struct mattx_vfs_readdir_reply local_reply;
-        memset(&local_reply, 0, sizeof(local_reply));
+        // Allocate on the Heap!
+        struct mattx_vfs_readdir_reply *local_reply = kzalloc(sizeof(*local_reply), GFP_KERNEL);
+        if (!local_reply) { fput(f); return -ENOMEM; }
+        
+        f->f_pos = *offset; // Fast-forward the kernel's file pointer!
         
         struct mattx_readdir_ctx mctx = {
             .ctx.actor = mattx_filldir,
-            .ctx.pos = *offset,
-            .reply = &local_reply,
+            .ctx.pos = f->f_pos,
+            .reply = local_reply,
         };
         
         iterate_dir(f, &mctx.ctx);
         
-        *offset = mctx.ctx.pos;
-        *out_count = local_reply.entry_count;
-        memcpy(entries, local_reply.entries, local_reply.entry_count * sizeof(struct mattx_dirent));
+        *offset = mctx.ctx.pos; 
+        *out_count = local_reply->entry_count;
+        memcpy(entries, local_reply->entries, local_reply->entry_count * sizeof(struct mattx_dirent));
         
+        kfree(local_reply);
         fput(f);
         return 0;
     }
@@ -2214,31 +2220,35 @@ static void handle_vfs_getattr_reply(struct mattx_link *link, struct mattx_heade
 static void handle_vfs_readdir_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
     if (payload) {
         struct mattx_vfs_readdir_req *req = payload;
-        struct mattx_vfs_readdir_reply reply;
+        // FIXED: Allocate on the Heap!
+        struct mattx_vfs_readdir_reply *reply = kzalloc(sizeof(*reply), GFP_KERNEL);
         struct file *f;
 
-        memset(&reply, 0, sizeof(reply));
-        reply.req_id = req->req_id;
+        if (!reply) return;
+        reply->req_id = req->req_id;
 
         f = filp_open(req->path, O_RDONLY | O_DIRECTORY, 0);
         if (!IS_ERR(f)) {
+            f->f_pos = req->offset; // FIXED: Fast-forward the kernel's file pointer!
+            
             struct mattx_readdir_ctx mctx = {
                 .ctx.actor = mattx_filldir,
-                .ctx.pos = req->offset,
-                .reply = &reply,
+                .ctx.pos = f->f_pos,
+                .reply = reply,
             };
             
             iterate_dir(f, &mctx.ctx);
-            reply.new_offset = mctx.ctx.pos;
+            reply->new_offset = mctx.ctx.pos;
             fput(f);
-            reply.error = 0;
+            reply->error = 0;
         } else {
-            reply.error = PTR_ERR(f);
+            reply->error = PTR_ERR(f);
         }
 
         if (cluster_map[hdr->sender_id]) {
-            mattx_comm_send(cluster_map[hdr->sender_id], MATTX_MSG_VFS_READDIR_REPLY, &reply, sizeof(reply));
+            mattx_comm_send(cluster_map[hdr->sender_id], MATTX_MSG_VFS_READDIR_REPLY, reply, sizeof(*reply));
         }
+        kfree(reply);
     }
 }
 

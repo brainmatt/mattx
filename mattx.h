@@ -474,8 +474,9 @@ struct mattx_vfs_getattr_reply {
 
 struct mattx_dirent {
     u64 ino;
+    u64 offset; // Track the offset of each specific file!
     u8 type;
-    char name[64]; // Max 63 chars + null terminator for our prototype
+    char name[64]; 
 };
 
 struct mattx_vfs_readdir_req {
@@ -489,7 +490,7 @@ struct mattx_vfs_readdir_reply {
     int error;
     u64 new_offset;
     u32 entry_count;
-    struct mattx_dirent entries[40]; // Send up to 40 files per packet (< ~3KB)
+    struct mattx_dirent entries[20]; // block of 20 dir entries
 };
 
 // This defines the standard signature for all message handlers
