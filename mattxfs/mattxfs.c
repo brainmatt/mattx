@@ -1,6 +1,7 @@
 #include <linux/module.h>
 #include <linux/fs.h>
 #include <linux/pagemap.h>
+#include <linux/version.h>
 #include "../mattx.h" 
 
 MODULE_LICENSE("GPL");
@@ -254,8 +255,33 @@ static const struct file_operations mattxfs_remote_dir_fops = {
     .llseek         = generic_file_llseek,
 };
 
+
+// --- NEW: The Dummy Create Hook ---
+// This tricks the VFS into thinking we created the file locally, so it passes 
+// the call down to our .open hook, which sends the O_CREAT flag over the network!
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
+static int mattxfs_remote_create(struct mnt_idmap *idmap, struct inode *dir, struct dentry *dentry, umode_t mode, bool excl) {
+#else
+static int mattxfs_remote_create(struct user_namespace *mnt_userns, struct inode *dir, struct dentry *dentry, umode_t mode, bool excl) {
+#endif
+    struct inode *inode = new_inode(dir->i_sb);
+    if (!inode) return -ENOMEM;
+
+    inode->i_ino = get_next_ino(); // Assign a random inode number for the local memory
+    inode->i_mode = S_IFREG | mode;
+    simple_inode_init_ts(inode);
+    
+    // Assign the file operations so it can be opened and written to!
+    inode->i_fop = &mattxfs_remote_file_fops;
+    set_nlink(inode, 1);
+    
+    d_instantiate(dentry, inode);
+    return 0;
+}
+
 static const struct inode_operations mattxfs_remote_iops = {
     .lookup         = mattxfs_remote_lookup,  
+    .create         = mattxfs_remote_create, // Allow file creation!
 };
 
 
@@ -342,9 +368,14 @@ static const struct inode_operations mattxfs_root_iops = {
 // FILESYSTEM MOUNT & INIT
 // ============================================================================
 
+// The modern way to force inode deletion on unmount! ---
+static int mattxfs_drop_inode(struct inode *inode) {
+    return 1; // 1 means "Always delete this inode from memory!"
+}
+
 static const struct super_operations mattxfs_s_ops = {
     .statfs         = simple_statfs,
-    .drop_inode     = generic_delete_inode,
+    .drop_inode     = mattxfs_drop_inode, 
 };
 
 static int mattxfs_fill_super(struct super_block *sb, void *data, int silent) {
