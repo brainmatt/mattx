@@ -256,7 +256,14 @@ static const struct file_operations mattxfs_remote_dir_fops = {
 };
 
 
-// --- NEW: The Dummy Create Hook ---
+// Dummy Unlink so 'rm' works! ---
+static int mattxfs_remote_unlink(struct inode *dir, struct dentry *dentry) {
+    // For now, we just pretend we deleted it so the VFS is happy.
+    // In the future, we will send a MATTX_MSG_VFS_UNLINK_REQ over the network!
+    return 0; 
+}
+
+// The Dummy Create Hook ---
 // This tricks the VFS into thinking we created the file locally, so it passes 
 // the call down to our .open hook, which sends the O_CREAT flag over the network!
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
@@ -267,11 +274,15 @@ static int mattxfs_remote_create(struct user_namespace *mnt_userns, struct inode
     struct inode *inode = new_inode(dir->i_sb);
     if (!inode) return -ENOMEM;
 
-    inode->i_ino = get_next_ino(); // Assign a random inode number for the local memory
+    inode->i_ino = get_next_ino(); 
     inode->i_mode = S_IFREG | mode;
+    
+    // --- FIXED: Assign the file to the user who created it! ---
+    inode->i_uid = current_fsuid();
+    inode->i_gid = current_fsgid();
+    
     simple_inode_init_ts(inode);
     
-    // Assign the file operations so it can be opened and written to!
     inode->i_fop = &mattxfs_remote_file_fops;
     set_nlink(inode, 1);
     
@@ -282,6 +293,7 @@ static int mattxfs_remote_create(struct user_namespace *mnt_userns, struct inode
 static const struct inode_operations mattxfs_remote_iops = {
     .lookup         = mattxfs_remote_lookup,  
     .create         = mattxfs_remote_create, // Allow file creation!
+    .unlink         = mattxfs_remote_unlink, // NEW: Wire up the rm command!
 };
 
 
