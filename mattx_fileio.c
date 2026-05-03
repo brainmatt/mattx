@@ -19,6 +19,27 @@ static bool check_rpc_done(pid_t pid) {
     return done;
 }
 
+// Identity Spoofing Helpers ---
+static const struct cred *mattx_override_creds(u32 uid, u32 gid, struct cred **new_cred_out) {
+    struct cred *new_cred = prepare_creds();
+    if (!new_cred) return NULL;
+    
+    new_cred->uid = make_kuid(&init_user_ns, uid);
+    new_cred->euid = new_cred->uid;
+    new_cred->fsuid = new_cred->uid;
+    new_cred->gid = make_kgid(&init_user_ns, gid);
+    new_cred->egid = new_cred->gid;
+    new_cred->fsgid = new_cred->gid;
+    
+    *new_cred_out = new_cred;
+    return override_creds(new_cred);
+}
+
+static void mattx_revert_creds(const struct cred *old_cred, struct cred *new_cred) {
+    if (old_cred) revert_creds(old_cred);
+    if (new_cred) put_cred(new_cred);
+}
+
 // Global File Table for MattXFS ---
 // This holds the real files opened on behalf of remote MattXFS clients
 static struct file *mfs_open_files[MAX_FDS];
@@ -2214,6 +2235,9 @@ int mattx_rpc_vfs_open(int node_id, const char *path, int flags, int mode, int *
     req.req_id = req_id;
     req.flags = flags;
     req.mode = mode;
+    // Grab the identity of the user typing the command! ---
+    req.uid = from_kuid(&init_user_ns, current_fsuid());
+    req.gid = from_kgid(&init_user_ns, current_fsgid());
     strncpy(req.path, path, sizeof(req.path) - 1);
     mattx_comm_send(cluster_map[node_id], MATTX_MSG_VFS_OPEN_REQ, &req, sizeof(req));
 
@@ -2528,6 +2552,9 @@ int mattx_rpc_vfs_unlink(int node_id, const char *path) {
 
     memset(&req, 0, sizeof(req));
     req.req_id = req_id;
+    // Grab the identity! ---
+    req.uid = from_kuid(&init_user_ns, current_fsuid());
+    req.gid = from_kgid(&init_user_ns, current_fsgid());
     strncpy(req.path, path, sizeof(req.path) - 1);
     mattx_comm_send(cluster_map[node_id], MATTX_MSG_SYS_UNLINK_REQ, &req, sizeof(req));
 
@@ -2698,11 +2725,20 @@ static void handle_vfs_open_req(struct mattx_link *link, struct mattx_header *hd
         struct mattx_vfs_open_reply reply;
         struct file *f;
         int i, fd_slot = -1;
+        const struct cred *old_cred = NULL;
+        struct cred *new_cred = NULL;
 
         memset(&reply, 0, sizeof(reply));
         reply.req_id = req->req_id;
 
+        // Put on the mask of the remote user! ---
+        old_cred = mattx_override_creds(req->uid, req->gid, &new_cred);
+
         f = filp_open(req->path, req->flags, req->mode);
+        
+        // Take off the mask
+        mattx_revert_creds(old_cred, new_cred);
+
         if (!IS_ERR(f)) {
             spin_lock(&mfs_file_lock);
             for (i = 0; i < MAX_FDS; i++) {
@@ -2959,6 +2995,8 @@ static void handle_sys_unlink_req(struct mattx_link *link, struct mattx_header *
         struct task_struct *deputy = NULL;
         struct path parent_path;
         int err = -ENOENT;
+        const struct cred *old_cred = NULL;
+        struct cred *new_cred = NULL;
 
         memset(&reply, 0, sizeof(reply));
         reply.req_id = req->req_id;
@@ -2966,21 +3004,21 @@ static void handle_sys_unlink_req(struct mattx_link *link, struct mattx_header *
 
         printk(KERN_INFO "MattX:[RPC] Received UNLINK request from Node %u for file: '%s'\n", hdr->sender_id, req->path);
 
-        // If orig_pid is set, this came from a Kprobe! We must borrow the Deputy's credentials!
         if (req->orig_pid != 0) {
             rcu_read_lock();
             deputy = pid_task(find_vpid(req->orig_pid), PIDTYPE_PID);
             if (deputy) get_task_struct(deputy);
             rcu_read_unlock();
+            
+            if (deputy) {
+                if (deputy->mm) kthread_use_mm(deputy->mm);
+                old_cred = override_creds(deputy->cred);
+            }
+        } else {
+            // It's a MattXFS request! Use the network credentials! ---
+            old_cred = mattx_override_creds(req->uid, req->gid, &new_cred);
         }
 
-        const struct cred *old_cred = NULL;
-        if (deputy) {
-            if (deputy->mm) kthread_use_mm(deputy->mm);
-            old_cred = override_creds(deputy->cred);
-        }
-
-        // Safely delete the file from the hard drive
         err = kern_path(req->path, LOOKUP_PARENT, &parent_path);
         if (!err) {
             struct dentry *parent = parent_path.dentry;
@@ -3006,9 +3044,11 @@ static void handle_sys_unlink_req(struct mattx_link *link, struct mattx_header *
             revert_creds(old_cred);
             if (deputy->mm) kthread_unuse_mm(deputy->mm);
             put_task_struct(deputy);
+        } else {
+            // Revert MattXFS credentials
+            mattx_revert_creds(old_cred, new_cred);
         }
 
-        printk(KERN_INFO "MattX:[RPC] Sending UNLINK_REPLY (Err: %d) back to Node %u...\n", reply.error, hdr->sender_id);
         if (cluster_map[hdr->sender_id]) {
             mattx_comm_send(cluster_map[hdr->sender_id], MATTX_MSG_SYS_UNLINK_REPLY, &reply, sizeof(reply));
         }

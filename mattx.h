@@ -513,6 +513,8 @@ struct mattx_vfs_open_req {
     u64 req_id;
     int flags;
     int mode;
+    u32 uid; // Teleport the user's ID!
+    u32 gid; // Teleport the user's group ID!    
     char path[256];
 };
 
@@ -584,6 +586,8 @@ struct mattx_vfs_fsync_reply {
 struct mattx_sys_unlink_req {
     u64 req_id;
     u32 orig_pid;
+    u32 uid; // Teleport the user's ID!
+    u32 gid; // Teleport the user's group ID!    
     char path[256];
 };
 
