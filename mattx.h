@@ -105,6 +105,8 @@ enum mattx_msg_type {
     MATTX_MSG_VFS_LSEEK_REPLY,
     MATTX_MSG_VFS_FSYNC_REQ,
     MATTX_MSG_VFS_FSYNC_REPLY,
+    MATTX_MSG_SYS_UNLINK_REQ,
+    MATTX_MSG_SYS_UNLINK_REPLY,
 };
 
 struct mattx_header {
@@ -394,6 +396,9 @@ struct mattx_rpc_work {
     bool is_dup;
     int new_local_fd; // -1 if just dup()
     
+    // For UNLINK
+    bool is_unlink; // For the Kprobe worker
+
     // For SOCKET
     bool is_socket;
     int domain;
@@ -575,6 +580,19 @@ struct mattx_vfs_fsync_reply {
     int error;
 };
 
+// Notice we include BOTH req_id (for MattXFS) and orig_pid (for Kprobes)!
+struct mattx_sys_unlink_req {
+    u64 req_id;
+    u32 orig_pid;
+    char path[256];
+};
+
+struct mattx_sys_unlink_reply {
+    u64 req_id;
+    u32 orig_pid;
+    int error;
+};
+
 
 // This defines the standard signature for all message handlers
 typedef void (*mattx_msg_handler_fn)(struct mattx_link *link, struct mattx_header *hdr, void *payload);
@@ -651,6 +669,7 @@ ssize_t mattx_rpc_vfs_write(int node_id, int remote_fd, const void *buf, size_t 
 void mattx_rpc_vfs_close(int node_id, int remote_fd);
 loff_t mattx_rpc_vfs_llseek(int node_id, int remote_fd, loff_t offset, int whence);
 int mattx_rpc_vfs_fsync(int node_id, int remote_fd, loff_t start, loff_t end, int datasync);
+int mattx_rpc_vfs_unlink(int node_id, const char *path);
 
 #endif // MATTX_H
 

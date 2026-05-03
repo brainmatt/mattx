@@ -2477,6 +2477,73 @@ int mattx_rpc_vfs_fsync(int node_id, int remote_fd, loff_t start, loff_t end, in
 }
 EXPORT_SYMBOL(mattx_rpc_vfs_fsync);
 
+int mattx_rpc_vfs_unlink(int node_id, const char *path) {
+    int i, slot = -1;
+    u64 req_id;
+    struct mattx_sys_unlink_req req;
+    int err = -EIO;
+
+    if (node_id == my_node_id) {
+        // Local Fast-Path!
+        struct path parent_path;
+        err = kern_path(path, LOOKUP_PARENT, &parent_path);
+        if (!err) {
+            struct dentry *parent = parent_path.dentry;
+            struct inode *dir = parent->d_inode;
+            struct dentry *victim;
+            char *basename = strrchr(path, '/');
+            basename = basename ? basename + 1 : (char *)path;
+            
+            inode_lock_nested(dir, I_MUTEX_PARENT);
+            victim = lookup_one_len(basename, parent, strlen(basename));
+            if (!IS_ERR(victim)) {
+                err = vfs_unlink(mnt_idmap(parent_path.mnt), dir, victim, NULL);
+                dput(victim);
+            } else {
+                err = PTR_ERR(victim);
+            }
+            inode_unlock(dir);
+            path_put(&parent_path);
+        }
+        return err;
+    }
+
+    if (!cluster_map[node_id]) return -ENOTCONN;
+
+    spin_lock(&vfs_rpc_lock);
+    for (i = 0; i < MAX_VFS_RPC; i++) {
+        if (!vfs_rpc_registry[i].in_use) {
+            slot = i;
+            vfs_rpc_registry[i].in_use = true;
+            req_id = next_req_id++;
+            vfs_rpc_registry[i].req_id = req_id;
+            vfs_rpc_registry[i].done = false;
+            init_waitqueue_head(&vfs_rpc_registry[i].wq);
+            break;
+        }
+    }
+    spin_unlock(&vfs_rpc_lock);
+
+    if (slot == -1) return -EBUSY;
+
+    memset(&req, 0, sizeof(req));
+    req.req_id = req_id;
+    strncpy(req.path, path, sizeof(req.path) - 1);
+    mattx_comm_send(cluster_map[node_id], MATTX_MSG_SYS_UNLINK_REQ, &req, sizeof(req));
+
+    wait_event_interruptible(vfs_rpc_registry[slot].wq, vfs_rpc_registry[slot].done);
+
+    err = vfs_rpc_registry[slot].error;
+
+    spin_lock(&vfs_rpc_lock);
+    vfs_rpc_registry[slot].in_use = false;
+    spin_unlock(&vfs_rpc_lock);
+
+    return err;
+}
+EXPORT_SYMBOL(mattx_rpc_vfs_unlink);
+
+
 void mattx_rpc_vfs_close(int node_id, int remote_fd) {
     // --- NEW: The Local Fast-Path! ---
     if (node_id == my_node_id) {
@@ -2885,6 +2952,108 @@ static void handle_vfs_fsync_reply(struct mattx_link *link, struct mattx_header 
     }
 }
 
+static void handle_sys_unlink_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    if (payload) {
+        struct mattx_sys_unlink_req *req = payload;
+        struct mattx_sys_unlink_reply reply;
+        struct task_struct *deputy = NULL;
+        struct path parent_path;
+        int err = -ENOENT;
+
+        memset(&reply, 0, sizeof(reply));
+        reply.req_id = req->req_id;
+        reply.orig_pid = req->orig_pid;
+
+        printk(KERN_INFO "MattX:[RPC] Received UNLINK request from Node %u for file: '%s'\n", hdr->sender_id, req->path);
+
+        // If orig_pid is set, this came from a Kprobe! We must borrow the Deputy's credentials!
+        if (req->orig_pid != 0) {
+            rcu_read_lock();
+            deputy = pid_task(find_vpid(req->orig_pid), PIDTYPE_PID);
+            if (deputy) get_task_struct(deputy);
+            rcu_read_unlock();
+        }
+
+        const struct cred *old_cred = NULL;
+        if (deputy) {
+            if (deputy->mm) kthread_use_mm(deputy->mm);
+            old_cred = override_creds(deputy->cred);
+        }
+
+        // Safely delete the file from the hard drive
+        err = kern_path(req->path, LOOKUP_PARENT, &parent_path);
+        if (!err) {
+            struct dentry *parent = parent_path.dentry;
+            struct inode *dir = parent->d_inode;
+            struct dentry *victim;
+            char *basename = strrchr(req->path, '/');
+            basename = basename ? basename + 1 : req->path;
+            
+            inode_lock_nested(dir, I_MUTEX_PARENT);
+            victim = lookup_one_len(basename, parent, strlen(basename));
+            if (!IS_ERR(victim)) {
+                err = vfs_unlink(mnt_idmap(parent_path.mnt), dir, victim, NULL);
+                dput(victim);
+            } else {
+                err = PTR_ERR(victim);
+            }
+            inode_unlock(dir);
+            path_put(&parent_path);
+        }
+        reply.error = err;
+
+        if (deputy) {
+            revert_creds(old_cred);
+            if (deputy->mm) kthread_unuse_mm(deputy->mm);
+            put_task_struct(deputy);
+        }
+
+        printk(KERN_INFO "MattX:[RPC] Sending UNLINK_REPLY (Err: %d) back to Node %u...\n", reply.error, hdr->sender_id);
+        if (cluster_map[hdr->sender_id]) {
+            mattx_comm_send(cluster_map[hdr->sender_id], MATTX_MSG_SYS_UNLINK_REPLY, &reply, sizeof(reply));
+        }
+    }
+}
+
+static void handle_sys_unlink_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    if (payload) {
+        struct mattx_sys_unlink_reply *reply = payload;
+        int i;
+
+        printk(KERN_INFO "MattX:[RPC] Received UNLINK_REPLY. Error: %d\n", reply->error);
+
+        // 1. Wake up MattXFS (if req_id is set)
+        if (reply->req_id != 0) {
+            spin_lock(&vfs_rpc_lock);
+            for (i = 0; i < MAX_VFS_RPC; i++) {
+                if (vfs_rpc_registry[i].in_use && vfs_rpc_registry[i].req_id == reply->req_id) {
+                    vfs_rpc_registry[i].error = reply->error;
+                    vfs_rpc_registry[i].done = true;
+                    wake_up_interruptible(&vfs_rpc_registry[i].wq);
+                    break;
+                }
+            }
+            spin_unlock(&vfs_rpc_lock);
+        }
+
+        // 2. Wake up Kprobe (if orig_pid is set)
+        if (reply->orig_pid != 0) {
+            spin_lock(&guest_lock);
+            for (i = 0; i < guest_count; i++) {
+                if (guest_registry[i].orig_pid == reply->orig_pid && guest_registry[i].home_node == hdr->sender_id) {
+                    guest_registry[i].rpc_fsync_res = reply->error;
+                    guest_registry[i].rpc_done = true;
+                    if (guest_registry[i].rpc_wq) {
+                        wake_up_interruptible(guest_registry[i].rpc_wq);
+                    }
+                    break;
+                }
+            }
+            spin_unlock(&guest_lock);
+        }
+    }
+}
+
 static void handle_vfs_close_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
     if (payload) {
         struct mattx_vfs_close_req *req = payload;
@@ -2912,6 +3081,8 @@ void mattx_fileio_init_handlers(void) {
     mattx_register_handler(MATTX_MSG_SYS_DUP_REPLY, handle_sys_dup_reply);
     mattx_register_handler(MATTX_MSG_SYS_FSYNC_REQ, handle_sys_fsync_req);
     mattx_register_handler(MATTX_MSG_SYS_FSYNC_REPLY, handle_sys_fsync_reply);
+    mattx_register_handler(MATTX_MSG_SYS_UNLINK_REQ, handle_sys_unlink_req);
+    mattx_register_handler(MATTX_MSG_SYS_UNLINK_REPLY, handle_sys_unlink_reply);
     mattx_register_handler(MATTX_MSG_SYS_SOCKET_REQ, handle_sys_socket_req);
     mattx_register_handler(MATTX_MSG_SYS_SOCKET_REPLY, handle_sys_socket_reply);
     mattx_register_handler(MATTX_MSG_SYS_CONNECT_REQ, handle_sys_connect_req);

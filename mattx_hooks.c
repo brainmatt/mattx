@@ -22,6 +22,17 @@ static void mattx_rpc_worker(struct work_struct *work) {
         if (cluster_map[rpc->home_node]) {
             mattx_comm_send(cluster_map[rpc->home_node], MATTX_MSG_SYS_DUP_REQ, &req, sizeof(req));
         }
+    } else if (rpc->is_unlink) {
+        struct mattx_sys_unlink_req req;
+        memset(&req, 0, sizeof(req));
+        req.orig_pid = rpc->orig_pid;
+        req.req_id = 0; // 0 means this is a Kprobe request, not a VFS request!
+        strncpy(req.path, rpc->filename, sizeof(req.path) - 1);
+
+        printk(KERN_INFO "MattX:[RPC] Worker started for PID %d. Sending UNLINK_REQ to Node %d...\n", rpc->local_pid, rpc->home_node);
+        if (cluster_map[rpc->home_node]) {
+            mattx_comm_send(cluster_map[rpc->home_node], MATTX_MSG_SYS_UNLINK_REQ, &req, sizeof(req));
+        }        
     } else if (rpc->is_socket) {
         struct mattx_sys_socket_req req;
         memset(&req, 0, sizeof(req));
@@ -159,7 +170,7 @@ static void mattx_rpc_worker(struct work_struct *work) {
         if (rpc->select_writefds && copy_from_user(out_fds, rpc->select_writefds, sizeof(fd_set))) {}
         if (rpc->select_exceptfds && copy_from_user(ex_fds, rpc->select_exceptfds, sizeof(fd_set))) {}
 
-        // --- FIXED: Look up FDs in the Surrogate's file table, not the kworker's! ---
+        // Look up FDs in the Surrogate's file table, not the kworker's! ---
         rcu_read_lock();
         surrogate = pid_task(find_vpid(rpc->local_pid), PIDTYPE_PID);
         if (surrogate) get_task_struct(surrogate);
@@ -247,7 +258,7 @@ static void mattx_rpc_worker(struct work_struct *work) {
         if (rpc->is_statx) {
             // (Removed statx block since we deleted it)
         // --- FIXED: Group ALL FD-Operating Syscalls together! ---
-        } else if (rpc->is_connect || rpc->is_bind || rpc->is_listen || rpc->is_sendto) {
+        } else if (rpc->is_unlink || rpc->is_connect || rpc->is_bind || rpc->is_listen || rpc->is_sendto) {
             struct pt_regs *regs = task_pt_regs(surrogate);
             int error = -1;
             bool success = false;
@@ -741,6 +752,139 @@ static int ret_handler_dup(struct kretprobe_instance *ri, struct pt_regs *regs) 
 
     return 0;
 }
+
+// --- UNLINK HOOK ---
+struct unlinkat_kretprobe_data {
+    const char __user *pathname;
+};
+
+static struct kretprobe unlinkat_kprobe;
+
+static int entry_handler_unlinkat(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    pid_t my_pid = current->pid;
+    struct unlinkat_kretprobe_data *data = (struct unlinkat_kretprobe_data *)ri->data;
+
+    if (!is_guest_process(my_pid)) return 0; 
+    
+    // --- THE GOLDEN RULE: Bypass if MattXFS is enabled! ---
+    if (config_mattxfs_enabled) return 0; 
+
+    // __x64_sys_unlinkat(int dfd, const char __user *pathname, int flag)
+    data->pathname = (const char __user *)regs->si;
+
+    regs->si = 0; // Sabotage! Force -EFAULT
+
+    return 0;
+}
+
+static int ret_handler_unlinkat(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    pid_t my_pid = current->pid;
+    struct unlinkat_kretprobe_data *data = (struct unlinkat_kretprobe_data *)ri->data;
+    char filename[256] = {0};
+    int home_node = -1;
+    u32 orig_pid = 0;
+    int i;
+
+    if (!is_guest_process(my_pid)) return 0;
+    if (config_mattxfs_enabled) return 0; // Bypass!
+
+    if (strncpy_from_user(filename, data->pathname, sizeof(filename) - 1) > 0) {
+        spin_lock(&guest_lock);
+        for (i = 0; i < guest_count; i++) {
+            if (guest_registry[i].local_pid == my_pid) {
+                home_node = guest_registry[i].home_node;
+                orig_pid = guest_registry[i].orig_pid;
+                guest_registry[i].rpc_done = false; 
+                break;
+            }
+        }
+        spin_unlock(&guest_lock);
+
+        if (home_node != -1) {
+            struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
+            if (rpc) {
+                INIT_WORK(&rpc->work, mattx_rpc_worker);
+                rpc->local_pid = my_pid;
+                rpc->orig_pid = orig_pid;
+                rpc->home_node = home_node;
+                rpc->is_unlink = true;
+                strncpy(rpc->filename, filename, sizeof(rpc->filename) - 1);
+
+                printk(KERN_INFO "MattX:[HOOK] Intercepted unlinkat('%s'). Freezing Surrogate %d...\n", filename, my_pid);
+                send_sig(SIGSTOP, current, 0);
+                schedule_work(&rpc->work);
+            }
+        }
+    }
+    return 0;
+}
+
+// --- UNLINK HOOK ---
+struct unlinkat_kretprobe_data {
+    const char __user *pathname;
+};
+
+static struct kretprobe unlinkat_kprobe;
+
+static int entry_handler_unlinkat(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    pid_t my_pid = current->pid;
+    struct unlinkat_kretprobe_data *data = (struct unlinkat_kretprobe_data *)ri->data;
+
+    if (!is_guest_process(my_pid)) return 0; 
+    
+    // --- THE GOLDEN RULE: Bypass if MattXFS is enabled! ---
+    if (config_mattxfs_enabled) return 0; 
+
+    // __x64_sys_unlinkat(int dfd, const char __user *pathname, int flag)
+    data->pathname = (const char __user *)regs->si;
+
+    regs->si = 0; // Sabotage! Force -EFAULT
+
+    return 0;
+}
+
+static int ret_handler_unlinkat(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    pid_t my_pid = current->pid;
+    struct unlinkat_kretprobe_data *data = (struct unlinkat_kretprobe_data *)ri->data;
+    char filename[256] = {0};
+    int home_node = -1;
+    u32 orig_pid = 0;
+    int i;
+
+    if (!is_guest_process(my_pid)) return 0;
+    if (config_mattxfs_enabled) return 0; // Bypass!
+
+    if (strncpy_from_user(filename, data->pathname, sizeof(filename) - 1) > 0) {
+        spin_lock(&guest_lock);
+        for (i = 0; i < guest_count; i++) {
+            if (guest_registry[i].local_pid == my_pid) {
+                home_node = guest_registry[i].home_node;
+                orig_pid = guest_registry[i].orig_pid;
+                guest_registry[i].rpc_done = false; 
+                break;
+            }
+        }
+        spin_unlock(&guest_lock);
+
+        if (home_node != -1) {
+            struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
+            if (rpc) {
+                INIT_WORK(&rpc->work, mattx_rpc_worker);
+                rpc->local_pid = my_pid;
+                rpc->orig_pid = orig_pid;
+                rpc->home_node = home_node;
+                rpc->is_unlink = true;
+                strncpy(rpc->filename, filename, sizeof(rpc->filename) - 1);
+
+                printk(KERN_INFO "MattX:[HOOK] Intercepted unlinkat('%s'). Freezing Surrogate %d...\n", filename, my_pid);
+                send_sig(SIGSTOP, current, 0);
+                schedule_work(&rpc->work);
+            }
+        }
+    }
+    return 0;
+}
+
 
 // --- SOCKET HOOK ---
 struct socket_kretprobe_data {

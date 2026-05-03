@@ -256,11 +256,16 @@ static const struct file_operations mattxfs_remote_dir_fops = {
 };
 
 
-// Dummy Unlink so 'rm' works! ---
 static int mattxfs_remote_unlink(struct inode *dir, struct dentry *dentry) {
-    // For now, we just pretend we deleted it so the VFS is happy.
-    // In the future, we will send a MATTX_MSG_VFS_UNLINK_REQ over the network!
-    return 0; 
+    char path_buf[256];
+    int node_id = get_node_id_from_dentry(dentry);
+    
+    get_remote_path_from_dentry(dentry, path_buf, sizeof(path_buf));
+    
+    printk(KERN_INFO "MattXFS:[UNLINK] Requesting unlink for %s on Node %d\n", path_buf, node_id);
+    
+    // Actually delete the file over the network! ---
+    return mattx_rpc_vfs_unlink(node_id, path_buf);
 }
 
 // The Dummy Create Hook ---
