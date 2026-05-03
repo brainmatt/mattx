@@ -1648,6 +1648,18 @@ int mattx_hooks_init(void) {
         printk(KERN_ERR "MattX: register_kretprobe failed for dup2, returned %d\n", ret);
     }
 
+    memset(&unlinkat_kprobe, 0, sizeof(unlinkat_kprobe));
+    unlinkat_kprobe.kp.symbol_name = "__x64_sys_unlinkat";
+    unlinkat_kprobe.entry_handler = entry_handler_unlinkat;
+    unlinkat_kprobe.handler = ret_handler_unlinkat;
+    unlinkat_kprobe.data_size = sizeof(struct unlinkat_kretprobe_data);
+    unlinkat_kprobe.maxactive = 64;
+
+    ret = register_kretprobe(&unlinkat_kprobe);
+    if (ret < 0) {
+        printk(KERN_ERR "MattX: register_kretprobe failed for unlinkat, returned %d\n", ret);
+    }
+
     memset(&socket_kprobe, 0, sizeof(socket_kprobe));
     socket_kprobe.kp.symbol_name = "__sys_socket";
     socket_kprobe.entry_handler = entry_handler_socket;
@@ -1757,6 +1769,7 @@ void mattx_hooks_exit(void) {
     unregister_kretprobe(&bind_kprobe);
     unregister_kretprobe(&connect_kprobe);
     unregister_kretprobe(&socket_kprobe);
+    unregister_kretprobe(&unlinkat_kprobe);
     unregister_kretprobe(&dup2_kprobe);
     unregister_kretprobe(&dup_kprobe);
     unregister_kretprobe(&openat_kprobe);
