@@ -3000,7 +3000,6 @@ static void handle_sys_unlink_req(struct mattx_link *link, struct mattx_header *
         struct mattx_sys_unlink_req *req = payload;
         struct mattx_sys_unlink_reply reply;
         struct task_struct *deputy = NULL;
-        struct path parent_path;
         int err = -ENOENT;
         const struct cred *old_cred = NULL;
         struct cred *new_cred = NULL;
