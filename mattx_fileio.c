@@ -2509,41 +2509,32 @@ int mattx_rpc_vfs_unlink(int node_id, const char *path) {
 
     if (node_id == my_node_id) {
         // The Perfect VFS Dance (Local) ---
-        struct path parent_path;
-        err = kern_path(path, LOOKUP_PARENT, &parent_path);
+        // The Reverse Lookup (Local) ---
+        struct path victim_path;
+        err = kern_path(path, 0, &victim_path);
         if (!err) {
-            struct dentry *parent = parent_path.dentry;
+            struct dentry *parent = dget_parent(victim_path.dentry);
             struct inode *dir = parent->d_inode;
-            struct dentry *victim;
-            char *basename = strrchr(path, '/');
-            basename = basename ? basename + 1 : (char *)path;
             
-            // 1. Lock the mount point!
-            err = mnt_want_write(parent_path.mnt);
+            err = mnt_want_write(victim_path.mnt);
             if (!err) {
                 inode_lock_nested(dir, I_MUTEX_PARENT);
-                victim = lookup_one_len(basename, parent, strlen(basename));
-                if (!IS_ERR(victim)) {
-                    // 2. Ensure the file actually exists!
-                    if (d_is_positive(victim)) {
-                        err = vfs_unlink(mnt_idmap(parent_path.mnt), dir, victim, NULL);
-                        if (err) printk(KERN_ERR "MattXFS:[LOCAL] vfs_unlink failed: %d\n", err);
-                    } else {
-                        err = -ENOENT;
-                    }
-                    dput(victim);
+                
+                // Double check the file wasn't moved while we were locking!
+                if (victim_path.dentry->d_parent == parent && d_is_positive(victim_path.dentry)) {
+                    err = vfs_unlink(mnt_idmap(victim_path.mnt), dir, victim_path.dentry, NULL);
+                    if (err) printk(KERN_ERR "MattXFS:[LOCAL] vfs_unlink failed: %d\n", err);
                 } else {
-                    err = PTR_ERR(victim);
-                    printk(KERN_ERR "MattXFS:[LOCAL] lookup_one_len failed: %d\n", err);
+                    err = -ENOENT;
                 }
+                
                 inode_unlock(dir);
-                mnt_drop_write(parent_path.mnt); // Unlock the mount point!
+                mnt_drop_write(victim_path.mnt);
             } else {
                 printk(KERN_ERR "MattXFS:[LOCAL] mnt_want_write failed: %d\n", err);
             }
-            path_put(&parent_path);
-        } else {
-            printk(KERN_ERR "MattXFS:[LOCAL] kern_path failed: %d\n", err);
+            dput(parent);
+            path_put(&victim_path);
         }
         return err;
     }
@@ -3036,40 +3027,34 @@ static void handle_sys_unlink_req(struct mattx_link *link, struct mattx_header *
         }
 
         // The Perfect VFS Dance (Remote) ---
-        err = kern_path(req->path, LOOKUP_PARENT, &parent_path);
+        // The Reverse Lookup (Remote) ---
+        struct path victim_path;
+        err = kern_path(req->path, 0, &victim_path);
         if (!err) {
-            struct dentry *parent = parent_path.dentry;
+            struct dentry *parent = dget_parent(victim_path.dentry);
             struct inode *dir = parent->d_inode;
-            struct dentry *victim;
-            char *basename = strrchr(req->path, '/');
-            basename = basename ? basename + 1 : req->path;
             
-            // 1. Lock the mount point!
-            err = mnt_want_write(parent_path.mnt);
+            err = mnt_want_write(victim_path.mnt);
             if (!err) {
                 inode_lock_nested(dir, I_MUTEX_PARENT);
-                victim = lookup_one_len(basename, parent, strlen(basename));
-                if (!IS_ERR(victim)) {
-                    // 2. Ensure the file actually exists!
-                    if (d_is_positive(victim)) {
-                        err = vfs_unlink(mnt_idmap(parent_path.mnt), dir, victim, NULL);
-                        if (err) printk(KERN_ERR "MattX:[RPC] vfs_unlink failed: %d\n", err);
-                    } else {
-                        err = -ENOENT;
-                    }
-                    dput(victim);
+                
+                if (victim_path.dentry->d_parent == parent && d_is_positive(victim_path.dentry)) {
+                    err = vfs_unlink(mnt_idmap(victim_path.mnt), dir, victim_path.dentry, NULL);
+                    if (err) printk(KERN_ERR "MattX:[RPC] vfs_unlink failed: %d\n", err);
                 } else {
-                    err = PTR_ERR(victim);
-                    printk(KERN_ERR "MattX:[RPC] lookup_one_len failed: %d\n", err);
+                    err = -ENOENT;
                 }
+                
                 inode_unlock(dir);
-                mnt_drop_write(parent_path.mnt); // Unlock the mount point!
+                mnt_drop_write(victim_path.mnt);
             } else {
                 printk(KERN_ERR "MattX:[RPC] mnt_want_write failed: %d\n", err);
             }
-            path_put(&parent_path);
+            dput(parent);
+            path_put(&victim_path);
         } else {
-            printk(KERN_ERR "MattX:[RPC] kern_path failed: %d\n", err);
+            // Only print if it's a weird error, ignore standard "File not found" (-ENOENT)
+            if (err != -ENOENT) printk(KERN_ERR "MattX:[RPC] kern_path failed: %d\n", err);
         }
         reply.error = err;
 
