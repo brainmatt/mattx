@@ -90,6 +90,10 @@ void mattx_capture_and_send_state(struct task_struct *task, int target_node) {
 
     req->orig_pid = task->pid;
     
+    // Pass the Home Node and Feature Flag to the Stub! ---
+    req->home_node = my_node_id;
+    req->mattxfs_enabled = config_mattxfs_enabled ? 1 : 0;
+
     cred = get_task_cred(task);
     if (cred) {
         req->uid = from_kuid(&init_user_ns, cred->uid);
@@ -194,6 +198,10 @@ void mattx_capture_and_return_state(struct task_struct *task, u32 orig_pid, int 
 
     req->orig_pid = orig_pid;
 
+    // Pass the Home Node and Feature Flag to the Stub! ---
+    req->home_node = my_node_id;
+    req->mattxfs_enabled = config_mattxfs_enabled ? 1 : 0;
+    
     regs = task_pt_regs(task);
     if (regs) {
         memcpy(&req->regs, regs, sizeof(struct pt_regs));

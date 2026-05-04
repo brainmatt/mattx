@@ -138,7 +138,7 @@ struct mattx_migration_req {
     u32 orig_pid;
     u32 uid; 
     u32 gid; 
-    u32 pad; 
+    u32 home_node; // Tell the stub where home is!
     struct mattx_cpu_regs regs; 
     uint64_t fsbase; 
     uint64_t gsbase; 
@@ -148,7 +148,8 @@ struct mattx_migration_req {
     u32 fd_count;          
     u32 open_fds[MAX_FDS]; 
     u32 vma_count;
-    u32 pad2;
+    u8 mattxfs_enabled; // Tell the stub if it should build the illusion
+    u8 pad[3];          // Alignment padding
     struct mattx_vma_info vmas[]; 
 };
 

@@ -1,3 +1,4 @@
+#define _GNU_SOURCE // REQUIRED for CLONE_NEWNS!
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -10,11 +11,14 @@
 #include <stdint.h>
 #include <sys/mman.h> 
 #include <signal.h>
+#include <sched.h>      // For unshare()
+#include <sys/mount.h>  // For mount()
+#include <sys/stat.h>   // For mkdir()
 #include <netlink/netlink.h>
 #include <netlink/genl/genl.h>
 #include <netlink/genl/ctrl.h>
 
-// --- FIXED: Match the kernel's new MAX_FDS ---
+// Match the kernel's new MAX_FDS ---
 #define MAX_FDS 256
 
 enum { MATTX_ATTR_UNSPEC, MATTX_ATTR_NODE_ID, MATTX_ATTR_IPV4_ADDR, MATTX_ATTR_STUB_PID, MATTX_ATTR_BLUEPRINT, MATTX_ATTR_MY_NODE_ID, MATTX_ATTR_LOCAL_IP, __MATTX_ATTR_MAX };
@@ -39,7 +43,7 @@ struct mattx_migration_req {
     uint32_t orig_pid;
     uint32_t uid; 
     uint32_t gid; 
-    uint32_t pad;
+    uint32_t home_node;
     struct mattx_cpu_regs regs;
     uint64_t fsbase; 
     uint64_t gsbase; 
@@ -47,9 +51,10 @@ struct mattx_migration_req {
     uint64_t arg_end;   
     char comm[16]; 
     uint32_t fd_count;          
-    uint32_t open_fds[MAX_FDS]; // FIXED: Now uses 256
+    uint32_t open_fds[MAX_FDS]; 
     uint32_t vma_count;
-    uint32_t pad2;
+    uint8_t mattxfs_enabled;
+    uint8_t pad[3];
     struct mattx_vma_info vmas[]; 
 };
 
@@ -157,6 +162,36 @@ int main() {
     }
     
     printf("MattX-Stub: Memory carved and FD table expanded to %d. Ready for hijack.\n", MAX_FDS);
+
+    // PHASE 22 - THE NAMESPACE ILLUSION ---
+    if (received_req->mattxfs_enabled) {
+        char mfs_path[256];
+        snprintf(mfs_path, sizeof(mfs_path), "/mattxfs/%u", received_req->home_node);
+        
+        printf("MattX-Stub: MattXFS is enabled. Building Namespace Illusion...\n");
+        
+        // 1. Detach from the host's mount namespace
+        if (unshare(CLONE_NEWNS) == 0) {
+            
+            // 2. Mark all mounts as private so our changes don't leak to VM2's real OS
+            mount("none", "/", NULL, MS_REC | MS_PRIVATE, NULL);
+            
+            // 3. Trap the process inside the MattXFS remote folder!
+            if (chroot(mfs_path) == 0) {
+                chdir("/"); // Move to the new root
+                
+                // 4. Mount a fresh /proc inside the bubble so glibc doesn't panic
+                mkdir("/proc", 0755);
+                mount("proc", "/proc", "proc", 0, NULL);
+                
+                printf("MattX-Stub: Illusion complete! Trapped in %s\n", mfs_path);
+            } else {
+                perror("MattX-Stub: chroot failed (Is MattXFS mounted?)");
+            }
+        } else {
+            perror("MattX-Stub: unshare failed");
+        }
+    }
 
     msg = nlmsg_alloc();
     genlmsg_put(msg, NL_AUTO_PORT, NL_AUTO_SEQ, family_id, 0, 0, MATTX_CMD_HIJACK_ME, 1);
