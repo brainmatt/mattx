@@ -40,7 +40,7 @@
 #define DEFAULT_PORT 7225
 #define DEFAULT_IFACE "eth0"
 
-enum { MATTX_ATTR_UNSPEC, MATTX_ATTR_NODE_ID, MATTX_ATTR_IPV4_ADDR, MATTX_ATTR_STUB_PID, MATTX_ATTR_BLUEPRINT, MATTX_ATTR_MY_NODE_ID, MATTX_ATTR_LOCAL_IP, MATTX_ATTR_CONFIG_FILE_IO, MATTX_ATTR_CONFIG_NET_IO, MATTX_ATTR_MATTXFS_ENABLED, __MATTX_ATTR_MAX };
+enum { MATTX_ATTR_UNSPEC, MATTX_ATTR_NODE_ID, MATTX_ATTR_IPV4_ADDR, MATTX_ATTR_STUB_PID, MATTX_ATTR_BLUEPRINT, MATTX_ATTR_MY_NODE_ID, MATTX_ATTR_LOCAL_IP, MATTX_ATTR_CONFIG_FILE_IO, MATTX_ATTR_CONFIG_NET_IO, MATTX_ATTR_MATTXFS_ENABLED, MATTX_ATTR_DFSA_DIR, __MATTX_ATTR_MAX };
 #define MATTX_ATTR_MAX (__MATTX_ATTR_MAX - 1)
 
 enum { MATTX_CMD_UNSPEC, MATTX_CMD_NODE_JOIN, MATTX_CMD_NODE_LEAVE, MATTX_CMD_HIJACK_ME, MATTX_CMD_GET_BLUEPRINT, MATTX_CMD_SET_LOCAL_IP, MATTX_CMD_SET_CONFIG, __MATTX_CMD_MAX };
@@ -54,6 +54,7 @@ struct mattx_config {
     uint8_t migrate_file_io;
     uint8_t migrate_net_io;
     uint8_t mattxfs_enabled;
+    char dfsa_dir[256];
 };
 
 struct mattx_beacon {
@@ -115,7 +116,10 @@ void register_config_to_kernel() {
     nla_put_u8(msg, MATTX_ATTR_CONFIG_FILE_IO, config.migrate_file_io);
     nla_put_u8(msg, MATTX_ATTR_CONFIG_NET_IO, config.migrate_net_io);
     nla_put_u8(msg, MATTX_ATTR_MATTXFS_ENABLED, config.mattxfs_enabled);
-
+    if (strlen(config.dfsa_dir) > 0) {
+        nla_put_string(msg, MATTX_ATTR_DFSA_DIR, config.dfsa_dir);
+    }
+    
     if (nl_send_auto(nl_sock, msg) < 0) {
         printf("ERROR: Failed to push configuration to kernel.\n");
     } else {
@@ -216,6 +220,7 @@ void load_config() {
             if (strcmp(temp_val, "false") == 0 || strcmp(temp_val, "0") == 0) config.mattxfs_enabled = 0;
             continue;
         }
+        if (sscanf(line, "DFSA_DIR=%255s", config.dfsa_dir)) continue;        
     }
     fclose(fp);
     if (config.node_id == 0) config.node_id = generate_node_id(config.interface);

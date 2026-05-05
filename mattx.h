@@ -168,6 +168,7 @@ struct mattx_migration_req {
     uint64_t arg_start; 
     uint64_t arg_end;   
     char comm[16]; 
+    char dfsa_dir[256]; // Tell the stub what to bind-mount!
     u32 fd_count;          
     u32 open_fds[MAX_FDS]; 
     u32 vma_count;
@@ -647,6 +648,7 @@ extern bool balancer_enabled;
 extern u32 my_node_id; 
 extern u32 my_ip_addr; 
 extern bool config_mattxfs_enabled; // The MattxFs Feature Flag
+extern char config_dfsa_dir[256]; // and the DFSA exclude
 
 // Configuration Toggles
 extern bool config_migrate_file_io;

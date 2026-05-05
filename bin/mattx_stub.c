@@ -72,7 +72,8 @@ struct mattx_migration_req {
     uint64_t gsbase; 
     uint64_t arg_start; 
     uint64_t arg_end;   
-    char comm[16]; 
+    char comm[16];
+    char dfsa_dir[256];    
     uint32_t fd_count;          
     uint32_t open_fds[MAX_FDS]; 
     uint32_t vma_count;
@@ -186,30 +187,42 @@ int main() {
     
     printf("MattX-Stub: Memory carved and FD table expanded to %d. Ready for hijack.\n", MAX_FDS);
 
-    // PHASE 22 - THE NAMESPACE ILLUSION ---
+    // --- PHASE 22 & 23 - THE NAMESPACE ILLUSION & DFSA ---
     if (received_req->mattxfs_enabled) {
         char mfs_path[256];
         snprintf(mfs_path, sizeof(mfs_path), "/mattxfs/%u", received_req->home_node);
         
         printf("MattX-Stub: MattXFS is enabled. Building Namespace Illusion...\n");
         
-        // 1. Detach from the host's mount namespace
         if (unshare(CLONE_NEWNS) == 0) {
-            
-            // 2. Mark all mounts as private so our changes don't leak to VM2's real OS
             mount("none", "/", NULL, MS_REC | MS_PRIVATE, NULL);
             
-            // 3. Trap the process inside the MattXFS remote folder!
-            if (chroot(mfs_path) == 0) {
-                chdir("/"); // Move to the new root
+            // --- NEW: PHASE 23 (DFSA BIND MOUNT) ---
+            if (received_req->dfsa_dir[0] != '\0') {
+                char dfsa_target[512];
+                snprintf(dfsa_target, sizeof(dfsa_target), "%s%s", mfs_path, received_req->dfsa_dir);
                 
-                // 4. Mount a fresh /proc inside the bubble so glibc doesn't panic
+                // Secret Trick: We call access() to force MattXFS to send a lookup RPC to Node 1.
+                // This ensures the virtual inode for the target folder actually exists in memory 
+                // before we try to mount over it!
+                access(dfsa_target, F_OK);
+                
+                // The Magic Bind Mount!
+                if (mount(received_req->dfsa_dir, dfsa_target, NULL, MS_BIND | MS_REC, NULL) == 0) {
+                    printf("MattX-Stub: DFSA Bind Mount successful: %s -> %s\n", received_req->dfsa_dir, dfsa_target);
+                } else {
+                    perror("MattX-Stub: DFSA Bind Mount failed (Does the folder exist on both nodes?)");
+                }
+            }
+            // ---------------------------------------
+
+            if (chroot(mfs_path) == 0) {
+                chdir("/"); 
                 mkdir("/proc", 0755);
                 mount("proc", "/proc", "proc", 0, NULL);
-                
                 printf("MattX-Stub: Illusion complete! Trapped in %s\n", mfs_path);
             } else {
-                perror("MattX-Stub: chroot failed (Is MattXFS mounted?)");
+                perror("MattX-Stub: chroot failed");
             }
         } else {
             perror("MattX-Stub: unshare failed");
