@@ -205,42 +205,40 @@ static void handle_return_blueprint(struct mattx_link *link, struct mattx_header
         if (deputy) get_task_struct(deputy);
         rcu_read_unlock();
 
-        if (deputy) {
-            printk(KERN_INFO "MattX:[IMPORT] Found frozen Deputy PID %d. Preparing memory map...\n", deputy->pid);
-            
-            if (hijacked_stub_task) put_task_struct(hijacked_stub_task);
-            hijacked_stub_task = deputy; 
+        if (deputy->mm) {
+            kthread_use_mm(deputy->mm);
+            for (i = 0; i < pending_migration->vma_count; i++) {
+                unsigned long start = pending_migration->vmas[i].vm_start;
+                unsigned long len = pending_migration->vmas[i].vm_end - start;
+                unsigned long vma_flags = pending_migration->vmas[i].vm_flags;
+                
+                // The vDSO Protector ---
+                // Only carve out memory for Writable regions (Stack, Heap, Data).
+                // Leave Read-Only code (.text) and kernel pages ([vdso]) completely intact!
+                if (vma_flags & VM_WRITE) {
+                    unsigned long prot = PROT_READ | PROT_WRITE | PROT_EXEC;
+                    unsigned long flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED;
+                    unsigned long ret_addr;
 
-            if (deputy->mm) {
-                kthread_use_mm(deputy->mm);
-                for (i = 0; i < pending_migration->vma_count; i++) {
-                    unsigned long start = pending_migration->vmas[i].vm_start;
-                    unsigned long len = pending_migration->vmas[i].vm_end - start;
-                    unsigned long vma_flags = pending_migration->vmas[i].vm_flags;
-                    
-                    // The vDSO Protector ---
-                    // Only carve out memory for Writable regions (Stack, Heap, Data).
-                    // Leave Read-Only code (.text) and kernel pages ([vdso]) completely intact!
-                    if (vma_flags & VM_WRITE) {
-                        unsigned long prot = PROT_READ | PROT_WRITE | PROT_EXEC;
-                        unsigned long flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED;
-                        unsigned long ret_addr;
+                    // The Stack Growth Protector ---
+                    if (vma_flags & VM_GROWSDOWN) {
+                        flags |= MAP_GROWSDOWN;
+                    }
 
-                        ret_addr = vm_mmap(NULL, start, len, prot, flags, 0);
-                        if (IS_ERR_VALUE(ret_addr)) {
-                            printk(KERN_ERR "MattX:[IMPORT] Failed to carve VMA at 0x%lx (err: %ld)\n", start, ret_addr);
-                        }
+                    ret_addr = vm_mmap(NULL, start, len, prot, flags, 0);
+                    if (IS_ERR_VALUE(ret_addr)) {
+                        printk(KERN_ERR "MattX:[RECALL] Failed to carve VMA at 0x%lx (err: %ld)\n", start, ret_addr);
                     }
                 }
-                kthread_unuse_mm(deputy->mm);
-                printk(KERN_INFO "MattX:[IMPORT] Successfully carved Writable VMAs into Deputy!\n");
             }
-
+            kthread_unuse_mm(deputy->mm);
+            printk(KERN_INFO "MattX:[RECALL] Successfully carved Writable VMAs into Deputy!\n");
+        
             printk(KERN_INFO "MattX:[IMPORT] Sending READY_FOR_DATA signal to Node %d...\n", pending_source_node);
             mattx_comm_send(cluster_map[pending_source_node], MATTX_MSG_READY_FOR_DATA, NULL, 0);
         } else {
             printk(KERN_ERR "MattX:[IMPORT] ERROR: Deputy PID %u not found!\n", req->orig_pid);
-        }
+        }        
     }
 }
 

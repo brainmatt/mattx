@@ -166,18 +166,26 @@ int main() {
     for (uint32_t i = 0; i < received_req->vma_count; i++) {
         struct mattx_vma_info *v = &received_req->vmas[i];
         size_t size = v->vm_end - v->vm_start;
-        
-        int prot = PROT_READ | PROT_WRITE | PROT_EXEC;
 
-        void *addr = mmap((void *)v->vm_start, size, prot, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+        int prot = PROT_READ | PROT_WRITE | PROT_EXEC;
+        int flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED;
+
+        // The Stack Growth Protector ---
+        // 0x0100 is the Linux kernel's internal value for VM_GROWSDOWN
+        if (v->vm_flags & 0x0100) {
+            flags |= MAP_GROWSDOWN;
+        }
+
+        void *addr = mmap((void *)v->vm_start, size, prot, flags, -1, 0);        
         if (addr == MAP_FAILED) {
             perror("MattX-Stub: mmap MAP_FIXED failed");
         } else {
-            printf("MattX-Stub: Carved VMA %u: 0x%lx - 0x%lx (RWX)\n", i, v->vm_start, v->vm_end);
+            printf("MattX-Stub: Carved VMA %u: 0x%lx - 0x%lx (RWX%s)\n", 
+                   i, v->vm_start, v->vm_end, (flags & MAP_GROWSDOWN) ? " + GROWSDOWN" : "");
         }
     }
     
-    // --- FIXED: Clean, dynamic FD table expansion! ---
+    // Clean, dynamic FD table expansion! ---
     for (int i = 3; i < MAX_FDS; i++) {
         dup2(0, i); 
     }
