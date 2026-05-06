@@ -117,7 +117,7 @@ static void handle_process_exit(struct mattx_link *link, struct mattx_header *hd
         struct task_struct *deputy = NULL;
         int i;
 
-        printk(KERN_INFO "MattX: [FUNERAL] Received exit notice for Deputy PID %u from Node %u\n", 
+        mattx_dbg(" [FUNERAL] Received exit notice for Deputy PID %u from Node %u\n", 
                exit_msg->orig_pid, hdr->sender_id);
 
         rcu_read_lock();
@@ -126,7 +126,7 @@ static void handle_process_exit(struct mattx_link *link, struct mattx_header *hd
         rcu_read_unlock();
 
         if (deputy) {
-            printk(KERN_INFO "MattX: [FUNERAL] Laying Deputy PID %u to rest (Sending SIGKILL)...\n", deputy->pid);
+            mattx_dbg(" [FUNERAL] Laying Deputy PID %u to rest (Sending SIGKILL)...\n", deputy->pid);
             send_sig(SIGKILL, deputy, 0);
             put_task_struct(deputy);
         }
@@ -166,7 +166,7 @@ static void handle_kill_surrogate(struct mattx_link *link, struct mattx_header *
             rcu_read_unlock();
 
             if (surrogate) {
-                printk(KERN_INFO "MattX:[ASSASSIN] Executing Surrogate PID %d (Sending SIGKILL)...\n", surrogate->pid);
+                mattx_dbg("[ASSASSIN] Executing Surrogate PID %d (Sending SIGKILL)...\n", surrogate->pid);
                 send_sig(SIGKILL, surrogate, 0);
                 put_task_struct(surrogate);
             }
@@ -191,6 +191,6 @@ bool is_rpc_pending(pid_t pid) {
 void mattx_guest_init_handlers(void) {
     mattx_register_handler(MATTX_MSG_PROCESS_EXIT, handle_process_exit);
     mattx_register_handler(MATTX_MSG_KILL_SURROGATE, handle_kill_surrogate);
-    printk(KERN_INFO "MattX: [GUEST] Network handlers registered.\n");
+    mattx_dbg(" [GUEST] Network handlers registered.\n");
 }
 

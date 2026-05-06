@@ -118,7 +118,7 @@ static int mattx_fake_getattr(struct user_namespace *mnt_userns, const struct pa
     }
     spin_unlock(&guest_lock);
 
-    printk(KERN_INFO "MattX:[WORMHOLE] Surrogate %d requesting GETATTR for FD %u. Sleeping...\n", my_pid, req.fd);
+    mattx_dbg("[WORMHOLE] Surrogate %d requesting GETATTR for FD %u. Sleeping...\n", my_pid, req.fd);
 
     // 2. Send the request to Node 1
     mattx_comm_send(cluster_map[fd_info->home_node], MATTX_MSG_SYS_STATX_REQ, &req, sizeof(req));
@@ -168,7 +168,7 @@ static int mattx_fake_getattr(struct user_namespace *mnt_userns, const struct pa
     }
     spin_unlock(&guest_lock);
 
-    printk(KERN_INFO "MattX:[WORMHOLE] Surrogate %d woke up! GETATTR result: %d (Size: %lld).\n", my_pid, ret_error, stat->size);
+    mattx_dbg("[WORMHOLE] Surrogate %d woke up! GETATTR result: %d (Size: %lld).\n", my_pid, ret_error, stat->size);
     return ret_error;
 }
 
@@ -204,7 +204,7 @@ static loff_t mattx_fake_llseek(struct file *file, loff_t offset, int whence) {
     }
     spin_unlock(&guest_lock);
 
-    printk(KERN_INFO "MattX:[WORMHOLE] Surrogate %d seeking FD %u (offset %lld, whence %d). Sleeping...\n", my_pid, req.fd, offset, whence);
+    mattx_dbg("[WORMHOLE] Surrogate %d seeking FD %u (offset %lld, whence %d). Sleeping...\n", my_pid, req.fd, offset, whence);
 
     // 2. Send the request to Node 1
     mattx_comm_send(cluster_map[fd_info->home_node], MATTX_MSG_SYS_LSEEK_REQ, &req, sizeof(req));
@@ -228,7 +228,7 @@ static loff_t mattx_fake_llseek(struct file *file, loff_t offset, int whence) {
         file->f_pos = ret_offset;
     }
 
-    printk(KERN_INFO "MattX:[WORMHOLE] Surrogate %d woke up! Seek result: %lld.\n", my_pid, ret_offset);
+    mattx_dbg("[WORMHOLE] Surrogate %d woke up! Seek result: %lld.\n", my_pid, ret_offset);
     return ret_offset;
 }
 
@@ -261,7 +261,7 @@ static int mattx_fake_fsync(struct file *file, loff_t start, loff_t end, int dat
     }
     spin_unlock(&guest_lock);
 
-    printk(KERN_INFO "MattX:[WORMHOLE] Surrogate %d requesting FSYNC for FD %u. Sleeping...\n", my_pid, req.fd);
+    mattx_dbg("[WORMHOLE] Surrogate %d requesting FSYNC for FD %u. Sleeping...\n", my_pid, req.fd);
 
     // 2. Send the request to Node 1
     mattx_comm_send(cluster_map[fd_info->home_node], MATTX_MSG_SYS_FSYNC_REQ, &req, sizeof(req));
@@ -280,7 +280,7 @@ static int mattx_fake_fsync(struct file *file, loff_t start, loff_t end, int dat
     }
     spin_unlock(&guest_lock);
 
-    printk(KERN_INFO "MattX:[WORMHOLE] Surrogate %d woke up! FSYNC result: %d.\n", my_pid, ret_error);
+    mattx_dbg("[WORMHOLE] Surrogate %d woke up! FSYNC result: %d.\n", my_pid, ret_error);
     return ret_error;
 }
 
@@ -316,7 +316,7 @@ static ssize_t mattx_fake_read(struct file *file, char __user *buf, size_t count
     }
     spin_unlock(&guest_lock);
 
-    printk(KERN_INFO "MattX:[WORMHOLE] Surrogate %d requesting %zu bytes from FD %u. Sleeping...\n", my_pid, to_read, req.fd);
+    mattx_dbg("[WORMHOLE] Surrogate %d requesting %zu bytes from FD %u. Sleeping...\n", my_pid, to_read, req.fd);
 
     // 2. Send the request to Node 1
     mattx_comm_send(cluster_map[fd_info->home_node], MATTX_MSG_SYS_READ_REQ, &req, sizeof(req));
@@ -349,7 +349,7 @@ static ssize_t mattx_fake_read(struct file *file, char __user *buf, size_t count
 
     if (read_buf) kfree(read_buf);
 
-    printk(KERN_INFO "MattX:[WORMHOLE] Surrogate %d woke up! Read %zd bytes.\n", my_pid, ret_bytes);
+    mattx_dbg("[WORMHOLE] Surrogate %d woke up! Read %zd bytes.\n", my_pid, ret_bytes);
     return ret_bytes;
 }
 
@@ -397,7 +397,7 @@ static int mattx_fake_release(struct inode *inode, struct file *file) {
             req.orig_pid = fd_info->orig_pid;
             req.remote_fd = fd_info->remote_fd;
 
-            printk(KERN_INFO "MattX:[WORMHOLE] Surrogate closed FD %u. Sending CLOSE_REQ to Node %d...\n", req.remote_fd, fd_info->home_node);
+            mattx_dbg("[WORMHOLE] Surrogate closed FD %u. Sending CLOSE_REQ to Node %d...\n", req.remote_fd, fd_info->home_node);
             mattx_comm_send(cluster_map[fd_info->home_node], MATTX_MSG_SYS_CLOSE_REQ, &req, sizeof(req));
         }
         kfree(fd_info);
@@ -492,7 +492,7 @@ static void handle_sys_open_req(struct mattx_link *link, struct mattx_header *hd
         int remote_fd = -1;
         int i, j;
 
-        printk(KERN_INFO "MattX:[RPC] Received OPEN request from Node %u for file: '%s'\n", hdr->sender_id, req->filename);
+        mattx_dbg("[RPC] Received OPEN request from Node %u for file: '%s'\n", hdr->sender_id, req->filename);
 
         rcu_read_lock();
         deputy = pid_task(find_vpid(req->orig_pid), PIDTYPE_PID);
@@ -544,7 +544,7 @@ static void handle_sys_open_req(struct mattx_link *link, struct mattx_header *hd
         reply.orig_pid = req->orig_pid;
         reply.remote_fd = remote_fd;
 
-        printk(KERN_INFO "MattX:[RPC] Sending OPEN_REPLY (Remote FD: %d) back to Node %u...\n", remote_fd, hdr->sender_id);
+        mattx_dbg("[RPC] Sending OPEN_REPLY (Remote FD: %d) back to Node %u...\n", remote_fd, hdr->sender_id);
         if (cluster_map[hdr->sender_id]) {
             mattx_comm_send(cluster_map[hdr->sender_id], MATTX_MSG_SYS_OPEN_REPLY, &reply, sizeof(reply));
         }
@@ -556,7 +556,7 @@ static void handle_sys_open_reply(struct mattx_link *link, struct mattx_header *
         struct mattx_sys_open_reply *reply = (struct mattx_sys_open_reply *)payload;
         int i;
 
-        printk(KERN_INFO "MattX:[RPC] Received OPEN_REPLY for Orig PID %u. Remote FD is %d.\n", reply->orig_pid, reply->remote_fd);
+        mattx_dbg("[RPC] Received OPEN_REPLY for Orig PID %u. Remote FD is %d.\n", reply->orig_pid, reply->remote_fd);
 
         spin_lock(&guest_lock);
         for (i = 0; i < guest_count; i++) {
@@ -578,7 +578,7 @@ static void handle_sys_close_req(struct mattx_link *link, struct mattx_header *h
         struct mattx_sys_close_req *req = (struct mattx_sys_close_req *)payload;
         int i;
         
-        printk(KERN_INFO "MattX:[RPC] Received CLOSE request for Remote FD %u from Node %u\n", req->remote_fd, hdr->sender_id);
+        mattx_dbg("[RPC] Received CLOSE request for Remote FD %u from Node %u\n", req->remote_fd, hdr->sender_id);
 
         if (req->remote_fd >= 1000) {
             int slot = req->remote_fd - 1000;
@@ -588,7 +588,7 @@ static void handle_sys_close_req(struct mattx_link *link, struct mattx_header *h
                     if (slot < MAX_FDS && export_registry[i].remote_files[slot]) {
                         fput(export_registry[i].remote_files[slot]);
                         export_registry[i].remote_files[slot] = NULL;
-                        printk(KERN_INFO "MattX:[RPC] Successfully closed Remote FD %u\n", req->remote_fd);
+                        mattx_dbg("[RPC] Successfully closed Remote FD %u\n", req->remote_fd);
                     }
                     break;
                 }
@@ -605,7 +605,7 @@ static void handle_sys_read_req(struct mattx_link *link, struct mattx_header *hd
         struct file *file = NULL;
         int i;
         
-        printk(KERN_INFO "MattX:[WORMHOLE] Received READ request for FD %u from Node %u. Reading from Deputy...\n", req->fd, hdr->sender_id);
+        mattx_dbg("[WORMHOLE] Received READ request for FD %u from Node %u. Reading from Deputy...\n", req->fd, hdr->sender_id);
 
         if (req->fd >= 1000) {
             int slot = req->fd - 1000;
@@ -696,7 +696,7 @@ static void handle_sys_read_reply(struct mattx_link *link, struct mattx_header *
         struct mattx_sys_read_reply *reply = (struct mattx_sys_read_reply *)payload;
         int i;
 
-        printk(KERN_INFO "MattX:[RPC] Received READ_REPLY for Orig PID %u. Bytes read: %zd\n", reply->orig_pid, reply->bytes_read);
+        mattx_dbg("[RPC] Received READ_REPLY for Orig PID %u. Bytes read: %zd\n", reply->orig_pid, reply->bytes_read);
 
         spin_lock(&guest_lock);
         for (i = 0; i < guest_count; i++) {
@@ -739,7 +739,7 @@ static void handle_sys_lseek_req(struct mattx_link *link, struct mattx_header *h
         reply.result_offset = -EBADF;
         reply.error = -EBADF;
 
-        printk(KERN_INFO "MattX:[WORMHOLE] Received LSEEK req for FD %u from Node %u (offset %lld, whence %d)\n", req->fd, hdr->sender_id, req->offset, req->whence);
+        mattx_dbg("[WORMHOLE] Received LSEEK req for FD %u from Node %u (offset %lld, whence %d)\n", req->fd, hdr->sender_id, req->offset, req->whence);
 
         if (req->fd >= 1000) {
             int slot = req->fd - 1000;
@@ -800,7 +800,7 @@ static void handle_sys_statx_req(struct mattx_link *link, struct mattx_header *h
         reply.error = -EBADF;
         memset(&reply.statx_buf, 0, sizeof(reply.statx_buf));
 
-        printk(KERN_INFO "MattX:[WORMHOLE] Received STATX req for FD %u from Node %u\n", req->fd, hdr->sender_id);
+        mattx_dbg("[WORMHOLE] Received STATX req for FD %u from Node %u\n", req->fd, hdr->sender_id);
 
         if (req->fd >= 1000) {
             int slot = req->fd - 1000;
@@ -902,7 +902,7 @@ static void handle_sys_dup_req(struct mattx_link *link, struct mattx_header *hdr
         reply.new_remote_fd = -EBADF;
         reply.error = -EBADF;
 
-        printk(KERN_INFO "MattX:[WORMHOLE] Received DUP req for Remote FD %u from Node %u\n", req->old_remote_fd, hdr->sender_id);
+        mattx_dbg("[WORMHOLE] Received DUP req for Remote FD %u from Node %u\n", req->old_remote_fd, hdr->sender_id);
 
         if (req->old_remote_fd >= 1000) {
             int slot = req->old_remote_fd - 1000;
@@ -920,7 +920,7 @@ static void handle_sys_dup_req(struct mattx_link *link, struct mattx_header *hdr
                                 export_registry[i].remote_files[j] = file;
                                 reply.new_remote_fd = j + 1000;
                                 reply.error = 0;
-                                printk(KERN_INFO "MattX:[WORMHOLE] Duplicated Exported FD %u to %d\n", req->old_remote_fd, reply.new_remote_fd);
+                                mattx_dbg("[WORMHOLE] Duplicated Exported FD %u to %d\n", req->old_remote_fd, reply.new_remote_fd);
                                 break;
                             }
                         }
@@ -973,7 +973,7 @@ static void handle_sys_dup_req(struct mattx_link *link, struct mattx_header *hdr
                                 __set_bit(new_fd, fdt->open_fds);
                                 reply.new_remote_fd = new_fd;
                                 reply.error = 0;
-                                printk(KERN_INFO "MattX:[WORMHOLE] Duplicated Deputy FD %u to %d\n", req->old_remote_fd, reply.new_remote_fd);
+                                mattx_dbg("[WORMHOLE] Duplicated Deputy FD %u to %d\n", req->old_remote_fd, reply.new_remote_fd);
                             } else {
                                 fput(file);
                                 reply.error = -EMFILE;
@@ -1003,7 +1003,7 @@ static void handle_sys_fsync_req(struct mattx_link *link, struct mattx_header *h
         reply.orig_pid = req->orig_pid;
         reply.error = -EBADF;
 
-        printk(KERN_INFO "MattX:[WORMHOLE] Received FSYNC req for FD %u from Node %u\n", req->fd, hdr->sender_id);
+        mattx_dbg("[WORMHOLE] Received FSYNC req for FD %u from Node %u\n", req->fd, hdr->sender_id);
 
         if (req->fd >= 1000) {
             int slot = req->fd - 1000;
@@ -1072,7 +1072,7 @@ static void handle_sys_socket_req(struct mattx_link *link, struct mattx_header *
         int remote_fd = -1;
         int i, j;
 
-        printk(KERN_INFO "MattX:[NETWORK] Received SOCKET request from Node %u (domain: %d, type: %d, protocol: %d)\n", 
+        mattx_dbg("[NETWORK] Received SOCKET request from Node %u (domain: %d, type: %d, protocol: %d)\n", 
                hdr->sender_id, req->domain, req->type, req->protocol);
 
         rcu_read_lock();
@@ -1149,7 +1149,7 @@ static void handle_sys_connect_req(struct mattx_link *link, struct mattx_header 
         reply.orig_pid = req->orig_pid;
         reply.error = -EBADF;
 
-        printk(KERN_INFO "MattX:[NETWORK] Received CONNECT request for FD %u from Node %u\n", req->fd, hdr->sender_id);
+        mattx_dbg("[NETWORK] Received CONNECT request for FD %u from Node %u\n", req->fd, hdr->sender_id);
 
         if (req->fd >= 1000) {
             int slot = req->fd - 1000;
@@ -1206,7 +1206,7 @@ static void handle_sys_lseek_reply(struct mattx_link *link, struct mattx_header 
         struct mattx_sys_lseek_reply *reply = (struct mattx_sys_lseek_reply *)payload;
         int i;
 
-        printk(KERN_INFO "MattX:[RPC] Received LSEEK_REPLY for Orig PID %u. Result: %lld\n", reply->orig_pid, reply->result_offset);
+        mattx_dbg("[RPC] Received LSEEK_REPLY for Orig PID %u. Result: %lld\n", reply->orig_pid, reply->result_offset);
 
         spin_lock(&guest_lock);
         for (i = 0; i < guest_count; i++) {
@@ -1230,7 +1230,7 @@ static void handle_sys_statx_reply(struct mattx_link *link, struct mattx_header 
         struct mattx_sys_statx_reply *reply = (struct mattx_sys_statx_reply *)payload;
         int i;
 
-        printk(KERN_INFO "MattX:[RPC] Received STATX_REPLY for Orig PID %u. Error: %d\n", reply->orig_pid, reply->error);
+        mattx_dbg("[RPC] Received STATX_REPLY for Orig PID %u. Error: %d\n", reply->orig_pid, reply->error);
 
         spin_lock(&guest_lock);
         for (i = 0; i < guest_count; i++) {
@@ -1262,7 +1262,7 @@ static void handle_sys_dup_reply(struct mattx_link *link, struct mattx_header *h
         struct mattx_sys_dup_reply *reply = (struct mattx_sys_dup_reply *)payload;
         int i;
 
-        printk(KERN_INFO "MattX:[RPC] Received DUP_REPLY for Orig PID %u. New Remote FD: %d\n", reply->orig_pid, reply->new_remote_fd);
+        mattx_dbg("[RPC] Received DUP_REPLY for Orig PID %u. New Remote FD: %d\n", reply->orig_pid, reply->new_remote_fd);
 
         spin_lock(&guest_lock);
         for (i = 0; i < guest_count; i++) {
@@ -1284,7 +1284,7 @@ static void handle_sys_fsync_reply(struct mattx_link *link, struct mattx_header 
         struct mattx_sys_fsync_reply *reply = (struct mattx_sys_fsync_reply *)payload;
         int i;
 
-        printk(KERN_INFO "MattX:[RPC] Received FSYNC_REPLY for Orig PID %u. Error: %d\n", reply->orig_pid, reply->error);
+        mattx_dbg("[RPC] Received FSYNC_REPLY for Orig PID %u. Error: %d\n", reply->orig_pid, reply->error);
 
         spin_lock(&guest_lock);
         for (i = 0; i < guest_count; i++) {
@@ -1306,7 +1306,7 @@ static void handle_sys_socket_reply(struct mattx_link *link, struct mattx_header
         struct mattx_sys_socket_reply *reply = (struct mattx_sys_socket_reply *)payload;
         int i;
 
-        printk(KERN_INFO "MattX:[RPC] Received SOCKET_REPLY for Orig PID %u. Remote FD: %d\n", reply->orig_pid, reply->remote_fd);
+        mattx_dbg("[RPC] Received SOCKET_REPLY for Orig PID %u. Remote FD: %d\n", reply->orig_pid, reply->remote_fd);
 
         spin_lock(&guest_lock);
         for (i = 0; i < guest_count; i++) {
@@ -1328,7 +1328,7 @@ static void handle_sys_connect_reply(struct mattx_link *link, struct mattx_heade
         struct mattx_sys_connect_reply *reply = (struct mattx_sys_connect_reply *)payload;
         int i;
 
-        printk(KERN_INFO "MattX:[RPC] Received CONNECT_REPLY for Orig PID %u. Error: %d\n", reply->orig_pid, reply->error);
+        mattx_dbg("[RPC] Received CONNECT_REPLY for Orig PID %u. Error: %d\n", reply->orig_pid, reply->error);
 
         spin_lock(&guest_lock);
         for (i = 0; i < guest_count; i++) {
@@ -1357,7 +1357,7 @@ static void handle_sys_bind_req(struct mattx_link *link, struct mattx_header *hd
         reply.orig_pid = req->orig_pid;
         reply.error = -EBADF;
 
-        printk(KERN_INFO "MattX:[NETWORK] Received BIND request for FD %u from Node %u\n", req->fd, hdr->sender_id);
+        mattx_dbg("[NETWORK] Received BIND request for FD %u from Node %u\n", req->fd, hdr->sender_id);
 
         if (req->fd >= 1000) {
             int slot = req->fd - 1000;
@@ -1419,7 +1419,7 @@ static void handle_sys_listen_req(struct mattx_link *link, struct mattx_header *
         reply.orig_pid = req->orig_pid;
         reply.error = -EBADF;
 
-        printk(KERN_INFO "MattX:[NETWORK] Received LISTEN request for FD %u from Node %u\n", req->fd, hdr->sender_id);
+        mattx_dbg("[NETWORK] Received LISTEN request for FD %u from Node %u\n", req->fd, hdr->sender_id);
 
         if (req->fd >= 1000) {
             int slot = req->fd - 1000;
@@ -1477,7 +1477,7 @@ static void handle_sys_generic_int_reply(struct mattx_link *link, struct mattx_h
         struct mattx_sys_connect_reply *reply = (struct mattx_sys_connect_reply *)payload;
         int i;
 
-        printk(KERN_INFO "MattX:[RPC] Received Integer REPLY (Err: %d) for Orig PID %u\n", reply->error, reply->orig_pid);
+        mattx_dbg("[RPC] Received Integer REPLY (Err: %d) for Orig PID %u\n", reply->error, reply->orig_pid);
 
         spin_lock(&guest_lock);
         for (i = 0; i < guest_count; i++) {
@@ -1657,7 +1657,7 @@ static void handle_sys_recv_reply(struct mattx_link *link, struct mattx_header *
         struct mattx_sys_recv_reply *reply = (struct mattx_sys_recv_reply *)payload;
         int i;
 
-        printk(KERN_INFO "MattX:[RPC] Received RECV_REPLY for Orig PID %u. Bytes recv: %zd\n", reply->orig_pid, reply->bytes_recv);
+        mattx_dbg("[RPC] Received RECV_REPLY for Orig PID %u. Bytes recv: %zd\n", reply->orig_pid, reply->bytes_recv);
 
         spin_lock(&guest_lock);
         for (i = 0; i < guest_count; i++) {
@@ -1701,7 +1701,7 @@ static void mattx_accept_worker(struct work_struct *work) {
     reply.remote_fd = -EBADF;
     reply.error = -EBADF;
 
-    printk(KERN_INFO "MattX:[RPC] Accept Worker started for Deputy PID %u\n", rpc->orig_pid);
+    mattx_dbg("[RPC] Accept Worker started for Deputy PID %u\n", rpc->orig_pid);
 
     if (rpc->remote_fd >= 1000) {
         int slot = rpc->remote_fd - 1000;
@@ -1827,7 +1827,7 @@ static void mattx_accept_worker(struct work_struct *work) {
     }
 
     if (cluster_map[rpc->home_node]) {
-        printk(KERN_INFO "MattX:[RPC] Sending ACCEPT_REPLY (Remote FD: %d) back to Node %u...\n", reply.remote_fd, rpc->home_node);
+        mattx_dbg("[RPC] Sending ACCEPT_REPLY (Remote FD: %d) back to Node %u...\n", reply.remote_fd, rpc->home_node);
         mattx_comm_send(cluster_map[rpc->home_node], MATTX_MSG_SYS_ACCEPT_REPLY, &reply, sizeof(reply));
     }
     
@@ -1838,7 +1838,7 @@ static void handle_sys_accept_req(struct mattx_link *link, struct mattx_header *
     if (payload) {
         struct mattx_sys_accept_req *req = (struct mattx_sys_accept_req *)payload;
         
-        printk(KERN_INFO "MattX:[RPC] Received ACCEPT request from Node %u. Escaping to Workqueue...\n", hdr->sender_id);
+        mattx_dbg("[RPC] Received ACCEPT request from Node %u. Escaping to Workqueue...\n", hdr->sender_id);
 
         // Throw the blocking accept call onto a background worker!
         struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC);
@@ -1858,7 +1858,7 @@ static void handle_sys_accept_reply(struct mattx_link *link, struct mattx_header
         struct mattx_sys_accept_reply *reply = (struct mattx_sys_accept_reply *)payload;
         int i;
 
-        printk(KERN_INFO "MattX:[RPC] Received ACCEPT_REPLY for Orig PID %u. New Remote FD: %d\n", reply->orig_pid, reply->remote_fd);
+        mattx_dbg("[RPC] Received ACCEPT_REPLY for Orig PID %u. New Remote FD: %d\n", reply->orig_pid, reply->remote_fd);
 
         spin_lock(&guest_lock);
         for (i = 0; i < guest_count; i++) {
@@ -1905,7 +1905,7 @@ static void mattx_poll_worker(struct work_struct *work) {
     reply.nfds = rpc->nfds;
     memcpy(reply.fds, rpc->poll_fds, sizeof(struct mattx_pollfd) * rpc->nfds);
 
-    printk(KERN_INFO "MattX:[RPC] Poll Worker started for Deputy PID %u (Timeout: %dms)\n", rpc->orig_pid, rpc->timeout);
+    mattx_dbg("[RPC] Poll Worker started for Deputy PID %u (Timeout: %dms)\n", rpc->orig_pid, rpc->timeout);
 
     if (has_timeout) {
         expire = jiffies + msecs_to_jiffies(rpc->timeout);
@@ -1965,7 +1965,7 @@ static void mattx_poll_worker(struct work_struct *work) {
     }
 
     if (cluster_map[rpc->home_node]) {
-        printk(KERN_INFO "MattX:[RPC] Sending POLL_REPLY (Ready: %d) back to Node %u...\n", reply.retval, rpc->home_node);
+        mattx_dbg("[RPC] Sending POLL_REPLY (Ready: %d) back to Node %u...\n", reply.retval, rpc->home_node);
         mattx_comm_send(cluster_map[rpc->home_node], MATTX_MSG_SYS_POLL_REPLY, &reply, sizeof(reply));
     }
     
@@ -1994,7 +1994,7 @@ static void handle_sys_poll_reply(struct mattx_link *link, struct mattx_header *
         struct mattx_sys_poll_reply *reply = (struct mattx_sys_poll_reply *)payload;
         int i;
 
-        printk(KERN_INFO "MattX:[RPC] Received POLL_REPLY for Orig PID %u. Ready FDs: %d\n", reply->orig_pid, reply->retval);
+        mattx_dbg("[RPC] Received POLL_REPLY for Orig PID %u. Ready FDs: %d\n", reply->orig_pid, reply->retval);
 
         spin_lock(&guest_lock);
         for (i = 0; i < guest_count; i++) {
@@ -3031,7 +3031,7 @@ static void handle_sys_unlink_req(struct mattx_link *link, struct mattx_header *
         reply.req_id = req->req_id;
         reply.orig_pid = req->orig_pid;
 
-        printk(KERN_INFO "MattX:[RPC] Received UNLINK request from Node %u for file: '%s'\n", hdr->sender_id, req->path);
+        mattx_dbg("[RPC] Received UNLINK request from Node %u for file: '%s'\n", hdr->sender_id, req->path);
 
         if (req->orig_pid != 0) {
             rcu_read_lock();
@@ -3100,7 +3100,7 @@ static void handle_sys_unlink_reply(struct mattx_link *link, struct mattx_header
         struct mattx_sys_unlink_reply *reply = payload;
         int i;
 
-        printk(KERN_INFO "MattX:[RPC] Received UNLINK_REPLY. Error: %d\n", reply->error);
+        mattx_dbg("[RPC] Received UNLINK_REPLY. Error: %d\n", reply->error);
 
         // 1. Wake up MattXFS (if req_id is set)
         if (reply->req_id != 0) {
@@ -3195,7 +3195,7 @@ void mattx_fileio_init_handlers(void) {
     mattx_register_handler(MATTX_MSG_VFS_FSYNC_REQ, handle_vfs_fsync_req);
     mattx_register_handler(MATTX_MSG_VFS_FSYNC_REPLY, handle_vfs_fsync_reply);
 
-    printk(KERN_INFO "MattX: [FILEIO] Network handlers registered.\n");
+    mattx_dbg(" [FILEIO] Network handlers registered.\n");
 }
 
 
@@ -3205,7 +3205,7 @@ void mattx_fileio_exit(void) {
     int i, j;
     struct file *f;
 
-    printk(KERN_INFO "MattX: [FILEIO] Purging all open files...\n");
+    mattx_dbg(" [FILEIO] Purging all open files...\n");
 
     // 1. Clean up MFS open files
     spin_lock(&mfs_file_lock);
@@ -3236,5 +3236,5 @@ void mattx_fileio_exit(void) {
     export_count = 0;
     spin_unlock(&export_lock);
     
-    printk(KERN_INFO "MattX: [FILEIO] File purge complete.\n");
+    mattx_dbg(" [FILEIO] File purge complete.\n");
 }

@@ -115,7 +115,7 @@ static int mattx_receiver_loop(void *data) {
         }
     }
     
-    printk(KERN_INFO "MattX: [COMM] Receiver thread exiting for Node %d\n", link->node_id);
+    mattx_dbg(" [COMM] Receiver thread exiting for Node %d\n", link->node_id);
     return 0;
 }
 

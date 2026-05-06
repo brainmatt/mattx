@@ -35,7 +35,7 @@ static void handle_migrate_req(struct mattx_link *link, struct mattx_header *hdr
         pending_source_node = hdr->sender_id;
         injected_pages_count = 0;
 
-        printk(KERN_INFO "MattX:[IMPORT] Received Blueprint for PID %u. Saving to pending...\n", req->orig_pid);
+        mattx_dbg("[IMPORT] Received Blueprint for PID %u. Saving to pending...\n", req->orig_pid);
         if (pending_migration) kvfree(pending_migration);
         
         pending_migration = kvmalloc(hdr->length, GFP_KERNEL);
@@ -80,7 +80,7 @@ static void handle_page_transfer(struct mattx_link *link, struct mattx_header *h
 }
 
 static void handle_migrate_done(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
-    printk(KERN_INFO "MattX:[IMPORT] All memory transferred! Total pages injected: %d\n", injected_pages_count);
+    mattx_dbg("[IMPORT] All memory transferred! Total pages injected: %d\n", injected_pages_count);
     
     if (hijacked_stub_task && pending_migration) {
         struct pt_regs *regs;
@@ -91,7 +91,7 @@ static void handle_migrate_done(struct mattx_link *link, struct mattx_header *hd
         struct file **fake_files; 
         int i;
 
-        printk(KERN_INFO "MattX:[IMPORT] Commencing full brain transplant on PID %d...\n", hijacked_stub_task->pid);
+        mattx_dbg("[IMPORT] Commencing full brain transplant on PID %d...\n", hijacked_stub_task->pid);
 
         while (!(READ_ONCE(hijacked_stub_task->__state) & __TASK_STOPPED) && retries > 0) {
             msleep(10);
@@ -163,16 +163,16 @@ static void handle_migrate_done(struct mattx_link *link, struct mattx_header *hd
                             __set_bit(fd_num, fdt->open_fds);                        }
                     }
                     spin_unlock(&hijacked_stub_task->files->file_lock);
-                    printk(KERN_INFO "MattX:[IMPORT] Successfully injected %u Fake FDs!\n", pending_migration->fd_count);
+                    mattx_dbg("[IMPORT] Successfully injected %u Fake FDs!\n", pending_migration->fd_count);
                 }
                 kfree(fake_files); 
             }
 
             if (access_process_vm(hijacked_stub_task, regs->ip, rip_buf, 8, FOLL_FORCE) == 8) {
-                printk(KERN_INFO "MattX:[DEBUG] Target RIP (0x%lx) contains: %8ph\n", regs->ip, rip_buf);
+                mattx_dbg("[DEBUG] Target RIP (0x%lx) contains: %8ph\n", regs->ip, rip_buf);
             }
 
-            printk(KERN_INFO "MattX:[IMPORT] IT'S ALIVE! Sending SIGCONT to PID %d\n", hijacked_stub_task->pid);
+            mattx_dbg("[IMPORT] IT'S ALIVE! Sending SIGCONT to PID %d\n", hijacked_stub_task->pid);
             send_sig(SIGCONT, hijacked_stub_task, 0);
             
             add_guest_process(hijacked_stub_task->pid, pending_migration->orig_pid, pending_source_node);
@@ -191,7 +191,7 @@ static void handle_return_blueprint(struct mattx_link *link, struct mattx_header
         struct mattx_migration_req *req = (struct mattx_migration_req *)payload;
         struct task_struct *deputy = NULL;
 
-        printk(KERN_INFO "MattX:[IMPORT] Received RETURN Blueprint for Deputy PID %u. Saving to pending...\n", req->orig_pid);
+        mattx_dbg("[IMPORT] Received RETURN Blueprint for Deputy PID %u. Saving to pending...\n", req->orig_pid);
         
         pending_source_node = hdr->sender_id;
         injected_pages_count = 0;
@@ -205,7 +205,7 @@ static void handle_return_blueprint(struct mattx_link *link, struct mattx_header
         rcu_read_unlock();
 
         if (deputy) {
-            printk(KERN_INFO "MattX:[RECALL] Found frozen Deputy PID %d. Preparing for injection...\n", deputy->pid);
+            mattx_dbg("[RECALL] Found frozen Deputy PID %d. Preparing for injection...\n", deputy->pid);
             
             if (hijacked_stub_task) put_task_struct(hijacked_stub_task);
             hijacked_stub_task = deputy; 
@@ -217,7 +217,7 @@ static void handle_return_blueprint(struct mattx_link *link, struct mattx_header
             // We just leave the mm_struct exactly as it is, and let the data pump 
             // safely overwrite the variables using access_process_vm.
 
-            printk(KERN_INFO "MattX: [RECALL] Sending READY_FOR_DATA signal to Node %d...\n", pending_source_node);
+            mattx_dbg(" [RECALL] Sending READY_FOR_DATA signal to Node %d...\n", pending_source_node);
             mattx_comm_send(cluster_map[pending_source_node], MATTX_MSG_READY_FOR_DATA, NULL, 0);
         } else {
             printk(KERN_ERR "MattX: [RECALL] ERROR: Deputy PID %u not found!\n", req->orig_pid);
@@ -226,7 +226,7 @@ static void handle_return_blueprint(struct mattx_link *link, struct mattx_header
 }
 
 static void handle_return_done(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
-    printk(KERN_INFO "MattX:[IMPORT] Return memory transferred successfully! Pages: %d\n", injected_pages_count);
+    mattx_dbg("[IMPORT] Return memory transferred successfully! Pages: %d\n", injected_pages_count);
     
     if (hijacked_stub_task && pending_migration) {
         struct pt_regs *regs = task_pt_regs(hijacked_stub_task);
@@ -235,7 +235,7 @@ static void handle_return_done(struct mattx_link *link, struct mattx_header *hdr
         if (regs) {
             memcpy(regs, &pending_migration->regs, sizeof(struct pt_regs));
             
-            printk(KERN_INFO "MattX:[IMPORT] Deputy Brain Restored. New RIP: 0x%lx\n", regs->ip);
+            mattx_dbg("[IMPORT] Deputy Brain Restored. New RIP: 0x%lx\n", regs->ip);
             
             spin_lock(&export_lock);
             for (i = 0; i < export_count; i++) {
@@ -246,7 +246,7 @@ static void handle_return_done(struct mattx_link *link, struct mattx_header *hdr
             }
             spin_unlock(&export_lock);
 
-            printk(KERN_INFO "MattX:[IMPORT] Welcome home! Sending SIGCONT to Deputy PID %d\n", hijacked_stub_task->pid);
+            mattx_dbg("[IMPORT] Welcome home! Sending SIGCONT to Deputy PID %d\n", hijacked_stub_task->pid);
             send_sig(SIGCONT, hijacked_stub_task, 0);
         }
         
@@ -264,6 +264,6 @@ void mattx_import_init_handlers(void) {
     mattx_register_handler(MATTX_MSG_MIGRATE_DONE, handle_migrate_done);
     mattx_register_handler(MATTX_MSG_RETURN_BLUEPRINT, handle_return_blueprint);
     mattx_register_handler(MATTX_MSG_RETURN_DONE, handle_return_done);
-    printk(KERN_INFO "MattX: [IMPORT] Network handlers registered.\n");
+    mattx_dbg(" [IMPORT] Network handlers registered.\n");
 }
 

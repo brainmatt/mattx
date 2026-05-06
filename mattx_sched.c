@@ -76,7 +76,7 @@ static void mattx_evaluate_and_balance(u32 local_cpu_load) {
         if (cond_a || cond_b) {
             struct task_struct *task = mattx_find_candidate_task();
             if (task) {
-                printk(KERN_INFO "MattX: [MIGRATE] Selected PID %d (%s) for migration to Node %d!\n", 
+                mattx_dbg(" [MIGRATE] Selected PID %d (%s) for migration to Node %d!\n", 
                        task->pid, task->comm, best_node);
                 mattx_capture_and_send_state(task, best_node);
                 put_task_struct(task); 
@@ -97,7 +97,7 @@ int mattx_balancer_loop(void *data) {
     struct { u32 orig_pid; int target_node; } dead_exports[16];
     int dead_export_count;
 
-    printk(KERN_INFO "MattX: Balancer thread started\n");
+    mattx_dbg(" Balancer thread started\n");
 
     while (!kthread_should_stop()) {
         local_load.cpu_load = (u32)avenrun[0]; 
@@ -147,7 +147,7 @@ int mattx_balancer_loop(void *data) {
             exit_msg.orig_pid = dead_guests[i].orig_pid;
             exit_msg.exit_code = 0; 
             
-            printk(KERN_INFO "MattX: [WATCHER] Guest PID %d died. Notifying Home Node %d...\n", 
+            mattx_dbg(" [WATCHER] Guest PID %d died. Notifying Home Node %d...\n", 
                    dead_guests[i].local_pid, dead_guests[i].home_node);
                    
             if (cluster_map[dead_guests[i].home_node]) {
@@ -194,7 +194,7 @@ int mattx_balancer_loop(void *data) {
             kill_msg.orig_pid = dead_exports[i].orig_pid;
             kill_msg.exit_code = 0; 
 
-            printk(KERN_INFO "MattX: [WATCHER] Exported PID %d died. Sending Assassination Order to Node %d...\n",
+            mattx_dbg(" [WATCHER] Exported PID %d died. Sending Assassination Order to Node %d...\n",
                    dead_exports[i].orig_pid, dead_exports[i].target_node);
 
             if (cluster_map[dead_exports[i].target_node]) {
@@ -213,7 +213,7 @@ static void handle_heartbeat(struct mattx_link *link, struct mattx_header *hdr, 
     if (link->node_id == -1 && hdr->sender_id < MAX_NODES) {
         link->node_id = hdr->sender_id;
         cluster_map[link->node_id] = link;
-        printk(KERN_INFO "MattX: [SCHED] Registered new connection from Node %u\n", hdr->sender_id);
+        mattx_dbg(" [SCHED] Registered new connection from Node %u\n", hdr->sender_id);
     }
 }
 
@@ -228,6 +228,6 @@ static void handle_load_update(struct mattx_link *link, struct mattx_header *hdr
 void mattx_sched_init_handlers(void) {
     mattx_register_handler(MATTX_MSG_HEARTBEAT, handle_heartbeat);
     mattx_register_handler(MATTX_MSG_LOAD_UPDATE, handle_load_update);
-    printk(KERN_INFO "MattX: [SCHED] Network handlers registered.\n");
+    mattx_dbg(" [SCHED] Network handlers registered.\n");
 }
 

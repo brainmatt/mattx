@@ -130,24 +130,24 @@ static ssize_t admin_write(struct file *file, const char __user *ubuf, size_t co
         
         if (strcmp(cmd, "balancer") == 0 && arg1 != -1) {
             balancer_enabled = (arg1 != 0);
-            printk(KERN_INFO "MattX: [ADMIN] Automatic Load Balancer set to: %d\n", balancer_enabled);
+            mattx_dbg(" [ADMIN] Automatic Load Balancer set to: %d\n", balancer_enabled);
         }
         else if (strcmp(cmd, "debug") == 0 && arg1 != -1) {
             // The Debug Toggle ---
             config_debug_mode = (arg1 != 0);
-            printk(KERN_INFO "MattX: [ADMIN] Debug Mode set to: %s\n", config_debug_mode ? "ON" : "OFF");
+            mattx_dbg(" [ADMIN] Debug Mode set to: %s\n", config_debug_mode ? "ON" : "OFF");
         }        
         else if (strcmp(cmd, "migrate") == 0 && arg1 != -1 && arg2_str[0] != '\0') {
             
             if (strcmp(arg2_str, "home") == 0) {
-                printk(KERN_INFO "MattX:[ADMIN] Manual recall requested: PID %d to HOME\n", arg1);
+                mattx_dbg("[ADMIN] Manual recall requested: PID %d to HOME\n", arg1);
                 mattx_trigger_recall(arg1);
             } 
             else {
                 int arg2;
                 if (kstrtoint(arg2_str, 10, &arg2) == 0) {
                     struct task_struct *task;
-                    printk(KERN_INFO "MattX: [ADMIN] Manual migration requested: PID %d to Node %d\n", arg1, arg2);
+                    mattx_dbg(" [ADMIN] Manual migration requested: PID %d to Node %d\n", arg1, arg2);
                     
                     if (arg2 < 0 || arg2 >= MAX_NODES || !cluster_map[arg2]) {
                         printk(KERN_ERR "MattX:[ADMIN] Target Node %d is not connected!\n", arg2);
@@ -187,7 +187,7 @@ int mattx_proc_init(void) {
     proc_create("guests", 0444, mattx_proc_dir, &guests_proc_ops); 
     proc_create("admin", 0666, mattx_proc_dir, &admin_proc_ops); 
 
-    printk(KERN_INFO "MattX: /proc/mattx interface created successfully.\n");
+    mattx_dbg(" /proc/mattx interface created successfully.\n");
     return 0;
 }
 

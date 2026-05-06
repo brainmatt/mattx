@@ -120,7 +120,7 @@ static int mattx_nl_cmd_get_blueprint(struct sk_buff *skb, struct genl_info *inf
     }
 
     genlmsg_end(reply_skb, msg_head);
-    printk(KERN_INFO "MattX: [NL] Sending Blueprint (%d bytes) back to Stub PID %u\n", len, info->snd_portid);
+    mattx_dbg(" [NL] Sending Blueprint (%d bytes) back to Stub PID %u\n", len, info->snd_portid);
     return genlmsg_reply(reply_skb, info);
 }
 
@@ -140,10 +140,10 @@ static int mattx_nl_cmd_hijack_me(struct sk_buff *skb, struct genl_info *info) {
     if (hijacked_stub_task) put_task_struct(hijacked_stub_task);
     hijacked_stub_task = stub_task;
 
-    printk(KERN_INFO "MattX: [HIJACK] SUCCESS! Stub PID %u is carved and ready.\n", stub_pid);
+    mattx_dbg(" [HIJACK] SUCCESS! Stub PID %u is carved and ready.\n", stub_pid);
 
     if (pending_source_node != -1 && cluster_map[pending_source_node]) {
-        printk(KERN_INFO "MattX: [HIJACK] Sending READY_FOR_DATA signal to Node %d...\n", pending_source_node);
+        mattx_dbg(" [HIJACK] Sending READY_FOR_DATA signal to Node %d...\n", pending_source_node);
         mattx_comm_send(cluster_map[pending_source_node], MATTX_MSG_READY_FOR_DATA, NULL, 0);
     }
 
@@ -153,7 +153,7 @@ static int mattx_nl_cmd_hijack_me(struct sk_buff *skb, struct genl_info *info) {
 static int mattx_nl_cmd_set_local_ip(struct sk_buff *skb, struct genl_info *info) {
     if (info->attrs[MATTX_ATTR_LOCAL_IP]) {
         my_ip_addr = nla_get_u32(info->attrs[MATTX_ATTR_LOCAL_IP]);
-        printk(KERN_INFO "MattX: [NL] Daemon registered local IP: %pI4\n", &my_ip_addr);
+        mattx_dbg(" [NL] Daemon registered local IP: %pI4\n", &my_ip_addr);
     }
     return 0;
 }
@@ -167,14 +167,14 @@ static int mattx_nl_cmd_set_config(struct sk_buff *skb, struct genl_info *info) 
     }
     if (info->attrs[MATTX_ATTR_MATTXFS_ENABLED]) {
         config_mattxfs_enabled = nla_get_u8(info->attrs[MATTX_ATTR_MATTXFS_ENABLED]) ? true : false;
-        printk(KERN_INFO "MattX:[NL] MattXFS Overlay Mode Enabled: %s\n", config_mattxfs_enabled ? "TRUE" : "FALSE");
+        mattx_dbg("[NL] MattXFS Overlay Mode Enabled: %s\n", config_mattxfs_enabled ? "TRUE" : "FALSE");
     }
     if (info->attrs[MATTX_ATTR_DFSA_DIR]) {
         nla_strscpy(config_dfsa_dir, info->attrs[MATTX_ATTR_DFSA_DIR], sizeof(config_dfsa_dir));
-        printk(KERN_INFO "MattX:[NL] DFSA Directory set to: '%s'\n", config_dfsa_dir);
+        mattx_dbg("[NL] DFSA Directory set to: '%s'\n", config_dfsa_dir);
     }
     
-    printk(KERN_INFO "MattX: Configuration Updated - FileIO: %s, NetworkIO: %s, MattXFS: %s\n",
+    mattx_dbg(" Configuration Updated - FileIO: %s, NetworkIO: %s, MattXFS: %s\n",
            config_migrate_file_io ? "TRUE" : "FALSE",
            config_migrate_network_io ? "TRUE" : "FALSE",
            config_mattxfs_enabled ? "TRUE" : "FALSE");

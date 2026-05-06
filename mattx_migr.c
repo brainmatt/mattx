@@ -67,7 +67,7 @@ static void mattx_freeze_task_safely(struct task_struct *task) {
 
     ret = task_work_add(task, &ctx.cb, TWA_SIGNAL);
     if (ret == 0) {
-        printk(KERN_INFO "MattX:[DRAIN] Injected Task Work into PID %d. Waiting for stable state...\n", task->pid);
+        mattx_dbg("[DRAIN] Injected Task Work into PID %d. Waiting for stable state...\n", task->pid);
         
         // If the task was stopped by something else (like job control), we must nudge it 
         // so it wakes up and executes our Task Work!
@@ -76,7 +76,7 @@ static void mattx_freeze_task_safely(struct task_struct *task) {
         }
         
         wait_for_completion(&ctx.done);
-        printk(KERN_INFO "MattX:[DRAIN] PID %d is now stable and frozen at the user-space boundary!\n", task->pid);
+        mattx_dbg("[DRAIN] PID %d is now stable and frozen at the user-space boundary!\n", task->pid);
     } else {
         printk(KERN_WARNING "MattX:[DRAIN] task_work_add failed for PID %d. Falling back to SIGSTOP.\n", task->pid);
         send_sig(SIGSTOP, task, 0);
@@ -106,7 +106,7 @@ void mattx_capture_and_send_state(struct task_struct *task, int target_node) {
     req = kzalloc(max_payload_size, GFP_KERNEL);
     if (!req) return;
 
-    printk(KERN_INFO "MattX:[EXTRACT] Initiating state capture for PID %d (%s)...\n", task->pid, task->comm);
+    mattx_dbg("[EXTRACT] Initiating state capture for PID %d (%s)...\n", task->pid, task->comm);
 
     // Use the Jedi Master Pivot!
     mattx_freeze_task_safely(task);
@@ -124,11 +124,11 @@ void mattx_capture_and_send_state(struct task_struct *task, int target_node) {
         req->uid = from_kuid(&init_user_ns, cred->uid);
         req->gid = from_kgid(&init_user_ns, cred->gid);
         put_cred(cred); 
-        printk(KERN_INFO "MattX:[EXTRACT] Captured Identity -> UID: %u, GID: %u\n", req->uid, req->gid);
+        mattx_dbg("[EXTRACT] Captured Identity -> UID: %u, GID: %u\n", req->uid, req->gid);
     }
 
     get_task_comm(req->comm, task);
-    printk(KERN_INFO "MattX:[EXTRACT] Captured process name: '%s'\n", req->comm);
+    mattx_dbg("[EXTRACT] Captured process name: '%s'\n", req->comm);
 
     // --- RESTORED: Extract Open File Descriptors ---
     req->fd_count = 0;
@@ -142,7 +142,7 @@ void mattx_capture_and_send_state(struct task_struct *task, int target_node) {
             }
         }
         spin_unlock(&task->files->file_lock);
-        printk(KERN_INFO "MattX:[EXTRACT] Captured %u open File Descriptors.\n", req->fd_count);
+        mattx_dbg("[EXTRACT] Captured %u open File Descriptors.\n", req->fd_count);
     }
 
     regs = task_pt_regs(task);
@@ -152,7 +152,7 @@ void mattx_capture_and_send_state(struct task_struct *task, int target_node) {
         req->gsbase = task->thread.gsbase;
         
         if (access_process_vm(task, req->regs.rip, rip_buf, 8, FOLL_FORCE) == 8) {
-            printk(KERN_INFO "MattX: [DEBUG] Source RIP (0x%lx) contains: %8ph\n", (unsigned long)req->regs.rip, rip_buf);
+            mattx_dbg(" [DEBUG] Source RIP (0x%lx) contains: %8ph\n", (unsigned long)req->regs.rip, rip_buf);
         }
     }
 
@@ -185,7 +185,7 @@ void mattx_capture_and_send_state(struct task_struct *task, int target_node) {
     migrating_target_node = target_node;
 
     if (cluster_map[target_node]) {
-        printk(KERN_INFO "MattX:[MIGRATE] Sending blueprint to Node %d. Waiting for READY signal...\n", target_node);
+        mattx_dbg("[MIGRATE] Sending blueprint to Node %d. Waiting for READY signal...\n", target_node);
         mattx_comm_send(cluster_map[target_node], MATTX_MSG_MIGRATE_REQ, req, actual_payload_size);
     }
     kfree(req);
@@ -216,7 +216,7 @@ void mattx_capture_and_return_state(struct task_struct *task, u32 orig_pid, int 
     req = kzalloc(max_payload_size, GFP_KERNEL);
     if (!req) return;
 
-    printk(KERN_INFO "MattX:[EXTRACT] Initiating RETURN state capture for Surrogate PID %d...\n", task->pid);
+    mattx_dbg("[EXTRACT] Initiating RETURN state capture for Surrogate PID %d...\n", task->pid);
 
     // Use the Jedi Master Pivot!
     mattx_freeze_task_safely(task);
@@ -263,7 +263,7 @@ void mattx_capture_and_return_state(struct task_struct *task, u32 orig_pid, int 
     migrating_target_node = target_node;
 
     if (cluster_map[target_node]) {
-        printk(KERN_INFO "MattX:[MIGRATE] Sending RETURN blueprint to Node %d. Waiting for READY signal...\n", target_node);
+        mattx_dbg("[MIGRATE] Sending RETURN blueprint to Node %d. Waiting for READY signal...\n", target_node);
         mattx_comm_send(cluster_map[target_node], MATTX_MSG_RETURN_BLUEPRINT, req, actual_payload_size);
     }
     kfree(req);
@@ -278,7 +278,7 @@ void mattx_send_vma_data(void) {
     if (!local_migration_req || !migrating_task || migrating_target_node == -1) return;
     if (!cluster_map[migrating_target_node]) return;
 
-    printk(KERN_INFO "MattX: [MIGRATE] Starting data pipeline to Node %d...\n", migrating_target_node);
+    mattx_dbg(" [MIGRATE] Starting data pipeline to Node %d...\n", migrating_target_node);
 
     for (int i = 0; i < local_migration_req->vma_count; i++) {
         unsigned long start = local_migration_req->vmas[i].vm_start;
@@ -332,14 +332,14 @@ void mattx_send_vma_data(void) {
         }
     }
     
-    printk(KERN_INFO "MattX:[MIGRATE] Pipeline stats: %d total, %d sent, %d skipped, %d net errors\n", 
+    mattx_dbg("[MIGRATE] Pipeline stats: %d total, %d sent, %d skipped, %d net errors\n", 
            total_pages, sent_pages, skipped_pages, network_errors);
            
     if (is_returning) {
-        printk(KERN_INFO "MattX:[MIGRATE] Return pipeline complete. Sending RETURN_DONE signal.\n");
+        mattx_dbg("[MIGRATE] Return pipeline complete. Sending RETURN_DONE signal.\n");
         mattx_comm_send(cluster_map[migrating_target_node], MATTX_MSG_RETURN_DONE, NULL, 0);
         
-        printk(KERN_INFO "MattX:[RECALL] Executing local Surrogate PID %d...\n", migrating_task->pid);
+        mattx_dbg("[RECALL] Executing local Surrogate PID %d...\n", migrating_task->pid);
         send_sig(SIGKILL, migrating_task, 0);
         
         spin_lock(&guest_lock);
@@ -351,11 +351,11 @@ void mattx_send_vma_data(void) {
         }
         spin_unlock(&guest_lock);
     } else {
-        printk(KERN_INFO "MattX:[MIGRATE] Data pipeline complete. Sending DONE signal.\n");
+        mattx_dbg("[MIGRATE] Data pipeline complete. Sending DONE signal.\n");
         mattx_comm_send(cluster_map[migrating_target_node], MATTX_MSG_MIGRATE_DONE, NULL, 0);
         
         add_export_process(migrating_task->pid, migrating_target_node);
-        printk(KERN_INFO "MattX:[REGISTRY] PID %d registered as Exported to Node %d.\n", migrating_task->pid, migrating_target_node);
+        mattx_dbg("[REGISTRY] PID %d registered as Exported to Node %d.\n", migrating_task->pid, migrating_target_node);
     }
     
     put_task_struct(migrating_task);
@@ -380,12 +380,12 @@ void mattx_trigger_recall(pid_t orig_pid) {
 
     req.orig_pid = orig_pid;
 
-    printk(KERN_INFO "MattX: [RECALL] Sending RECALL_REQ for PID %d to Node %d...\n", orig_pid, target_node);
+    mattx_dbg(" [RECALL] Sending RECALL_REQ for PID %d to Node %d...\n", orig_pid, target_node);
     mattx_comm_send(cluster_map[target_node], MATTX_MSG_RECALL_REQ, &req, sizeof(req));
 }
 
 static void handle_ready_for_data(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
-    printk(KERN_INFO "MattX:[EXPORT] Received READY signal from Node %u. Starting data pump...\n", hdr->sender_id);
+    mattx_dbg("[EXPORT] Received READY signal from Node %u. Starting data pump...\n", hdr->sender_id);
     mattx_send_vma_data();
 }
 
@@ -395,7 +395,7 @@ static void handle_recall_req(struct mattx_link *link, struct mattx_header *hdr,
         pid_t local_stub_pid = -1;
         int i;
 
-        printk(KERN_INFO "MattX:[EXPORT] Received RECALL request for Orig PID %u from Node %u\n", 
+        mattx_dbg("[EXPORT] Received RECALL request for Orig PID %u from Node %u\n", 
                req->orig_pid, hdr->sender_id);
         
         spin_lock(&guest_lock);
@@ -415,7 +415,7 @@ static void handle_recall_req(struct mattx_link *link, struct mattx_header *hdr,
             rcu_read_unlock();
 
             if (surrogate) {
-                printk(KERN_INFO "MattX:[EXPORT] Found Surrogate PID %d. Capturing state...\n", surrogate->pid);
+                mattx_dbg("[EXPORT] Found Surrogate PID %d. Capturing state...\n", surrogate->pid);
                 mattx_capture_and_return_state(surrogate, req->orig_pid, hdr->sender_id);
                 put_task_struct(surrogate);
             } else {
@@ -430,6 +430,6 @@ static void handle_recall_req(struct mattx_link *link, struct mattx_header *hdr,
 void mattx_migr_init_handlers(void) {
     mattx_register_handler(MATTX_MSG_READY_FOR_DATA, handle_ready_for_data);
     mattx_register_handler(MATTX_MSG_RECALL_REQ, handle_recall_req);
-    printk(KERN_INFO "MattX: [EXPORT] Network handlers registered.\n");
+    mattx_dbg(" [EXPORT] Network handlers registered.\n");
 }
 

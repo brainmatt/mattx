@@ -41,7 +41,7 @@ static void mattx_rpc_worker(struct work_struct *work) {
         req.old_remote_fd = rpc->remote_fd;
         req.new_local_fd = rpc->new_local_fd;
 
-        printk(KERN_INFO "MattX:[RPC] Worker started for PID %d. Sending DUP_REQ to Node %d...\n", rpc->local_pid, rpc->home_node);
+        mattx_dbg("[RPC] Worker started for PID %d. Sending DUP_REQ to Node %d...\n", rpc->local_pid, rpc->home_node);
         if (cluster_map[rpc->home_node]) {
             mattx_comm_send(cluster_map[rpc->home_node], MATTX_MSG_SYS_DUP_REQ, &req, sizeof(req));
         }
@@ -52,7 +52,7 @@ static void mattx_rpc_worker(struct work_struct *work) {
         req.req_id = 0; // 0 means this is a Kprobe request, not a VFS request!
         strncpy(req.path, rpc->filename, sizeof(req.path) - 1);
 
-        printk(KERN_INFO "MattX:[RPC] Worker started for PID %d. Sending UNLINK_REQ to Node %d...\n", rpc->local_pid, rpc->home_node);
+        mattx_dbg("[RPC] Worker started for PID %d. Sending UNLINK_REQ to Node %d...\n", rpc->local_pid, rpc->home_node);
         if (cluster_map[rpc->home_node]) {
             mattx_comm_send(cluster_map[rpc->home_node], MATTX_MSG_SYS_UNLINK_REQ, &req, sizeof(req));
         }        
@@ -64,7 +64,7 @@ static void mattx_rpc_worker(struct work_struct *work) {
         req.type = rpc->type;
         req.protocol = rpc->protocol;
 
-        printk(KERN_INFO "MattX:[RPC] Worker started for PID %d. Sending SOCKET_REQ to Node %d...\n", rpc->local_pid, rpc->home_node);
+        mattx_dbg("[RPC] Worker started for PID %d. Sending SOCKET_REQ to Node %d...\n", rpc->local_pid, rpc->home_node);
         if (cluster_map[rpc->home_node]) {
             mattx_comm_send(cluster_map[rpc->home_node], MATTX_MSG_SYS_SOCKET_REQ, &req, sizeof(req));
         }
@@ -76,7 +76,7 @@ static void mattx_rpc_worker(struct work_struct *work) {
         req.addrlen = rpc->addrlen;
         memcpy(&req.addr, &rpc->addr, rpc->addrlen);
 
-        printk(KERN_INFO "MattX:[RPC] Worker started for PID %d. Sending CONNECT_REQ to Node %d...\n", rpc->local_pid, rpc->home_node);
+        mattx_dbg("[RPC] Worker started for PID %d. Sending CONNECT_REQ to Node %d...\n", rpc->local_pid, rpc->home_node);
         if (cluster_map[rpc->home_node]) {
             mattx_comm_send(cluster_map[rpc->home_node], MATTX_MSG_SYS_CONNECT_REQ, &req, sizeof(req));
         }
@@ -88,7 +88,7 @@ static void mattx_rpc_worker(struct work_struct *work) {
         req.addrlen = rpc->addrlen;
         memcpy(&req.addr, &rpc->addr, rpc->addrlen);
 
-        printk(KERN_INFO "MattX:[RPC] Worker started for PID %d. Sending BIND_REQ to Node %d...\n", rpc->local_pid, rpc->home_node);
+        mattx_dbg("[RPC] Worker started for PID %d. Sending BIND_REQ to Node %d...\n", rpc->local_pid, rpc->home_node);
         if (cluster_map[rpc->home_node]) {
             mattx_comm_send(cluster_map[rpc->home_node], MATTX_MSG_SYS_BIND_REQ, &req, sizeof(req));
         }
@@ -99,7 +99,7 @@ static void mattx_rpc_worker(struct work_struct *work) {
         req.fd = rpc->remote_fd;
         req.backlog = rpc->backlog;
 
-        printk(KERN_INFO "MattX:[RPC] Worker started for PID %d. Sending LISTEN_REQ to Node %d...\n", rpc->local_pid, rpc->home_node);
+        mattx_dbg("[RPC] Worker started for PID %d. Sending LISTEN_REQ to Node %d...\n", rpc->local_pid, rpc->home_node);
         if (cluster_map[rpc->home_node]) {
             mattx_comm_send(cluster_map[rpc->home_node], MATTX_MSG_SYS_LISTEN_REQ, &req, sizeof(req));
         }
@@ -117,7 +117,7 @@ static void mattx_rpc_worker(struct work_struct *work) {
             req->len = to_send;
             
             if (copy_from_user(req->data, rpc->buff, to_send) == 0) {
-                printk(KERN_INFO "MattX:[RPC] Worker sending SEND_REQ to Node %d...\n", rpc->home_node);
+                mattx_dbg("[RPC] Worker sending SEND_REQ to Node %d...\n", rpc->home_node);
                 if (cluster_map[rpc->home_node]) {
                     mattx_comm_send(cluster_map[rpc->home_node], MATTX_MSG_SYS_SEND_REQ, payload_buf, payload_size);
                 }
@@ -133,7 +133,7 @@ static void mattx_rpc_worker(struct work_struct *work) {
         req.flags = rpc->flags;
         req.size = min_t(size_t, rpc->size, 4096);
         
-        printk(KERN_INFO "MattX:[RPC] Worker sending RECV_REQ to Node %d...\n", rpc->home_node);
+        mattx_dbg("[RPC] Worker sending RECV_REQ to Node %d...\n", rpc->home_node);
         if (cluster_map[rpc->home_node]) {
             mattx_comm_send(cluster_map[rpc->home_node], MATTX_MSG_SYS_RECV_REQ, &req, sizeof(req));
         }        
@@ -145,7 +145,7 @@ static void mattx_rpc_worker(struct work_struct *work) {
         req.fd = rpc->remote_fd;
         req.flags = rpc->flags;
 
-        printk(KERN_INFO "MattX:[RPC] Worker started for PID %d. Sending ACCEPT_REQ to Node %d...\n", rpc->local_pid, rpc->home_node);
+        mattx_dbg("[RPC] Worker started for PID %d. Sending ACCEPT_REQ to Node %d...\n", rpc->local_pid, rpc->home_node);
         if (cluster_map[rpc->home_node]) {
             mattx_comm_send(cluster_map[rpc->home_node], MATTX_MSG_SYS_ACCEPT_REQ, &req, sizeof(req));
         }
@@ -158,7 +158,7 @@ static void mattx_rpc_worker(struct work_struct *work) {
         req.timeout = rpc->timeout;
         memcpy(req.fds, rpc->poll_fds, sizeof(struct mattx_pollfd) * rpc->nfds);
 
-        printk(KERN_INFO "MattX:[RPC] Worker started for PID %d. Sending POLL_REQ to Node %d...\n", rpc->local_pid, rpc->home_node);
+        mattx_dbg("[RPC] Worker started for PID %d. Sending POLL_REQ to Node %d...\n", rpc->local_pid, rpc->home_node);
         if (cluster_map[rpc->home_node]) {
             mattx_comm_send(cluster_map[rpc->home_node], MATTX_MSG_SYS_POLL_REQ, &req, sizeof(req));
         }
@@ -237,7 +237,7 @@ static void mattx_rpc_worker(struct work_struct *work) {
 
         kfree(in_fds); kfree(out_fds); kfree(ex_fds);
 
-        printk(KERN_INFO "MattX:[RPC] Translated select() to poll(). Sending POLL_REQ to Node %d...\n", rpc->home_node);
+        mattx_dbg("[RPC] Translated select() to poll(). Sending POLL_REQ to Node %d...\n", rpc->home_node);
         if (cluster_map[rpc->home_node]) {
             mattx_comm_send(cluster_map[rpc->home_node], MATTX_MSG_SYS_POLL_REQ, &req, sizeof(req));
         }
@@ -251,7 +251,7 @@ static void mattx_rpc_worker(struct work_struct *work) {
         req.flags = rpc->flags;
         req.mode = rpc->mode;
 
-        printk(KERN_INFO "MattX:[RPC] Worker started for PID %d. Sending OPEN_REQ to Node %d...\n", rpc->local_pid, rpc->home_node);
+        mattx_dbg("[RPC] Worker started for PID %d. Sending OPEN_REQ to Node %d...\n", rpc->local_pid, rpc->home_node);
         if (cluster_map[rpc->home_node]) {
             mattx_comm_send(cluster_map[rpc->home_node], MATTX_MSG_SYS_OPEN_REQ, &req, sizeof(req));
         }
@@ -318,7 +318,7 @@ static void mattx_rpc_worker(struct work_struct *work) {
             if (success) {
                 // Shove the return code (e.g., 0) directly into RAX! No Fake FDs allocated!
                 regs->ax = error;
-                printk(KERN_INFO "MattX:[RPC] Illusion Complete! Networking syscall returned %d to Surrogate %d\n", error, rpc->local_pid);
+                mattx_dbg("[RPC] Illusion Complete! Networking syscall returned %d to Surrogate %d\n", error, rpc->local_pid);
             } else {
                 regs->ax = -EBADF;
             }
@@ -350,7 +350,7 @@ static void mattx_rpc_worker(struct work_struct *work) {
             
             if (regs) {
                 regs->ax = ret_bytes;
-                printk(KERN_INFO "MattX:[RPC] Illusion Complete! recvfrom returned %zd\n", ret_bytes);
+                mattx_dbg("[RPC] Illusion Complete! recvfrom returned %zd\n", ret_bytes);
             }
 
         // ACCEPT AWAKENING
@@ -414,7 +414,7 @@ static void mattx_rpc_worker(struct work_struct *work) {
                                 if (addr_buf) kfree(addr_buf);
                             }
 
-                            printk(KERN_INFO "MattX:[RPC] Illusion Complete! Mapped New Remote FD %d to Local FD %d\n", remote_fd, local_fd);
+                            mattx_dbg("[RPC] Illusion Complete! Mapped New Remote FD %d to Local FD %d\n", remote_fd, local_fd);
                         } else {
                             fput(fake_file);
                             regs->ax = -EMFILE;
@@ -454,7 +454,7 @@ static void mattx_rpc_worker(struct work_struct *work) {
                     regs->ax = -EFAULT;
                 } else {
                     regs->ax = retval; // Return the number of ready FDs
-                    printk(KERN_INFO "MattX:[RPC] Illusion Complete! poll returned %d\n", retval);
+                    mattx_dbg("[RPC] Illusion Complete! poll returned %d\n", retval);
                 }
                 kfree(reply_data);
             } else {
@@ -504,7 +504,7 @@ static void mattx_rpc_worker(struct work_struct *work) {
                 kfree(in_fds); kfree(out_fds); kfree(ex_fds);
 
                 regs->ax = retval;
-                printk(KERN_INFO "MattX:[RPC] Illusion Complete! select() returned %d\n", retval);
+                mattx_dbg("[RPC] Illusion Complete! select() returned %d\n", retval);
                 kfree(reply_data);
             } else {
                 regs->ax = -EBADF;
@@ -515,7 +515,7 @@ static void mattx_rpc_worker(struct work_struct *work) {
             struct pt_regs *regs = task_pt_regs(surrogate);
             int local_fd = regs ? regs->ax : -1; 
 
-            printk(KERN_INFO "MattX:[DEBUG] Remote FD from VM1: %d. Local regs->ax: %d\n", remote_fd, local_fd);
+            mattx_dbg("[DEBUG] Remote FD from VM1: %d. Local regs->ax: %d\n", remote_fd, local_fd);
 
             if (local_fd < 0) {
                 printk(KERN_ERR "MattX:[DEBUG] Local syscall failed (expected)! Searching for a free FD slot...\n");
@@ -566,7 +566,7 @@ static void mattx_rpc_worker(struct work_struct *work) {
                         // --- RESTORED: Hijack the return value! ---
                         regs->ax = local_fd; 
                         
-                        printk(KERN_INFO "MattX:[RPC] Illusion Complete! Mapped Remote FD %d to Local FD %d\n", remote_fd, local_fd);
+                        mattx_dbg("[RPC] Illusion Complete! Mapped Remote FD %d to Local FD %d\n", remote_fd, local_fd);
                     } else {
                         if (!IS_ERR(fake_file)) fput(fake_file);
                         kfree(fd_info);
@@ -589,10 +589,10 @@ static void mattx_rpc_worker(struct work_struct *work) {
         spin_unlock(&guest_lock);
 
         if (safe_to_wake) {
-            printk(KERN_INFO "MattX:[RPC] Worker finished for PID %d. Waking Surrogate...\n", rpc->local_pid);
+            mattx_dbg("[RPC] Worker finished for PID %d. Waking Surrogate...\n", rpc->local_pid);
             send_sig(SIGCONT, surrogate, 0);
         } else {
-            printk(KERN_INFO "MattX:[RPC] Worker finished, but Surrogate %d is migrating! Leaving it frozen.\n", rpc->local_pid);
+            mattx_dbg("[RPC] Worker finished, but Surrogate %d is migrating! Leaving it frozen.\n", rpc->local_pid);
         }
         
         put_task_struct(surrogate);
@@ -676,7 +676,7 @@ static int ret_handler_openat(struct kretprobe_instance *ri, struct pt_regs *reg
                 rpc->mode = data->mode;
                 strncpy(rpc->filename, filename, sizeof(rpc->filename) - 1);
 
-                printk(KERN_INFO "MattX:[HOOK] Intercepted open('%s'). Freezing Surrogate %d and escaping to Workqueue...\n", filename, my_pid);
+                mattx_dbg("[HOOK] Intercepted open('%s'). Freezing Surrogate %d and escaping to Workqueue...\n", filename, my_pid);
                 
                 send_sig(SIGSTOP, current, 0);
                 schedule_work(&rpc->work);
@@ -784,7 +784,7 @@ static int ret_handler_dup(struct kretprobe_instance *ri, struct pt_regs *regs) 
             }
             rpc->mode = 0666;
 
-            printk(KERN_INFO "MattX:[HOOK] Intercepted dup(fd=%d). Freezing Surrogate %d and escaping to Workqueue...\n", data->oldfd, my_pid);
+            mattx_dbg("[HOOK] Intercepted dup(fd=%d). Freezing Surrogate %d and escaping to Workqueue...\n", data->oldfd, my_pid);
             
             send_sig(SIGSTOP, current, 0);
             schedule_work(&rpc->work);
@@ -851,7 +851,7 @@ static int ret_handler_unlinkat(struct kretprobe_instance *ri, struct pt_regs *r
                 rpc->is_unlink = true;
                 strncpy(rpc->filename, filename, sizeof(rpc->filename) - 1);
 
-                printk(KERN_INFO "MattX:[HOOK] Intercepted unlinkat('%s'). Freezing Surrogate %d...\n", filename, my_pid);
+                mattx_dbg("[HOOK] Intercepted unlinkat('%s'). Freezing Surrogate %d...\n", filename, my_pid);
                 send_sig(SIGSTOP, current, 0);
                 schedule_work(&rpc->work);
             }
@@ -923,7 +923,7 @@ static int ret_handler_socket(struct kretprobe_instance *ri, struct pt_regs *reg
             // Fake an O_RDWR open so mattx_vfs_proxy is fully featured
             rpc->flags = O_RDWR;
 
-            printk(KERN_INFO "MattX:[HOOK] Intercepted socket(domain=%d). Freezing Surrogate %d and escaping to Workqueue...\n", data->domain, my_pid);
+            mattx_dbg("[HOOK] Intercepted socket(domain=%d). Freezing Surrogate %d and escaping to Workqueue...\n", data->domain, my_pid);
             
             send_sig(SIGSTOP, current, 0);
             schedule_work(&rpc->work);
@@ -1020,7 +1020,7 @@ static int ret_handler_connect(struct kretprobe_instance *ri, struct pt_regs *re
             rpc->addrlen = data->addrlen;
             memcpy(&rpc->addr, &data->addr, data->addrlen);
 
-            printk(KERN_INFO "MattX:[HOOK] Intercepted connect(fd=%d). Freezing Surrogate %d and escaping to Workqueue...\n", data->fd, my_pid);
+            mattx_dbg("[HOOK] Intercepted connect(fd=%d). Freezing Surrogate %d and escaping to Workqueue...\n", data->fd, my_pid);
             
             send_sig(SIGSTOP, current, 0);
             schedule_work(&rpc->work);
@@ -1108,7 +1108,7 @@ static int ret_handler_bind(struct kretprobe_instance *ri, struct pt_regs *regs)
             rpc->addrlen = data->addrlen;
             memcpy(&rpc->addr, &data->addr, data->addrlen);
 
-            printk(KERN_INFO "MattX:[HOOK] Intercepted bind(fd=%d). Freezing Surrogate %d...\n", data->fd, my_pid);
+            mattx_dbg("[HOOK] Intercepted bind(fd=%d). Freezing Surrogate %d...\n", data->fd, my_pid);
             send_sig(SIGSTOP, current, 0);
             schedule_work(&rpc->work);
         }
@@ -1193,7 +1193,7 @@ static int ret_handler_listen(struct kretprobe_instance *ri, struct pt_regs *reg
             rpc->remote_fd = data->remote_fd;
             rpc->backlog = data->backlog;
 
-            printk(KERN_INFO "MattX:[HOOK] Intercepted listen(fd=%d). Freezing Surrogate %d...\n", data->fd, my_pid);
+            mattx_dbg("[HOOK] Intercepted listen(fd=%d). Freezing Surrogate %d...\n", data->fd, my_pid);
             send_sig(SIGSTOP, current, 0);
             schedule_work(&rpc->work);
         }
@@ -1284,7 +1284,7 @@ static int ret_handler_sendto(struct kretprobe_instance *ri, struct pt_regs *reg
             rpc->len = data->len;
             rpc->flags = data->flags;
 
-            printk(KERN_INFO "MattX:[HOOK] Intercepted sendto(fd=%d). Freezing Surrogate %d...\n", data->fd, my_pid);
+            mattx_dbg("[HOOK] Intercepted sendto(fd=%d). Freezing Surrogate %d...\n", data->fd, my_pid);
             send_sig(SIGSTOP, current, 0);
             schedule_work(&rpc->work);
         }
@@ -1375,7 +1375,7 @@ static int ret_handler_recvfrom(struct kretprobe_instance *ri, struct pt_regs *r
             rpc->size = data->size;
             rpc->flags = data->flags;
 
-            printk(KERN_INFO "MattX:[HOOK] Intercepted recvfrom(fd=%d). Freezing Surrogate %d...\n", data->fd, my_pid);
+            mattx_dbg("[HOOK] Intercepted recvfrom(fd=%d). Freezing Surrogate %d...\n", data->fd, my_pid);
             send_sig(SIGSTOP, current, 0);
             schedule_work(&rpc->work);
         }
@@ -1468,7 +1468,7 @@ static int ret_handler_accept(struct kretprobe_instance *ri, struct pt_regs *reg
             rpc->buff = data->upeer_sockaddr; 
             rpc->size = (size_t)data->upeer_addrlen; 
 
-            printk(KERN_INFO "MattX:[HOOK] Intercepted accept(fd=%d). Freezing Surrogate %d...\n", data->fd, my_pid);
+            mattx_dbg("[HOOK] Intercepted accept(fd=%d). Freezing Surrogate %d...\n", data->fd, my_pid);
             send_sig(SIGSTOP, current, 0);
             schedule_work(&rpc->work);
         }
@@ -1566,7 +1566,7 @@ static int ret_handler_poll(struct kretprobe_instance *ri, struct pt_regs *regs)
             rpc->poll_ufds = data->ufds;
             memcpy(rpc->poll_fds, data->fds, sizeof(struct mattx_pollfd) * data->nfds);
 
-            printk(KERN_INFO "MattX:[HOOK] Intercepted poll(). Freezing Surrogate %d...\n", my_pid);
+            mattx_dbg("[HOOK] Intercepted poll(). Freezing Surrogate %d...\n", my_pid);
             send_sig(SIGSTOP, current, 0);
             schedule_work(&rpc->work);
         }
@@ -1640,7 +1640,7 @@ static int ret_handler_select(struct kretprobe_instance *ri, struct pt_regs *reg
             rpc->select_exceptfds = data->exp;
             rpc->select_timeout = data->tvp;
 
-            printk(KERN_INFO "MattX:[HOOK] Intercepted select(). Freezing Surrogate %d...\n", my_pid);
+            mattx_dbg("[HOOK] Intercepted select(). Freezing Surrogate %d...\n", my_pid);
             send_sig(SIGSTOP, current, 0);
             schedule_work(&rpc->work);
         }
@@ -1796,7 +1796,7 @@ int mattx_hooks_init(void) {
     ret = register_kretprobe(&select_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for select, returned %d\n", ret);
 
-    printk(KERN_INFO "MattX: Syscall Hooks (Kprobes) registered successfully.\n");
+    mattx_dbg(" Syscall Hooks (Kprobes) registered successfully.\n");
     return 0;
 }
 
@@ -1814,6 +1814,6 @@ void mattx_hooks_exit(void) {
     unregister_kretprobe(&dup2_kprobe);
     unregister_kretprobe(&dup_kprobe);
     unregister_kretprobe(&openat_kprobe);
-    printk(KERN_INFO "MattX: Syscall Hooks (Kprobes) unregistered.\n");
+    mattx_dbg(" Syscall Hooks (Kprobes) unregistered.\n");
 }
 
