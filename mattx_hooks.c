@@ -518,7 +518,7 @@ static void mattx_rpc_worker(struct work_struct *work) {
             mattx_dbg("[DEBUG] Remote FD from VM1: %d. Local regs->ax: %d\n", remote_fd, local_fd);
 
             if (local_fd < 0) {
-                printk(KERN_ERR "MattX:[DEBUG] Local syscall failed (expected)! Searching for a free FD slot...\n");
+                mattx_dbg("[DEBUG] Local syscall failed (expected)! Searching for a free FD slot...\n");
                 
                 if (surrogate->files) {
                     spin_lock(&surrogate->files->file_lock);

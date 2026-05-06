@@ -71,7 +71,15 @@ static void handle_page_transfer(struct mattx_link *link, struct mattx_header *h
         
         if (res != ph->length) {
             if (ph->offset == 0) {
-                printk(KERN_ERR "MattX:[IMPORT] Failed to inject %u bytes at 0x%lx (res: %d)\n", ph->length, target_addr, res);
+                // The Intelligent Error Filter ---
+                if (res == 0) {
+                    // The kernel protected a special page (like vDSO/vvar). 
+                    // This is completely harmless, so we hide it in debug mode!
+                    mattx_dbg("[IMPORT] Skipped injecting %u bytes at 0x%lx (Protected page)\n", ph->length, target_addr);
+                } else {
+                    // A real memory fault occurred! We MUST print this as an error.
+                    printk(KERN_ERR "MattX:[IMPORT] Failed to inject %u bytes at 0x%lx (res: %d)\n", ph->length, target_addr, res);
+                }
             }
         } else {
             injected_pages_count++;
