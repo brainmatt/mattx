@@ -1,105 +1,99 @@
-# 🚀 MattX: The Modern Linux SSI Cluster
+# MattX - The Modern Single System Image (SSI) Cluster
 
-**MattX** is an experimental, out-of-tree Single System Image (SSI) clustering framework for modern Linux 6.x kernels. 
+<div align="center">
+  <img src="https://raw.githubusercontent.com/brainmatt/mattx/refs/heads/main/tools/3dmattx/3DMattX.png" width="800" alt="3DMattX Cluster Visualization">
+  <p><em>3DMattX: Gamified, real-time 3D cluster visualization and load monitoring.</em></p>
+</div>
 
-Born from the spiritual heritage of the legendary **openMosix** project, MattX brings transparent, live process migration into the modern era. It allows a cluster of standard Linux machines to act as a single, massive symmetric multiprocessor (SMP) system. Processes can be teleported across the network—complete with their memory, CPU registers, credentials, and open file descriptors—without the application ever knowing it moved.
+[![License: GPL v2](https://img.shields.io/badge/License-GPL%20v2-blue.svg)](https://www.gnu.org/licenses/old-licenses/gpl-2.0.en.html)
+[![Kernel: 6.x](https://img.shields.io/badge/Linux_Kernel-6.12+-orange.svg)]()
 
-## ✨ Key Features
+**MattX** is a modern, out-of-tree Linux kernel module that brings the magic of **Single System Image (SSI)** clustering to the Linux 6.x era. 
 
-*   **Transparent Live Migration:** Teleport running, CPU-bound user-space applications across physical nodes with zero modifications to the application code.
-*   **Zero-Config Auto-Discovery:** Nodes dynamically find each other using UDP Multicast beacons. No static IP maps or complex orchestration required.
-*   **Autonomous Load Balancing:** The MattX kernel module continuously exchanges fixed-point CPU load metrics. When a node becomes overloaded, it automatically hunts for the heaviest CPU-bound task and migrates it to the least-loaded peer.
-*   **The VFS Wormhole (Syscall Routing):** Migrated processes maintain their connection to the Home Node's filesystem. We intercept and route VFS operations across the cluster seamlessly, providing a perfect "Illusion" that the process never left home. Currently supports: `open/openat`, `read`, `write`, `close`, `lseek`, `stat/fstat/statx`, `dup/dup2`, and `fsync/fdatasync`.
-*   **Modern Kernel Native:** Built for Linux 6.x. It safely navigates modern kernel protections, utilizing the Maple Tree (`VMA_ITERATOR`) for memory mapping, `access_process_vm` for safe memory injection, and RCU locks for process hunting.
-*   **Distributed Lifecycle Management:** Perfect symmetry. If a migrated process exits on a remote node, the home node cleans up. If a user `kill`s the origin process on the home node, an "Assassination Order" is sent to instantly terminate the remote surrogate.
+Inspired by the legendary openMosix project, MattX allows multiple physical or virtual machines to act as one massive, unified computer. It autonomously load-balances CPU-bound tasks by seamlessly teleporting running processes across the network—preserving their memory, CPU registers, file descriptors, and network sockets—without requiring any modifications to the Linux kernel source code.
 
-## 🏗️ Architecture
+---
 
-MattX operates on a **Master/Deputy & Surrogate** model, split across three main components:
+## ✨ Key Features (MattX v1.0)
 
-1.  **`mattx.ko` (The Kernel Engine):** The core LKM. It handles high-speed TCP kernel-to-kernel communication, state extraction, memory injection, and VFS proxying.
-2.  **`mattx-discd` (The Matchmaker):** A lightweight user-space daemon that broadcasts UDP beacons and bridges discovery data to the kernel via Generic Netlink.
-3.  **`mattx-stub` (The Vessel):** A tiny user-space binary spawned on the target node during migration. It requests the incoming memory blueprint, uses `mmap(MAP_FIXED)` to carve out the exact memory layout required, and then sacrifices itself to be overwritten by the incoming process.
+### 🧠 Live Process Teleportation & The Syscall Drainer
+MattX migrates running processes safely using a custom **Syscall Drainer**. Instead of violently freezing processes with `SIGSTOP` while they hold kernel locks, MattX uses modern `task_work_add(TWA_SIGNAL)` to gently guide the process to the user-space boundary. Once in a 100% stable state, its memory map (VMAs), CPU registers (`pt_regs`), and credentials (`struct cred`) are extracted and streamed over a custom TCP data pump to the target node.
 
-### The Migration Lifecycle (The Golden Path)
-When a process is migrated from Node A (Home) to Node B (Remote):
-1.  **Freeze & Extract:** Node A sends `SIGSTOP` to the target process. It extracts the CPU registers (`pt_regs`), Thread Local Storage (`FS_BASE`), Credentials (UID/GID), and the Memory Blueprint (VMAs).
-2.  **Spawn & Carve:** Node B receives the blueprint and spawns `mattx-stub`. The stub carves the exact memory holes needed and expands its File Descriptor table.
-3.  **The Data Pump:** Node A safely streams the physical memory pages over TCP. Node B injects them directly into the stub's carved memory.
-4.  **The Awakening:** Node B overwrites the stub's CPU registers, applies the original user credentials, renames the process, injects the VFS Proxy FDs, and sends `SIGCONT`. The process resumes execution exactly where it left off.
+### 🗂️ MattXFS & The Namespace Illusion
+To ensure migrated processes can still access their original files, MattX introduces **MattXFS**, a custom Virtual File System (VFS). 
+When a process arrives on a remote node, MattX spawns a surrogate (`mattx-stub`) inside a private Linux Mount Namespace (`unshare(CLONE_NEWNS)`). The stub bind-mounts the remote MattXFS cluster tree (e.g., `/mattxfs/709/`) directly over its own root directory (`/`). 
+* **The Result:** The Linux VFS natively routes all file operations (`open`, `read`, `write`, `seek`, `fsync`) across the network back to the Home Node. This completely eliminates the need for hacky Kprobes for file I/O!
 
-### The File I/O Illusion (The Wormhole)
-To trick migrated applications into believing they are still on their Home Node, MattX dynamically creates proxy file descriptors (`anon_inode_getfile`) using custom Virtual File System (VFS) operations.
-* **Networked Syscalls:** File operations like `read`, `write`, `lseek`, and `fsync` trigger RPC calls over TCP. VM2 forwards the request, VM1 executes the native kernel operation (e.g., `vfs_llseek`, `kernel_read`, `vfs_fsync_range`) on the true file descriptor, and sends the exact result back.
-* **The Reflection (`statx`):** Metadata requests are intercepted and faithfully reconstructed across the network, accurately spoofing permissions, sizes, and timestamps.
-* **The Cloner (`dup2`):** When a Surrogate duplicates a proxy file descriptor, MattX coordinates with the Home Node to duplicate the underlying kernel references, ensuring the Wormhole handles complex pipe structures flawlessly.
+### ⚡ Direct File System Access (DFSA)
+For true High-Performance Computing (HPC), sending file I/O over a TCP wormhole is a bottleneck. MattX supports **DFSA**. If your cluster shares a SAN or NFS drive (e.g., `/mnt/shared`), you can configure MattX to bypass the network. The Namespace Illusion will bind-mount the local SAN directly into the surrogate's glass box, allowing migrated processes to read and write shared data at bare-metal disk speeds.
 
-## 🛠️ Getting Started
+### 🌐 The Network I/O Wormhole
+Migrated processes don't lose their network connections! MattX uses Kretprobes to intercept network system calls (`socket`, `bind`, `listen`, `connect`, `sendto`, `recvfrom`). It tunnels these requests back to the Home Node, allowing a process running on Node B to maintain an active TCP connection established on Node A. It even features a **Distributed Wait Queue** to seamlessly route asynchronous `poll()` and `select()` calls across the cluster!
 
-Full MattX Documentation [All MattX Details](https://github.com/brainmatt/mattx/blob/main/DOCUMENTATION.md).
+### 🔄 Perfect Lifecycle Symmetry (The Funeral Director)
+MattX maintains strict tracking of exported "Deputies" and remote "Surrogates." If a migrated process finishes its work and exits naturally, the remote node sends a Death Certificate back home to cleanly terminate the Deputy. If a Sysadmin types `kill -9 <pid>` on the Home Node, an Assassination Order is instantly dispatched to terminate the remote Surrogate. No ghost processes, no memory leaks.
 
+---
 
-### Prerequisites
-*   Linux Kernel 6.x (Tested on 6.12+)
-*   `build-essential`, `linux-headers`, `libnl-3-dev`, `libnl-genl-3-dev`
+## ⚙️ Configuration (`/etc/mattx.conf`)
 
-### Installation
-~~~
-# Compile the kernel module and user-space tools
-make
-~~~
+MattX is designed to be "Zero-Config" via UDP Multicast auto-discovery, but it offers powerful toggles for cluster administrators:
 
-~~~
-# Install the surrogate stub (Crucial: The kernel looks for it here!)
-sudo cp mattx-stub /usr/local/bin/
-~~~
+```ini
+# Network interface and UDP Multicast group for Zero-Config Auto-Discovery
+INTERFACE=eth0
+MULTICAST_GROUP=239.0.0.1
+PORT=7225
 
-~~~
-# Load the kernel module
-sudo insmod mattx.ko
-~~~
+# Feature Toggles (A/B Testing & Fallbacks)
+MIGRATE_NETWORK_IO=true     # Set to false to disable socket routing
+MIGRATE_FILE_IO=true        # Set to false to fallback to Kprobe File I/O
+MATTXFS_ENABLED=true        # Set to true to enable the MattXFS Namespace Illusion
 
-~~~
-# Start the discovery daemon
-sudo ./mattx-discd &
-~~~
+# Direct File System Access (DFSA)
+DFSA_DIR=/mnt/shared        # Directory to bypass network routing (e.g., shared NFS/SAN)
+```
 
-### 🎛️ Administration (/proc/mattx)
-MattX embraces the UNIX philosophy. Cluster management is handled entirely through a simple, scriptable /proc virtual filesystem.
+---
 
-Display a live table of connected Node IDs, IP Addresses, CPU Load, and Free Memory.
-~~~
-# View Cluster State:
-cat /proc/mattx/nodes
-MattX Cluster Nodes:
-------------------------------------------------------------
-Node ID		IP Address	CPU Load	Mem Free (MB)
-------------------------------------------------------------
-709 (Local)	127.0.0.1	2048		727
-814		192.168.122.38	2048		738
+## 📊 Administration & Monitoring (`/proc/mattx/`)
 
-Balancer Enabled: YES
-~~~
+MattX embraces the UNIX philosophy. The entire cluster can be monitored and controlled using simple text files in the `/proc/mattx/` virtual directory.
 
-Configure loadbalancer:
-~~~
-# Disable Automatic Load Balancing:
+### Read-Only Monitoring
+* `cat /proc/mattx/nodes` - Displays a live table of all connected nodes, their IP addresses, CPU load, and Free Memory.
+* `cat /proc/mattx/exports` - Lists all processes that have been migrated *away* from this node (`<orig_pid>:<target_node>`).
+* `cat /proc/mattx/guests` - Lists all foreign processes currently running *on* this node (`<local_surrogate_pid>:<home_node>`).
+
+### Real-Time Cluster Control
+You can control the cluster dynamically by echoing commands into `/proc/mattx/admin`:
+
+```bash
+# Disable the automatic load balancer (useful for manual testing)
 echo "balancer 0" > /proc/mattx/admin
-~~~
 
-Manual Forward Migration:
-~~~
-# Teleport PID 1234 to Node 814
+# Manually migrate a specific PID to a specific Node ID
 echo "migrate 1234 814" > /proc/mattx/admin
-~~~
 
-Manual Return Migration (Recall):
-~~~
-# Pull a previously migrated process back to its Home Node
+# Recall a migrated process back to its Home Node!
 echo "migrate 1234 home" > /proc/mattx/admin
-~~~
+```
 
-### ⚠️ Disclaimer
-MattX is an experimental prototype diving into the deep "dark arts" of the Linux kernel (manipulating pt_regs, memory maps, and VFS structures on the fly). While it has been engineered with extreme care to avoid kernel panics, it should not be run on production systems containing critical data.
-Built with 🍚, 🥚, and a lot of ☕.
+---
 
+## 🛠️ The Ecosystem Tools
+
+* **`mattx.ko` & `mattxfs.ko`**: The core kernel modules.
+* **`mattx-discd`**: The user-space UDP discovery daemon. It reads `/etc/mattx.conf` and configures the kernel via Generic Netlink.
+* **`mattx-stub`**: The user-space surrogate binary. It carves memory, builds the Namespace Illusion, and sacrifices itself to receive the brain transplant of a migrated process.
+* **`3DMattX`**: A gamified, WebGL-based 3D cluster visualization tool. Fly through your cluster in real-time and watch the CPU load bars rise and fall as processes migrate!
+
+---
+
+## 📜 License
+
+MattX is proudly open-source and released under the **GNU General Public License v2.0 (GPLv2)** to ensure maximum compatibility with the Linux kernel ecosystem. 
+
+*Commercial licensing options are available upon request.*
+
+**Copyright (c) 2026 by Matthias Rechenburg.**
