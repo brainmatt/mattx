@@ -285,7 +285,7 @@ static int mattxfs_remote_unlink(struct inode *dir, struct dentry *dentry) {
     
     get_remote_path_from_dentry(dentry, path_buf, sizeof(path_buf));
     
-    printk(KERN_INFO "MattXFS:[UNLINK] Requesting unlink for %s on Node %d\n", path_buf, node_id);
+    mattx_dbg("[UNLINK] Requesting unlink for %s on Node %d\n", path_buf, node_id);
     
     // Actually delete the file over the network! ---
     return mattx_rpc_vfs_unlink(node_id, path_buf);
@@ -461,13 +461,13 @@ static struct file_system_type mattxfs_type = {
 static int __init mattxfs_init(void) {
     int ret = register_filesystem(&mattxfs_type);
     if (ret) printk(KERN_ERR "MattXFS: Failed to register filesystem\n");
-    else printk(KERN_INFO "MattXFS: Filesystem registered successfully.\n");
+    else mattx_dbg(" Filesystem registered successfully.\n");
     return ret;
 }
 
 static void __exit mattxfs_exit(void) {
     unregister_filesystem(&mattxfs_type);
-    printk(KERN_INFO "MattXFS: Filesystem unregistered.\n");
+    mattx_dbg(" Filesystem unregistered.\n");
 }
 
 module_init(mattxfs_init);
