@@ -47,6 +47,8 @@ bool config_mattxfs_enabled = true; // Default to true
 EXPORT_SYMBOL(config_mattxfs_enabled);
 char config_dfsa_dir[256] = {0}; // Default empty
 EXPORT_SYMBOL(config_dfsa_dir);
+bool config_debug_mode = true; // Default to ON so we see everything!
+EXPORT_SYMBOL(config_debug_mode);
 
 enum { MATTX_ATTR_UNSPEC, MATTX_ATTR_NODE_ID, MATTX_ATTR_IPV4_ADDR, MATTX_ATTR_STUB_PID, MATTX_ATTR_BLUEPRINT, MATTX_ATTR_MY_NODE_ID, MATTX_ATTR_LOCAL_IP, MATTX_ATTR_CONFIG_FILE_IO, MATTX_ATTR_CONFIG_NET_IO, MATTX_ATTR_MATTXFS_ENABLED, MATTX_ATTR_DFSA_DIR, __MATTX_ATTR_MAX };
 #define MATTX_ATTR_MAX (__MATTX_ATTR_MAX - 1)

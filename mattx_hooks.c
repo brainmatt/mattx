@@ -257,18 +257,36 @@ static void mattx_rpc_worker(struct work_struct *work) {
         }
     }
 
+    // The Ghost Exorcist
     bool done = false;
-    while (!done) {
+    bool is_alive = true; // Track if our Surrogate still exists!
+    while (!done && is_alive) {
         msleep(100);
+        
+        bool found = false;
         spin_lock(&guest_lock);
         for (i = 0; i < guest_count; i++) {
             if (guest_registry[i].local_pid == rpc->local_pid) {
+                found = true;
                 done = guest_registry[i].rpc_done;
                 if (done) remote_fd = guest_registry[i].rpc_remote_fd;
                 break;
             }
         }
         spin_unlock(&guest_lock);
+        
+        // If we looped through the whole registry and didn't find our PID,
+        // it means the Assassin killed it during a migration!
+        if (!found) {
+            is_alive = false;
+        }
+    }
+
+    // If the Surrogate was assassinated, we just quietly exit and free our memory!
+    if (!is_alive) {
+        mattx_dbg("[RPC] Surrogate %d disappeared! Kworker aborting cleanly.\n", rpc->local_pid);
+        kfree(rpc);
+        return; 
     }
 
     struct task_struct *surrogate = NULL;

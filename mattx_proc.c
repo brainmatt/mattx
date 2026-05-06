@@ -54,6 +54,8 @@ static int nodes_show(struct seq_file *m, void *v) {
     }
     
     seq_printf(m, "\nBalancer Enabled: %s\n", balancer_enabled ? "YES" : "NO");
+    seq_printf(m, "MattXFS Enabled: %s\n", config_mattxfs_enabled ? "YES" : "NO");
+    seq_printf(m, "Debug Mode: %s\n", config_debug_mode ? "ON" : "OFF");
     return 0;
 }
 
@@ -129,7 +131,12 @@ static ssize_t admin_write(struct file *file, const char __user *ubuf, size_t co
         if (strcmp(cmd, "balancer") == 0 && arg1 != -1) {
             balancer_enabled = (arg1 != 0);
             printk(KERN_INFO "MattX: [ADMIN] Automatic Load Balancer set to: %d\n", balancer_enabled);
-        } 
+        }
+        else if (strcmp(cmd, "debug") == 0 && arg1 != -1) {
+            // The Debug Toggle ---
+            config_debug_mode = (arg1 != 0);
+            printk(KERN_INFO "MattX: [ADMIN] Debug Mode set to: %s\n", config_debug_mode ? "ON" : "OFF");
+        }        
         else if (strcmp(cmd, "migrate") == 0 && arg1 != -1 && arg2_str[0] != '\0') {
             
             if (strcmp(arg2_str, "home") == 0) {

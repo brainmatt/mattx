@@ -649,6 +649,12 @@ extern u32 my_node_id;
 extern u32 my_ip_addr; 
 extern bool config_mattxfs_enabled; // The MattxFs Feature Flag
 extern char config_dfsa_dir[256]; // and the DFSA exclude
+extern bool config_debug_mode; // NEW: The Debug Toggle
+
+// The Extreme Debugging Macro ---
+// This replaces printk(KERN_INFO...). It checks the flag before printing!
+#define mattx_dbg(fmt, ...) \
+    do { if (config_debug_mode) printk(KERN_INFO "MattX:" fmt, ##__VA_ARGS__); } while (0)
 
 // Configuration Toggles
 extern bool config_migrate_file_io;
