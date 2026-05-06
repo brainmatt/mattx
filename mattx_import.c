@@ -190,7 +190,6 @@ static void handle_return_blueprint(struct mattx_link *link, struct mattx_header
     if (payload) {
         struct mattx_migration_req *req = (struct mattx_migration_req *)payload;
         struct task_struct *deputy = NULL;
-        int i;
 
         printk(KERN_INFO "MattX:[IMPORT] Received RETURN Blueprint for Deputy PID %u. Saving to pending...\n", req->orig_pid);
         
