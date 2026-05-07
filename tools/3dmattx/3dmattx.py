@@ -21,7 +21,7 @@
 # Commercial licensing options are available upon request.
 #
 
-from flask import Flask, jsonify
+from flask import Flask, jsonify, render_template
 import re
 import random
 
