@@ -244,6 +244,49 @@
         }
     </script>
 
+
+    <script>
+        // Browser check function
+        function checkBrowser() {
+            // User agent string
+            const userAgent = navigator.userAgent;
+
+            // Mobile phone detection regex patterns
+            const mobilePatterns = [
+                /Android/i,
+                /webOS/i,
+                /iPhone/i,
+                /iPad/i,
+                /iPod/i,
+                /BlackBerry/i,
+                /Windows Phone/i,
+                /Opera Mini/i,
+                /IEMobile/i,
+                /Mobile/i,
+                /Tablet/i
+            ];
+
+            // Check if user agent matches any mobile pattern
+            const isMobileDevice = mobilePatterns.some(pattern => pattern.test(userAgent));
+
+            // Also check viewport width as fallback
+            const screenWidth = window.innerWidth;
+            const isMobileViewport = screenWidth < 768;
+
+            // If mobile device detected, redirect to GitHub repo
+            if (isMobileDevice || isMobileViewport) {
+                window.location.href = 'https://github.com/brainmatt/mattx';
+            }
+        }
+
+        // Run browser check on page load
+        window.addEventListener('load', checkBrowser);
+        
+        // Also check immediately
+        checkBrowser();
+    </script>
+
+
 </body>
 </html>
 
