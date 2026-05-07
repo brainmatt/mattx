@@ -1,0 +1,249 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MattX - The Modern SSI Cluster</title>
+    <style>
+        /* --- GLOBAL RESET & FONTS --- */
+        body, html {
+            margin: 0; padding: 0; width: 100%; height: 100%;
+            background-color: #000; overflow: hidden;
+            font-family: 'Courier New', Courier, monospace;
+            color: #00ffcc;
+        }
+
+        /* --- LAYER 1: DEEP SPACE WINDOW (The GIF) --- */
+        #space-window {
+            position: absolute;
+            top: 0; left: 0; width: 100%; height: 100%;
+            z-index: 1;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            background: radial-gradient(circle at center, #0a1128 0%, #000000 100%);
+        }
+        #space-window img {
+            width: 100%; height: 100%; object-fit: cover; opacity: 0.8;
+        }
+
+        /* --- LAYER 2: THE SVG COCKPIT OVERLAY --- */
+        #cockpit {
+            position: absolute;
+            top: 0; left: 0; width: 100%; height: 100%;
+            z-index: 2;
+            pointer-events: none; 
+        }
+
+        /* --- LAYER 3: LEFT PANEL (COMMAND CONTROLS) --- */
+        #left-panel {
+            position: absolute;
+            top: 50%; left: 3%; transform: translateY(-50%);
+            z-index: 3;
+            display: flex;
+            flex-direction: column;
+            gap: 15px;
+            width: 260px;
+        }
+
+        .cyber-btn {
+            background: rgba(11, 19, 25, 0.85);
+            border: 2px solid #00ffcc;
+            color: #00ffcc;
+            padding: 12px 15px;
+            font-size: 15px;
+            font-weight: bold;
+            font-family: 'Courier New', Courier, monospace;
+            text-transform: uppercase;
+            cursor: pointer;
+            transition: all 0.2s ease-in-out;
+            box-shadow: 0 0 10px rgba(0, 255, 204, 0.2), inset 0 0 10px rgba(0, 255, 204, 0.1);
+            text-align: left;
+        }
+
+        .cyber-btn:hover {
+            background: #00ffcc;
+            color: #000;
+            box-shadow: 0 0 20px rgba(0, 255, 204, 0.8), inset 0 0 20px rgba(0, 255, 204, 0.8);
+            text-shadow: none;
+        }
+
+        /* --- LAYER 4: RIGHT PANEL (CRT TERMINAL) --- */
+        #right-panel {
+            position: absolute;
+            top: 50%; right: 3%; transform: translateY(-50%);
+            z-index: 3;
+            width: 500px; height: 650px;
+            background: rgba(5, 15, 10, 0.92);
+            border: 2px solid #00ff00;
+            border-radius: 10px;
+            box-shadow: 0 0 20px rgba(0, 255, 0, 0.3), inset 0 0 30px rgba(0, 255, 0, 0.2);
+            display: flex;
+            flex-direction: column;
+        }
+
+        /* The CRT Scanline & Flicker Effect */
+        #right-panel::after {
+            content: " ";
+            display: block; position: absolute;
+            top: 0; left: 0; bottom: 0; right: 0;
+            background: linear-gradient(rgba(18, 16, 16, 0) 50%, rgba(0, 0, 0, 0.25) 50%);
+            background-size: 100% 4px;
+            z-index: 4; pointer-events: none;
+        }
+
+        #crt-screen {
+            flex-grow: 1;
+            color: #00ff00;
+            text-shadow: 0 0 5px #00ff00;
+            font-size: 14px;
+            line-height: 1.4;
+            padding: 20px;
+            overflow-y: auto;
+            animation: flicker 0.15s infinite;
+        }
+
+        /* Hide scrollbar for cleaner look */
+        #crt-screen::-webkit-scrollbar { width: 8px; }
+        #crt-screen::-webkit-scrollbar-track { background: rgba(0,255,0,0.1); }
+        #crt-screen::-webkit-scrollbar-thumb { background: #00ff00; }
+
+        #legal-footer {
+            font-size: 9px;
+            color: #00ff00;
+            opacity: 0.5;
+            padding: 10px 20px;
+            border-top: 1px solid rgba(0, 255, 0, 0.3);
+            text-align: justify;
+        }
+
+        @keyframes flicker {
+            0% { opacity: 0.95; }
+            50% { opacity: 1; }
+            100% { opacity: 0.98; }
+        }
+
+        .highlight { color: #fff; text-shadow: 0 0 8px #fff; font-weight: bold; }
+        .tiny-link { font-size: 11px; color: #00ff00; text-decoration: none; opacity: 0.6; transition: opacity 0.2s; }
+        .tiny-link:hover { opacity: 1; text-decoration: underline; }
+    </style>
+</head>
+<body>
+
+    <!-- LAYER 1: Deep Space Window -->
+    <div id="space-window">
+        <!-- FIXED: Now using the animated GIF! -->
+        <img src="https://raw.githubusercontent.com/brainmatt/mattx/refs/heads/main/tools/3dmattx/3DMattX.gif" alt="3DMattX Cluster">
+    </div>
+
+    <!-- LAYER 2: The SVG Cockpit -->
+    <svg id="cockpit" viewBox="0 0 1920 1080" preserveAspectRatio="none">
+        <path d="M0,0 H1920 V1080 H0 Z M350,100 V980 H1570 V100 Z" 
+              fill="#0b1319" fill-rule="evenodd" opacity="0.95"/>
+        <rect x="350" y="100" width="1220" height="880" fill="none" stroke="#00ffcc" stroke-width="4" filter="drop-shadow(0 0 10px #00ffcc)"/>
+        <path d="M0,100 L350,100 M1570,100 L1920,100 M0,980 L350,980 M1570,980 L1920,980" stroke="#00ffcc" stroke-width="2" opacity="0.5"/>
+        <polygon points="350,100 400,50 1520,50 1570,100" fill="#111e29" stroke="#00ffcc" stroke-width="2"/>
+        <polygon points="350,980 400,1030 1520,1030 1570,980" fill="#111e29" stroke="#00ffcc" stroke-width="2"/>
+        <text x="960" y="80" fill="#00ffcc" font-family="Courier" font-size="24" font-weight="bold" text-anchor="middle" letter-spacing="5">MATTX V1.0 COMMAND CENTER</text>
+    </svg>
+
+    <!-- LAYER 3: Left Panel (Buttons) -->
+    <div id="left-panel">
+        <button class="cyber-btn" onclick="loadContent('init')">[ INIT SEQUENCE ]</button>
+        <button class="cyber-btn" onclick="loadContent('directive')">[ SSI DIRECTIVE ]</button>
+        <button class="cyber-btn" onclick="loadContent('capabilities')">[ CAPABILITIES ]</button>
+        <button class="cyber-btn" onclick="loadContent('classification')">[ CLASSIFICATION ]</button>
+        <button class="cyber-btn" onclick="loadContent('uplink')">[ GITHUB UPLINK ]</button>
+        <button class="cyber-btn" onclick="loadContent('comms')">[ COMMS CHANNEL ]</button>
+    </div>
+
+    <!-- LAYER 4: Right Panel (CRT Monitor) -->
+    <div id="right-panel">
+        <div id="crt-screen">
+            > SYSTEM BOOT...<br>
+            > KERNEL 6.12 DETECTED.<br>
+            > MATTX V1.0 ONLINE.<br><br>
+            > AWAITING COMMAND INPUT...<br>
+            <span class="highlight">_</span>
+        </div>
+        <div id="legal-footer">
+            Legal: Mosix is Copyright (c) 2002 by Amnon Barak. The Mosix is a trademark of Amnon Barak. openMosix is licensed under version 2 of the GNU General Public License as published by the Free Software Foundation. Linux is a Registered Trademark of Linus Torvalds.
+        </div>
+    </div>
+
+    <!-- THE BRAIN: Vanilla JS Content Router -->
+    <script>
+        const contentDatabase = {
+            'init': `
+                > EXECUTING INIT SEQUENCE...<br><br>
+                <span class="highlight">MattX - 1.0 OFFICIAL RELEASE</span><br><br>
+                A re-implementation of openMosix for modern Linux Kernel 6.x.<br><br>
+                MattX is a modern, out-of-tree Linux kernel module that brings the magic of Single System Image (SSI) clustering to the Linux 6.x era.<br><br>
+                Inspired by the legendary openMosix project, MattX allows multiple physical or virtual machines to act as one massive, unified computer. It autonomously load-balances CPU-bound tasks by seamlessly teleporting running processes across the network—preserving their memory, CPU registers, file descriptors, and network sockets—without requiring any modifications to the Linux kernel source code.
+            `,
+            'directive': `
+                > QUERYING SSI DIRECTIVE...<br><br>
+                <span class="highlight">What is MattX SSI?</span><br><br>
+                MattX is a full, feature-complete re-implementation of the awesome HPC loadbalancing features in the discontinued "openMosix" project for modern linux kernel >=6.6 (openMosix was discontinued around 2008 because it sadly did not survive the switch from linux kernel 2.4 to 2.6).<br><br>
+                MattX is a High Performance Computing (HPC) platform. It is designed to be the "cluster layer" which transforms a "bunch of computers" into a Single System Image Cluster - meaning it provides linux processes an illusion of one big, multi-CPU system. <br><br>
+                In MattX, processes can transparently move (migrate) live from one server to another without interruption to allow perfect load-balancing, especially for huge parallel HPC applications.
+            `,
+            'capabilities': `
+                > FETCHING CAPABILITIES...<br><br>
+                <span class="highlight">MattX Features:</span><br>
+                - Support for live process migration across the network.<br>
+                - High performance SSI cluster filesystem "MattXFS".<br>
+                - Direct Filesystem Access (DFSA) for bare-metal speed on shared storage.<br>
+                - Custom IO routing/partitioning for network and file access.<br>
+                - Automatic loadbalancing - zero administration.<br>
+                - Auto-discovery of cluster nodes / zero-config.<br>
+                - Simple /proc/mattx interface for administration & monitoring.<br>
+                - 3DMattX: Included gamified, WebGL-based 3D cluster visualization tool.
+            `,
+            'classification': `
+                > RUNNING CLASSIFICATION SCAN...<br><br>
+                <span class="highlight">What MattX is NOT:</span><br>
+                - MattX is not another CRIU.<br>
+                - MattX is not "just the old 2.4 openMosix patch applied to a current 6.x kernel"!<br><br>
+                This would have been actually nearly impossible since the linux kernel has massively changed from 2.4 to today. MattX is developed "from scratch". It has been implemented via a standard linux kernel module and does not require any changes to the standard kernel source code. <br><br>
+                It is "just" using the standard functions and functionality provided by the standard linux kernel. In short: MattX development started with an empty sheet and we have implemented a unique architecture to re-implement the functionality of "good old openMosix".
+            `,
+            'uplink': `
+                > ESTABLISHING SECURE UPLINK...<br><br>
+                <span class="highlight">License Directive:</span><br>
+                MattX is proudly open-source and released under the GNU General Public License v2.0 (GPLv2) to ensure maximum compatibility with the Linux kernel ecosystem.<br><br>
+                <span class="highlight">Access the central repository:</span><br>
+                <a href="https://github.com/brainmatt/mattx" target="_blank" style="color:#00ffcc; text-decoration:underline;">github.com/brainmatt/mattx</a><br><br>
+                We hope you enjoy HPC clustering with MattX! :)
+            `,
+            'comms': `
+                > OPENING SECURE COMMS CHANNEL...<br><br>
+                Direct transmission line established.<br>
+                Awaiting incoming signals at:<br><br>
+                <span class="highlight" id="scrambled-comms"></span><br><br>
+                <br><br><br>
+                <a href="./impress.html" class="tiny-link">[ Legal / Impressum ]</a>
+            `
+        };
+
+        function loadContent(id) {
+            const screen = document.getElementById('crt-screen');
+            screen.innerHTML = "> PROCESSING...";
+            
+            setTimeout(() => {
+                screen.innerHTML = contentDatabase[id] + '<br><br><span class="highlight">_</span>';
+                
+                // The Anti-Spam Bot Hack!
+                if (id === 'comms') {
+                    const user = 'info';
+                    const domain = 'mattx.de';
+                    document.getElementById('scrambled-comms').innerHTML = 
+                        '<a href="mailto:' + user + '@' + domain + '" style="color:#00ffcc;">' + user + '@' + domain + '</a>';
+                }
+            }, 150);
+        }
+    </script>
+
+</body>
+</html>
+
