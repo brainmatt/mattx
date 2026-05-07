@@ -62,7 +62,7 @@ MattX embraces the UNIX philosophy. The entire cluster can be monitored and cont
 
 ### Read-Only Monitoring
 * `cat /proc/mattx/nodes` - Displays a live table of all connected nodes, their IP addresses, CPU load, and Free Memory.
-* `cat /proc/mattx/exports` - Lists all processes that have been migrated *away* from this node (`<orig_pid>:<target_node>`).
+* `cat /proc/mattx/remote` - Lists all processes that have been migrated *away* from this node (`<orig_pid>:<target_node>`).
 * `cat /proc/mattx/guests` - Lists all foreign processes currently running *on* this node (`<local_surrogate_pid>:<home_node>`).
 
 ### Real-Time Cluster Control
