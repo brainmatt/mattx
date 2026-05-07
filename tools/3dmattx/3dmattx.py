@@ -22,10 +22,58 @@
 #
 
 from flask import Flask, jsonify
-from flask import render_template
 import re
+import random
 
 app = Flask(__name__)
+
+# Initialize simulated cluster nodes
+DEMO_NODES = {}
+
+def initialize_demo_nodes():
+    """Initialize 64 simulated cluster nodes with static IDs and IPs"""
+    for node_id in range(1, 65):
+        DEMO_NODES[node_id] = {
+            "nodeid": str(node_id),
+            "ipaddress": f"192.168.2.{node_id}",
+            "cpuload": random.randint(2000, 3000),
+            "memfree": random.randint(2000, 3000)
+        }
+
+def update_demo_nodes():
+    """Update cpu_load and mem_free values with smooth random variations"""
+    for node_id in DEMO_NODES:
+        node = DEMO_NODES[node_id]
+        
+        # Update CPU Load with random variation
+        variation_type = random.choice(['up', 'down', 'stay'])
+        if variation_type == 'up':
+            change = random.randint(10, 50)
+            new_cpuload = int(node["cpuload"]) + change
+        elif variation_type == 'down':
+            change = random.randint(10, 50)
+            new_cpuload = int(node["cpuload"]) - change
+        else:  # stay the same
+            new_cpuload = int(node["cpuload"])
+        
+        # Ensure CPU Load stays within limits [2000, 3000]
+        new_cpuload = max(2000, min(3000, new_cpuload))
+        node["cpuload"] = str(new_cpuload)
+        
+        # Update Memory Free with random variation
+        variation_type = random.choice(['up', 'down', 'stay'])
+        if variation_type == 'up':
+            change = random.randint(10, 50)
+            new_memfree = int(node["memfree"]) + change
+        elif variation_type == 'down':
+            change = random.randint(10, 50)
+            new_memfree = int(node["memfree"]) - change
+        else:  # stay the same
+            new_memfree = int(node["memfree"])
+        
+        # Ensure Memory Free stays within limits [2000, 3000]
+        new_memfree = max(2000, min(3000, new_memfree))
+        node["memfree"] = str(new_memfree)
 
 def parse_mattx_nodes():
     """Parse /proc/mattx/nodes and return structured data"""
@@ -76,10 +124,6 @@ def parse_mattx_nodes():
     
     return nodes
 
-@app.route('/')
-def webroot():
-    return render_template('index.html')
-
 @app.route('/mattx', methods=['GET'])
 def mattx():
     """API endpoint to retrieve MattX cluster node information"""
@@ -91,6 +135,29 @@ def mattx():
     return jsonify({"mattx": nodes_data})
 
 
-if __name__ == '__main__':
-    app.run(debug=True, host='0.0.0.0', port=5000)
+@app.route('/demo', methods=['GET'])
+def demo():
+    """API endpoint to retrieve simulated 64 cluster nodes with smooth load variations"""
+    # Update node metrics with random variations
+    update_demo_nodes()
     
+    # Convert nodes dict to list format
+    nodes_list = list(DEMO_NODES.values())
+    
+    return jsonify({"mattx": nodes_list})
+
+
+@app.route('/')
+def webroot():
+    return render_template('index.html')
+
+
+@app.route('/democluster')
+def democluster():
+    return render_template('democluster.html')
+
+
+if __name__ == '__main__':
+    # Initialize demo nodes on startup
+    initialize_demo_nodes()
+    app.run(debug=True, host='0.0.0.0', port=5000)
