@@ -1,7 +1,7 @@
 # MattX - The Modern Single System Image (SSI) Cluster
 
 <div align="center">
-  <img src="https://raw.githubusercontent.com/brainmatt/mattx/refs/heads/main/tools/3dmattx/3DMattX.png" width="800" alt="3DMattX Cluster Visualization">
+  <img src="https://raw.githubusercontent.com/brainmatt/mattx/refs/heads/main/tools/3dmattx/3DMattX.gif" width="800" alt="3DMattX Cluster Visualization">
   <p><em>3DMattX: Gamified, real-time 3D cluster visualization and load monitoring.</em></p>
 </div>
 
