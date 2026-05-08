@@ -94,6 +94,4 @@ echo "migrate 1234 home" > /proc/mattx/admin
 
 MattX is proudly open-source and released under the **GNU General Public License v2.0 (GPLv2)** to ensure maximum compatibility with the Linux kernel ecosystem. 
 
-*Commercial licensing options are available upon request.*
-
 **Copyright (c) 2026 by Matthias Rechenburg.**
