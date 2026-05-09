@@ -25,6 +25,10 @@
 #include <linux/wait.h> 
 #include <linux/poll.h>
 
+// Helper for modern x86_64 syscall wrappers (__x64_sys_*)
+// The first argument (regs->di) is a pointer to the real pt_regs!
+#define SYSCALL_REGS(regs) ((struct pt_regs *)(regs)->di)
+
 static struct kretprobe openat_kprobe;
 
 // --- IPC WORMHOLE: Read/Write Kprobes ---
@@ -818,16 +822,15 @@ static struct kretprobe dup2_kprobe;
 static int entry_handler_dup(struct kretprobe_instance *ri, struct pt_regs *regs) {
     pid_t my_pid = current->pid;
     struct dup_kretprobe_data *data = (struct dup_kretprobe_data *)ri->data;
+    struct pt_regs *sys_regs = SYSCALL_REGS(regs); // Unwrap!
 
     if (!is_guest_process(my_pid)) return 0;
+    if (config_mattxfs_enabled) return 0; 
 
-    if (config_mattxfs_enabled) return 0; // Bypass!
-
-    data->oldfd = (int)regs->di;
+    data->oldfd = (int)sys_regs->di;
     
-    // Check which kprobe triggered this by using the standard kernel helper
     if (get_kretprobe(ri) == &dup2_kprobe) {
-        data->newfd = (int)regs->si;
+        data->newfd = (int)sys_regs->si;
     } else {
         data->newfd = -1;
     }
@@ -850,9 +853,8 @@ static int entry_handler_dup(struct kretprobe_instance *ri, struct pt_regs *regs
     }
 
     if (data->is_wormhole_fd) {
-        regs->di = -1; // Sabotage! The local dup will fail with -EBADF
+        sys_regs->di = -1; // Sabotage inner FD!
     }
-
     return 0;
 }
 
@@ -918,16 +920,13 @@ static struct kretprobe unlinkat_kprobe;
 static int entry_handler_unlinkat(struct kretprobe_instance *ri, struct pt_regs *regs) {
     pid_t my_pid = current->pid;
     struct unlinkat_kretprobe_data *data = (struct unlinkat_kretprobe_data *)ri->data;
+    struct pt_regs *sys_regs = SYSCALL_REGS(regs); // Unwrap!
 
     if (!is_guest_process(my_pid)) return 0; 
-    
-    // --- THE GOLDEN RULE: Bypass if MattXFS is enabled! ---
     if (config_mattxfs_enabled) return 0; 
 
-    // __x64_sys_unlinkat(int dfd, const char __user *pathname, int flag)
-    data->pathname = (const char __user *)regs->si;
-
-    regs->si = 0; // Sabotage! Force -EFAULT
+    data->pathname = (const char __user *)sys_regs->si;
+    sys_regs->si = 0; // Sabotage inner pathname!
 
     return 0;
 }
@@ -1605,22 +1604,19 @@ static struct kretprobe poll_kprobe;
 static int entry_handler_poll(struct kretprobe_instance *ri, struct pt_regs *regs) {
     pid_t my_pid = current->pid;
     struct poll_kretprobe_data *data = (struct poll_kretprobe_data *)ri->data;
+    struct pt_regs *sys_regs = SYSCALL_REGS(regs); // Unwrap!
     int i;
 
     if (!is_guest_process(my_pid)) return 0; 
     if (!config_migrate_network_io) return 0;
 
-    // __x64_sys_poll(struct pollfd __user *ufds, unsigned int nfds, int timeout)
-    data->ufds = (void __user *)regs->di;
-    data->nfds = (int)regs->si;
-    data->timeout = (int)regs->dx;
+    data->ufds = (void __user *)sys_regs->di;
+    data->nfds = (int)sys_regs->si;
+    data->timeout = (int)sys_regs->dx;
     data->is_wormhole = false;
 
     if (data->nfds > 0 && data->nfds <= 16) {
-        // Copy the array from user-space
         if (copy_from_user(data->fds, data->ufds, data->nfds * sizeof(struct pollfd)) == 0) {
-            
-            // Translate Local FDs to Remote FDs!
             for (i = 0; i < data->nfds; i++) {
                 if (data->fds[i].fd >= 0) {
                     struct file *f = fget(data->fds[i].fd);
@@ -1628,7 +1624,7 @@ static int entry_handler_poll(struct kretprobe_instance *ri, struct pt_regs *reg
                         if (f->f_op == &mattx_fops) {
                             struct mattx_fake_fd_info *fd_info = f->private_data;
                             if (fd_info) {
-                                data->fds[i].fd = fd_info->remote_fd; // Swap it!
+                                data->fds[i].fd = fd_info->remote_fd; 
                                 data->is_wormhole = true;
                             }
                         }
@@ -1640,9 +1636,8 @@ static int entry_handler_poll(struct kretprobe_instance *ri, struct pt_regs *reg
     }
 
     if (data->is_wormhole) {
-        regs->di = 0; // Sabotage! Pass NULL to the real sys_poll so it fails instantly with -EFAULT
+        sys_regs->di = 0; // Sabotage inner pointer!
     }
-
     return 0;
 }
 
@@ -1703,19 +1698,18 @@ static struct kretprobe select_kprobe;
 static int entry_handler_select(struct kretprobe_instance *ri, struct pt_regs *regs) {
     pid_t my_pid = current->pid;
     struct select_kretprobe_data *data = (struct select_kretprobe_data *)ri->data;
+    struct pt_regs *sys_regs = SYSCALL_REGS(regs); // Unwrap!
 
     if (!is_guest_process(my_pid)) return 0; 
     if (!config_migrate_network_io) return 0;
 
-    // __x64_sys_select(int n, fd_set __user *inp, fd_set __user *outp, fd_set __user *exp, struct timeval __user *tvp)
-    data->n = (int)regs->di;
-    data->inp = (void __user *)regs->si;
-    data->outp = (void __user *)regs->dx;
-    data->exp = (void __user *)regs->cx;
-    data->tvp = (void __user *)regs->r8;
+    data->n = (int)sys_regs->di;
+    data->inp = (void __user *)sys_regs->si;
+    data->outp = (void __user *)sys_regs->dx;
+    data->exp = (void __user *)sys_regs->cx;
+    data->tvp = (void __user *)sys_regs->r8;
 
-    regs->di = -1; // Sabotage! Force -EBADF so the local syscall aborts instantly
-
+    sys_regs->di = -1; // Sabotage inner FD count!
     return 0;
 }
 
@@ -1778,20 +1772,19 @@ static struct kretprobe pselect6_kprobe;
 static int entry_handler_pselect6(struct kretprobe_instance *ri, struct pt_regs *regs) {
     pid_t my_pid = current->pid;
     struct pselect6_kretprobe_data *data = (struct pselect6_kretprobe_data *)ri->data;
+    struct pt_regs *sys_regs = SYSCALL_REGS(regs); // Unwrap!
 
     if (!is_guest_process(my_pid)) return 0; 
     if (!config_migrate_network_io) return 0;
 
-    // __x64_sys_pselect6(int n, fd_set __user *inp, fd_set __user *outp, fd_set __user *exp, struct __kernel_timespec __user *tsp, void __user *sig)
-    data->n = (int)regs->di;
-    data->inp = (void __user *)regs->si;
-    data->outp = (void __user *)regs->dx;
-    data->exp = (void __user *)regs->cx;
-    data->tsp = (void __user *)regs->r8;
-    data->sig = (void __user *)regs->r9;
+    data->n = (int)sys_regs->di;
+    data->inp = (void __user *)sys_regs->si;
+    data->outp = (void __user *)sys_regs->dx;
+    data->exp = (void __user *)sys_regs->cx;
+    data->tsp = (void __user *)sys_regs->r8;
+    data->sig = (void __user *)sys_regs->r9;
 
-    regs->di = -1; // Sabotage! Force -EBADF so the local syscall aborts instantly
-
+    sys_regs->di = -1; // Sabotage inner FD count!
     return 0;
 }
 
@@ -1843,18 +1836,18 @@ static int ret_handler_pselect6(struct kretprobe_instance *ri, struct pt_regs *r
 static int entry_handler_read(struct kretprobe_instance *ri, struct pt_regs *regs) {
     pid_t my_pid = current->pid;
     struct rw_kretprobe_data *data = (struct rw_kretprobe_data *)ri->data;
+    struct pt_regs *sys_regs = SYSCALL_REGS(regs); // Unwrap!
 
     if (!is_guest_process(my_pid)) return 0;
 
-    data->fd = (int)regs->di;
-    data->buf = (void __user *)regs->si;
-    data->count = (size_t)regs->dx;
+    data->fd = (int)sys_regs->di;
+    data->buf = (void __user *)sys_regs->si;
+    data->count = (size_t)sys_regs->dx;
     data->is_wormhole = false;
 
     if (data->fd >= 0) {
         struct file *f = fget(data->fd);
         if (f) {
-            // If it's NOT MattXFS, check if it's a local Pipe/Socket
             if (f->f_op != &mattx_fops) {
                 struct inode *inode = file_inode(f);
                 if (S_ISFIFO(inode->i_mode) || S_ISSOCK(inode->i_mode)) {
@@ -1863,13 +1856,12 @@ static int entry_handler_read(struct kretprobe_instance *ri, struct pt_regs *reg
             }
             fput(f);
         } else {
-            // fget() failed! This is a Ghost FD from the Deputy!
             data->is_wormhole = true;
         }
     }
 
     if (data->is_wormhole) {
-        regs->di = -1; // Sabotage! Force local read to fail instantly
+        sys_regs->di = -1; // Sabotage the inner FD, NOT the wrapper pointer!
     }
     return 0;
 }
@@ -1918,12 +1910,13 @@ static int ret_handler_read(struct kretprobe_instance *ri, struct pt_regs *regs)
 static int entry_handler_write(struct kretprobe_instance *ri, struct pt_regs *regs) {
     pid_t my_pid = current->pid;
     struct rw_kretprobe_data *data = (struct rw_kretprobe_data *)ri->data;
+    struct pt_regs *sys_regs = SYSCALL_REGS(regs); // Unwrap!
 
     if (!is_guest_process(my_pid)) return 0;
 
-    data->fd = (int)regs->di;
-    data->buf = (void __user *)regs->si;
-    data->count = (size_t)regs->dx;
+    data->fd = (int)sys_regs->di;
+    data->buf = (void __user *)sys_regs->si;
+    data->count = (size_t)sys_regs->dx;
     data->is_wormhole = false;
 
     if (data->fd >= 0) {
@@ -1937,12 +1930,12 @@ static int entry_handler_write(struct kretprobe_instance *ri, struct pt_regs *re
             }
             fput(f);
         } else {
-            data->is_wormhole = true; // Ghost FD!
+            data->is_wormhole = true; 
         }
     }
 
     if (data->is_wormhole) {
-        regs->di = -1; // Sabotage!
+        sys_regs->di = -1; // Sabotage the inner FD!
     }
     return 0;
 }
