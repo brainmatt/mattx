@@ -27,6 +27,18 @@
 
 static struct kretprobe openat_kprobe;
 
+// --- IPC WORMHOLE: Read/Write Kprobes ---
+struct rw_kretprobe_data {
+    int fd;
+    void __user *buf;
+    size_t count;
+    bool is_wormhole;
+};
+
+static struct kretprobe read_kprobe;
+static struct kretprobe write_kprobe;
+
+
 static void mattx_rpc_worker(struct work_struct *work) {
     struct mattx_rpc_work *rpc = container_of(work, struct mattx_rpc_work, work);
     int i;
@@ -136,7 +148,53 @@ static void mattx_rpc_worker(struct work_struct *work) {
         mattx_dbg("[RPC] Worker sending RECV_REQ to Node %d...\n", rpc->home_node);
         if (cluster_map[rpc->home_node]) {
             mattx_comm_send(cluster_map[rpc->home_node], MATTX_MSG_SYS_RECV_REQ, &req, sizeof(req));
-        }        
+        }
+
+    // IPC WORMHOLE: READ WORKER ---
+    } else if (rpc->is_read) {
+        struct mattx_sys_read_req req;
+        memset(&req, 0, sizeof(req));
+        req.orig_pid = rpc->orig_pid;
+        req.fd = rpc->remote_fd;
+        req.count = min_t(size_t, rpc->len, 4096);
+
+        mattx_dbg("[RPC] Worker sending READ_REQ for Ghost FD %d to Node %d...\n", rpc->remote_fd, rpc->home_node);
+        if (cluster_map[rpc->home_node]) {
+            mattx_comm_send(cluster_map[rpc->home_node], MATTX_MSG_SYS_READ_REQ, &req, sizeof(req));
+        }
+
+    // IPC WORMHOLE: WRITE WORKER ---
+    } else if (rpc->is_write) {
+        size_t to_send = min_t(size_t, rpc->len, 4096);
+        size_t payload_size = sizeof(struct mattx_syscall_req) + to_send;
+        void *payload_buf = kmalloc(payload_size, GFP_KERNEL);
+        
+        if (payload_buf) {
+            struct mattx_syscall_req *req = (struct mattx_syscall_req *)payload_buf;
+            req->orig_pid = rpc->orig_pid;
+            req->fd = rpc->remote_fd;
+            req->len = to_send;
+            
+            if (copy_from_user(req->data, rpc->buff, to_send) == 0) {
+                mattx_dbg("[RPC] Worker sending SYSCALL_FWD (write) for Ghost FD %d to Node %d...\n", rpc->remote_fd, rpc->home_node);
+                if (cluster_map[rpc->home_node]) {
+                    mattx_comm_send(cluster_map[rpc->home_node], MATTX_MSG_SYSCALL_FWD, payload_buf, payload_size);
+                }
+            }
+            kfree(payload_buf);
+        }
+        
+        // SYSCALL_FWD is a fire-and-forget! We must fake the completion immediately.
+        spin_lock(&guest_lock);
+        for (i = 0; i < guest_count; i++) {
+            if (guest_registry[i].local_pid == rpc->local_pid) {
+                guest_registry[i].rpc_fsync_res = to_send; // Store bytes written
+                guest_registry[i].rpc_done = true;
+                break;
+            }
+        }
+        spin_unlock(&guest_lock);        
+
     // ACCEPT WORKER
     } else if (rpc->is_accept) {
         struct mattx_sys_accept_req req;
@@ -321,6 +379,55 @@ static void mattx_rpc_worker(struct work_struct *work) {
                 mattx_dbg("[RPC] Illusion Complete! Networking syscall returned %d to Surrogate %d\n", error, rpc->local_pid);
             } else {
                 regs->ax = -EBADF;
+            }
+
+        // IPC WORMHOLE: READ AWAKENING ---
+        } else if (rpc->is_read) {
+            struct pt_regs *regs = task_pt_regs(surrogate);
+            ssize_t ret_bytes = -1;
+            void *read_buf = NULL;
+
+            spin_lock(&guest_lock);
+            for (i = 0; i < guest_count; i++) {
+                if (guest_registry[i].local_pid == rpc->local_pid) {
+                    ret_bytes = guest_registry[i].rpc_read_bytes;
+                    read_buf = guest_registry[i].rpc_read_buf;
+                    guest_registry[i].rpc_read_buf = NULL;
+                    break;
+                }
+            }
+            spin_unlock(&guest_lock);
+
+            if (ret_bytes > 0 && read_buf) {
+                if (copy_to_user(rpc->buff, read_buf, ret_bytes)) {
+                    ret_bytes = -EFAULT;
+                }
+            }
+            
+            if (read_buf) kfree(read_buf);
+            
+            if (regs) {
+                regs->ax = ret_bytes;
+                mattx_dbg("[RPC] Illusion Complete! read() on Ghost FD returned %zd\n", ret_bytes);
+            }
+
+        // IPC WORMHOLE: WRITE AWAKENING ---
+        } else if (rpc->is_write) {
+            struct pt_regs *regs = task_pt_regs(surrogate);
+            int bytes_written = -1;
+
+            spin_lock(&guest_lock);
+            for (i = 0; i < guest_count; i++) {
+                if (guest_registry[i].local_pid == rpc->local_pid) {
+                    bytes_written = guest_registry[i].rpc_fsync_res;
+                    break;
+                }
+            }
+            spin_unlock(&guest_lock);
+
+            if (regs) {
+                regs->ax = bytes_written;
+                mattx_dbg("[RPC] Illusion Complete! write() on Ghost FD returned %d\n", bytes_written);
             }
 
         // RECVFROM AWAKENING ---
@@ -1650,6 +1757,157 @@ static int ret_handler_select(struct kretprobe_instance *ri, struct pt_regs *reg
 }
 
 
+// --- IPC WORMHOLE: Read Handlers ---
+static int entry_handler_read(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    pid_t my_pid = current->pid;
+    struct rw_kretprobe_data *data = (struct rw_kretprobe_data *)ri->data;
+
+    if (!is_guest_process(my_pid)) return 0;
+
+    data->fd = (int)regs->di;
+    data->buf = (void __user *)regs->si;
+    data->count = (size_t)regs->dx;
+    data->is_wormhole = false;
+
+    if (data->fd >= 0) {
+        struct file *f = fget(data->fd);
+        if (f) {
+            // If it's NOT MattXFS, check if it's a local Pipe/Socket
+            if (f->f_op != &mattx_fops) {
+                struct inode *inode = file_inode(f);
+                if (S_ISFIFO(inode->i_mode) || S_ISSOCK(inode->i_mode)) {
+                    data->is_wormhole = true;
+                }
+            }
+            fput(f);
+        } else {
+            // fget() failed! This is a Ghost FD from the Deputy!
+            data->is_wormhole = true;
+        }
+    }
+
+    if (data->is_wormhole) {
+        regs->di = -1; // Sabotage! Force local read to fail instantly
+    }
+    return 0;
+}
+
+static int ret_handler_read(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    pid_t my_pid = current->pid;
+    struct rw_kretprobe_data *data = (struct rw_kretprobe_data *)ri->data;
+    int home_node = -1;
+    u32 orig_pid = 0;
+    int i;
+
+    if (!is_guest_process(my_pid) || !data->is_wormhole) return 0;
+
+    spin_lock(&guest_lock);
+    for (i = 0; i < guest_count; i++) {
+        if (guest_registry[i].local_pid == my_pid) {
+            home_node = guest_registry[i].home_node;
+            orig_pid = guest_registry[i].orig_pid;
+            guest_registry[i].rpc_done = false; 
+            break;
+        }
+    }
+    spin_unlock(&guest_lock);
+
+    if (home_node != -1) {
+        struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
+        if (rpc) {
+            INIT_WORK(&rpc->work, mattx_rpc_worker);
+            rpc->local_pid = my_pid;
+            rpc->orig_pid = orig_pid;
+            rpc->home_node = home_node;
+            rpc->is_read = true;
+            rpc->remote_fd = data->fd; 
+            rpc->buff = data->buf;
+            rpc->len = data->count;
+
+            mattx_dbg("[HOOK] Intercepted read(fd=%d). Freezing Surrogate %d...\n", data->fd, my_pid);
+            send_sig(SIGSTOP, current, 0);
+            schedule_work(&rpc->work);
+        }
+    }
+    return 0;
+}
+
+// --- IPC WORMHOLE: Write Handlers ---
+static int entry_handler_write(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    pid_t my_pid = current->pid;
+    struct rw_kretprobe_data *data = (struct rw_kretprobe_data *)ri->data;
+
+    if (!is_guest_process(my_pid)) return 0;
+
+    data->fd = (int)regs->di;
+    data->buf = (void __user *)regs->si;
+    data->count = (size_t)regs->dx;
+    data->is_wormhole = false;
+
+    if (data->fd >= 0) {
+        struct file *f = fget(data->fd);
+        if (f) {
+            if (f->f_op != &mattx_fops) {
+                struct inode *inode = file_inode(f);
+                if (S_ISFIFO(inode->i_mode) || S_ISSOCK(inode->i_mode)) {
+                    data->is_wormhole = true;
+                }
+            }
+            fput(f);
+        } else {
+            data->is_wormhole = true; // Ghost FD!
+        }
+    }
+
+    if (data->is_wormhole) {
+        regs->di = -1; // Sabotage!
+    }
+    return 0;
+}
+
+static int ret_handler_write(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    pid_t my_pid = current->pid;
+    struct rw_kretprobe_data *data = (struct rw_kretprobe_data *)ri->data;
+    int home_node = -1;
+    u32 orig_pid = 0;
+    int i;
+
+    if (!is_guest_process(my_pid) || !data->is_wormhole) return 0;
+
+    spin_lock(&guest_lock);
+    for (i = 0; i < guest_count; i++) {
+        if (guest_registry[i].local_pid == my_pid) {
+            home_node = guest_registry[i].home_node;
+            orig_pid = guest_registry[i].orig_pid;
+            guest_registry[i].rpc_done = false; 
+            break;
+        }
+    }
+    spin_unlock(&guest_lock);
+
+    if (home_node != -1) {
+        struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
+        if (rpc) {
+            INIT_WORK(&rpc->work, mattx_rpc_worker);
+            rpc->local_pid = my_pid;
+            rpc->orig_pid = orig_pid;
+            rpc->home_node = home_node;
+            rpc->is_write = true;
+            rpc->remote_fd = data->fd;
+            rpc->buff = data->buf;
+            rpc->len = data->count;
+
+            mattx_dbg("[HOOK] Intercepted write(fd=%d). Freezing Surrogate %d...\n", data->fd, my_pid);
+            send_sig(SIGSTOP, current, 0);
+            schedule_work(&rpc->work);
+        }
+    }
+    return 0;
+}
+
+
+
+
 int mattx_hooks_init(void) {
     int ret;
     memset(&openat_kprobe, 0, sizeof(openat_kprobe));
@@ -1796,11 +2054,33 @@ int mattx_hooks_init(void) {
     ret = register_kretprobe(&select_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for select, returned %d\n", ret);
 
+    // IPC WORMHOLE REGISTRATION ---
+    memset(&read_kprobe, 0, sizeof(read_kprobe));
+    read_kprobe.kp.symbol_name = "__x64_sys_read";
+    read_kprobe.entry_handler = entry_handler_read;
+    read_kprobe.handler = ret_handler_read;
+    read_kprobe.data_size = sizeof(struct rw_kretprobe_data);
+    read_kprobe.maxactive = 64;
+    ret = register_kretprobe(&read_kprobe);
+    if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for read, returned %d\n", ret);
+
+    memset(&write_kprobe, 0, sizeof(write_kprobe));
+    write_kprobe.kp.symbol_name = "__x64_sys_write";
+    write_kprobe.entry_handler = entry_handler_write;
+    write_kprobe.handler = ret_handler_write;
+    write_kprobe.data_size = sizeof(struct rw_kretprobe_data);
+    write_kprobe.maxactive = 64;
+    ret = register_kretprobe(&write_kprobe);
+    if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for write, returned %d\n", ret);
+
+
     mattx_dbg(" Syscall Hooks (Kprobes) registered successfully.\n");
     return 0;
 }
 
 void mattx_hooks_exit(void) {
+    unregister_kretprobe(&write_kprobe);
+    unregister_kretprobe(&read_kprobe);    
     unregister_kretprobe(&select_kprobe);
     unregister_kretprobe(&poll_kprobe);
     unregister_kretprobe(&accept_kprobe);

@@ -443,6 +443,8 @@ struct mattx_rpc_work {
     // --- Send/Recv Workqueue Fields ---
     bool is_sendto;
     bool is_recvfrom;
+    bool is_read;   // For the IPC Wormhole
+    bool is_write;  // For the IPC Wormhole
     void __user *buff;
     size_t len;
     size_t size;    
