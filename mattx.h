@@ -461,6 +461,7 @@ struct mattx_rpc_work {
 
     // For SELECT ---
     bool is_select;
+    bool is_pselect6;
     int select_nfds;
     void __user *select_readfds;
     void __user *select_writefds;

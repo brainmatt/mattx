@@ -221,8 +221,8 @@ static void mattx_rpc_worker(struct work_struct *work) {
             mattx_comm_send(cluster_map[rpc->home_node], MATTX_MSG_SYS_POLL_REQ, &req, sizeof(req));
         }
 
-    // SELECT WORKER (MOST COMPLEX: Need to translate Bitmaps to Poll Array and back!)
-    } else if (rpc->is_select) {
+    // SELECT & PSELECT6 WORKER (Translate Bitmaps to Poll Array and back!)
+    } else if (rpc->is_select || rpc->is_pselect6) {
         struct mattx_sys_poll_req req;
         fd_set *in_fds = NULL, *out_fds = NULL, *ex_fds = NULL;
         int timeout_ms = -1;
@@ -233,11 +233,18 @@ static void mattx_rpc_worker(struct work_struct *work) {
         memset(&req, 0, sizeof(req));
         req.orig_pid = rpc->orig_pid;
 
-        // 1. Translate timeval to milliseconds
+        // 1. Translate timeval/timespec to milliseconds
         if (rpc->select_timeout) {
-            struct __kernel_old_timeval tv; 
-            if (copy_from_user(&tv, rpc->select_timeout, sizeof(tv)) == 0) {
-                timeout_ms = (tv.tv_sec * 1000) + (tv.tv_usec / 1000);
+            if (rpc->is_pselect6) {
+                struct __kernel_timespec ts;
+                if (copy_from_user(&ts, rpc->select_timeout, sizeof(ts)) == 0) {
+                    timeout_ms = (ts.tv_sec * 1000) + (ts.tv_nsec / 1000000);
+                }
+            } else {
+                struct __kernel_old_timeval tv; 
+                if (copy_from_user(&tv, rpc->select_timeout, sizeof(tv)) == 0) {
+                    timeout_ms = (tv.tv_sec * 1000) + (tv.tv_usec / 1000);
+                }
             }
         }
         req.timeout = timeout_ms;
@@ -568,8 +575,8 @@ static void mattx_rpc_worker(struct work_struct *work) {
                 regs->ax = -EBADF;
             }
 
-        // --- SELECT AWAKENING ---
-        } else if (rpc->is_select) {
+        // --- SELECT & PSELECT6 AWAKENING ---
+        } else if (rpc->is_select || rpc->is_pselect6) {
             struct pt_regs *regs = task_pt_regs(surrogate);
             int retval = -EBADF;
             bool success = false;
@@ -1756,6 +1763,81 @@ static int ret_handler_select(struct kretprobe_instance *ri, struct pt_regs *reg
     return 0;
 }
 
+// --- PSELECT6 HOOK ---
+struct pselect6_kretprobe_data {
+    int n;
+    void __user *inp;
+    void __user *outp;
+    void __user *exp;
+    void __user *tsp;
+    void __user *sig;
+};
+
+static struct kretprobe pselect6_kprobe;
+
+static int entry_handler_pselect6(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    pid_t my_pid = current->pid;
+    struct pselect6_kretprobe_data *data = (struct pselect6_kretprobe_data *)ri->data;
+
+    if (!is_guest_process(my_pid)) return 0; 
+    if (!config_migrate_network_io) return 0;
+
+    // __x64_sys_pselect6(int n, fd_set __user *inp, fd_set __user *outp, fd_set __user *exp, struct __kernel_timespec __user *tsp, void __user *sig)
+    data->n = (int)regs->di;
+    data->inp = (void __user *)regs->si;
+    data->outp = (void __user *)regs->dx;
+    data->exp = (void __user *)regs->cx;
+    data->tsp = (void __user *)regs->r8;
+    data->sig = (void __user *)regs->r9;
+
+    regs->di = -1; // Sabotage! Force -EBADF so the local syscall aborts instantly
+
+    return 0;
+}
+
+static int ret_handler_pselect6(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    pid_t my_pid = current->pid;
+    struct pselect6_kretprobe_data *data = (struct pselect6_kretprobe_data *)ri->data;
+    int home_node = -1;
+    u32 orig_pid = 0;
+    int i;
+
+    if (!is_guest_process(my_pid) || !config_migrate_network_io) return 0;
+
+    spin_lock(&guest_lock);
+    for (i = 0; i < guest_count; i++) {
+        if (guest_registry[i].local_pid == my_pid) {
+            home_node = guest_registry[i].home_node;
+            orig_pid = guest_registry[i].orig_pid;
+            guest_registry[i].rpc_done = false; 
+            break;
+        }
+    }
+    spin_unlock(&guest_lock);
+
+    if (home_node != -1) {
+        struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
+        if (rpc) {
+            INIT_WORK(&rpc->work, mattx_rpc_worker);
+            rpc->local_pid = my_pid;
+            rpc->orig_pid = orig_pid;
+            rpc->home_node = home_node;
+            
+            rpc->is_pselect6 = true;
+            rpc->select_nfds = data->n;
+            rpc->select_readfds = data->inp;
+            rpc->select_writefds = data->outp;
+            rpc->select_exceptfds = data->exp;
+            rpc->select_timeout = data->tsp;
+
+            mattx_dbg("[HOOK] Intercepted pselect6(). Freezing Surrogate %d...\n", my_pid);
+            send_sig(SIGSTOP, current, 0);
+            schedule_work(&rpc->work);
+        }
+    }
+
+    return 0;
+}
 
 // --- IPC WORMHOLE: Read Handlers ---
 static int entry_handler_read(struct kretprobe_instance *ri, struct pt_regs *regs) {
@@ -2054,7 +2136,16 @@ int mattx_hooks_init(void) {
     ret = register_kretprobe(&select_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for select, returned %d\n", ret);
 
-    // IPC WORMHOLE REGISTRATION ---
+    memset(&pselect6_kprobe, 0, sizeof(pselect6_kprobe));
+    pselect6_kprobe.kp.symbol_name = "__x64_sys_pselect6";
+    pselect6_kprobe.entry_handler = entry_handler_pselect6;
+    pselect6_kprobe.handler = ret_handler_pselect6;
+    pselect6_kprobe.data_size = sizeof(struct pselect6_kretprobe_data);
+    pselect6_kprobe.maxactive = 64;
+    
+    ret = register_kretprobe(&pselect6_kprobe);
+    if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for pselect6, returned %d\n", ret);
+    
     memset(&read_kprobe, 0, sizeof(read_kprobe));
     read_kprobe.kp.symbol_name = "__x64_sys_read";
     read_kprobe.entry_handler = entry_handler_read;
@@ -2079,6 +2170,7 @@ int mattx_hooks_init(void) {
 }
 
 void mattx_hooks_exit(void) {
+    unregister_kretprobe(&pselect6_kprobe);    
     unregister_kretprobe(&write_kprobe);
     unregister_kretprobe(&read_kprobe);    
     unregister_kretprobe(&select_kprobe);
