@@ -3,6 +3,7 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include <stdarg.h>
 #include <pvm3.h>
 
 #define LOG_FILE "/tmp/pvmtest.log"
