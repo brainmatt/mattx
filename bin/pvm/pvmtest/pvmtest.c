@@ -1,116 +1,72 @@
+/* pvmtest.c - The Master Process */
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
-#include <time.h>
 #include <stdarg.h>
+#include <unistd.h>
 #include <pvm3.h>
 
-#define LOG_FILE "/tmp/pvmtest.log"
-#define MAX_MSG_LEN 256
+#define MSG_INIT 1
+#define MSG_DONE 2
 
-/**
- * Log to both stdout and log file
- */
-void log_message(const char *format, ...) {
-    FILE *logfile;
+void log_debug(const char *fmt, ...) {
+    FILE *f;
     va_list args;
-    char timestamp[64];
-    time_t now = time(NULL);
-    struct tm *timeinfo = localtime(&now);
-    
-    strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", timeinfo);
-    
-    va_start(args, format);
-    
-    /* Print to stdout */
-    printf("[%s] ", timestamp);
-    vprintf(format, args);
+
+    // Print to stdout
+    va_start(args, fmt);
+    printf("[MASTER] ");
+    vprintf(fmt, args);
     printf("\n");
-    
-    /* Print to log file */
-    logfile = fopen(LOG_FILE, "a");
-    if (logfile != NULL) {
-        fprintf(logfile, "[%s] ", timestamp);
-        vfprintf(logfile, format, args);
-        fprintf(logfile, "\n");
-        fclose(logfile);
-    }
-    
     va_end(args);
+
+    // Append to logfile
+    f = fopen("/tmp/pvmtest.log", "a");
+    if (f) {
+        va_start(args, fmt);
+        fprintf(f, "[MASTER] ");
+        vfprintf(f, fmt, args);
+        fprintf(f, "\n");
+        va_end(args);
+        fclose(f);
+    }
 }
 
-/**
- * Master Program
- * Spawns a client process and communicates with it via PVM
- */
-int main(int argc, char *argv[]) {
-    int mytid;
-    int slavetid;
-    int result;
-    int value = 1;
-    
-    /* Initialize PVM */
-    mytid = pvm_mytid();
-    log_message("MASTER: PVM Master process started, mytid=%d", mytid);
-    
-    /* Spawn the slave process */
-    log_message("MASTER: Spawning pvmtest-client...");
-    result = pvm_spawn("pvmtest-client", (char **)NULL, PvmTaskDefault, (char *)NULL, 1, &slavetid);
-    
-    if (result < 1) {
-        log_message("MASTER: ERROR - Failed to spawn slave process");
+int main(int argc, char **argv) {
+    int my_tid, client_tid;
+    int numt;
+    int start_val = 1;
+    int result_val = 0;
+
+    log_debug("Starting up. Enrolling in PVM...");
+    my_tid = pvm_mytid();
+    if (my_tid < 0) {
+        log_debug("ERROR: Failed to enroll in PVM. Is pvmd running?");
+        exit(1);
+    }
+    log_debug("Enrolled successfully. My TID is %x", my_tid);
+
+    log_debug("Spawning 'pvmtest-client'...");
+    // Spawn 1 instance of the client
+    numt = pvm_spawn("pvmtest-client", NULL, PvmTaskDefault, "", 1, &client_tid);
+    if (numt != 1) {
+        log_debug("ERROR: Failed to spawn client! Return code: %d", numt);
         pvm_exit();
         exit(1);
     }
-    
-    log_message("MASTER: Successfully spawned slave, slavetid=%d", slavetid);
-    
-    /* Initialize send buffer and pack the initial integer value */
-    log_message("MASTER: Initializing send buffer and packing integer value %d", value);
+    log_debug("Successfully spawned client. Client TID is %x", client_tid);
+
+    log_debug("Packing and sending initial integer: %d", start_val);
     pvm_initsend(PvmDataDefault);
-    pvm_pkint(&value, 1, 0);
-    
-    /* Send the integer to the slave */
-    log_message("MASTER: Sending initial value %d to slave (tid=%d)", value, slavetid);
-    result = pvm_send(slavetid, 1);
-    
-    if (result < 0) {
-        log_message("MASTER: ERROR - Failed to send data to slave");
-        pvm_exit();
-        exit(1);
-    }
-    
-    log_message("MASTER: Successfully sent initial value, waiting for result...");
-    
-    /* Wait for the result from the slave */
-    log_message("MASTER: Entering receive mode, waiting for slave to send result...");
-    result = pvm_recv(slavetid, -1);
-    
-    if (result < 0) {
-        log_message("MASTER: ERROR - Failed to receive data from slave");
-        pvm_exit();
-        exit(1);
-    }
-    
-    log_message("MASTER: Received message from slave, unpacking result...");
-    
-    /* Unpack the received integer */
-    int final_result = 0;
-    pvm_upkint(&final_result, 1, 1);
-    
-    log_message("MASTER: Successfully received final result value: %d", final_result);
-    
-    if (final_result == 1000) {
-        log_message("MASTER: Received expected final value 1000, shutting down...");
-    } else {
-        log_message("MASTER: WARNING - Received unexpected value %d (expected 1000)", final_result);
-    }
-    
-    /* Exit PVM */
-    log_message("MASTER: Calling pvm_exit()...");
+    pvm_pkint(&start_val, 1, 1);
+    pvm_send(client_tid, MSG_INIT);
+    log_debug("Message sent. Entering retrieve mode (waiting for result)...");
+
+    // Wait for the final result
+    pvm_recv(client_tid, MSG_DONE);
+    pvm_upkint(&result_val, 1, 1);
+    log_debug("Received final result from client: %d", result_val);
+
+    log_debug("Workflow complete. Shutting down PVM and exiting.");
     pvm_exit();
-    
-    log_message("MASTER: Master process finished successfully");
-    
     return 0;
 }

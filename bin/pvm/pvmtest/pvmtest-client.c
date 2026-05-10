@@ -1,116 +1,78 @@
+/* pvmtest-client.c - The Client/Worker Process */
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
-#include <time.h>
-#include <unistd.h>
 #include <stdarg.h>
+#include <unistd.h>
 #include <pvm3.h>
 
-#define LOG_FILE "/tmp/pvmtest.log"
-#define MAX_MSG_LEN 256
+#define MSG_INIT 1
+#define MSG_DONE 2
 
-/**
- * Log to both stdout and log file
- */
-void log_message(const char *format, ...) {
-    FILE *logfile;
+void log_debug(const char *fmt, ...) {
+    FILE *f;
     va_list args;
-    char timestamp[64];
-    time_t now = time(NULL);
-    struct tm *timeinfo = localtime(&now);
-    
-    strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", timeinfo);
-    
-    va_start(args, format);
-    
-    /* Print to stdout */
-    printf("[%s] ", timestamp);
-    vprintf(format, args);
+
+    // Print to stdout
+    va_start(args, fmt);
+    printf("[CLIENT] ");
+    vprintf(fmt, args);
     printf("\n");
-    
-    /* Print to log file */
-    logfile = fopen(LOG_FILE, "a");
-    if (logfile != NULL) {
-        fprintf(logfile, "[%s] ", timestamp);
-        vfprintf(logfile, format, args);
-        fprintf(logfile, "\n");
-        fclose(logfile);
-    }
-    
     va_end(args);
+
+    // Append to logfile
+    f = fopen("/tmp/pvmtest.log", "a");
+    if (f) {
+        va_start(args, fmt);
+        fprintf(f, "[CLIENT] ");
+        vfprintf(f, fmt, args);
+        fprintf(f, "\n");
+        va_end(args);
+        fclose(f);
+    }
 }
 
-/**
- * Slave/Worker/Client Program
- * Receives initial value from master, counts up to 1000, and sends result back
- */
-int main(int argc, char *argv[]) {
-    int mytid;
-    int mastertid;
-    int result;
-    int received_value = 0;
-    int counter;
-    
-    /* Initialize PVM */
-    mytid = pvm_mytid();
-    mastertid = pvm_parent();
-    
-    log_message("CLIENT: PVM Client process started, mytid=%d, parent (master)=%d", mytid, mastertid);
-    
-    /* Receive the initial message from master */
-    log_message("CLIENT: Entering receive mode, waiting for initial message from master...");
-    result = pvm_recv(mastertid, -1);
-    
-    if (result < 0) {
-        log_message("CLIENT: ERROR - Failed to receive initial message from master");
+int main(int argc, char **argv) {
+    int my_tid, master_tid;
+    int current_val = 0;
+    int i;
+
+    log_debug("Starting up. Enrolling in PVM...");
+    my_tid = pvm_mytid();
+    if (my_tid < 0) {
+        log_debug("ERROR: Failed to enroll in PVM.");
+        exit(1);
+    }
+
+    master_tid = pvm_parent();
+    if (master_tid < 0) {
+        log_debug("ERROR: Failed to get parent TID. Was I spawned manually?");
         pvm_exit();
         exit(1);
     }
-    
-    log_message("CLIENT: Received message from master, unpacking initial value...");
-    
-    /* Unpack the received integer */
-    pvm_upkint(&received_value, 1, 1);
-    
-    log_message("CLIENT: Successfully unpacked initial value: %d", received_value);
-    log_message("CLIENT: Starting count-up from %d to 1000 with 1-second delays...", received_value);
-    
-    /* Count up from received value to 1000 with 1-second delay per step */
-    for (counter = received_value; counter <= 1000; counter++) {
-        log_message("CLIENT: Counter value: %d", counter);
-        
-        /* Sleep for 1 second (except after the last iteration) */
-        if (counter < 1000) {
-            sleep(1);
-        }
+    log_debug("Enrolled successfully. My TID is %x. Master TID is %x", my_tid, master_tid);
+
+    log_debug("Waiting for initial message from Master...");
+    pvm_recv(master_tid, MSG_INIT);
+    pvm_upkint(&current_val, 1, 1);
+    log_debug("Received starting integer: %d", current_val);
+
+    log_debug("Beginning count-up to 1000...");
+    for (i = current_val; i <= 1000; i++) {
+        // Log every single step so we can see exactly when migration freezes it!
+        log_debug("Counting... %d", i);
+        sleep(1);
     }
-    
-    log_message("CLIENT: Count-up completed, reached value 1000");
-    
-    /* Prepare and send the final result back to master */
-    log_message("CLIENT: Initializing send buffer for result message...");
+
+    log_debug("Reached 1000! Packing and sending result to Master...");
     pvm_initsend(PvmDataDefault);
+    pvm_pkint(&i, 1, 1); // Send the final value (which will be 1001 after the loop, or we can send 1000)
     
-    log_message("CLIENT: Packing final value 1000...");
-    int final_value = 1000;
-    pvm_pkint(&final_value, 1, 1);
-    
-    log_message("CLIENT: Sending final result value 1000 to master (tid=%d)", mastertid);
-    result = pvm_send(mastertid, 2);
-    
-    if (result < 0) {
-        log_message("CLIENT: ERROR - Failed to send result to master");
-        pvm_exit();
-        exit(1);
-    }
-    
-    log_message("CLIENT: Successfully sent final result to master");
-    
-    /* Exit PVM */
-    log_message("CLIENT: Calling pvm_exit()...");
+    // Let's explicitly send 1000 as requested
+    int final_result = 1000;
+    pvm_pkint(&final_result, 1, 1);
+    pvm_send(master_tid, MSG_DONE);
+
+    log_debug("Result sent. Shutting down PVM and exiting.");
     pvm_exit();
-    
-    log_message("CLIENT: Client process finished successfully");
-    
     return 0;
 }
