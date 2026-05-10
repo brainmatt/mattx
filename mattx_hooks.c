@@ -746,12 +746,14 @@ static bool is_wormhole_fd(int fd, int *remote_fd_out) {
             } else {
                 struct inode *inode = file_inode(f);
                 if (S_ISFIFO(inode->i_mode) || S_ISSOCK(inode->i_mode)) {
-                    wormhole = true; // Local Pipe or Socket!
+                    if (remote_fd_out) *remote_fd_out = fd; // 1:1 Mapping!
+                    wormhole = true;
                 }
             }
             fput(f);
         } else {
-            wormhole = true; // fget failed -> Ghost FD from Deputy!
+            if (remote_fd_out) *remote_fd_out = fd; // Ghost FD! 1:1 Mapping!
+            wormhole = true;
         }
     }
     return wormhole;
@@ -1025,16 +1027,13 @@ static int entry_handler_socket(struct kretprobe_instance *ri, struct pt_regs *r
     pid_t my_pid = current->pid;
     struct socket_kretprobe_data *data = (struct socket_kretprobe_data *)ri->data;
 
-    if (!is_guest_process(my_pid)) return 0; 
-    if (!config_migrate_network_io) return 0;
+    if (!is_guest_process(my_pid) || !config_migrate_network_io) return 0; 
 
-    // sys_socket(int family, int type, int protocol)
     data->domain = (int)regs->di;
     data->type = (int)regs->si;
     data->protocol = (int)regs->dx;
 
-    regs->di = -1; // Sabotage! The local __sys_socket will fail with -EAFNOSUPPORT
-
+    regs->di = -1; // Sabotage!
     return 0;
 }
 
@@ -1098,22 +1097,21 @@ static struct kretprobe connect_kprobe;
 static int entry_handler_connect(struct kretprobe_instance *ri, struct pt_regs *regs) {
     pid_t my_pid = current->pid;
     struct connect_kretprobe_data *data = (struct connect_kretprobe_data *)ri->data;
-    struct pt_regs *sys_regs = SYSCALL_REGS(regs);
 
     if (!is_guest_process(my_pid) || !config_migrate_network_io) return 0; 
 
-    data->fd = (int)sys_regs->di;
-    data->addrlen = (int)sys_regs->dx;
+    data->fd = (int)regs->di;
+    data->addrlen = (int)regs->dx;
     data->remote_fd = -1;
 
     if (data->addrlen > 0 && data->addrlen <= sizeof(struct sockaddr_storage)) {
-        if (copy_from_user(&data->addr, (void __user *)sys_regs->si, data->addrlen)) data->addrlen = 0;
+        if (copy_from_user(&data->addr, (void __user *)regs->si, data->addrlen)) data->addrlen = 0;
     } else {
         data->addrlen = 0;
     }
 
     data->is_wormhole_fd = is_wormhole_fd(data->fd, &data->remote_fd);
-    if (data->is_wormhole_fd) sys_regs->di = -1; // Sabotage!
+    if (data->is_wormhole_fd) regs->di = -1; // Sabotage!
     return 0;
 }
 
@@ -1166,22 +1164,21 @@ static struct kretprobe bind_kprobe;
 static int entry_handler_bind(struct kretprobe_instance *ri, struct pt_regs *regs) {
     pid_t my_pid = current->pid;
     struct connect_kretprobe_data *data = (struct connect_kretprobe_data *)ri->data;
-    struct pt_regs *sys_regs = SYSCALL_REGS(regs);
 
     if (!is_guest_process(my_pid) || !config_migrate_network_io) return 0; 
 
-    data->fd = (int)sys_regs->di;
-    data->addrlen = (int)sys_regs->dx;
+    data->fd = (int)regs->di;
+    data->addrlen = (int)regs->dx;
     data->remote_fd = -1;
 
     if (data->addrlen > 0 && data->addrlen <= sizeof(struct sockaddr_storage)) {
-        if (copy_from_user(&data->addr, (void __user *)sys_regs->si, data->addrlen)) data->addrlen = 0;
+        if (copy_from_user(&data->addr, (void __user *)regs->si, data->addrlen)) data->addrlen = 0;
     } else {
         data->addrlen = 0;
     }
 
     data->is_wormhole_fd = is_wormhole_fd(data->fd, &data->remote_fd);
-    if (data->is_wormhole_fd) sys_regs->di = -1; // Sabotage!
+    if (data->is_wormhole_fd) regs->di = -1; // Sabotage!
     return 0;
 }
 
@@ -1240,16 +1237,15 @@ static struct kretprobe listen_kprobe;
 static int entry_handler_listen(struct kretprobe_instance *ri, struct pt_regs *regs) {
     pid_t my_pid = current->pid;
     struct listen_kretprobe_data *data = (struct listen_kretprobe_data *)ri->data;
-    struct pt_regs *sys_regs = SYSCALL_REGS(regs);
 
     if (!is_guest_process(my_pid) || !config_migrate_network_io) return 0; 
 
-    data->fd = (int)sys_regs->di;
-    data->backlog = (int)sys_regs->si;
+    data->fd = (int)regs->di;
+    data->backlog = (int)regs->si;
     data->remote_fd = -1;
 
     data->is_wormhole_fd = is_wormhole_fd(data->fd, &data->remote_fd);
-    if (data->is_wormhole_fd) sys_regs->di = -1; // Sabotage!
+    if (data->is_wormhole_fd) regs->di = -1; // Sabotage!
     return 0;
 }
 
@@ -1309,18 +1305,17 @@ static struct kretprobe sendto_kprobe;
 static int entry_handler_sendto(struct kretprobe_instance *ri, struct pt_regs *regs) {
     pid_t my_pid = current->pid;
     struct sendto_kretprobe_data *data = (struct sendto_kretprobe_data *)ri->data;
-    struct pt_regs *sys_regs = SYSCALL_REGS(regs);
 
     if (!is_guest_process(my_pid) || !config_migrate_network_io) return 0; 
 
-    data->fd = (int)sys_regs->di;
-    data->buff = (void __user *)sys_regs->si;
-    data->len = (size_t)sys_regs->dx;
-    data->flags = (unsigned int)sys_regs->cx;
+    data->fd = (int)regs->di;
+    data->buff = (void __user *)regs->si;
+    data->len = (size_t)regs->dx;
+    data->flags = (unsigned int)regs->cx;
     data->remote_fd = -1;
     
     data->is_wormhole_fd = is_wormhole_fd(data->fd, &data->remote_fd);
-    if (data->is_wormhole_fd) sys_regs->di = -1; // Sabotage!
+    if (data->is_wormhole_fd) regs->di = -1; // Sabotage!
     return 0;
 }
 
@@ -1382,18 +1377,17 @@ static struct kretprobe recvfrom_kprobe;
 static int entry_handler_recvfrom(struct kretprobe_instance *ri, struct pt_regs *regs) {
     pid_t my_pid = current->pid;
     struct recvfrom_kretprobe_data *data = (struct recvfrom_kretprobe_data *)ri->data;
-    struct pt_regs *sys_regs = SYSCALL_REGS(regs);
 
     if (!is_guest_process(my_pid) || !config_migrate_network_io) return 0; 
 
-    data->fd = (int)sys_regs->di;
-    data->ubuf = (void __user *)sys_regs->si;
-    data->size = (size_t)sys_regs->dx;
-    data->flags = (unsigned int)sys_regs->cx;
+    data->fd = (int)regs->di;
+    data->ubuf = (void __user *)regs->si;
+    data->size = (size_t)regs->dx;
+    data->flags = (unsigned int)regs->cx;
     data->remote_fd = -1;
 
     data->is_wormhole_fd = is_wormhole_fd(data->fd, &data->remote_fd);
-    if (data->is_wormhole_fd) sys_regs->di = -1; // Sabotage!
+    if (data->is_wormhole_fd) regs->di = -1; // Sabotage!
     return 0;
 }
 
@@ -1455,18 +1449,17 @@ static struct kretprobe accept_kprobe;
 static int entry_handler_accept(struct kretprobe_instance *ri, struct pt_regs *regs) {
     pid_t my_pid = current->pid;
     struct accept_kretprobe_data *data = (struct accept_kretprobe_data *)ri->data;
-    struct pt_regs *sys_regs = SYSCALL_REGS(regs);
 
     if (!is_guest_process(my_pid) || !config_migrate_network_io) return 0; 
 
-    data->fd = (int)sys_regs->di;
-    data->upeer_sockaddr = (struct sockaddr __user *)sys_regs->si;
-    data->upeer_addrlen = (int __user *)sys_regs->dx;
-    data->flags = (int)sys_regs->cx;
+    data->fd = (int)regs->di;
+    data->upeer_sockaddr = (struct sockaddr __user *)regs->si;
+    data->upeer_addrlen = (int __user *)regs->dx;
+    data->flags = (int)regs->cx;
     data->remote_fd = -1;
 
     data->is_wormhole_fd = is_wormhole_fd(data->fd, &data->remote_fd);
-    if (data->is_wormhole_fd) sys_regs->di = -1; // Sabotage!
+    if (data->is_wormhole_fd) regs->di = -1; // Sabotage!
     return 0;
 }
 

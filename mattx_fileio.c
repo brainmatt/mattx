@@ -1921,23 +1921,49 @@ static void mattx_poll_worker(struct work_struct *work) {
         for (i = 0; i < export_count; i++) {
             if (export_registry[i].orig_pid == rpc->orig_pid) {
                 deputy_alive = true;
-                
+
                 // 2. Check every FD in the array
                 for (int j = 0; j < rpc->nfds; j++) {
                     int remote_fd = reply.fds[j].fd;
+                    struct file *f = NULL;
+                    struct task_struct *deputy = NULL;
+
                     if (remote_fd >= 1000) {
                         int slot = remote_fd - 1000;
                         if (slot < MAX_FDS && export_registry[i].remote_files[slot]) {
-                            struct file *f = export_registry[i].remote_files[slot];
-                            
-                            // vfs_poll with NULL doesn't sleep, it just returns the current state!
-                            __poll_t mask = vfs_poll(f, NULL);
-                            
-                            reply.fds[j].revents = mask & reply.fds[j].events;
-                            if (reply.fds[j].revents) {
-                                ready_count++;
-                            }
+                            f = export_registry[i].remote_files[slot];
+                            get_file(f);
                         }
+                    } else if (remote_fd >= 0) {
+                        // Native Deputy FD!
+                        rcu_read_lock();
+                        deputy = pid_task(find_vpid(rpc->orig_pid), PIDTYPE_PID);
+                        if (deputy) get_task_struct(deputy);
+                        rcu_read_unlock();
+
+                        if (deputy) {
+                            struct files_struct *files = deputy->files;
+                            if (files) {
+                                spin_lock(&files->file_lock);
+                                struct fdtable *fdt = files_fdtable(files);
+                                if (remote_fd < fdt->max_fds) {
+                                    f = rcu_dereference_raw(fdt->fd[remote_fd]);
+                                    if (f) get_file(f);
+                                }
+                                spin_unlock(&files->file_lock);
+                            }
+                            put_task_struct(deputy);
+                        }
+                    }
+
+                    if (f) {
+                        // vfs_poll with NULL doesn't sleep, it just returns the current state!
+                        __poll_t mask = vfs_poll(f, NULL);
+                        reply.fds[j].revents = mask & reply.fds[j].events;
+                        if (reply.fds[j].revents) {
+                            ready_count++;
+                        }
+                        fput(f);
                     }
                 }
                 break;
