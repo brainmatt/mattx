@@ -738,12 +738,11 @@ static void mattx_rpc_worker(struct work_struct *work) {
             } else {
                 mattx_dbg("[RPC] Worker finished, but Surrogate %d is migrating! Leaving it frozen.\n", rpc->local_pid);
             }
-            
-            put_task_struct(surrogate);
         }
-
-        kfree(rpc);
+        put_task_struct(surrogate);
     }
+
+    kfree(rpc);
 }
 
 // --- UNIVERSAL GHOST FD DETECTOR ---
