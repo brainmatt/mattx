@@ -68,7 +68,7 @@ int main(int argc, char *argv[]) {
     /* Initialize send buffer and pack the initial integer value */
     log_message("MASTER: Initializing send buffer and packing integer value %d", value);
     pvm_initsend(PvmDataDefault);
-    pvm_pkint(&value, 1, 1);
+    pvm_pkint(&value, 1, 0);
     
     /* Send the integer to the slave */
     log_message("MASTER: Sending initial value %d to slave (tid=%d)", value, slavetid);
