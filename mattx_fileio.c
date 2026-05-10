@@ -393,12 +393,26 @@ static int mattx_fake_release(struct inode *inode, struct file *file) {
     struct mattx_sys_close_req req;
 
     if (fd_info) {
-        if (cluster_map[fd_info->home_node]) {
+        bool is_migrating = false;
+        
+        // Check if the process is currently migrating (Recall phase)
+        spin_lock(&guest_lock);
+        for (int i = 0; i < guest_count; i++) {
+            if (guest_registry[i].local_pid == current->pid) {
+                is_migrating = guest_registry[i].is_migrating;
+                break;
+            }
+        }
+        spin_unlock(&guest_lock);
+
+        if (cluster_map[fd_info->home_node] && !is_migrating) {
             req.orig_pid = fd_info->orig_pid;
             req.remote_fd = fd_info->remote_fd;
 
             mattx_dbg("[WORMHOLE] Surrogate closed FD %u. Sending CLOSE_REQ to Node %d...\n", req.remote_fd, fd_info->home_node);
             mattx_comm_send(cluster_map[fd_info->home_node], MATTX_MSG_SYS_CLOSE_REQ, &req, sizeof(req));
+        } else if (is_migrating) {
+            mattx_dbg("[WORMHOLE] Surrogate is migrating! Shielding Remote FD %u from closure.\n", fd_info->remote_fd);
         }
         kfree(fd_info);
     }
@@ -577,6 +591,7 @@ static void handle_sys_close_req(struct mattx_link *link, struct mattx_header *h
     if (payload) {
         struct mattx_sys_close_req *req = (struct mattx_sys_close_req *)payload;
         int i;
+        struct file *f_to_close = NULL;
         
         mattx_dbg("[RPC] Received CLOSE request for Remote FD %u from Node %u\n", req->remote_fd, hdr->sender_id);
 
@@ -586,14 +601,19 @@ static void handle_sys_close_req(struct mattx_link *link, struct mattx_header *h
             for (i = 0; i < export_count; i++) {
                 if (export_registry[i].orig_pid == req->orig_pid) {
                     if (slot < MAX_FDS && export_registry[i].remote_files[slot]) {
-                        fput(export_registry[i].remote_files[slot]);
+                        f_to_close = export_registry[i].remote_files[slot];
                         export_registry[i].remote_files[slot] = NULL;
-                        mattx_dbg("[RPC] Successfully closed Remote FD %u\n", req->remote_fd);
                     }
                     break;
                 }
             }
             spin_unlock(&export_lock);
+            
+            // Call fput safely OUTSIDE the spinlock!
+            if (f_to_close) {
+                fput(f_to_close);
+                mattx_dbg("[RPC] Successfully closed Remote FD %u\n", req->remote_fd);
+            }
         }
     }
 }
@@ -2628,14 +2648,21 @@ EXPORT_SYMBOL(mattx_rpc_vfs_unlink);
 
 
 void mattx_rpc_vfs_close(int node_id, int remote_fd) {
-    // --- NEW: The Local Fast-Path! ---
+    // The Local Fast-Path! ---
     if (node_id == my_node_id) {
+        struct file *f_to_close = NULL;
+        
         spin_lock(&mfs_file_lock);
         if (remote_fd < MAX_FDS && mfs_open_files[remote_fd]) {
-            fput(mfs_open_files[remote_fd]);
+            f_to_close = mfs_open_files[remote_fd];
             mfs_open_files[remote_fd] = NULL;
         }
         spin_unlock(&mfs_file_lock);
+        
+        // Call fput safely OUTSIDE the spinlock!
+        if (f_to_close) {
+            fput(f_to_close);
+        }
         return;
     }
 
@@ -3163,12 +3190,19 @@ static void handle_sys_unlink_reply(struct mattx_link *link, struct mattx_header
 static void handle_vfs_close_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
     if (payload) {
         struct mattx_vfs_close_req *req = payload;
+        struct file *f_to_close = NULL;
+        
         spin_lock(&mfs_file_lock);
         if (req->remote_fd < MAX_FDS && mfs_open_files[req->remote_fd]) {
-            fput(mfs_open_files[req->remote_fd]);
+            f_to_close = mfs_open_files[req->remote_fd];
             mfs_open_files[req->remote_fd] = NULL;
         }
         spin_unlock(&mfs_file_lock);
+        
+        // Call fput safely OUTSIDE the spinlock!
+        if (f_to_close) {
+            fput(f_to_close);
+        }
     }
 }
 

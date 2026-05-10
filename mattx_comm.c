@@ -232,6 +232,7 @@ int mattx_listener_loop(void *data) {
         err = kernel_accept(listen_sock, &client_sock, 0);
         if (err < 0) {
             if (err == -EAGAIN || err == -EINTR) continue;
+            msleep(10); // Prevent 100% CPU spin on persistent accept errors!
             continue;
         }
         struct mattx_link *link = kzalloc(sizeof(*link), GFP_KERNEL);
