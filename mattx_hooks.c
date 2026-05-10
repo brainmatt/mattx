@@ -365,372 +365,385 @@ static void mattx_rpc_worker(struct work_struct *work) {
     rcu_read_unlock();
 
     if (surrogate) {
-        // --- THE QUANTUM RACE CONDITION FIX ---
-        // We MUST wait for the Surrogate to completely exit the syscall path
-        // and enter the TASK_STOPPED state before we modify its registers!
+        // --- THE QUANTUM RACE CONDITION FIX (V2: With Dead-Task Protection) ---
         int wait_loops = 0;
-        while (!task_is_stopped_or_traced(surrogate)) {
+        bool is_stopped = false;
+        
+        while (1) {
+            if (task_is_stopped_or_traced(surrogate)) {
+                is_stopped = true;
+                break;
+            }
+            // If the task is exiting, or its stack was already freed, ABORT!
+            if ((surrogate->flags & PF_EXITING) || !surrogate->stack) {
+                mattx_dbg("[RPC] Surrogate %d is exiting or dead. Aborting illusion.\n", rpc->local_pid);
+                break;
+            }
             msleep(1); // Sleep 1 millisecond
             wait_loops++;
             if (wait_loops > 2000) {
                 mattx_dbg("[RPC] WARNING: Surrogate %d took too long to stop!\n", rpc->local_pid);
-                break; // 2 second timeout to prevent infinite hangs
+                break; // 2 second timeout
             }
         }
         
-        // NOW it is safe to apply the Illusion!
-        if (rpc->is_statx) {
-            // (Removed statx block since we deleted it)
-        // --- FIXED: Group ALL FD-Operating Syscalls together! ---
-        } else if (rpc->is_unlink || rpc->is_connect || rpc->is_bind || rpc->is_listen || rpc->is_sendto) {
-            struct pt_regs *regs = task_pt_regs(surrogate);
-            int error = -1;
-            bool success = false;
-
-            spin_lock(&guest_lock);
-            for (i = 0; i < guest_count; i++) {
-                if (guest_registry[i].local_pid == rpc->local_pid) {
-                    // We reused rpc_fsync_res to store the generic integer reply from VM1
-                    error = guest_registry[i].rpc_fsync_res; 
-                    success = true;
-                    break;
-                }
-            }
-            spin_unlock(&guest_lock);
-
-            if (success) {
-                // Shove the return code (e.g., 0) directly into RAX! No Fake FDs allocated!
-                regs->ax = error;
-                mattx_dbg("[RPC] Illusion Complete! Networking syscall returned %d to Surrogate %d\n", error, rpc->local_pid);
-            } else {
-                regs->ax = -EBADF;
-            }
-
-        // IPC WORMHOLE: READ AWAKENING ---
-        } else if (rpc->is_read) {
-            struct pt_regs *regs = task_pt_regs(surrogate);
-            ssize_t ret_bytes = -1;
-            void *read_buf = NULL;
-
-            spin_lock(&guest_lock);
-            for (i = 0; i < guest_count; i++) {
-                if (guest_registry[i].local_pid == rpc->local_pid) {
-                    ret_bytes = guest_registry[i].rpc_read_bytes;
-                    read_buf = guest_registry[i].rpc_read_buf;
-                    guest_registry[i].rpc_read_buf = NULL;
-                    break;
-                }
-            }
-            spin_unlock(&guest_lock);
-
-            if (ret_bytes > 0 && read_buf) {
-                if (copy_to_user(rpc->buff, read_buf, ret_bytes)) {
-                    ret_bytes = -EFAULT;
-                }
-            }
+        // ONLY apply the illusion if the task is safely stopped and has a stack!
+        if (is_stopped && surrogate->stack) {
             
-            if (read_buf) kfree(read_buf);
-            
-            if (regs) {
-                regs->ax = ret_bytes;
-                mattx_dbg("[RPC] Illusion Complete! read() on Ghost FD returned %zd\n", ret_bytes);
-            }
+            // NOW it is safe to apply the Illusion!
+            if (rpc->is_statx) {
+                // (Removed statx block since we deleted it)
+            // --- FIXED: Group ALL FD-Operating Syscalls together! ---
+            } else if (rpc->is_unlink || rpc->is_connect || rpc->is_bind || rpc->is_listen || rpc->is_sendto) {
+                struct pt_regs *regs = task_pt_regs(surrogate);
+                int error = -1;
+                bool success = false;
 
-        // IPC WORMHOLE: WRITE AWAKENING ---
-        } else if (rpc->is_write) {
-            struct pt_regs *regs = task_pt_regs(surrogate);
-            int bytes_written = -1;
-
-            spin_lock(&guest_lock);
-            for (i = 0; i < guest_count; i++) {
-                if (guest_registry[i].local_pid == rpc->local_pid) {
-                    bytes_written = guest_registry[i].rpc_fsync_res;
-                    break;
+                spin_lock(&guest_lock);
+                for (i = 0; i < guest_count; i++) {
+                    if (guest_registry[i].local_pid == rpc->local_pid) {
+                        // We reused rpc_fsync_res to store the generic integer reply from VM1
+                        error = guest_registry[i].rpc_fsync_res; 
+                        success = true;
+                        break;
+                    }
                 }
-            }
-            spin_unlock(&guest_lock);
+                spin_unlock(&guest_lock);
 
-            if (regs) {
-                regs->ax = bytes_written;
-                mattx_dbg("[RPC] Illusion Complete! write() on Ghost FD returned %d\n", bytes_written);
-            }
-
-        // RECVFROM AWAKENING ---
-        } else if (rpc->is_recvfrom) {
-            struct pt_regs *regs = task_pt_regs(surrogate);
-            ssize_t ret_bytes = -1;
-            void *read_buf = NULL;
-
-            spin_lock(&guest_lock);
-            for (i = 0; i < guest_count; i++) {
-                if (guest_registry[i].local_pid == rpc->local_pid) {
-                    ret_bytes = guest_registry[i].rpc_read_bytes;
-                    read_buf = guest_registry[i].rpc_read_buf;
-                    guest_registry[i].rpc_read_buf = NULL;
-                    break;
+                if (success) {
+                    // Shove the return code (e.g., 0) directly into RAX! No Fake FDs allocated!
+                    regs->ax = error;
+                    mattx_dbg("[RPC] Illusion Complete! Networking syscall returned %d to Surrogate %d\n", error, rpc->local_pid);
+                } else {
+                    regs->ax = -EBADF;
                 }
-            }
-            spin_unlock(&guest_lock);
 
-            if (ret_bytes > 0 && read_buf) {
-                if (copy_to_user(rpc->buff, read_buf, ret_bytes)) {
-                    ret_bytes = -EFAULT;
+            // IPC WORMHOLE: READ AWAKENING ---
+            } else if (rpc->is_read) {
+                struct pt_regs *regs = task_pt_regs(surrogate);
+                ssize_t ret_bytes = -1;
+                void *read_buf = NULL;
+
+                spin_lock(&guest_lock);
+                for (i = 0; i < guest_count; i++) {
+                    if (guest_registry[i].local_pid == rpc->local_pid) {
+                        ret_bytes = guest_registry[i].rpc_read_bytes;
+                        read_buf = guest_registry[i].rpc_read_buf;
+                        guest_registry[i].rpc_read_buf = NULL;
+                        break;
+                    }
                 }
-            }
-            
-            if (read_buf) kfree(read_buf);
-            
-            if (regs) {
-                regs->ax = ret_bytes;
-                mattx_dbg("[RPC] Illusion Complete! recvfrom returned %zd\n", ret_bytes);
-            }
+                spin_unlock(&guest_lock);
 
-        // ACCEPT AWAKENING
-        } else if (rpc->is_accept) {
-            struct pt_regs *regs = task_pt_regs(surrogate);
-            int local_fd = -1;
-            
-            // If remote_fd is >= 0, VM1 successfully accepted a connection!
-            if (remote_fd >= 0) {
-                struct mattx_fake_fd_info *fd_info = kmalloc(sizeof(*fd_info), GFP_KERNEL);
-                if (fd_info) {
-                    fd_info->home_node = rpc->home_node;
-                    fd_info->orig_pid = rpc->orig_pid;
-                    fd_info->remote_fd = remote_fd;
+                if (ret_bytes > 0 && read_buf) {
+                    if (copy_to_user(rpc->buff, read_buf, ret_bytes)) {
+                        ret_bytes = -EFAULT;
+                    }
+                }
+                
+                if (read_buf) kfree(read_buf);
+                
+                if (regs) {
+                    regs->ax = ret_bytes;
+                    mattx_dbg("[RPC] Illusion Complete! read() on Ghost FD returned %zd\n", ret_bytes);
+                }
+
+            // IPC WORMHOLE: WRITE AWAKENING ---
+            } else if (rpc->is_write) {
+                struct pt_regs *regs = task_pt_regs(surrogate);
+                int bytes_written = -1;
+
+                spin_lock(&guest_lock);
+                for (i = 0; i < guest_count; i++) {
+                    if (guest_registry[i].local_pid == rpc->local_pid) {
+                        bytes_written = guest_registry[i].rpc_fsync_res;
+                        break;
+                    }
+                }
+                spin_unlock(&guest_lock);
+
+                if (regs) {
+                    regs->ax = bytes_written;
+                    mattx_dbg("[RPC] Illusion Complete! write() on Ghost FD returned %d\n", bytes_written);
+                }
+
+            // RECVFROM AWAKENING ---
+            } else if (rpc->is_recvfrom) {
+                struct pt_regs *regs = task_pt_regs(surrogate);
+                ssize_t ret_bytes = -1;
+                void *read_buf = NULL;
+
+                spin_lock(&guest_lock);
+                for (i = 0; i < guest_count; i++) {
+                    if (guest_registry[i].local_pid == rpc->local_pid) {
+                        ret_bytes = guest_registry[i].rpc_read_bytes;
+                        read_buf = guest_registry[i].rpc_read_buf;
+                        guest_registry[i].rpc_read_buf = NULL;
+                        break;
+                    }
+                }
+                spin_unlock(&guest_lock);
+
+                if (ret_bytes > 0 && read_buf) {
+                    if (copy_to_user(rpc->buff, read_buf, ret_bytes)) {
+                        ret_bytes = -EFAULT;
+                    }
+                }
+                
+                if (read_buf) kfree(read_buf);
+                
+                if (regs) {
+                    regs->ax = ret_bytes;
+                    mattx_dbg("[RPC] Illusion Complete! recvfrom returned %zd\n", ret_bytes);
+                }
+
+            // ACCEPT AWAKENING
+            } else if (rpc->is_accept) {
+                struct pt_regs *regs = task_pt_regs(surrogate);
+                int local_fd = -1;
+                
+                // If remote_fd is >= 0, VM1 successfully accepted a connection!
+                if (remote_fd >= 0) {
+                    struct mattx_fake_fd_info *fd_info = kmalloc(sizeof(*fd_info), GFP_KERNEL);
+                    if (fd_info) {
+                        fd_info->home_node = rpc->home_node;
+                        fd_info->orig_pid = rpc->orig_pid;
+                        fd_info->remote_fd = remote_fd;
+                        
+                        struct file *fake_file = anon_inode_getfile("mattx_vfs_proxy", &mattx_fops, fd_info, O_RDWR);
+                        
+                        if (!IS_ERR(fake_file) && surrogate->files) {
+                            spin_lock(&surrogate->files->file_lock);
+                            struct fdtable *fdt = files_fdtable(surrogate->files);
+                            for (int j = 3; j < fdt->max_fds; j++) {
+                                if (!rcu_dereference_raw(fdt->fd[j])) {
+                                    rcu_assign_pointer(fdt->fd[j], fake_file);
+                                    __set_bit(j, fdt->open_fds);
+                                    local_fd = j;
+                                    break;
+                                }
+                            }
+                            spin_unlock(&surrogate->files->file_lock);
+                            
+                            if (local_fd >= 0) {
+                                regs->ax = local_fd; // Return the new Local FD!
+
+                                // Copy the client's IP address back to user-space if requested
+                                if (rpc->buff && rpc->size) {
+                                    int __user *ulen = (int __user *)rpc->size;
+                                    int len, g_idx;
+                                    void *addr_buf = NULL;
+                                    int addr_len = 0;
+
+                                    spin_lock(&guest_lock);
+                                    for (g_idx = 0; g_idx < guest_count; g_idx++) {
+                                        if (guest_registry[g_idx].local_pid == rpc->local_pid) {
+                                            addr_len = guest_registry[g_idx].rpc_fsync_res;
+                                            addr_buf = guest_registry[g_idx].rpc_read_buf;
+                                            guest_registry[g_idx].rpc_read_buf = NULL; 
+                                            break;
+                                        }
+                                    }
+                                    spin_unlock(&guest_lock);
+
+                                    // Ensure addr_len is > 0 before copying!
+                                    if (addr_buf && addr_len > 0 && get_user(len, ulen) == 0) {
+                                        len = min_t(int, len, addr_len);
+                                        if (copy_to_user(rpc->buff, addr_buf, len)) {
+                                            printk(KERN_WARNING "MattX:[RPC] Failed to copy sockaddr to user!\n");
+                                        } else {
+                                            put_user(len, ulen); 
+                                        }
+                                    }
+                                    if (addr_buf) kfree(addr_buf);
+                                }
+
+                                mattx_dbg("[RPC] Illusion Complete! Mapped New Remote FD %d to Local FD %d\n", remote_fd, local_fd);
+                            } else {
+                                fput(fake_file);
+                                regs->ax = -EMFILE;
+                            }
+                        } else {
+                            kfree(fd_info);
+                            regs->ax = -ENFILE;
+                        }
+                    }
+                } else {
+                    // VM1 returned an error (e.g., -EAGAIN for non-blocking sockets)
+                    regs->ax = remote_fd; 
+                }            
+    
+            // POLL AWAKENING
+            } else if (rpc->is_poll) {
+                struct pt_regs *regs = task_pt_regs(surrogate);
+                int retval = -EBADF;
+                bool success = false;
+                struct mattx_sys_poll_reply *reply_data = NULL;
+
+                spin_lock(&guest_lock);
+                for (i = 0; i < guest_count; i++) {
+                    if (guest_registry[i].local_pid == rpc->local_pid) {
+                        retval = guest_registry[i].rpc_fsync_res; // We stored retval here
+                        reply_data = guest_registry[i].rpc_read_buf; // We stored the array here
+                        guest_registry[i].rpc_read_buf = NULL;
+                        success = true;
+                        break;
+                    }
+                }
+                spin_unlock(&guest_lock);
+
+                if (success && reply_data) {
+                    // Copy the updated revents back to the user-space array!
+                    if (copy_to_user(rpc->poll_ufds, reply_data->fds, sizeof(struct pollfd) * rpc->nfds)) {
+                        regs->ax = -EFAULT;
+                    } else {
+                        regs->ax = retval; // Return the number of ready FDs
+                        mattx_dbg("[RPC] Illusion Complete! poll returned %d\n", retval);
+                    }
+                    kfree(reply_data);
+                } else {
+                    regs->ax = -EBADF;
+                }
+
+            // --- SELECT & PSELECT6 AWAKENING ---
+            } else if (rpc->is_select || rpc->is_pselect6) {
+                struct pt_regs *regs = task_pt_regs(surrogate);
+                int retval = -EBADF;
+                bool success = false;
+                struct mattx_sys_poll_reply *reply_data = NULL;
+
+                spin_lock(&guest_lock);
+                for (i = 0; i < guest_count; i++) {
+                    if (guest_registry[i].local_pid == rpc->local_pid) {
+                        retval = guest_registry[i].rpc_fsync_res; 
+                        reply_data = guest_registry[i].rpc_read_buf; 
+                        guest_registry[i].rpc_read_buf = NULL;
+                        success = true;
+                        break;
+                    }
+                }
+                spin_unlock(&guest_lock);
+
+                if (success && reply_data) {
+                    fd_set *in_fds = kzalloc(sizeof(fd_set), GFP_KERNEL);
+                    fd_set *out_fds = kzalloc(sizeof(fd_set), GFP_KERNEL);
+                    fd_set *ex_fds = kzalloc(sizeof(fd_set), GFP_KERNEL);
+
+                    // 4. Translate Poll Array back to Bitmaps!
+                    for (int j = 0; j < reply_data->nfds; j++) {
+                        int local_fd = rpc->poll_fds[j].fd; // We saved the local FD here earlier!
+                        short revents = reply_data->fds[j].revents;
+
+                        if (revents & (POLLIN | POLLERR | POLLHUP)) __set_bit(local_fd, (unsigned long *)in_fds);
+                        if (revents & (POLLOUT | POLLERR | POLLHUP)) __set_bit(local_fd, (unsigned long *)out_fds);
+                        if (revents & (POLLPRI | POLLERR | POLLHUP)) __set_bit(local_fd, (unsigned long *)ex_fds);
+                    }
+
+                    // 5. Copy the updated bitmaps back to user-space
+                    // Check return values to satisfy the compiler!
+                    if (rpc->select_readfds && copy_to_user(rpc->select_readfds, in_fds, sizeof(fd_set))) {}
+                    if (rpc->select_writefds && copy_to_user(rpc->select_writefds, out_fds, sizeof(fd_set))) {}
+                    if (rpc->select_exceptfds && copy_to_user(rpc->select_exceptfds, ex_fds, sizeof(fd_set))) {}
+
+                    kfree(in_fds); kfree(out_fds); kfree(ex_fds);
+
+                    regs->ax = retval;
+                    mattx_dbg("[RPC] Illusion Complete! select() returned %d\n", retval);
+                    kfree(reply_data);
+                } else {
+                    regs->ax = -EBADF;
+                }
+
+            // --- FD-Creating Syscalls (open, socket, dup) fall through here! ---
+            } else if (remote_fd >= 0) {
+                struct pt_regs *regs = task_pt_regs(surrogate);
+                int local_fd = regs ? regs->ax : -1; 
+
+                mattx_dbg("[DEBUG] Remote FD from VM1: %d. Local regs->ax: %d\n", remote_fd, local_fd);
+
+                if (local_fd < 0) {
+                    mattx_dbg("[DEBUG] Local syscall failed (expected)! Searching for a free FD slot...\n");
                     
-                    struct file *fake_file = anon_inode_getfile("mattx_vfs_proxy", &mattx_fops, fd_info, O_RDWR);
-                    
-                    if (!IS_ERR(fake_file) && surrogate->files) {
+                    if (surrogate->files) {
                         spin_lock(&surrogate->files->file_lock);
                         struct fdtable *fdt = files_fdtable(surrogate->files);
-                        for (int j = 3; j < fdt->max_fds; j++) {
-                            if (!rcu_dereference_raw(fdt->fd[j])) {
-                                rcu_assign_pointer(fdt->fd[j], fake_file);
-                                __set_bit(j, fdt->open_fds);
-                                local_fd = j;
+                        int fd;
+                        for (fd = 3; fd < fdt->max_fds; fd++) {
+                            if (!rcu_dereference_raw(fdt->fd[fd])) {
+                                local_fd = fd;
+                                __set_bit(fd, fdt->open_fds);
                                 break;
                             }
                         }
                         spin_unlock(&surrogate->files->file_lock);
+                    }
+                }
+
+                if (local_fd >= 0) {
+                    struct mattx_fake_fd_info *fd_info = kmalloc(sizeof(*fd_info), GFP_KERNEL);
+                    if (fd_info) {
+                        fd_info->home_node = rpc->home_node;
+                        fd_info->orig_pid = rpc->orig_pid;
+                        fd_info->remote_fd = remote_fd;
                         
-                        if (local_fd >= 0) {
-                            regs->ax = local_fd; // Return the new Local FD!
+                        // Use the original flags (filtered to file access modes) to create the fake file
+                        struct file *fake_file = anon_inode_getfile("mattx_vfs_proxy", &mattx_fops, fd_info, rpc->flags & O_ACCMODE);
+                        struct file *old_file = NULL;
 
-                            // Copy the client's IP address back to user-space if requested
-                            if (rpc->buff && rpc->size) {
-                                int __user *ulen = (int __user *)rpc->size;
-                                int len, g_idx;
-                                void *addr_buf = NULL;
-                                int addr_len = 0;
-
-                                spin_lock(&guest_lock);
-                                for (g_idx = 0; g_idx < guest_count; g_idx++) {
-                                    if (guest_registry[g_idx].local_pid == rpc->local_pid) {
-                                        addr_len = guest_registry[g_idx].rpc_fsync_res;
-                                        addr_buf = guest_registry[g_idx].rpc_read_buf;
-                                        guest_registry[g_idx].rpc_read_buf = NULL; 
-                                        break;
-                                    }
-                                }
-                                spin_unlock(&guest_lock);
-
-                                // Ensure addr_len is > 0 before copying!
-                                if (addr_buf && addr_len > 0 && get_user(len, ulen) == 0) {
-                                    len = min_t(int, len, addr_len);
-                                    if (copy_to_user(rpc->buff, addr_buf, len)) {
-                                        printk(KERN_WARNING "MattX:[RPC] Failed to copy sockaddr to user!\n");
-                                    } else {
-                                        put_user(len, ulen); 
-                                    }
-                                }
-                                if (addr_buf) kfree(addr_buf);
+                        if (!IS_ERR(fake_file) && surrogate->files) {
+                            // Inject our custom inode_operations so we can catch fstat/getattr!
+                            if (fake_file->f_inode) {
+                                fake_file->f_inode->i_op = &mattx_iops;
                             }
 
-                            mattx_dbg("[RPC] Illusion Complete! Mapped New Remote FD %d to Local FD %d\n", remote_fd, local_fd);
+                            spin_lock(&surrogate->files->file_lock);
+                            struct fdtable *fdt = files_fdtable(surrogate->files);
+                            
+                            if (local_fd < fdt->max_fds) {
+                                old_file = rcu_dereference_raw(fdt->fd[local_fd]);
+                                rcu_assign_pointer(fdt->fd[local_fd], fake_file);
+                            }
+                            spin_unlock(&surrogate->files->file_lock);
+                            
+                            if (old_file) fput(old_file); 
+                            
+                            // --- RESTORED: Hijack the return value! ---
+                            regs->ax = local_fd; 
+                            
+                            mattx_dbg("[RPC] Illusion Complete! Mapped Remote FD %d to Local FD %d\n", remote_fd, local_fd);
                         } else {
-                            fput(fake_file);
-                            regs->ax = -EMFILE;
+                            if (!IS_ERR(fake_file)) fput(fake_file);
+                            kfree(fd_info);
                         }
-                    } else {
-                        kfree(fd_info);
-                        regs->ax = -ENFILE;
                     }
                 }
-            } else {
-                // VM1 returned an error (e.g., -EAGAIN for non-blocking sockets)
-                regs->ax = remote_fd; 
-            }            
- 
-        // POLL AWAKENING
-        } else if (rpc->is_poll) {
-            struct pt_regs *regs = task_pt_regs(surrogate);
-            int retval = -EBADF;
-            bool success = false;
-            struct mattx_sys_poll_reply *reply_data = NULL;
+            }
 
+            // The Migration Lock Check ---
+            bool safe_to_wake = true;
             spin_lock(&guest_lock);
             for (i = 0; i < guest_count; i++) {
                 if (guest_registry[i].local_pid == rpc->local_pid) {
-                    retval = guest_registry[i].rpc_fsync_res; // We stored retval here
-                    reply_data = guest_registry[i].rpc_read_buf; // We stored the array here
-                    guest_registry[i].rpc_read_buf = NULL;
-                    success = true;
+                    if (guest_registry[i].is_migrating) {
+                        safe_to_wake = false;
+                    }
                     break;
                 }
             }
             spin_unlock(&guest_lock);
 
-            if (success && reply_data) {
-                // Copy the updated revents back to the user-space array!
-                if (copy_to_user(rpc->poll_ufds, reply_data->fds, sizeof(struct pollfd) * rpc->nfds)) {
-                    regs->ax = -EFAULT;
-                } else {
-                    regs->ax = retval; // Return the number of ready FDs
-                    mattx_dbg("[RPC] Illusion Complete! poll returned %d\n", retval);
-                }
-                kfree(reply_data);
+            if (safe_to_wake) {
+                mattx_dbg("[RPC] Worker finished for PID %d. Waking Surrogate...\n", rpc->local_pid);
+                send_sig(SIGCONT, surrogate, 0);
             } else {
-                regs->ax = -EBADF;
+                mattx_dbg("[RPC] Worker finished, but Surrogate %d is migrating! Leaving it frozen.\n", rpc->local_pid);
             }
-
-        // --- SELECT & PSELECT6 AWAKENING ---
-        } else if (rpc->is_select || rpc->is_pselect6) {
-            struct pt_regs *regs = task_pt_regs(surrogate);
-            int retval = -EBADF;
-            bool success = false;
-            struct mattx_sys_poll_reply *reply_data = NULL;
-
-            spin_lock(&guest_lock);
-            for (i = 0; i < guest_count; i++) {
-                if (guest_registry[i].local_pid == rpc->local_pid) {
-                    retval = guest_registry[i].rpc_fsync_res; 
-                    reply_data = guest_registry[i].rpc_read_buf; 
-                    guest_registry[i].rpc_read_buf = NULL;
-                    success = true;
-                    break;
-                }
-            }
-            spin_unlock(&guest_lock);
-
-            if (success && reply_data) {
-                fd_set *in_fds = kzalloc(sizeof(fd_set), GFP_KERNEL);
-                fd_set *out_fds = kzalloc(sizeof(fd_set), GFP_KERNEL);
-                fd_set *ex_fds = kzalloc(sizeof(fd_set), GFP_KERNEL);
-
-                // 4. Translate Poll Array back to Bitmaps!
-                for (int j = 0; j < reply_data->nfds; j++) {
-                    int local_fd = rpc->poll_fds[j].fd; // We saved the local FD here earlier!
-                    short revents = reply_data->fds[j].revents;
-
-                    if (revents & (POLLIN | POLLERR | POLLHUP)) __set_bit(local_fd, (unsigned long *)in_fds);
-                    if (revents & (POLLOUT | POLLERR | POLLHUP)) __set_bit(local_fd, (unsigned long *)out_fds);
-                    if (revents & (POLLPRI | POLLERR | POLLHUP)) __set_bit(local_fd, (unsigned long *)ex_fds);
-                }
-
-                // 5. Copy the updated bitmaps back to user-space
-                // Check return values to satisfy the compiler!
-                if (rpc->select_readfds && copy_to_user(rpc->select_readfds, in_fds, sizeof(fd_set))) {}
-                if (rpc->select_writefds && copy_to_user(rpc->select_writefds, out_fds, sizeof(fd_set))) {}
-                if (rpc->select_exceptfds && copy_to_user(rpc->select_exceptfds, ex_fds, sizeof(fd_set))) {}
-
-                kfree(in_fds); kfree(out_fds); kfree(ex_fds);
-
-                regs->ax = retval;
-                mattx_dbg("[RPC] Illusion Complete! select() returned %d\n", retval);
-                kfree(reply_data);
-            } else {
-                regs->ax = -EBADF;
-            }
-
-        // --- FD-Creating Syscalls (open, socket, dup) fall through here! ---
-        } else if (remote_fd >= 0) {
-            struct pt_regs *regs = task_pt_regs(surrogate);
-            int local_fd = regs ? regs->ax : -1; 
-
-            mattx_dbg("[DEBUG] Remote FD from VM1: %d. Local regs->ax: %d\n", remote_fd, local_fd);
-
-            if (local_fd < 0) {
-                mattx_dbg("[DEBUG] Local syscall failed (expected)! Searching for a free FD slot...\n");
-                
-                if (surrogate->files) {
-                    spin_lock(&surrogate->files->file_lock);
-                    struct fdtable *fdt = files_fdtable(surrogate->files);
-                    int fd;
-                    for (fd = 3; fd < fdt->max_fds; fd++) {
-                        if (!rcu_dereference_raw(fdt->fd[fd])) {
-                            local_fd = fd;
-                            __set_bit(fd, fdt->open_fds);
-                            break;
-                        }
-                    }
-                    spin_unlock(&surrogate->files->file_lock);
-                }
-            }
-
-            if (local_fd >= 0) {
-                struct mattx_fake_fd_info *fd_info = kmalloc(sizeof(*fd_info), GFP_KERNEL);
-                if (fd_info) {
-                    fd_info->home_node = rpc->home_node;
-                    fd_info->orig_pid = rpc->orig_pid;
-                    fd_info->remote_fd = remote_fd;
-                    
-                    // Use the original flags (filtered to file access modes) to create the fake file
-                    struct file *fake_file = anon_inode_getfile("mattx_vfs_proxy", &mattx_fops, fd_info, rpc->flags & O_ACCMODE);
-                    struct file *old_file = NULL;
-
-                    if (!IS_ERR(fake_file) && surrogate->files) {
-                        // Inject our custom inode_operations so we can catch fstat/getattr!
-                        if (fake_file->f_inode) {
-                            fake_file->f_inode->i_op = &mattx_iops;
-                        }
-
-                        spin_lock(&surrogate->files->file_lock);
-                        struct fdtable *fdt = files_fdtable(surrogate->files);
-                        
-                        if (local_fd < fdt->max_fds) {
-                            old_file = rcu_dereference_raw(fdt->fd[local_fd]);
-                            rcu_assign_pointer(fdt->fd[local_fd], fake_file);
-                        }
-                        spin_unlock(&surrogate->files->file_lock);
-                        
-                        if (old_file) fput(old_file); 
-                        
-                        // --- RESTORED: Hijack the return value! ---
-                        regs->ax = local_fd; 
-                        
-                        mattx_dbg("[RPC] Illusion Complete! Mapped Remote FD %d to Local FD %d\n", remote_fd, local_fd);
-                    } else {
-                        if (!IS_ERR(fake_file)) fput(fake_file);
-                        kfree(fd_info);
-                    }
-                }
-            }
+            
+            put_task_struct(surrogate);
         }
 
-        // The Migration Lock Check ---
-        bool safe_to_wake = true;
-        spin_lock(&guest_lock);
-        for (i = 0; i < guest_count; i++) {
-            if (guest_registry[i].local_pid == rpc->local_pid) {
-                if (guest_registry[i].is_migrating) {
-                    safe_to_wake = false;
-                }
-                break;
-            }
-        }
-        spin_unlock(&guest_lock);
-
-        if (safe_to_wake) {
-            mattx_dbg("[RPC] Worker finished for PID %d. Waking Surrogate...\n", rpc->local_pid);
-            send_sig(SIGCONT, surrogate, 0);
-        } else {
-            mattx_dbg("[RPC] Worker finished, but Surrogate %d is migrating! Leaving it frozen.\n", rpc->local_pid);
-        }
-        
-        put_task_struct(surrogate);
+        kfree(rpc);
     }
-
-    kfree(rpc);
 }
 
 // --- UNIVERSAL GHOST FD DETECTOR ---
