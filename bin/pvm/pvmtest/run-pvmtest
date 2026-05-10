@@ -1,0 +1,8 @@
+# Make sure PVMDIR is set to your PVM3 installation
+export PVMDIR=/path/to/pvm3
+
+# Build the programs
+make
+
+# Run the master (it will automatically spawn the client)
+./pvmtest
