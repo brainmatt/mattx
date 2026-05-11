@@ -646,10 +646,14 @@ static void mattx_rpc_worker(struct work_struct *work) {
                         if (revents & (POLLPRI | POLLERR | POLLHUP)) __set_bit(local_fd, (unsigned long *)&rpc->ex_fds);
                     }
 
-                    // FIX: Use access_process_vm!
-                    if (rpc->select_readfds_ptr) access_process_vm(surrogate, (unsigned long)rpc->select_readfds_ptr, &rpc->in_fds, sizeof(fd_set), FOLL_WRITE | FOLL_FORCE);
-                    if (rpc->select_writefds_ptr) access_process_vm(surrogate, (unsigned long)rpc->select_writefds_ptr, &rpc->out_fds, sizeof(fd_set), FOLL_WRITE | FOLL_FORCE);
-                    if (rpc->select_exceptfds_ptr) access_process_vm(surrogate, (unsigned long)rpc->select_exceptfds_ptr, &rpc->ex_fds, sizeof(fd_set), FOLL_WRITE | FOLL_FORCE);
+                    // --- THE STACK SMASH FIX ---
+                    // Only write the exact number of bytes the user allocated!
+                    size_t copy_size = (rpc->select_nfds + 7) / 8;
+                    if (copy_size > sizeof(fd_set)) copy_size = sizeof(fd_set);
+
+                    if (rpc->select_readfds_ptr) access_process_vm(surrogate, (unsigned long)rpc->select_readfds_ptr, &rpc->in_fds, copy_size, FOLL_WRITE | FOLL_FORCE);
+                    if (rpc->select_writefds_ptr) access_process_vm(surrogate, (unsigned long)rpc->select_writefds_ptr, &rpc->out_fds, copy_size, FOLL_WRITE | FOLL_FORCE);
+                    if (rpc->select_exceptfds_ptr) access_process_vm(surrogate, (unsigned long)rpc->select_exceptfds_ptr, &rpc->ex_fds, copy_size, FOLL_WRITE | FOLL_FORCE);
 
                     regs->ax = retval;
                     mattx_dbg("[RPC] Illusion Complete! select() returned %d\n", retval);
@@ -1670,18 +1674,21 @@ static int ret_handler_select(struct kretprobe_instance *ri, struct pt_regs *reg
             rpc->select_writefds_ptr = data->outp;
             rpc->select_exceptfds_ptr = data->exp;
             
+            size_t copy_size = (data->n + 7) / 8;
+            if (copy_size > sizeof(fd_set)) copy_size = sizeof(fd_set);
+
             memset(&rpc->in_fds, 0, sizeof(fd_set));
             memset(&rpc->out_fds, 0, sizeof(fd_set));
             memset(&rpc->ex_fds, 0, sizeof(fd_set));
             
             // COPY FROM USER IN THE CORRECT CONTEXT!
-            if (data->inp && copy_from_user(&rpc->in_fds, data->inp, sizeof(fd_set))) {
+            if (data->inp && copy_from_user(&rpc->in_fds, data->inp, copy_size)) {
                 mattx_dbg("[HOOK] Warning: Failed to copy readfds from user!\n");
             }
-            if (data->outp && copy_from_user(&rpc->out_fds, data->outp, sizeof(fd_set))) {
+            if (data->outp && copy_from_user(&rpc->out_fds, data->outp, copy_size)) {
                 mattx_dbg("[HOOK] Warning: Failed to copy writefds from user!\n");
             }
-            if (data->exp && copy_from_user(&rpc->ex_fds, data->exp, sizeof(fd_set))) {
+            if (data->exp && copy_from_user(&rpc->ex_fds, data->exp, copy_size)) {
                 mattx_dbg("[HOOK] Warning: Failed to copy exceptfds from user!\n");
             }
 
@@ -1769,19 +1776,22 @@ static int ret_handler_pselect6(struct kretprobe_instance *ri, struct pt_regs *r
             rpc->select_readfds_ptr = data->inp;
             rpc->select_writefds_ptr = data->outp;
             rpc->select_exceptfds_ptr = data->exp;
-            
+
+            size_t copy_size = (data->n + 7) / 8;
+            if (copy_size > sizeof(fd_set)) copy_size = sizeof(fd_set);
+
             memset(&rpc->in_fds, 0, sizeof(fd_set));
             memset(&rpc->out_fds, 0, sizeof(fd_set));
             memset(&rpc->ex_fds, 0, sizeof(fd_set));
             
             // COPY FROM USER IN THE CORRECT CONTEXT!
-            if (data->inp && copy_from_user(&rpc->in_fds, data->inp, sizeof(fd_set))) {
+            if (data->inp && copy_from_user(&rpc->in_fds, data->inp, copy_size)) {
                 mattx_dbg("[HOOK] Warning: Failed to copy readfds from user!\n");
             }
-            if (data->outp && copy_from_user(&rpc->out_fds, data->outp, sizeof(fd_set))) {
+            if (data->outp && copy_from_user(&rpc->out_fds, data->outp, copy_size)) {
                 mattx_dbg("[HOOK] Warning: Failed to copy writefds from user!\n");
             }
-            if (data->exp && copy_from_user(&rpc->ex_fds, data->exp, sizeof(fd_set))) {
+            if (data->exp && copy_from_user(&rpc->ex_fds, data->exp, copy_size)) {
                 mattx_dbg("[HOOK] Warning: Failed to copy exceptfds from user!\n");
             }
 
