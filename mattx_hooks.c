@@ -1675,9 +1675,15 @@ static int ret_handler_select(struct kretprobe_instance *ri, struct pt_regs *reg
             memset(&rpc->ex_fds, 0, sizeof(fd_set));
             
             // COPY FROM USER IN THE CORRECT CONTEXT!
-            if (data->inp) copy_from_user(&rpc->in_fds, data->inp, sizeof(fd_set));
-            if (data->outp) copy_from_user(&rpc->out_fds, data->outp, sizeof(fd_set));
-            if (data->exp) copy_from_user(&rpc->ex_fds, data->exp, sizeof(fd_set));
+            if (data->inp && copy_from_user(&rpc->in_fds, data->inp, sizeof(fd_set))) {
+                mattx_dbg("[HOOK] Warning: Failed to copy readfds from user!\n");
+            }
+            if (data->outp && copy_from_user(&rpc->out_fds, data->outp, sizeof(fd_set))) {
+                mattx_dbg("[HOOK] Warning: Failed to copy writefds from user!\n");
+            }
+            if (data->exp && copy_from_user(&rpc->ex_fds, data->exp, sizeof(fd_set))) {
+                mattx_dbg("[HOOK] Warning: Failed to copy exceptfds from user!\n");
+            }
 
             if (data->tvp) {
                 struct __kernel_old_timeval tv;
@@ -1769,9 +1775,15 @@ static int ret_handler_pselect6(struct kretprobe_instance *ri, struct pt_regs *r
             memset(&rpc->ex_fds, 0, sizeof(fd_set));
             
             // COPY FROM USER IN THE CORRECT CONTEXT!
-            if (data->inp) copy_from_user(&rpc->in_fds, data->inp, sizeof(fd_set));
-            if (data->outp) copy_from_user(&rpc->out_fds, data->outp, sizeof(fd_set));
-            if (data->exp) copy_from_user(&rpc->ex_fds, data->exp, sizeof(fd_set));
+            if (data->inp && copy_from_user(&rpc->in_fds, data->inp, sizeof(fd_set))) {
+                mattx_dbg("[HOOK] Warning: Failed to copy readfds from user!\n");
+            }
+            if (data->outp && copy_from_user(&rpc->out_fds, data->outp, sizeof(fd_set))) {
+                mattx_dbg("[HOOK] Warning: Failed to copy writefds from user!\n");
+            }
+            if (data->exp && copy_from_user(&rpc->ex_fds, data->exp, sizeof(fd_set))) {
+                mattx_dbg("[HOOK] Warning: Failed to copy exceptfds from user!\n");
+            }
 
             if (data->tsp) {
                 struct __kernel_timespec ts;
