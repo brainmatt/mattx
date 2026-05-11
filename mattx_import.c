@@ -20,7 +20,7 @@
  *
  * Commercial licensing options are available upon request.
  */
- 
+
 #include "mattx.h"
 
 // Local state for the import pipeline
@@ -38,9 +38,13 @@ static void handle_migrate_req(struct mattx_link *link, struct mattx_header *hdr
         mattx_dbg("[IMPORT] Received Blueprint for PID %u. Saving to pending...\n", req->orig_pid);
         if (pending_migration) kvfree(pending_migration);
         
+        // FIX: Use kvmalloc to prevent fragmentation failures!
         pending_migration = kvmalloc(hdr->length, GFP_KERNEL);
         if (pending_migration) {
             memcpy(pending_migration, req, hdr->length);
+        } else {
+            printk(KERN_ERR "MattX:[IMPORT] FATAL: Failed to allocate memory for blueprint!\n");
+            return;
         }
 
         if (call_usermodehelper(stub_argv[0], stub_argv, stub_envp, UMH_NO_WAIT) != 0) {
@@ -56,28 +60,15 @@ static void handle_page_transfer(struct mattx_link *link, struct mattx_header *h
         unsigned long target_addr = pending_migration->vmas[ph->vma_index].vm_start + ph->offset;
         int res;
 
-        // If we are injecting into the Deputy (Return Migration), we must force the VMA to be writable!
-        if (hijacked_stub_task->mm) {
-            struct vm_area_struct *vma;
-            mmap_write_lock(hijacked_stub_task->mm);
-            vma = find_vma(hijacked_stub_task->mm, target_addr);
-            if (vma && target_addr >= vma->vm_start) {
-                vm_flags_set(vma, VM_WRITE); 
-            }
-            mmap_write_unlock(hijacked_stub_task->mm);
-        }
-
+        // REMOVED the dangerous vm_flags_set hack! 
+        // FOLL_FORCE | FOLL_WRITE safely handles read-only memory via the page fault handler.
         res = access_process_vm(hijacked_stub_task, target_addr, data, ph->length, FOLL_WRITE | FOLL_FORCE);
         
         if (res != ph->length) {
             if (ph->offset == 0) {
-                // The Intelligent Error Filter ---
                 if (res == 0) {
-                    // The kernel protected a special page (like vDSO/vvar). 
-                    // This is completely harmless, so we hide it in debug mode!
                     mattx_dbg("[IMPORT] Skipped injecting %u bytes at 0x%lx (Protected page)\n", ph->length, target_addr);
                 } else {
-                    // A real memory fault occurred! We MUST print this as an error.
                     printk(KERN_ERR "MattX:[IMPORT] Failed to inject %u bytes at 0x%lx (res: %d)\n", ph->length, target_addr, res);
                 }
             }
@@ -167,8 +158,8 @@ static void handle_migrate_done(struct mattx_link *link, struct mattx_header *hd
                         u32 fd_num = pending_migration->open_fds[i];
                         if (fd_num < fdt->max_fds && fake_files[i] && !IS_ERR(fake_files[i])) {
                             rcu_assign_pointer(fdt->fd[fd_num], fake_files[i]);
-                            // Tell the kernel bitmap that this FD is open!
-                            __set_bit(fd_num, fdt->open_fds);                        }
+                            __set_bit(fd_num, fdt->open_fds);                        
+                        }
                     }
                     spin_unlock(&hijacked_stub_task->files->file_lock);
                     mattx_dbg("[IMPORT] Successfully injected %u Fake FDs!\n", pending_migration->fd_count);
@@ -226,13 +217,6 @@ static void handle_return_blueprint(struct mattx_link *link, struct mattx_header
             if (hijacked_stub_task) put_task_struct(hijacked_stub_task);
             hijacked_stub_task = deputy; 
 
-            // The Deputy Trust Fall ---
-            // We DO NOT call vm_mmap here! The Deputy already has the perfect, 
-            // file-backed memory map (including the Read-Only .text segment).
-            // If we overwrite it with anonymous memory, we destroy the executable code!
-            // We just leave the mm_struct exactly as it is, and let the data pump 
-            // safely overwrite the variables using access_process_vm.
-
             mattx_dbg(" [RECALL] Sending READY_FOR_DATA signal to Node %d...\n", pending_source_node);
             mattx_comm_send(cluster_map[pending_source_node], MATTX_MSG_READY_FOR_DATA, NULL, 0);
         } else {
@@ -272,11 +256,9 @@ static void handle_return_done(struct mattx_link *link, struct mattx_header *hdr
         pending_migration = NULL;
         pending_source_node = -1;
     } else {
-        // Never fail silently again!
         printk(KERN_ERR "MattX: [RECALL] FATAL: Missing stub task or blueprint in return_done!\n");
     }
 }
-
 
 void mattx_import_init_handlers(void) {
     mattx_register_handler(MATTX_MSG_MIGRATE_REQ, handle_migrate_req);

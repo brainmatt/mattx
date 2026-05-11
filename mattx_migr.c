@@ -342,12 +342,31 @@ void mattx_send_vma_data(void) {
     
     mattx_dbg("[MIGRATE] Pipeline stats: %d total, %d sent, %d skipped, %d net errors\n", 
            total_pages, sent_pages, skipped_pages, network_errors);
+
            
+
     if (is_returning) {
         mattx_dbg("[MIGRATE] Return pipeline complete. Sending RETURN_DONE signal.\n");
         mattx_comm_send(cluster_map[migrating_target_node], MATTX_MSG_RETURN_DONE, NULL, 0);
         
         mattx_dbg("[RECALL] Executing local Surrogate PID %d...\n", migrating_task->pid);
+        
+        // --- THE ULTIMATE SHIELD ---
+        // Detach the Fake FDs before killing the task so mattx_fake_release does nothing!
+        if (migrating_task->files) {
+            spin_lock(&migrating_task->files->file_lock);
+            struct fdtable *fdt = files_fdtable(migrating_task->files);
+            for (int i = 0; i < fdt->max_fds; i++) {
+                struct file *f = rcu_dereference_raw(fdt->fd[i]);
+                if (f && f->f_op == &mattx_fops) {
+                    struct mattx_fake_fd_info *fd_info = f->private_data;
+                    f->private_data = NULL; // Detach!
+                    if (fd_info) kfree(fd_info);
+                }
+            }
+            spin_unlock(&migrating_task->files->file_lock);
+        }
+
         send_sig(SIGKILL, migrating_task, 0);
         
         spin_lock(&guest_lock);
