@@ -205,7 +205,15 @@ static void handle_return_blueprint(struct mattx_link *link, struct mattx_header
         injected_pages_count = 0;
 
         if (pending_migration) kvfree(pending_migration);
-        pending_migration = kmemdup(req, hdr->length, GFP_KERNEL);
+        
+        // FIX: Use kvmalloc to guarantee allocation success!
+        pending_migration = kvmalloc(hdr->length, GFP_KERNEL);
+        if (pending_migration) {
+            memcpy(pending_migration, req, hdr->length);
+        } else {
+            printk(KERN_ERR "MattX: [RECALL] FATAL: Failed to allocate memory for return blueprint!\n");
+            return;
+        }
         
         rcu_read_lock();
         deputy = pid_task(find_vpid(req->orig_pid), PIDTYPE_PID);
@@ -263,8 +271,12 @@ static void handle_return_done(struct mattx_link *link, struct mattx_header *hdr
         kvfree(pending_migration);
         pending_migration = NULL;
         pending_source_node = -1;
+    } else {
+        // Never fail silently again!
+        printk(KERN_ERR "MattX: [RECALL] FATAL: Missing stub task or blueprint in return_done!\n");
     }
 }
+
 
 void mattx_import_init_handlers(void) {
     mattx_register_handler(MATTX_MSG_MIGRATE_REQ, handle_migrate_req);

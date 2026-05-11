@@ -103,7 +103,9 @@ void mattx_capture_and_send_state(struct task_struct *task, int target_node) {
     is_returning = false; 
 
     max_payload_size = sizeof(struct mattx_migration_req) + (MAX_VMAS * sizeof(struct mattx_vma_info));
-    req = kzalloc(max_payload_size, GFP_KERNEL);
+    
+    // FIX: Use kvzalloc to prevent fragmentation failures!
+    req = kvzalloc(max_payload_size, GFP_KERNEL);
     if (!req) return;
 
     mattx_dbg("[EXTRACT] Initiating state capture for PID %d (%s)...\n", task->pid, task->comm);
@@ -152,7 +154,7 @@ void mattx_capture_and_send_state(struct task_struct *task, int target_node) {
         req->gsbase = task->thread.gsbase;
         
         if (access_process_vm(task, req->regs.rip, rip_buf, 8, FOLL_FORCE) == 8) {
-            mattx_dbg(" [DEBUG] Source RIP (0x%lx) contains: %8ph\n", (unsigned long)req->regs.rip, rip_buf);
+            mattx_dbg("[DEBUG] Source RIP (0x%lx) contains: %8ph\n", (unsigned long)req->regs.rip, rip_buf);
         }
     }
 
@@ -176,8 +178,10 @@ void mattx_capture_and_send_state(struct task_struct *task, int target_node) {
     req->vma_count = vma_count;
     actual_payload_size = sizeof(struct mattx_migration_req) + (vma_count * sizeof(struct mattx_vma_info));
 
-    if (local_migration_req) kfree(local_migration_req);
-    local_migration_req = kmemdup(req, actual_payload_size, GFP_KERNEL);
+    // FIX: Use kvfree and kvmalloc!
+    if (local_migration_req) kvfree(local_migration_req);
+    local_migration_req = kvmalloc(actual_payload_size, GFP_KERNEL);
+    if (local_migration_req) memcpy(local_migration_req, req, actual_payload_size);
     
     if (migrating_task) put_task_struct(migrating_task);
     get_task_struct(task);
@@ -188,7 +192,7 @@ void mattx_capture_and_send_state(struct task_struct *task, int target_node) {
         mattx_dbg("[MIGRATE] Sending blueprint to Node %d. Waiting for READY signal...\n", target_node);
         mattx_comm_send(cluster_map[target_node], MATTX_MSG_MIGRATE_REQ, req, actual_payload_size);
     }
-    kfree(req);
+    kvfree(req); // FIX: Use kvfree!
 }
 
 void mattx_capture_and_return_state(struct task_struct *task, u32 orig_pid, int target_node) {
@@ -213,7 +217,9 @@ void mattx_capture_and_return_state(struct task_struct *task, u32 orig_pid, int 
     spin_unlock(&guest_lock);  
       
     max_payload_size = sizeof(struct mattx_migration_req) + (MAX_VMAS * sizeof(struct mattx_vma_info));
-    req = kzalloc(max_payload_size, GFP_KERNEL);
+    
+    // FIX: Use kvzalloc!
+    req = kvzalloc(max_payload_size, GFP_KERNEL);
     if (!req) return;
 
     mattx_dbg("[EXTRACT] Initiating RETURN state capture for Surrogate PID %d...\n", task->pid);
@@ -254,8 +260,10 @@ void mattx_capture_and_return_state(struct task_struct *task, u32 orig_pid, int 
     req->vma_count = vma_count;
     actual_payload_size = sizeof(struct mattx_migration_req) + (vma_count * sizeof(struct mattx_vma_info));
 
-    if (local_migration_req) kfree(local_migration_req);
-    local_migration_req = kmemdup(req, actual_payload_size, GFP_KERNEL);
+    // FIX: Use kvfree and kvmalloc!
+    if (local_migration_req) kvfree(local_migration_req);
+    local_migration_req = kvmalloc(actual_payload_size, GFP_KERNEL);
+    if (local_migration_req) memcpy(local_migration_req, req, actual_payload_size);
     
     if (migrating_task) put_task_struct(migrating_task);
     get_task_struct(task);
@@ -266,7 +274,7 @@ void mattx_capture_and_return_state(struct task_struct *task, u32 orig_pid, int 
         mattx_dbg("[MIGRATE] Sending RETURN blueprint to Node %d. Waiting for READY signal...\n", target_node);
         mattx_comm_send(cluster_map[target_node], MATTX_MSG_RETURN_BLUEPRINT, req, actual_payload_size);
     }
-    kfree(req);
+    kvfree(req); // FIX: Use kvfree!
 }
 
 void mattx_send_vma_data(void) {

@@ -326,9 +326,12 @@ static void mattx_rpc_worker(struct work_struct *work) {
         }
     }
 
+
     // The Ghost Exorcist
     bool done = false;
     bool is_alive = true; // Track if our Surrogate still exists!
+    bool aborted = false; // Track if we were interrupted by a Migration!
+
     while (!done && is_alive) {
         msleep(100);
         
@@ -339,6 +342,14 @@ static void mattx_rpc_worker(struct work_struct *work) {
                 found = true;
                 done = guest_registry[i].rpc_done;
                 if (done) remote_fd = guest_registry[i].rpc_remote_fd;
+                
+                // --- THE TIME MACHINE FIX ---
+                // If a Return Migration was triggered, we MUST abort the RPC!
+                if (guest_registry[i].is_migrating) {
+                    aborted = true;
+                    done = true;
+                    guest_registry[i].rpc_done = true; // Clear the pending flag!
+                }
                 break;
             }
         }
@@ -390,8 +401,14 @@ static void mattx_rpc_worker(struct work_struct *work) {
         // ONLY apply the illusion if the task is safely stopped and has a stack!
         if (is_stopped && surrogate->stack) {
             
+            // If we aborted due to migration, inject -EINTR and skip the rest!
+            if (aborted) {
+                struct pt_regs *regs = task_pt_regs(surrogate);
+                if (regs) regs->ax = -EINTR; // Interrupted System Call
+                mattx_dbg("[RPC] Migration initiated! Aborted RPC for Surrogate %d\n", rpc->local_pid);
+            } 
             // NOW it is safe to apply the Illusion!
-            if (rpc->is_statx) {
+            else if (rpc->is_statx) {
                 // (Removed statx block since we deleted it)
             // --- FIXED: Group ALL FD-Operating Syscalls together! ---
             } else if (rpc->is_unlink || rpc->is_connect || rpc->is_bind || rpc->is_listen || rpc->is_sendto) {
