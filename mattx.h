@@ -672,6 +672,7 @@ extern bool config_debug_mode; // NEW: The Debug Toggle
 
 extern char config_migration_excludes[256];
 extern u32 config_node_affinity;
+u32 mattx_calc_local_load(void);
 
 // The Extreme Debugging Macro ---
 // This replaces printk(KERN_INFO...). It checks the flag before printing!

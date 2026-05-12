@@ -30,8 +30,9 @@ static struct proc_dir_entry *mattx_proc_dir;
 
 static int nodes_show(struct seq_file *m, void *v) {
     int i;
-    
-    u32 local_cpu = (u32)avenrun[0];
+
+    // Use the new instantaneous load calculator instead of avenrun!
+    u32 local_cpu = mattx_calc_local_load(); 
     u32 local_mem = (u32)(((u64)si_mem_available() * PAGE_SIZE) / (1024 * 1024));
 
     seq_printf(m, "MattX Cluster Nodes:\n");
@@ -39,7 +40,7 @@ static int nodes_show(struct seq_file *m, void *v) {
     seq_printf(m, "Node ID\t\tIP Address\tCPU Load\tMem Free (MB)\n");
     seq_printf(m, "------------------------------------------------------------\n");
 
-    // --- FIXED: Print the real IP address! ---
+    // Print the real IP address! ---
     seq_printf(m, "%d (Local)\t%pI4\t%u\t\t%u\n", 
                my_node_id, &my_ip_addr, local_cpu, local_mem);
 

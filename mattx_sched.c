@@ -45,10 +45,10 @@ static bool is_task_excluded(const char *comm) {
 }
 
 // --- INSTANTANEOUS LOAD: Count running threads ---
-static u32 mattx_calc_local_load(void) {
+u32 mattx_calc_local_load(void) {
     struct task_struct *p;
     u32 load = 0;
-    
+
     rcu_read_lock();
     for_each_process(p) {
         if ((p->flags & PF_KTHREAD) || !p->mm) continue;
