@@ -93,18 +93,18 @@ static struct task_struct* mattx_find_candidate_task(void) {
     return best_candidate;
 }
 
-// --- THE OPENMOSIX NORMALIZED LOAD ALGORITHM ---
+// --- THE OPENMOSIX NORMALIZED LOAD ALGORITHM (V2: Fixed Math!) ---
 static void mattx_evaluate_and_balance(u32 local_load, u32 local_affinity) {
     int i;
     int best_node = -1;
-    u32 lowest_remote_norm_load = 0xFFFFFFFF;
-    u32 local_norm_load;
+    u64 lowest_remote_norm_load = 0xFFFFFFFFFFFFFFFFULL;
+    u64 local_norm_load;
     int deficit = 0;
 
     if (!balancer_enabled || local_affinity == 0) return;
 
-    // Calculate Normalized Load (Load * 1000 / Affinity)
-    local_norm_load = (local_load * 1000) / local_affinity;
+    // Scale by 1,000,000 so that 1 process per CPU equals 1,000,000
+    local_norm_load = ((u64)local_load * 1000000ULL) / local_affinity;
 
     for (i = 0; i < MAX_NODES; i++) {
         if (cluster_map[i] && cluster_map[i]->node_id != -1) {
@@ -112,7 +112,7 @@ static void mattx_evaluate_and_balance(u32 local_load, u32 local_affinity) {
             u32 remote_affinity = cluster_load_table[i].affinity;
             if (remote_affinity == 0) remote_affinity = 1000; // Failsafe
             
-            u32 remote_norm_load = (remote_load * 1000) / remote_affinity;
+            u64 remote_norm_load = ((u64)remote_load * 1000000ULL) / remote_affinity;
             
             if (remote_norm_load < lowest_remote_norm_load) {
                 lowest_remote_norm_load = remote_norm_load;
@@ -122,17 +122,16 @@ static void mattx_evaluate_and_balance(u32 local_load, u32 local_affinity) {
     }
 
     if (best_node != -1) {
-        // If our normalized load is significantly higher than the best remote node
-        // (A difference of 1000 means a difference of 1 full process on equal hardware)
-        if (local_norm_load > lowest_remote_norm_load && (local_norm_load - lowest_remote_norm_load) >= 1000) {
+        // A difference of 500,000 means a difference of 0.5 processes per CPU
+        if (local_norm_load > lowest_remote_norm_load && (local_norm_load - lowest_remote_norm_load) >= 500000ULL) {
             
             // Calculate how many processes we need to shed to equalize!
-            deficit = ((local_norm_load - lowest_remote_norm_load) * local_affinity) / 1000 / 2;
+            deficit = (((local_norm_load - lowest_remote_norm_load) * local_affinity) / 1000000ULL) / 2;
             
             if (deficit < 1) deficit = 1;
             if (deficit > 5) deficit = 5; // Cap burst to 5 per cycle to avoid network storms
 
-            mattx_dbg("[BALANCER] Local Norm: %u, Node %d Norm: %u. Deficit: %d. Bursting!\n", 
+            mattx_dbg("[BALANCER] Local Norm: %llu, Node %d Norm: %llu. Deficit: %d. Bursting!\n", 
                    local_norm_load, best_node, lowest_remote_norm_load, deficit);
 
             for (i = 0; i < deficit; i++) {
@@ -147,6 +146,7 @@ static void mattx_evaluate_and_balance(u32 local_load, u32 local_affinity) {
                     
                     msleep(200); // Small delay between burst migrations to let the network breathe
                 } else {
+                    mattx_dbg("[BALANCER] Deficit is %d, but no suitable candidate tasks found! (Excluded or Sleeping?)\n", deficit);
                     break; // No more candidates found
                 }
             }
