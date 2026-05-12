@@ -90,6 +90,15 @@ echo "migrate 1234 home" > /proc/mattx/admin
 
 ---
 
+## Requirements and Kernel Support 
+
+**MattX** has currently only been tested on Debian Trixie, support for Kernels more recent than 6.12 has not been implemented yet.
+
+
+
+
+---
+
 ## 📜 License
 
 MattX is proudly open-source and released under the **GNU General Public License v2.0 (GPLv2)** to ensure maximum compatibility with the Linux kernel ecosystem. 
