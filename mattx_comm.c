@@ -260,4 +260,3 @@ void mattx_comm_disconnect(int node_id) {
     kfree(cluster_map[node_id]);
     cluster_map[node_id] = NULL;
 }
-
