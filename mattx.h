@@ -152,8 +152,9 @@ struct mattx_header {
 };
 
 struct mattx_load_info {
-    u32 cpu_load;    
-    u32 mem_free_mb; 
+    u32 cpu_load;    // Now instantaneous runqueue length!
+    u32 mem_free_mb;
+    u32 affinity;    // Node Speed / Affinity
 };
 
 struct mattx_vma_info {
@@ -668,6 +669,9 @@ extern u32 my_ip_addr;
 extern bool config_mattxfs_enabled; // The MattxFs Feature Flag
 extern char config_dfsa_dir[256]; // and the DFSA exclude
 extern bool config_debug_mode; // NEW: The Debug Toggle
+
+extern char config_migration_excludes[256];
+extern u32 config_node_affinity;
 
 // The Extreme Debugging Macro ---
 // This replaces printk(KERN_INFO...). It checks the flag before printing!

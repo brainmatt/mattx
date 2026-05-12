@@ -56,8 +56,11 @@ static int nodes_show(struct seq_file *m, void *v) {
     seq_printf(m, "\nBalancer Enabled: %s\n", balancer_enabled ? "YES" : "NO");
     seq_printf(m, "MattXFS Enabled: %s\n", config_mattxfs_enabled ? "YES" : "NO");
     seq_printf(m, "Debug Mode: %s\n", config_debug_mode ? "ON" : "OFF");
+    seq_printf(m, "Node Affinity: %u\n", config_node_affinity);
+    seq_printf(m, "Migration Excludes: %s\n", config_migration_excludes);
     return 0;
 }
+
 
 static int nodes_open(struct inode *inode, struct file *file) {
     return single_open(file, nodes_show, NULL);
@@ -117,7 +120,7 @@ static const struct proc_ops guests_proc_ops = {
 };
 
 static ssize_t admin_write(struct file *file, const char __user *ubuf, size_t count, loff_t *ppos) {
-    char buf[64];
+    char buf[256]; // Increased size to handle long exclude lists!
     char cmd[32];
     char arg2_str[32] = {0}; 
     int arg1 = -1;
@@ -126,6 +129,25 @@ static ssize_t admin_write(struct file *file, const char __user *ubuf, size_t co
     if (copy_from_user(buf, ubuf, len)) return -EFAULT;
     buf[len] = '\0';
 
+    // Strip trailing newline for cleaner parsing
+    char *nl = strchr(buf, '\n');
+    if (nl) *nl = '\0';
+
+    // --- NEW: Handle string-based commands first! ---
+    if (strncmp(buf, "exclude ", 8) == 0) {
+        strscpy(config_migration_excludes, buf + 8, sizeof(config_migration_excludes));
+        mattx_dbg(" [ADMIN] Migration excludes set to '%s'\n", config_migration_excludes);
+        return count;
+    } else if (strncmp(buf, "affinity ", 9) == 0) {
+        u32 val;
+        if (sscanf(buf + 9, "%u", &val) == 1) {
+            config_node_affinity = val;
+            mattx_dbg(" [ADMIN] Node affinity set to %u\n", val);
+        }
+        return count;
+    }
+
+    // --- Legacy integer-based commands ---
     if (sscanf(buf, "%31s %d %31s", cmd, &arg1, arg2_str) >= 2) {
         
         if (strcmp(cmd, "balancer") == 0 && arg1 != -1) {
@@ -133,7 +155,6 @@ static ssize_t admin_write(struct file *file, const char __user *ubuf, size_t co
             mattx_dbg(" [ADMIN] Automatic Load Balancer set to: %d\n", balancer_enabled);
         }
         else if (strcmp(cmd, "debug") == 0 && arg1 != -1) {
-            // The Debug Toggle ---
             config_debug_mode = (arg1 != 0);
             mattx_dbg(" [ADMIN] Debug Mode set to: %s\n", config_debug_mode ? "ON" : "OFF");
         }        

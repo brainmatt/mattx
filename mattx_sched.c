@@ -22,6 +22,47 @@
  */
 
 #include "mattx.h"
+#include <linux/cpumask.h> // For num_online_cpus()
+
+// --- NEW: Load Balancer Configuration ---
+char config_migration_excludes[256] = "top,bash,pvmd,sshd,mattx-discd,mattx-stub,systemd";
+u32 config_node_affinity = 0; // 0 means auto-calculate based on CPU cores
+static pid_t last_migrated_pid = 0; // Prevents picking the same task twice in a burst
+
+// --- THE BOUNCER: Check if task is on the VIP Exclude List ---
+static bool is_task_excluded(const char *comm) {
+    char excludes[256];
+    char *token, *rest;
+    
+    strscpy(excludes, config_migration_excludes, sizeof(excludes));
+    rest = excludes;
+    
+    while ((token = strsep(&rest, ",")) != NULL) {
+        while (*token == ' ') token++; // Trim leading spaces
+        if (strcmp(comm, token) == 0) return true;
+    }
+    return false;
+}
+
+// --- INSTANTANEOUS LOAD: Count running threads ---
+static u32 mattx_calc_local_load(void) {
+    struct task_struct *p;
+    u32 load = 0;
+    
+    rcu_read_lock();
+    for_each_process(p) {
+        if ((p->flags & PF_KTHREAD) || !p->mm) continue;
+        if (p->pid <= 1 || (p->flags & PF_EXITING)) continue;
+        if (is_guest_process(p->pid)) continue;
+        
+        // Count threads that are actively running or waiting for CPU
+        if (READ_ONCE(p->__state) == TASK_RUNNING) {
+            load++;
+        }
+    }
+    rcu_read_unlock();
+    return load;
+}
 
 static struct task_struct* mattx_find_candidate_task(void) {
     struct task_struct *p;
@@ -32,10 +73,13 @@ static struct task_struct* mattx_find_candidate_task(void) {
     for_each_process(p) {
         if ((p->flags & PF_KTHREAD) || !p->mm) continue;
         if (p->pid <= 1 || (p->flags & PF_EXITING)) continue;
-        if (strcmp(p->comm, "mattx-discd") == 0) continue;
-        if (strcmp(p->comm, "mattx-stub") == 0) continue;
-        
         if (is_guest_process(p->pid)) continue;
+        
+        // The Bouncer Check!
+        if (is_task_excluded(p->comm)) continue;
+        
+        // Prevent picking the same task twice during a burst!
+        if (p->pid == last_migrated_pid) continue;
 
         if (READ_ONCE(p->__state) != TASK_RUNNING) continue;
 
@@ -49,38 +93,62 @@ static struct task_struct* mattx_find_candidate_task(void) {
     return best_candidate;
 }
 
-static void mattx_evaluate_and_balance(u32 local_cpu_load) {
+// --- THE OPENMOSIX NORMALIZED LOAD ALGORITHM ---
+static void mattx_evaluate_and_balance(u32 local_load, u32 local_affinity) {
     int i;
     int best_node = -1;
-    u32 lowest_remote_load = 0xFFFFFFFF;
+    u32 lowest_remote_norm_load = 0xFFFFFFFF;
+    u32 local_norm_load;
+    int deficit = 0;
 
-    // --- NEW: Check if the admin paused the balancer! ---
-    if (!balancer_enabled) {
-        return; 
-    }
+    if (!balancer_enabled || local_affinity == 0) return;
+
+    // Calculate Normalized Load (Load * 1000 / Affinity)
+    local_norm_load = (local_load * 1000) / local_affinity;
 
     for (i = 0; i < MAX_NODES; i++) {
         if (cluster_map[i] && cluster_map[i]->node_id != -1) {
             u32 remote_load = cluster_load_table[i].cpu_load;
-            if (remote_load < lowest_remote_load) {
-                lowest_remote_load = remote_load;
+            u32 remote_affinity = cluster_load_table[i].affinity;
+            if (remote_affinity == 0) remote_affinity = 1000; // Failsafe
+            
+            u32 remote_norm_load = (remote_load * 1000) / remote_affinity;
+            
+            if (remote_norm_load < lowest_remote_norm_load) {
+                lowest_remote_norm_load = remote_norm_load;
                 best_node = i;
             }
         }
     }
 
     if (best_node != -1) {
-        int cond_a = (local_cpu_load > FIXED_LOAD_1_0 && lowest_remote_load < FIXED_LOAD_1_0);
-        int cond_b = (local_cpu_load > lowest_remote_load && (local_cpu_load - lowest_remote_load) > FIXED_LOAD_0_2);
+        // If our normalized load is significantly higher than the best remote node
+        // (A difference of 1000 means a difference of 1 full process on equal hardware)
+        if (local_norm_load > lowest_remote_norm_load && (local_norm_load - lowest_remote_norm_load) >= 1000) {
+            
+            // Calculate how many processes we need to shed to equalize!
+            deficit = ((local_norm_load - lowest_remote_norm_load) * local_affinity) / 1000 / 2;
+            
+            if (deficit < 1) deficit = 1;
+            if (deficit > 5) deficit = 5; // Cap burst to 5 per cycle to avoid network storms
 
-        if (cond_a || cond_b) {
-            struct task_struct *task = mattx_find_candidate_task();
-            if (task) {
-                mattx_dbg(" [MIGRATE] Selected PID %d (%s) for migration to Node %d!\n", 
-                       task->pid, task->comm, best_node);
-                mattx_capture_and_send_state(task, best_node);
-                put_task_struct(task); 
-                msleep(10000); 
+            mattx_dbg("[BALANCER] Local Norm: %u, Node %d Norm: %u. Deficit: %d. Bursting!\n", 
+                   local_norm_load, best_node, lowest_remote_norm_load, deficit);
+
+            for (i = 0; i < deficit; i++) {
+                struct task_struct *task = mattx_find_candidate_task();
+                if (task) {
+                    mattx_dbg("[MIGRATE] Selected PID %d (%s) for migration to Node %d!\n", 
+                           task->pid, task->comm, best_node);
+                    
+                    last_migrated_pid = task->pid;
+                    mattx_capture_and_send_state(task, best_node);
+                    put_task_struct(task); 
+                    
+                    msleep(200); // Small delay between burst migrations to let the network breathe
+                } else {
+                    break; // No more candidates found
+                }
             }
         }
     }
@@ -89,19 +157,22 @@ static void mattx_evaluate_and_balance(u32 local_cpu_load) {
 int mattx_balancer_loop(void *data) {
     struct mattx_load_info local_load;
     int i;
-    
     struct mattx_guest_info dead_guests[16]; 
     int dead_count;
-
-    // NEW: Array for dead exports
     struct { u32 orig_pid; int target_node; } dead_exports[16];
     int dead_export_count;
 
     mattx_dbg(" Balancer thread started\n");
 
     while (!kthread_should_stop()) {
-        local_load.cpu_load = (u32)avenrun[0]; 
-        // Convert pages to bytes, then to MB
+        
+        // Auto-calculate affinity if not set by admin
+        if (config_node_affinity == 0) {
+            config_node_affinity = num_online_cpus() * 1000;
+        }
+
+        local_load.cpu_load = mattx_calc_local_load(); // Instantaneous Load!
+        local_load.affinity = config_node_affinity;
         local_load.mem_free_mb = (u32)(((u64)si_mem_available() * PAGE_SIZE) / (1024 * 1024));
 
         for (i = 0; i < MAX_NODES; i++) {
@@ -110,7 +181,7 @@ int mattx_balancer_loop(void *data) {
             }
         }
         
-        mattx_evaluate_and_balance(local_load.cpu_load);
+        mattx_evaluate_and_balance(local_load.cpu_load, local_load.affinity);
 
         // --- The Guest Watcher (Node 2) ---
         dead_count = 0;
@@ -155,7 +226,7 @@ int mattx_balancer_loop(void *data) {
             }
         }
 
-        // --- NEW: The Home Watcher (Node 1) ---
+        // --- The Home Watcher (Node 1) ---
         dead_export_count = 0;
         spin_lock(&export_lock);
         for (i = 0; i < export_count; ) {
@@ -207,8 +278,7 @@ int mattx_balancer_loop(void *data) {
     return 0;
 }
 
-
-// --- NEW: Network Handlers for the Scheduler ---
+// --- Network Handlers for the Scheduler ---
 static void handle_heartbeat(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
     if (link->node_id == -1 && hdr->sender_id < MAX_NODES) {
         link->node_id = hdr->sender_id;
@@ -224,7 +294,6 @@ static void handle_load_update(struct mattx_link *link, struct mattx_header *hdr
     }
 }
 
-// This function tells the core router to send these specific messages to us!
 void mattx_sched_init_handlers(void) {
     mattx_register_handler(MATTX_MSG_HEARTBEAT, handle_heartbeat);
     mattx_register_handler(MATTX_MSG_LOAD_UPDATE, handle_load_update);
