@@ -2,7 +2,7 @@
 
 mload
 dstart
-echo "balancer 0" > /proc/mattx/admin
+echo "balancer 1" > /proc/mattx/admin
 
 echo "mounting mattxfs at /mattxfs"
 sudo mount -t mattxfs none /mattxfs
