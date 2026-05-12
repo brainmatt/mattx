@@ -56,6 +56,17 @@
 #include <linux/workqueue.h>     
 #include <linux/bitops.h>        
 #include <linux/stat.h>          
+#include <linux/version.h>
+
+// --- KERNEL COMPATIBILITY: The Sockaddr Evolution ---
+// In late 2025 (Linux 6.18/6.19+), the kernel replaced 'struct sockaddr *' 
+// with 'struct sockaddr_unsized *' in internal socket APIs to fix flexible array bounds checking.
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 18, 0)
+    #define MATTX_SA_CAST(addr) ((struct sockaddr_unsized *)(addr))
+#else
+    #define MATTX_SA_CAST(addr) ((struct sockaddr *)(addr))
+#endif
+
 
 #define MATTX_PORT 7226
 #define MAX_NODES 1024 

@@ -1202,7 +1202,7 @@ static void handle_sys_connect_req(struct mattx_link *link, struct mattx_header 
                 }
 
                 // Execute the connect operation on the real socket!
-                reply.error = sock->ops->connect(sock, (struct sockaddr *)&req->addr, req->addrlen, file->f_flags);
+                reply.error = sock->ops->connect(sock, MATTX_SA_CAST(&req->addr), req->addrlen, file->f_flags);
 
                 if (deputy) {
                     revert_creds(old_cred);
@@ -1409,7 +1409,7 @@ static void handle_sys_bind_req(struct mattx_link *link, struct mattx_header *hd
                     old_cred = override_creds(deputy->cred);
                 }
 
-                reply.error = sock->ops->bind(sock, (struct sockaddr *)&req->addr, req->addrlen);
+                reply.error = sock->ops->bind(sock, MATTX_SA_CAST(&req->addr), req->addrlen);
 
                 if (deputy) {
                     revert_creds(old_cred);
@@ -1792,7 +1792,7 @@ static void mattx_accept_worker(struct work_struct *work) {
                 if (err == 0) {
                     if (newsock->ops->getname) {
                         // Pass 2 instead of 1 to bypass the strict state check!
-                        int addr_len = newsock->ops->getname(newsock, (struct sockaddr *)&reply.addr, 2);
+                        int addr_len = newsock->ops->getname(newsock, MATTX_SA_CAST(&reply.addr), 2);
                         // Only save the length if it's a valid positive number!
                         if (addr_len > 0) {
                             reply.addrlen = addr_len;

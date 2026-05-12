@@ -195,7 +195,7 @@ struct mattx_link* mattx_comm_connect(__be32 ip_addr, int node_id) {
     addr.sin_port = htons(MATTX_PORT);
     addr.sin_addr.s_addr = ip_addr;
 
-    err = kernel_connect(link->sock, (struct sockaddr *)&addr, sizeof(addr), 0);
+    err = kernel_connect(link->sock, MATTX_SA_CAST(&addr), sizeof(addr), 0);
     if (err < 0) {
         sock_release(link->sock);
         kfree(link);
@@ -219,7 +219,7 @@ int mattx_listener_loop(void *data) {
     addr.sin_port = htons(MATTX_PORT);
     addr.sin_addr.s_addr = INADDR_ANY;
 
-    err = kernel_bind(listen_sock, (struct sockaddr *)&addr, sizeof(addr));
+    err = kernel_bind(listen_sock, MATTX_SA_CAST(&addr), sizeof(addr));
     if (err < 0) { sock_release(listen_sock); return err; }
 
     err = kernel_listen(listen_sock, 5);
@@ -240,7 +240,7 @@ int mattx_listener_loop(void *data) {
             link->sock = client_sock;
             link->node_id = -1; 
             
-            if (kernel_getpeername(client_sock, (struct sockaddr *)&peer_addr) >= 0) {
+            if (kernel_getpeername(client_sock, MATTX_SA_CAST(&peer_addr)) >= 0) {
                 link->ip_addr = peer_addr.sin_addr.s_addr;
             }
             
