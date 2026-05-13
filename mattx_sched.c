@@ -21,10 +21,17 @@
  * Commercial licensing options are available upon request.
  */
 
+ /*
+ * MattX - The Modern Single System Image (SSI) Cluster
+ * 
+ * Copyright (c) 2026 by Matthias Rechenburg
+ * All rights reserved.
+ */
+
 #include "mattx.h"
 #include <linux/cpumask.h> // For num_online_cpus()
 
-// --- NEW: Load Balancer Configuration ---
+// --- Load Balancer Configuration ---
 char config_migration_excludes[256] = "top,bash,pvmd,sshd,mattx-discd,mattx-stub,systemd";
 u32 config_node_affinity = 0; // 0 means auto-calculate based on CPU cores
 static pid_t last_migrated_pid = 0; // Prevents picking the same task twice in a burst
@@ -44,24 +51,27 @@ static bool is_task_excluded(const char *comm) {
     return false;
 }
 
-// --- INSTANTANEOUS LOAD: Count running threads ---
+// --- TRUE LOAD: Count runnable tasks (Scaled by 1000) ---
 u32 mattx_calc_local_load(void) {
     struct task_struct *p;
-    u32 load = 0;
-
+    u32 count = 0;
+    
     rcu_read_lock();
     for_each_process(p) {
         if ((p->flags & PF_KTHREAD) || !p->mm) continue;
         if (p->pid <= 1 || (p->flags & PF_EXITING)) continue;
         if (is_guest_process(p->pid)) continue;
         
-        // Count threads that are actively running or waiting for CPU
+        // Don't count excluded tasks, otherwise they artificially inflate our load!
+        if (is_task_excluded(p->comm)) continue;
+        
         if (READ_ONCE(p->__state) == TASK_RUNNING) {
-            load++;
+            count++;
         }
     }
     rcu_read_unlock();
-    return load;
+    
+    return count * 1000; // 1 Task = 1000 Load
 }
 
 static struct task_struct* mattx_find_candidate_task(void) {
@@ -75,10 +85,7 @@ static struct task_struct* mattx_find_candidate_task(void) {
         if (p->pid <= 1 || (p->flags & PF_EXITING)) continue;
         if (is_guest_process(p->pid)) continue;
         
-        // The Bouncer Check!
         if (is_task_excluded(p->comm)) continue;
-        
-        // Prevent picking the same task twice during a burst!
         if (p->pid == last_migrated_pid) continue;
 
         if (READ_ONCE(p->__state) != TASK_RUNNING) continue;
@@ -93,69 +100,53 @@ static struct task_struct* mattx_find_candidate_task(void) {
     return best_candidate;
 }
 
-// --- THE OPENMOSIX NORMALIZED LOAD ALGORITHM (V4: The Masterpiece) ---
+// --- THE TRUE OPENMOSIX NORMALIZED LOAD ALGORITHM ---
 static void mattx_evaluate_and_balance(u32 local_load, u32 local_affinity) {
     int i;
     int best_node = -1;
-    u64 lowest_remote_norm_load = 0xFFFFFFFFFFFFFFFFULL;
-    u32 best_mem = 0;
-    u64 local_norm_load;
-    int deficit = 0;
+    u32 lowest_remote_norm_load = 0xFFFFFFFF;
+    u32 local_norm_load;
+    int deficit_tasks = 0;
 
-    if (!balancer_enabled || local_affinity == 0) return;
+    if (!balancer_enabled || local_affinity == 0 || local_load == 0) return;
 
-    // --- THE CORE PROTECTOR ---
-    // Never migrate if we have fewer or equal tasks than our CPU cores!
-    u32 cores = local_affinity / 1000;
-    if (cores == 0) cores = 1;
-    if (local_load <= cores) return;
-
-    // Scale by 1,000,000 so that 1 process per CPU equals 1,000,000
-    local_norm_load = ((u64)local_load * 1000000ULL) / local_affinity;
+    // Normalized Load = (Load * 1000) / Affinity
+    local_norm_load = (local_load * 1000) / local_affinity;
 
     for (i = 0; i < MAX_NODES; i++) {
         if (cluster_map[i] && cluster_map[i]->node_id != -1) {
             u32 remote_load = cluster_load_table[i].cpu_load;
             u32 remote_affinity = cluster_load_table[i].affinity;
-            u32 remote_mem = cluster_load_table[i].mem_free_mb;
             if (remote_affinity == 0) remote_affinity = 1000; // Failsafe
             
-            u64 remote_norm_load = ((u64)remote_load * 1000000ULL) / remote_affinity;
+            u32 remote_norm_load = (remote_load * 1000) / remote_affinity;
             
             if (remote_norm_load < lowest_remote_norm_load) {
                 lowest_remote_norm_load = remote_norm_load;
                 best_node = i;
-                best_mem = remote_mem;
-            } else if (remote_norm_load == lowest_remote_norm_load) {
-                // --- THE TIE BREAKER ---
-                // If loads are equal (e.g., both 0), pick the one with MORE free memory!
-                if (remote_mem > best_mem) {
-                    best_node = i;
-                    best_mem = remote_mem;
-                }
             }
         }
     }
 
     if (best_node != -1) {
-        // A difference of 500,000 means a difference of 0.5 processes per CPU
-        if (local_norm_load > lowest_remote_norm_load && (local_norm_load - lowest_remote_norm_load) >= 500000ULL) {
+        // Threshold: 250 means a 25% imbalance of a single CPU core.
+        if (local_norm_load > lowest_remote_norm_load && (local_norm_load - lowest_remote_norm_load) >= 250) {
             
-            // Calculate how many processes we need to shed to equalize!
-            deficit = (((local_norm_load - lowest_remote_norm_load) * local_affinity) / 1000000ULL) / 2;
+            u32 deficit_norm = local_norm_load - lowest_remote_norm_load;
             
-            // Don't migrate more than we can spare without dropping below our core count!
-            if (deficit > (local_load - cores)) {
-                deficit = local_load - cores;
-            }
+            // Convert the normalized deficit back into actual task counts!
+            deficit_tasks = (deficit_norm * local_affinity) / 1000000;
             
-            if (deficit < 1) return; // Don't migrate if deficit is 0
-            if (deficit > 2) deficit = 2; // Cap burst to 2 to prevent network storms and D-state deadlocks
+            // We want to balance the load, so we only migrate HALF the deficit!
+            int burst = deficit_tasks / 2;
+            
+            if (burst < 1) burst = 1;
+            if (burst > 3) burst = 3; // Cap burst to 3 to prevent network storms
 
-            mattx_dbg("[BALANCER] Local Norm: %llu, Node %d Norm: %llu. Deficit: %d. Bursting!\n", 
-                   local_norm_load, best_node, lowest_remote_norm_load, deficit);
+            mattx_dbg("[BALANCER] Local Norm: %u, Node %d Norm: %u. Task Deficit: %d. Bursting %d!\n", 
+                   local_norm_load, best_node, lowest_remote_norm_load, deficit_tasks, burst);
 
-            for (i = 0; i < deficit; i++) {
+            for (i = 0; i < burst; i++) {
                 struct task_struct *task = mattx_find_candidate_task();
                 if (task) {
                     mattx_dbg("[MIGRATE] Selected PID %d (%s) for migration to Node %d!\n", 
@@ -165,9 +156,9 @@ static void mattx_evaluate_and_balance(u32 local_load, u32 local_affinity) {
                     mattx_capture_and_send_state(task, best_node);
                     put_task_struct(task); 
                     
-                    msleep(500); // Give the network 500ms to breathe between bursts
+                    msleep(200); // Let the network breathe
                 } else {
-                    break; // No more candidates found
+                    break; 
                 }
             }
         }
@@ -186,13 +177,10 @@ int mattx_balancer_loop(void *data) {
 
     while (!kthread_should_stop()) {
         
-        // Auto-calculate affinity if not set by admin
-        if (config_node_affinity == 0) {
-            config_node_affinity = num_online_cpus() * 1000;
-        }
+        u32 current_affinity = config_node_affinity ? config_node_affinity : num_online_cpus() * 1000;
 
-        local_load.cpu_load = mattx_calc_local_load(); // Instantaneous Load!
-        local_load.affinity = config_node_affinity;
+        local_load.cpu_load = mattx_calc_local_load(); 
+        local_load.affinity = current_affinity;
         local_load.mem_free_mb = (u32)(((u64)si_mem_available() * PAGE_SIZE) / (1024 * 1024));
 
         for (i = 0; i < MAX_NODES; i++) {
@@ -319,4 +307,3 @@ void mattx_sched_init_handlers(void) {
     mattx_register_handler(MATTX_MSG_LOAD_UPDATE, handle_load_update);
     mattx_dbg(" [SCHED] Network handlers registered.\n");
 }
-

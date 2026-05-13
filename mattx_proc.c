@@ -30,26 +30,29 @@ static struct proc_dir_entry *mattx_proc_dir;
 
 static int nodes_show(struct seq_file *m, void *v) {
     int i;
-
-    // Use the new instantaneous load calculator instead of avenrun!
+    
     u32 local_cpu = mattx_calc_local_load(); 
     u32 local_mem = (u32)(((u64)si_mem_available() * PAGE_SIZE) / (1024 * 1024));
+    u32 local_affinity = config_node_affinity ? config_node_affinity : num_online_cpus() * 1000;
 
     seq_printf(m, "MattX Cluster Nodes:\n");
-    seq_printf(m, "------------------------------------------------------------\n");
-    seq_printf(m, "Node ID\t\tIP Address\tCPU Load\tMem Free (MB)\n");
-    seq_printf(m, "------------------------------------------------------------\n");
+    seq_printf(m, "------------------------------------------------------------------------\n");
+    seq_printf(m, "Node ID\t\tIP Address\tCPU Load\tAffinity\tMem Free (MB)\n");
+    seq_printf(m, "------------------------------------------------------------------------\n");
 
-    // Print the real IP address! ---
-    seq_printf(m, "%d (Local)\t%pI4\t%u\t\t%u\n", 
-               my_node_id, &my_ip_addr, local_cpu, local_mem);
+    seq_printf(m, "%d (Local)\t%pI4\t%u\t\t%u\t\t%u\n", 
+               my_node_id, &my_ip_addr, local_cpu, local_affinity, local_mem);
 
     for (i = 0; i < MAX_NODES; i++) {
         if (cluster_map[i] && cluster_map[i]->node_id != -1) {
-            seq_printf(m, "%d\t\t%pI4\t%u\t\t%u\n", 
+            u32 remote_aff = cluster_load_table[i].affinity;
+            if (remote_aff == 0) remote_aff = 1000; // Failsafe for older packets
+
+            seq_printf(m, "%d\t\t%pI4\t%u\t\t%u\t\t%u\n", 
                        cluster_map[i]->node_id, 
                        &cluster_map[i]->ip_addr, 
                        cluster_load_table[i].cpu_load, 
+                       remote_aff,
                        cluster_load_table[i].mem_free_mb);
         }
     }
@@ -57,7 +60,7 @@ static int nodes_show(struct seq_file *m, void *v) {
     seq_printf(m, "\nBalancer Enabled: %s\n", balancer_enabled ? "YES" : "NO");
     seq_printf(m, "MattXFS Enabled: %s\n", config_mattxfs_enabled ? "YES" : "NO");
     seq_printf(m, "Debug Mode: %s\n", config_debug_mode ? "ON" : "OFF");
-    seq_printf(m, "Node Affinity: %u\n", config_node_affinity);
+    seq_printf(m, "Node Affinity: %u (0 = Auto)\n", config_node_affinity);
     seq_printf(m, "Migration Excludes: %s\n", config_migration_excludes);
     return 0;
 }
