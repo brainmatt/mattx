@@ -61,7 +61,9 @@ u32 mattx_calc_local_load(void) {
     for_each_process(p) {
         if ((p->flags & PF_KTHREAD) || !p->mm) continue;
         if (p->pid <= 1 || (p->flags & PF_EXITING)) continue;
-        if (is_guest_process(p->pid)) continue;
+        
+        // We MUST count guests so the node reflects its true CPU usage!
+        // REMOVED: if (is_guest_process(p->pid)) continue;
         
         // Don't count excluded tasks, otherwise they artificially inflate our load!
         if (is_task_excluded(p->comm)) continue;
