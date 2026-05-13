@@ -116,7 +116,6 @@ static void mattx_evaluate_and_balance(u32 local_load, u32 local_affinity) {
     int best_node = -1;
     u32 lowest_remote_norm_load = 0xFFFFFFFF;
     u32 local_norm_load;
-    int deficit_tasks = 0;
 
     if (!balancer_enabled || local_affinity == 0 || local_load == 0) return;
 
