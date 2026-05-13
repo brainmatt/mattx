@@ -93,23 +93,31 @@ static struct task_struct* mattx_find_candidate_task(void) {
     return best_candidate;
 }
 
-// --- THE OPENMOSIX NORMALIZED LOAD ALGORITHM (V3: The Oracle Learned Math!) ---
+// --- THE OPENMOSIX NORMALIZED LOAD ALGORITHM (V4: The Masterpiece) ---
 static void mattx_evaluate_and_balance(u32 local_load, u32 local_affinity) {
     int i;
     int best_node = -1;
     u64 lowest_remote_norm_load = 0xFFFFFFFFFFFFFFFFULL;
+    u32 best_mem = 0;
     u64 local_norm_load;
     int deficit = 0;
 
     if (!balancer_enabled || local_affinity == 0) return;
 
-    // Scale by 1,000,000 so that 1 process per CPU equals 1,000
+    // --- THE CORE PROTECTOR ---
+    // Never migrate if we have fewer or equal tasks than our CPU cores!
+    u32 cores = local_affinity / 1000;
+    if (cores == 0) cores = 1;
+    if (local_load <= cores) return;
+
+    // Scale by 1,000,000 so that 1 process per CPU equals 1,000,000
     local_norm_load = ((u64)local_load * 1000000ULL) / local_affinity;
 
     for (i = 0; i < MAX_NODES; i++) {
         if (cluster_map[i] && cluster_map[i]->node_id != -1) {
             u32 remote_load = cluster_load_table[i].cpu_load;
             u32 remote_affinity = cluster_load_table[i].affinity;
+            u32 remote_mem = cluster_load_table[i].mem_free_mb;
             if (remote_affinity == 0) remote_affinity = 1000; // Failsafe
             
             u64 remote_norm_load = ((u64)remote_load * 1000000ULL) / remote_affinity;
@@ -117,19 +125,32 @@ static void mattx_evaluate_and_balance(u32 local_load, u32 local_affinity) {
             if (remote_norm_load < lowest_remote_norm_load) {
                 lowest_remote_norm_load = remote_norm_load;
                 best_node = i;
+                best_mem = remote_mem;
+            } else if (remote_norm_load == lowest_remote_norm_load) {
+                // --- THE TIE BREAKER ---
+                // If loads are equal (e.g., both 0), pick the one with MORE free memory!
+                if (remote_mem > best_mem) {
+                    best_node = i;
+                    best_mem = remote_mem;
+                }
             }
         }
     }
 
     if (best_node != -1) {
-        // A difference of 500 means a difference of 0.5 processes per CPU
-        if (local_norm_load > lowest_remote_norm_load && (local_norm_load - lowest_remote_norm_load) >= 500ULL) {
+        // A difference of 500,000 means a difference of 0.5 processes per CPU
+        if (local_norm_load > lowest_remote_norm_load && (local_norm_load - lowest_remote_norm_load) >= 500000ULL) {
             
             // Calculate how many processes we need to shed to equalize!
             deficit = (((local_norm_load - lowest_remote_norm_load) * local_affinity) / 1000000ULL) / 2;
             
-            if (deficit < 1) deficit = 1;
-            if (deficit > 5) deficit = 5; // Cap burst to 5 per cycle to avoid network storms
+            // Don't migrate more than we can spare without dropping below our core count!
+            if (deficit > (local_load - cores)) {
+                deficit = local_load - cores;
+            }
+            
+            if (deficit < 1) return; // Don't migrate if deficit is 0
+            if (deficit > 2) deficit = 2; // Cap burst to 2 to prevent network storms and D-state deadlocks
 
             mattx_dbg("[BALANCER] Local Norm: %llu, Node %d Norm: %llu. Deficit: %d. Bursting!\n", 
                    local_norm_load, best_node, lowest_remote_norm_load, deficit);
@@ -144,9 +165,8 @@ static void mattx_evaluate_and_balance(u32 local_load, u32 local_affinity) {
                     mattx_capture_and_send_state(task, best_node);
                     put_task_struct(task); 
                     
-                    msleep(200); // Small delay between burst migrations to let the network breathe
+                    msleep(500); // Give the network 500ms to breathe between bursts
                 } else {
-                    mattx_dbg("[BALANCER] Deficit is %d, but no suitable candidate tasks found! (Excluded or Sleeping?)\n", deficit);
                     break; // No more candidates found
                 }
             }
