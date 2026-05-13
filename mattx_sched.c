@@ -35,6 +35,7 @@
 char config_migration_excludes[256] = "top,bash,pvmd,sshd,mattx-discd,mattx-stub,systemd";
 u32 config_node_affinity = 0; // 0 means auto-calculate based on CPU cores
 static pid_t last_migrated_pid = 0; // Prevents picking the same task twice in a burst
+static unsigned long last_migration_jiffies = 0; // Tracks the 5-second cooldown
 
 // --- THE BOUNCER: Check if task is on the VIP Exclude List ---
 static bool is_task_excluded(const char *comm) {
@@ -119,6 +120,12 @@ static void mattx_evaluate_and_balance(u32 local_load, u32 local_affinity) {
 
     if (!balancer_enabled || local_affinity == 0 || local_load == 0) return;
 
+    // --- THE COOLDOWN TIMER ---
+    // Prevent network storms by waiting 5 seconds after a migration burst!
+    if (last_migration_jiffies && time_before(jiffies, last_migration_jiffies + msecs_to_jiffies(5000))) {
+        return; 
+    }
+        
     // Normalized Load = (Load * 1000) / Affinity
     local_norm_load = (local_load * 1000) / local_affinity;
 
@@ -137,38 +144,28 @@ static void mattx_evaluate_and_balance(u32 local_load, u32 local_affinity) {
         }
     }
 
-    if (best_node != -1) {
+if (best_node != -1) {
         // Threshold: 250 means a 25% imbalance of a single CPU core.
         if (local_norm_load > lowest_remote_norm_load && (local_norm_load - lowest_remote_norm_load) >= 250) {
             
-            u32 deficit_norm = local_norm_load - lowest_remote_norm_load;
-            
-            // Convert the normalized deficit back into actual task counts!
-            deficit_tasks = (deficit_norm * local_affinity) / 1000000;
-            
-            // We want to balance the load, so we only migrate HALF the deficit!
-            int burst = deficit_tasks / 2;
-            
-            if (burst < 1) burst = 1;
-            if (burst > 3) burst = 3; // Cap burst to 3 to prevent network storms
+            mattx_dbg("[BALANCER] Local Norm: %u, Node %d Norm: %u. Imbalance detected!\n", 
+                   local_norm_load, best_node, lowest_remote_norm_load);
 
-            mattx_dbg("[BALANCER] Local Norm: %u, Node %d Norm: %u. Task Deficit: %d. Bursting %d!\n", 
-                   local_norm_load, best_node, lowest_remote_norm_load, deficit_tasks, burst);
-
-            for (i = 0; i < burst; i++) {
-                struct task_struct *task = mattx_find_candidate_task();
-                if (task) {
-                    mattx_dbg("[MIGRATE] Selected PID %d (%s) for migration to Node %d!\n", 
-                           task->pid, task->comm, best_node);
-                    
-                    last_migrated_pid = task->pid;
-                    mattx_capture_and_send_state(task, best_node);
-                    put_task_struct(task); 
-                    
-                    msleep(200); // Let the network breathe
-                } else {
-                    break; 
-                }
+            struct task_struct *task = mattx_find_candidate_task();
+            if (task) {
+                mattx_dbg("[MIGRATE] Selected PID %d (%s) for migration to Node %d!\n", 
+                       task->pid, task->comm, best_node);
+                
+                last_migrated_pid = task->pid;
+                mattx_capture_and_send_state(task, best_node);
+                put_task_struct(task); 
+                
+                // --- THE STRICT COOLDOWN ---
+                // Start the 5-second cooldown clock immediately after ONE migration!
+                last_migration_jiffies = jiffies;
+                mattx_dbg("[BALANCER] Migration complete. Entering 5-second cooldown.\n");
+            } else {
+                mattx_dbg("[BALANCER] Imbalance detected, but no suitable candidate tasks found!\n");
             }
         }
     }
