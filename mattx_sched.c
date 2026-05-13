@@ -65,6 +65,15 @@ u32 mattx_calc_local_load(void) {
         // Don't count excluded tasks, otherwise they artificially inflate our load!
         if (is_task_excluded(p->comm)) continue;
         
+        // --- DESIGN A: The Observer Blindspot ---
+        // Never count the process that is currently asking for the load!
+        if (p == current) continue;
+
+        // --- DESIGN B: The Minimum Age Filter ---
+        // Only count tasks that have consumed at least 50ms of CPU time (50,000,000 ns).
+        // This filters out tiny, transient scripts and commands like 'cat' or 'ls'.
+        if (p->se.sum_exec_runtime < 50000000ULL) continue;
+                
         if (READ_ONCE(p->__state) == TASK_RUNNING) {
             count++;
         }
@@ -185,7 +194,8 @@ int mattx_balancer_loop(void *data) {
 
         for (i = 0; i < MAX_NODES; i++) {
             if (cluster_map[i] && cluster_map[i]->node_id != -1) {
-                mattx_comm_send(cluster_map[i], MATTX_MSG_LOAD_UPDATE, &local_load, sizeof(local_load));
+                // Use the Mutex Bypass sender so the balancer never deadlocks!
+                mattx_comm_send_ctrl(cluster_map[i], MATTX_MSG_LOAD_UPDATE, &local_load, sizeof(local_load));
             }
         }
         

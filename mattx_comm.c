@@ -171,6 +171,51 @@ int mattx_comm_send(struct mattx_link *link, u32 type, void *data, u32 len) {
     return sent;
 }
 
+// Non-blocking sender for Control Messages (Load Updates, Heartbeats) ---
+int mattx_comm_send_ctrl(struct mattx_link *link, u32 type, void *data, u32 len) {
+    struct msghdr msg = {0};
+    struct kvec iov;
+    struct mattx_header *hdr;
+    int total_len = sizeof(struct mattx_header) + len;
+    int sent = 0;
+    int ret;
+    char *buf;
+
+    // THE MUTEX BYPASS: Try to grab the lock. 
+    // If the data pump is using it, we just drop the control message and return!
+    if (!mutex_trylock(&mattx_send_mutex)) return -EBUSY; 
+
+    buf = kvmalloc(total_len, GFP_KERNEL);
+    if (!buf) {
+        mutex_unlock(&mattx_send_mutex);
+        return -ENOMEM;
+    }
+
+    hdr = (struct mattx_header *)buf;
+    hdr->magic = MATTX_MAGIC;
+    hdr->type = type;
+    hdr->length = len;
+    hdr->sender_id = my_node_id;
+
+    if (len > 0 && data) memcpy(buf + sizeof(struct mattx_header), data, len);
+
+    while (sent < total_len) {
+        iov.iov_base = buf + sent;
+        iov.iov_len = total_len - sent;
+        ret = kernel_sendmsg(link->sock, &msg, &iov, 1, iov.iov_len);
+        if (ret <= 0) {
+            mutex_unlock(&mattx_send_mutex);
+            kvfree(buf);
+            return ret;
+        }
+        sent += ret;
+    }
+    
+    mutex_unlock(&mattx_send_mutex);
+    kvfree(buf);
+    return sent;
+}
+
 static void mattx_setup_link(struct mattx_link *link) {
     link->sk = link->sock->sk;
     tcp_sock_set_nodelay(link->sk);
