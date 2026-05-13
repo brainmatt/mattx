@@ -123,7 +123,7 @@ static void mattx_evaluate_and_balance(u32 local_load, u32 local_affinity) {
 
     // --- THE COOLDOWN TIMER ---
     // Prevent network storms by waiting 5 seconds after a migration burst!
-    if (last_migration_jiffies && time_before(jiffies, last_migration_jiffies + msecs_to_jiffies(500))) {
+    if (last_migration_jiffies && time_before(jiffies, last_migration_jiffies + msecs_to_jiffies(1000))) {
         return; 
     }
         
