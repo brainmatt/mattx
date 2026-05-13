@@ -123,7 +123,7 @@ static void mattx_evaluate_and_balance(u32 local_load, u32 local_affinity) {
 
     // --- THE COOLDOWN TIMER ---
     // Prevent network storms by waiting 5 seconds after a migration burst!
-    if (last_migration_jiffies && time_before(jiffies, last_migration_jiffies + msecs_to_jiffies(5000))) {
+    if (last_migration_jiffies && time_before(jiffies, last_migration_jiffies + msecs_to_jiffies(2000))) {
         return; 
     }
         
@@ -145,7 +145,7 @@ static void mattx_evaluate_and_balance(u32 local_load, u32 local_affinity) {
         }
     }
 
-if (best_node != -1) {
+    if (best_node != -1) {
         // Threshold: 250 means a 25% imbalance of a single CPU core.
         if (local_norm_load > lowest_remote_norm_load && (local_norm_load - lowest_remote_norm_load) >= 250) {
             
