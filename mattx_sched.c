@@ -93,7 +93,7 @@ static struct task_struct* mattx_find_candidate_task(void) {
     return best_candidate;
 }
 
-// --- THE OPENMOSIX NORMALIZED LOAD ALGORITHM (V2: Fixed Math!) ---
+// --- THE OPENMOSIX NORMALIZED LOAD ALGORITHM (V3: The Oracle Learned Math!) ---
 static void mattx_evaluate_and_balance(u32 local_load, u32 local_affinity) {
     int i;
     int best_node = -1;
@@ -103,7 +103,7 @@ static void mattx_evaluate_and_balance(u32 local_load, u32 local_affinity) {
 
     if (!balancer_enabled || local_affinity == 0) return;
 
-    // Scale by 1,000,000 so that 1 process per CPU equals 1,000,000
+    // Scale by 1,000,000 so that 1 process per CPU equals 1,000
     local_norm_load = ((u64)local_load * 1000000ULL) / local_affinity;
 
     for (i = 0; i < MAX_NODES; i++) {
@@ -122,8 +122,8 @@ static void mattx_evaluate_and_balance(u32 local_load, u32 local_affinity) {
     }
 
     if (best_node != -1) {
-        // A difference of 500,000 means a difference of 0.5 processes per CPU
-        if (local_norm_load > lowest_remote_norm_load && (local_norm_load - lowest_remote_norm_load) >= 500000ULL) {
+        // A difference of 500 means a difference of 0.5 processes per CPU
+        if (local_norm_load > lowest_remote_norm_load && (local_norm_load - lowest_remote_norm_load) >= 500ULL) {
             
             // Calculate how many processes we need to shed to equalize!
             deficit = (((local_norm_load - lowest_remote_norm_load) * local_affinity) / 1000000ULL) / 2;
