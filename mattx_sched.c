@@ -32,7 +32,7 @@
 #include <linux/cpumask.h> // For num_online_cpus()
 
 // --- Load Balancer Configuration ---
-char config_migration_excludes[256] = "top,bash,pvmd,sshd,mattx-discd,mattx-stub,systemd";
+char config_migration_excludes[256] = "top,bash,pvmd,sshd,mattx-discd,mattx-stub,systemd,systemd-journald";
 u32 config_node_affinity = 0; // 0 means auto-calculate based on CPU cores
 static pid_t last_migrated_pid = 0; // Prevents picking the same task twice in a burst
 static unsigned long last_migration_jiffies = 0; // Tracks the 5-second cooldown
