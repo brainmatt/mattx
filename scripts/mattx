@@ -1,5 +1,9 @@
 #!/bin/bash
 
+# no mattxfs vfs syscalls for testing
+sudo sed -i -e "s/MATTXFS_ENABLED=true/MATTXFS_ENABLED=false/g" /etc/mattx.conf
+
+
 # load module - need to be in mattx/ directory
 mload
 # start mattx-discd via systemd
@@ -12,6 +16,5 @@ echo "include pvmchess-client,mpichess-client,migtest,dfsatest,epolltest" > /pro
 echo "mounting mattxfs at /mattxfs"
 sudo mount -t mattxfs none /mattxfs
 
-# no mattxfs vfs syscalls for testing
+# debug enabled for testing
 echo "debug 1" > /proc/mattx/admin
-echo "config MATTXFS_ENABLED=0" > /proc/mattx/admin
