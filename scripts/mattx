@@ -11,3 +11,7 @@ echo "include pvmchess-client,mpichess-client,migtest,dfsatest,epolltest" > /pro
 # mount mattxfs
 echo "mounting mattxfs at /mattxfs"
 sudo mount -t mattxfs none /mattxfs
+
+# no mattxfs vfs syscalls for testing
+echo "debug 1" > /proc/mattx/admin
+echo "config MATTXFS_ENABLED=0" > /proc/mattx/admin
