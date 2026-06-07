@@ -14,7 +14,7 @@ Inspired by the legendary openMosix project, MattX allows multiple physical or v
 
 ---
 
-## ✨ Key Features (MattX v1.0)
+## ✨ Key Features (MattX v1.6)
 
 ### 🧠 Live Process Teleportation & The Syscall Drainer
 MattX migrates running processes safely using a custom **Syscall Drainer**. Instead of violently freezing processes with `SIGSTOP` while they hold kernel locks, MattX uses modern `task_work_add(TWA_SIGNAL)` to gently guide the process to the user-space boundary. Once in a 100% stable state, its memory map (VMAs), CPU registers (`pt_regs`), and credentials (`struct cred`) are extracted and streamed over a custom TCP data pump to the target node.
@@ -92,7 +92,7 @@ echo "migrate 1234 home" > /proc/mattx/admin
 
 ## Requirements and Kernel Support 
 
-**MattX** has currently only been tested on Debian Trixie, support for Kernels more recent than 7.12 has not been implemented yet.
+**MattX** is developed and tested on Debian Trixie for Kernel 6.x and Ubuntu 26.04 for Kernel 7.x.
 
 
 
