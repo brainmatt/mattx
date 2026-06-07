@@ -662,7 +662,6 @@ static void handle_sys_close_req(struct mattx_link *link, struct mattx_header *h
     }
 }
 
-}
 
 static void handle_sys_read_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
     if (payload) {
