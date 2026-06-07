@@ -25,6 +25,7 @@
 #include <linux/fs.h>
 #include <linux/pagemap.h>
 #include <linux/version.h>
+#include <linux/fs_context.h>
 #include "../mattx.h" 
 
 MODULE_LICENSE("GPL v2");
@@ -418,7 +419,13 @@ static const struct super_operations mattxfs_s_ops = {
     .drop_inode     = mattxfs_drop_inode, 
 };
 
-static int mattxfs_fill_super(struct super_block *sb, void *data, int silent) {
+// --- VFS API EVOLUTION ---
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 18, 0)
+static int mattxfs_fill_super(struct super_block *sb, struct fs_context *fc)
+#else
+static int mattxfs_fill_super(struct super_block *sb, void *data, int silent)
+#endif
+{
     struct inode *inode;
 
     sb->s_maxbytes      = MAX_LFS_FILESIZE;
@@ -446,17 +453,45 @@ static int mattxfs_fill_super(struct super_block *sb, void *data, int silent) {
     return 0;
 }
 
+// --- THE MOUNT API SWITCH ---
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 18, 0)
+
+// The Modern 7.x fs_context API
+static int mattxfs_get_tree(struct fs_context *fc) {
+    return get_tree_nodev(fc, mattxfs_fill_super);
+}
+
+static const struct fs_context_operations mattxfs_context_ops = {
+    .get_tree = mattxfs_get_tree,
+};
+
+static int mattxfs_init_fs_context(struct fs_context *fc) {
+    fc->ops = &mattxfs_context_ops;
+    return 0;
+}
+
+static struct file_system_type mattxfs_type = {
+    .name           = "mattxfs",
+    .owner          = THIS_MODULE,
+    .init_fs_context = mattxfs_init_fs_context,
+    .kill_sb        = kill_anon_super, // kill_litter_super was removed!
+};
+
+#else
+
+// The Legacy 6.x mount API
 static struct dentry *mattxfs_mount(struct file_system_type *fs_type, int flags, const char *dev_name, void *data) {
     return mount_nodev(fs_type, flags, data, mattxfs_fill_super);
 }
 
 static struct file_system_type mattxfs_type = {
-    .owner          = THIS_MODULE,
     .name           = "mattxfs",
+    .owner          = THIS_MODULE,
     .mount          = mattxfs_mount,
-    .kill_sb        = kill_litter_super, 
-    .fs_flags       = FS_USERNS_MOUNT,   
+    .kill_sb        = kill_litter_super,
 };
+
+#endif
 
 static int __init mattxfs_init(void) {
     int ret = register_filesystem(&mattxfs_type);

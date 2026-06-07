@@ -1,8 +1,13 @@
 #!/bin/bash
 
+# load module - need to be in mattx/ directory
 mload
+# start mattx-discd via systemd
 dstart
-echo "balancer 1" > /proc/mattx/admin
+# apply MattX configuration
+echo "balancer 0" > /proc/mattx/admin
+echo "include pvmchess-client,mpichess-client,migtest,dfsatest,epolltest" > /proc/mattx/admin
 
+# mount mattxfs
 echo "mounting mattxfs at /mattxfs"
 sudo mount -t mattxfs none /mattxfs

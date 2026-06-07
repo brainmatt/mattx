@@ -144,7 +144,7 @@
         <path d="M0,100 L350,100 M1570,100 L1920,100 M0,980 L350,980 M1570,980 L1920,980" stroke="#00ffcc" stroke-width="2" opacity="0.5"/>
         <polygon points="350,100 400,50 1520,50 1570,100" fill="#111e29" stroke="#00ffcc" stroke-width="2"/>
         <polygon points="350,980 400,1030 1520,1030 1570,980" fill="#111e29" stroke="#00ffcc" stroke-width="2"/>
-        <text x="960" y="80" fill="#00ffcc" font-family="Courier" font-size="24" font-weight="bold" text-anchor="middle" letter-spacing="5">MATTX V1.0 COMMAND CENTER</text>
+        <text x="960" y="80" fill="#00ffcc" font-family="Courier" font-size="24" font-weight="bold" text-anchor="middle" letter-spacing="5">MATTX V1.5 COMMAND CENTER</text>
     </svg>
 
     <!-- LAYER 3: Left Panel (Buttons) -->
@@ -161,8 +161,8 @@
     <div id="right-panel">
         <div id="crt-screen">
             > SYSTEM BOOT...<br>
-            > KERNEL 6.12 DETECTED.<br>
-            > MATTX V1.0 ONLINE.<br><br>
+            > KERNEL 7.0 DETECTED.<br>
+            > MATTX V1.5.<br><br>
             > AWAITING COMMAND INPUT...<br>
             <span class="highlight">_</span>
         </div>
@@ -177,8 +177,8 @@
             'init': `
                 > EXECUTING INIT SEQUENCE...<br><br>
                 <span class="highlight">MattX - 1.0 OFFICIAL RELEASE</span><br><br>
-                A re-implementation of openMosix for modern Linux Kernel 6.x.<br><br>
-                MattX is a modern, out-of-tree Linux kernel module that brings the magic of Single System Image (SSI) clustering to the Linux 6.x era.<br><br>
+                A re-implementation of openMosix for modern Linux Kernel 7.x.<br><br>
+                MattX is a modern, out-of-tree Linux kernel module that brings the magic of Single System Image (SSI) clustering to the Linux 7.x era.<br><br>
                 Inspired by the legendary openMosix project, MattX allows multiple physical or virtual machines to act as one massive, unified computer. It autonomously load-balances CPU-bound tasks by seamlessly teleporting running processes across the network—preserving their memory, CPU registers, file descriptors, and network sockets—without requiring any modifications to the Linux kernel source code.
             `,
             'directive': `
@@ -204,7 +204,7 @@
                 > RUNNING CLASSIFICATION SCAN...<br><br>
                 <span class="highlight">What MattX is NOT:</span><br>
                 - MattX is not another CRIU.<br>
-                - MattX is not "just the old 2.4 openMosix patch applied to a current 6.x kernel"!<br><br>
+                - MattX is not "just the old 2.4 openMosix patch applied to a current 7.x kernel"!<br><br>
                 This would have been actually nearly impossible since the linux kernel has massively changed from 2.4 to today. MattX is developed "from scratch". It has been implemented via a standard linux kernel module and does not require any changes to the standard kernel source code. <br><br>
                 It is "just" using the standard functions and functionality provided by the standard linux kernel. In short: MattX development started with an empty sheet and we have implemented a unique architecture to re-implement the functionality of "good old openMosix".
             `,

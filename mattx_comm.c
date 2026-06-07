@@ -284,10 +284,14 @@ int mattx_listener_loop(void *data) {
         if (link) {
             link->sock = client_sock;
             link->node_id = -1; 
-            
-            if (kernel_getpeername(client_sock, MATTX_SA_CAST(&peer_addr)) >= 0) {
+
+            // inconsistently left this specific function using the old struct!
+            if (kernel_getpeername(client_sock, (struct sockaddr *)&peer_addr) >= 0) {
                 link->ip_addr = peer_addr.sin_addr.s_addr;
-            }
+            }            
+            // if (kernel_getpeername(client_sock, MATTX_SA_CAST(&peer_addr)) >= 0) {
+            //     link->ip_addr = peer_addr.sin_addr.s_addr;
+            // }
             
             mattx_setup_link(link);
         } else {

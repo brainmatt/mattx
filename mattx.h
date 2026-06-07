@@ -57,6 +57,8 @@
 #include <linux/bitops.h>        
 #include <linux/stat.h>          
 #include <linux/version.h>
+#include <linux/time64.h> // Ensure we have time64_t
+#include <linux/task_work.h>
 
 
 // --- KERNEL COMPATIBILITY: The Sockaddr Evolution ---
@@ -75,10 +77,10 @@
 
 #define FIXED_LOAD_1_0 2048
 #define FIXED_LOAD_0_2 409
-#define MAX_VMAS 256 
+#define MAX_VMAS 1024 
 #define MAX_GUESTS 1024 
 
-#define MAX_FDS 256 
+#define MAX_FDS 256
 
 #define MATTX_MAGIC 0x4D415454 
 #define MATTX_MAX_PAYLOAD (10 * 1024 * 1024) 
@@ -142,6 +144,24 @@ enum mattx_msg_type {
     MATTX_MSG_VFS_FSYNC_REPLY,
     MATTX_MSG_SYS_UNLINK_REQ,
     MATTX_MSG_SYS_UNLINK_REPLY,
+    MATTX_MSG_SYS_EPOLL_CREATE_REQ,
+    MATTX_MSG_SYS_EPOLL_CREATE_REPLY,
+    MATTX_MSG_SYS_EPOLL_CTL_REQ,
+    MATTX_MSG_SYS_EPOLL_CTL_REPLY,
+    MATTX_MSG_SYS_EPOLL_WAIT_REQ,
+    MATTX_MSG_SYS_EPOLL_WAIT_REPLY,
+    MATTX_MSG_SYS_GETSOCKNAME_REQ,
+    MATTX_MSG_SYS_GETSOCKNAME_REPLY,
+    MATTX_MSG_SYS_GETPEERNAME_REQ,
+    MATTX_MSG_SYS_GETPEERNAME_REPLY,
+    MATTX_MSG_SYS_SETSOCKOPT_REQ,
+    MATTX_MSG_SYS_SETSOCKOPT_REPLY,
+    MATTX_MSG_SYS_GETSOCKOPT_REQ,
+    MATTX_MSG_SYS_GETSOCKOPT_REPLY,
+    MATTX_MSG_SYS_SENDMSG_REQ,
+    MATTX_MSG_SYS_SENDMSG_REPLY,
+    MATTX_MSG_SYS_RECVMSG_REQ,
+    MATTX_MSG_SYS_RECVMSG_REPLY,
 };
 
 struct mattx_header {
@@ -390,6 +410,7 @@ struct mattx_pollfd {
     u32 fd;
     short events;
     short revents;
+    u64 user_data; // Carry the epoll payload across the network! ---
 };
 
 struct mattx_sys_poll_req {
@@ -406,6 +427,124 @@ struct mattx_sys_poll_reply {
     int retval; // The number of FDs with events
     struct mattx_pollfd fds[16];
 };
+
+struct mattx_sys_epoll_create_req {
+    u32 orig_pid;
+    int flags; // For epoll_create1
+};
+
+struct mattx_sys_epoll_create_reply {
+    u32 orig_pid;
+    int remote_fd;
+    int error;
+};
+
+struct mattx_sys_epoll_ctl_req {
+    u32 orig_pid;
+    int epfd;
+    int op;
+    int fd;
+    struct epoll_event event; // We pass the actual struct, not a pointer!
+};
+
+struct mattx_sys_epoll_wait_req {
+    u32 orig_pid;
+    int epfd;
+    int maxevents;
+    int timeout;
+};
+
+struct mattx_sys_epoll_wait_reply {
+    u32 orig_pid;
+    int retval; // Number of events, or error
+    struct epoll_event events[]; // Flexible array for the returned events!
+};
+
+struct mattx_sys_getsockname_req { 
+    u32 orig_pid; int fd; 
+};
+
+struct mattx_sys_getsockname_reply { 
+    u32 orig_pid; 
+    int error; 
+    struct sockaddr_storage addr; 
+    int addrlen; 
+};
+
+struct mattx_sys_getpeername_req { 
+    u32 orig_pid; int fd; 
+};
+
+struct mattx_sys_getpeername_reply { 
+    u32 orig_pid; 
+    int error; 
+    struct sockaddr_storage addr; 
+    int addrlen; 
+};
+
+struct mattx_sys_setsockopt_req { 
+    u32 orig_pid; 
+    int fd; 
+    int level; 
+    int optname; 
+    int optlen; 
+    char optval[]; 
+};
+
+struct mattx_sys_setsockopt_reply { 
+    u32 orig_pid; 
+    int error; 
+};
+
+struct mattx_sys_getsockopt_req { 
+    u32 orig_pid; 
+    int fd; 
+    int level; 
+    int optname; 
+    int optlen; 
+};
+
+struct mattx_sys_getsockopt_reply { 
+    u32 orig_pid; 
+    int error; 
+    int optlen; 
+    char optval[]; 
+};
+
+struct mattx_sys_sendmsg_req {
+    u32 orig_pid;
+    int fd;
+    int flags;
+    int addrlen;
+    size_t datalen;
+    struct sockaddr_storage addr;
+    char data[]; // Flexible array for the flattened data!
+};
+
+struct mattx_sys_sendmsg_reply {
+    u32 orig_pid;
+    ssize_t bytes_sent;
+    int error;
+};
+
+struct mattx_sys_recvmsg_req {
+    u32 orig_pid;
+    int fd;
+    int flags;
+    int addrlen;
+    size_t datalen;
+};
+
+struct mattx_sys_recvmsg_reply {
+    u32 orig_pid;
+    ssize_t bytes_recv;
+    int error;
+    int addrlen;
+    struct sockaddr_storage addr;
+    char data[]; // Flexible array for the flattened data!
+};
+
+
 
 struct mattx_fake_fd_info {
     int home_node;
@@ -483,6 +622,35 @@ struct mattx_rpc_work {
     void __user *select_readfds_ptr;
     void __user *select_writefds_ptr;
     void __user *select_exceptfds_ptr;
+
+    // For EPOLL_CREATE ---
+    bool is_epoll_create;
+    int epoll_flags;
+
+    // For EPOLL_CTL ---
+    bool is_epoll_ctl;
+    int epoll_op;
+    struct epoll_event epoll_ev;
+
+    // For EPOLL_WAIT ---
+    bool is_epoll_wait;
+    int epoll_maxevents;
+    void __user *epoll_events_ptr;
+
+    // For SOCKOPTS & NAMES ---
+    bool is_getsockname;
+    bool is_getpeername;
+    bool is_setsockopt;
+    bool is_getsockopt;
+    int sock_level;
+    int sock_optname;
+    int sock_optlen;
+
+    // For SENDMSG & RECVMSG ---
+    bool is_sendmsg;
+    bool is_recvmsg;
+    struct msghdr __user *msg_ptr;
+
 };
 
 struct mattx_link {
@@ -492,6 +660,7 @@ struct mattx_link {
     struct sock *sk;
     struct task_struct *receiver_thread;
 };
+
 
 struct mattx_guest_info {
     pid_t local_pid;
@@ -506,13 +675,13 @@ struct mattx_guest_info {
     struct statx *rpc_statx_buf;
     int rpc_fsync_res;
     bool is_migrating; // The Migration Lock!
-
 };
 
 struct mattx_export_info {
     pid_t orig_pid;
     int target_node;
     struct file *remote_files[MAX_FDS]; 
+    bool abort_rpc; // The Kworker Kill-Switch! ---
 };
 
 struct mattx_vfs_getattr_req {
@@ -670,9 +839,65 @@ extern bool config_mattxfs_enabled; // The MattxFs Feature Flag
 extern char config_dfsa_dir[256]; // and the DFSA exclude
 extern bool config_debug_mode; // NEW: The Debug Toggle
 
-extern char config_migration_excludes[256];
+extern char config_migration_excludes[512]; // The Blacklist! ---
+extern char config_migration_includes[512]; // The VIP Whitelist! ---
 extern u32 config_node_affinity;
 u32 mattx_calc_local_load(void);
+
+// --- THE GHOST RESOLVERS FOR EPOLL ---
+typedef int (*mattx_task_work_add_fn)(struct task_struct *task, struct callback_head *twork, enum task_work_notify_mode mode);
+extern mattx_task_work_add_fn real_task_work_add;
+
+typedef long (*mattx_sys_epoll_create1_fn)(const struct pt_regs *regs);
+extern mattx_sys_epoll_create1_fn real_sys_epoll_create1;
+
+typedef long (*mattx_sys_epoll_ctl_fn)(const struct pt_regs *regs);
+extern mattx_sys_epoll_ctl_fn real_sys_epoll_ctl;
+
+typedef long (*mattx_sys_epoll_wait_fn)(const struct pt_regs *regs);
+extern mattx_sys_epoll_wait_fn real_sys_epoll_wait;
+
+
+// --- THE NETWORK GHOST RESOLVERS ---
+typedef long (*mattx_sys_bind_fn)(const struct pt_regs *regs);
+extern mattx_sys_bind_fn real_sys_bind;
+
+typedef long (*mattx_sys_connect_fn)(const struct pt_regs *regs);
+extern mattx_sys_connect_fn real_sys_connect;
+
+typedef long (*mattx_sys_listen_fn)(const struct pt_regs *regs);
+extern mattx_sys_listen_fn real_sys_listen;
+
+typedef long (*mattx_sys_sendto_fn)(const struct pt_regs *regs);
+extern mattx_sys_sendto_fn real_sys_sendto;
+
+typedef long (*mattx_sys_recvfrom_fn)(const struct pt_regs *regs);
+extern mattx_sys_recvfrom_fn real_sys_recvfrom;
+
+typedef long (*mattx_sys_socket_fn)(const struct pt_regs *regs);
+extern mattx_sys_socket_fn real_sys_socket;
+
+typedef long (*mattx_sys_accept4_fn)(const struct pt_regs *regs);
+extern mattx_sys_accept4_fn real_sys_accept4;
+
+typedef long (*mattx_sys_getsockname_fn)(const struct pt_regs *regs);
+extern mattx_sys_getsockname_fn real_sys_getsockname;
+
+typedef long (*mattx_sys_getpeername_fn)(const struct pt_regs *regs);
+extern mattx_sys_getpeername_fn real_sys_getpeername;
+
+typedef long (*mattx_sys_setsockopt_fn)(const struct pt_regs *regs);
+extern mattx_sys_setsockopt_fn real_sys_setsockopt;
+
+typedef long (*mattx_sys_getsockopt_fn)(const struct pt_regs *regs);
+extern mattx_sys_getsockopt_fn real_sys_getsockopt;
+
+typedef long (*mattx_sys_sendmsg_fn)(const struct pt_regs *regs);
+extern mattx_sys_sendmsg_fn real_sys_sendmsg;
+
+typedef long (*mattx_sys_recvmsg_fn)(const struct pt_regs *regs);
+extern mattx_sys_recvmsg_fn real_sys_recvmsg;
+
 
 // The Extreme Debugging Macro ---
 // This replaces printk(KERN_INFO...). It checks the flag before printing!
@@ -695,6 +920,8 @@ void mattx_send_vma_data(void);
 
 bool is_guest_process(pid_t pid);
 bool is_rpc_pending(pid_t pid); // Check if a Wormhole is open!
+bool check_rpc_done(pid_t pid);
+
 void add_guest_process(pid_t local_pid, u32 orig_pid, int home_node);
 void remove_guest_process(int index);
 

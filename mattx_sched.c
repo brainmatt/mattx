@@ -30,20 +30,37 @@
 
 #include "mattx.h"
 #include <linux/cpumask.h> // For num_online_cpus()
+#include <linux/timekeeping.h>
 
 // --- Load Balancer Configuration ---
-char config_migration_excludes[256] = "top,bash,pvmd,sshd,mattx-discd,mattx-stub,systemd,systemd-journald,systemd-journal";
+char config_migration_excludes[512] = "cat,watch,cron,top,bash,pvmd,sshd,sshd-session,mattx-discd,mattx-stub,systemd,systemd-journald,systemd-journal";
+char config_migration_includes[512] = ""; // Default empty (Whitelist disabled)
 u32 config_node_affinity = 0; // 0 means auto-calculate based on CPU cores
 static pid_t last_migrated_pid = 0; // Prevents picking the same task twice in a burst
 static unsigned long last_migration_jiffies = 0; // Tracks the 5-second cooldown
 
 // --- THE BOUNCER: Check if task is on the VIP Exclude List ---
 static bool is_task_excluded(const char *comm) {
-    char excludes[256];
+    char excludes[512];
     char *token, *rest;
     
     strscpy(excludes, config_migration_excludes, sizeof(excludes));
     rest = excludes;
+    
+    while ((token = strsep(&rest, ",")) != NULL) {
+        while (*token == ' ') token++; // Trim leading spaces
+        if (strcmp(comm, token) == 0) return true;
+    }
+    return false;
+}
+
+// --- THE VIP LIST: Check if task is explicitly allowed ---
+static bool is_task_included(const char *comm) {
+    char includes[512];
+    char *token, *rest;
+    
+    strscpy(includes, config_migration_includes, sizeof(includes));
+    rest = includes;
     
     while ((token = strsep(&rest, ",")) != NULL) {
         while (*token == ' ') token++; // Trim leading spaces
@@ -65,9 +82,16 @@ u32 mattx_calc_local_load(void) {
         // We MUST count guests so the node reflects its true CPU usage!
         // REMOVED: if (is_guest_process(p->pid)) continue;
         
-        // Don't count excluded tasks, otherwise they artificially inflate our load!
-        if (is_task_excluded(p->comm)) continue;
-        
+        // Don't count included/excluded tasks, otherwise they artificially inflate our load!
+        // --- THE SMART FILTER ---
+        if (config_migration_includes[0] != '\0') {
+            // Whitelist Mode: If it's NOT on the list, ignore it!
+            if (!is_task_included(p->comm)) continue;
+        } else {
+            // Blacklist Mode: If it IS on the list, ignore it!
+            if (is_task_excluded(p->comm)) continue;
+        }        
+
         // --- DESIGN A: The Observer Blindspot ---
         // Never count the process that is currently asking for the load!
         if (p == current) continue;
@@ -97,7 +121,13 @@ static struct task_struct* mattx_find_candidate_task(void) {
         if (p->pid <= 1 || (p->flags & PF_EXITING)) continue;
         if (is_guest_process(p->pid)) continue;
         
-        if (is_task_excluded(p->comm)) continue;
+        // --- THE SMART FILTER ---
+        if (config_migration_includes[0] != '\0') {
+            if (!is_task_included(p->comm)) continue;
+        } else {
+            if (is_task_excluded(p->comm)) continue;
+        }
+        
         if (p->pid == last_migrated_pid) continue;
 
         if (READ_ONCE(p->__state) != TASK_RUNNING) continue;
@@ -175,10 +205,6 @@ static void mattx_evaluate_and_balance(u32 local_load, u32 local_affinity) {
 int mattx_balancer_loop(void *data) {
     struct mattx_load_info local_load;
     int i;
-    struct mattx_guest_info dead_guests[16]; 
-    int dead_count;
-    struct { u32 orig_pid; int target_node; } dead_exports[16];
-    int dead_export_count;
 
     mattx_dbg(" Balancer thread started\n");
 
@@ -192,17 +218,16 @@ int mattx_balancer_loop(void *data) {
 
         for (i = 0; i < MAX_NODES; i++) {
             if (cluster_map[i] && cluster_map[i]->node_id != -1) {
-                // Use the Mutex Bypass sender so the balancer never deadlocks!
                 mattx_comm_send_ctrl(cluster_map[i], MATTX_MSG_LOAD_UPDATE, &local_load, sizeof(local_load));
             }
         }
         
         mattx_evaluate_and_balance(local_load.cpu_load, local_load.affinity);
 
-        // --- The Guest Watcher (Node 2) ---
-        dead_count = 0;
+        // --- THE SAFE GUEST WATCHER (Node 2) ---
+restart_guest_loop:
         spin_lock(&guest_lock);
-        for (i = 0; i < guest_count; ) {
+        for (i = 0; i < guest_count; i++) {
             struct task_struct *task = NULL;
             bool is_dead = false;
             
@@ -211,41 +236,47 @@ int mattx_balancer_loop(void *data) {
             if (task) get_task_struct(task);
             rcu_read_unlock();
             
-            if (!task) {
-                is_dead = true; 
-            } else {
-                if (task->exit_state != 0) {
-                    is_dead = true; 
-                }
-                put_task_struct(task);
-            }
+            if (!task || task->exit_state != 0) is_dead = true;
+            if (task) put_task_struct(task);
 
             if (is_dead) {
-                if (dead_count < 16) dead_guests[dead_count++] = guest_registry[i];
+                u32 dead_orig_pid = guest_registry[i].orig_pid;
+                int dead_home_node = guest_registry[i].home_node;
+                void *buf1 = guest_registry[i].rpc_read_buf;
+                void *buf2 = guest_registry[i].rpc_statx_buf;
+                
+                // --- Extract the migration flag before we delete the entry! ---
+                bool is_migrating = guest_registry[i].is_migrating; 
+                
                 remove_guest_process(i);
-            } else {
-                i++;
+                spin_unlock(&guest_lock); // DROP LOCK BEFORE CLEANUP!
+                
+                if (buf1) kfree(buf1);
+                if (buf2) kfree(buf2);
+                
+                // --- THE RECALL SHIELD ---
+                // If the guest is dying because we are migrating it back home,
+                // DO NOT send a PROCESS_EXIT message to VM1!
+                if (!is_migrating) {
+                    struct mattx_process_exit exit_msg;
+                    exit_msg.orig_pid = dead_orig_pid;
+                    exit_msg.exit_code = 0; 
+                    if (cluster_map[dead_home_node]) {
+                        mattx_comm_send(cluster_map[dead_home_node], MATTX_MSG_PROCESS_EXIT, &exit_msg, sizeof(exit_msg));
+                    }
+                } else {
+                    mattx_dbg(" [WATCHER] Guest PID died due to Recall. Skipping exit notice.\n");
+                }
+                
+                goto restart_guest_loop; // Restart safely!
             }
         }
         spin_unlock(&guest_lock);
 
-        for (i = 0; i < dead_count; i++) {
-            struct mattx_process_exit exit_msg;
-            exit_msg.orig_pid = dead_guests[i].orig_pid;
-            exit_msg.exit_code = 0; 
-            
-            mattx_dbg(" [WATCHER] Guest PID %d died. Notifying Home Node %d...\n", 
-                   dead_guests[i].local_pid, dead_guests[i].home_node);
-                   
-            if (cluster_map[dead_guests[i].home_node]) {
-                mattx_comm_send(cluster_map[dead_guests[i].home_node], MATTX_MSG_PROCESS_EXIT, &exit_msg, sizeof(exit_msg));
-            }
-        }
-
-        // --- The Home Watcher (Node 1) ---
-        dead_export_count = 0;
+        // --- THE SAFE HOME WATCHER (Node 1) ---
+restart_export_loop:
         spin_lock(&export_lock);
-        for (i = 0; i < export_count; ) {
+        for (i = 0; i < export_count; i++) {
             struct task_struct *task = NULL;
             bool is_dead = false;
 
@@ -254,40 +285,40 @@ int mattx_balancer_loop(void *data) {
             if (task) get_task_struct(task);
             rcu_read_unlock();
 
-            if (!task) {
-                is_dead = true;
-            } else {
-                if (task->exit_state != 0) {
-                    is_dead = true;
-                }
-                put_task_struct(task);
-            }
+            if (!task || task->exit_state != 0) is_dead = true;
+            if (task) put_task_struct(task);
 
             if (is_dead) {
-                if (dead_export_count < 16) {
-                    dead_exports[dead_export_count].orig_pid = export_registry[i].orig_pid;
-                    dead_exports[dead_export_count].target_node = export_registry[i].target_node;
-                    dead_export_count++;
+                struct file **files_to_close = kmalloc_array(MAX_FDS, sizeof(struct file *), GFP_ATOMIC);
+                u32 dead_pid = export_registry[i].orig_pid;
+                int dead_node = export_registry[i].target_node;
+                
+                // Copy file pointers to heap array
+                if (files_to_close) {
+                    memcpy(files_to_close, export_registry[i].remote_files, MAX_FDS * sizeof(struct file *));
                 }
+                
                 remove_export_process(i);
-            } else {
-                i++;
+                spin_unlock(&export_lock); // DROP LOCK BEFORE FPUT!
+
+                // Safely close all leaked files outside the spinlock!
+                if (files_to_close) {
+                    for (int j = 0; j < MAX_FDS; j++) {
+                        if (files_to_close[j]) fput(files_to_close[j]);
+                    }
+                    kfree(files_to_close);
+                }
+
+                struct mattx_process_exit kill_msg;
+                kill_msg.orig_pid = dead_pid;
+                kill_msg.exit_code = 0; 
+                if (cluster_map[dead_node]) {
+                    mattx_comm_send(cluster_map[dead_node], MATTX_MSG_KILL_SURROGATE, &kill_msg, sizeof(kill_msg));
+                }
+                goto restart_export_loop; // Restart safely!
             }
         }
         spin_unlock(&export_lock);
-
-        for (i = 0; i < dead_export_count; i++) {
-            struct mattx_process_exit kill_msg;
-            kill_msg.orig_pid = dead_exports[i].orig_pid;
-            kill_msg.exit_code = 0; 
-
-            mattx_dbg(" [WATCHER] Exported PID %d died. Sending Assassination Order to Node %d...\n",
-                   dead_exports[i].orig_pid, dead_exports[i].target_node);
-
-            if (cluster_map[dead_exports[i].target_node]) {
-                mattx_comm_send(cluster_map[dead_exports[i].target_node], MATTX_MSG_KILL_SURROGATE, &kill_msg, sizeof(kill_msg));
-            }
-        }
 
         msleep(BALANCER_INTERVAL_MS);
     }

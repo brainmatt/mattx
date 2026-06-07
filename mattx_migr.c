@@ -24,6 +24,163 @@
 #include "mattx.h"
 #include <linux/task_work.h>   // For task_work_add
 #include <linux/completion.h>  // For wait_for_completion
+#include <linux/kprobes.h>
+#include <linux/timekeeping.h>
+
+// epoll resolvers
+mattx_task_work_add_fn real_task_work_add = NULL;
+mattx_sys_epoll_create1_fn real_sys_epoll_create1 = NULL;
+mattx_sys_epoll_ctl_fn real_sys_epoll_ctl = NULL;
+mattx_sys_epoll_wait_fn real_sys_epoll_wait = NULL;
+// network resolvers
+mattx_sys_bind_fn real_sys_bind = NULL;
+mattx_sys_connect_fn real_sys_connect = NULL;
+mattx_sys_listen_fn real_sys_listen = NULL;
+mattx_sys_sendto_fn real_sys_sendto = NULL;
+mattx_sys_recvfrom_fn real_sys_recvfrom = NULL;
+mattx_sys_socket_fn real_sys_socket = NULL;
+mattx_sys_accept4_fn real_sys_accept4 = NULL;
+mattx_sys_getsockname_fn real_sys_getsockname = NULL;
+mattx_sys_getpeername_fn real_sys_getpeername = NULL;
+mattx_sys_setsockopt_fn real_sys_setsockopt = NULL;
+mattx_sys_getsockopt_fn real_sys_getsockopt = NULL;
+mattx_sys_sendmsg_fn real_sys_sendmsg = NULL;
+mattx_sys_recvmsg_fn real_sys_recvmsg = NULL;
+
+static void mattx_resolve_hidden_symbols(void) {
+    struct kprobe kp; // Only ONE struct on the stack!
+
+    // 1. task_work_add
+    memset(&kp, 0, sizeof(kp));
+    kp.symbol_name = "task_work_add";
+    if (register_kprobe(&kp) == 0) {
+        real_task_work_add = (mattx_task_work_add_fn)kp.addr;
+        unregister_kprobe(&kp);
+        mattx_dbg("[MIGR] Hacker Magic: Resolved task_work_add at %p\n", real_task_work_add);
+    }
+
+    // 2. epoll_create1
+    memset(&kp, 0, sizeof(kp));
+    kp.symbol_name = "__x64_sys_epoll_create1";
+    if (register_kprobe(&kp) == 0) {
+        real_sys_epoll_create1 = (mattx_sys_epoll_create1_fn)kp.addr;
+        unregister_kprobe(&kp);
+    }
+
+    // 3. epoll_ctl
+    memset(&kp, 0, sizeof(kp));
+    kp.symbol_name = "__x64_sys_epoll_ctl";
+    if (register_kprobe(&kp) == 0) {
+        real_sys_epoll_ctl = (mattx_sys_epoll_ctl_fn)kp.addr;
+        unregister_kprobe(&kp);
+    }
+
+    // 4. epoll_wait
+    memset(&kp, 0, sizeof(kp));
+    kp.symbol_name = "__x64_sys_epoll_wait";
+    if (register_kprobe(&kp) == 0) {
+        real_sys_epoll_wait = (mattx_sys_epoll_wait_fn)kp.addr;
+        unregister_kprobe(&kp);
+    }
+
+    // 5. bind
+    memset(&kp, 0, sizeof(kp));
+    kp.symbol_name = "__x64_sys_bind";
+    if (register_kprobe(&kp) == 0) {
+        real_sys_bind = (mattx_sys_bind_fn)kp.addr;
+        unregister_kprobe(&kp);
+    }
+
+    // 6. connect
+    memset(&kp, 0, sizeof(kp));
+    kp.symbol_name = "__x64_sys_connect";
+    if (register_kprobe(&kp) == 0) {
+        real_sys_connect = (mattx_sys_connect_fn)kp.addr;
+        unregister_kprobe(&kp);
+    }
+
+    // 7. listen
+    memset(&kp, 0, sizeof(kp));
+    kp.symbol_name = "__x64_sys_listen";
+    if (register_kprobe(&kp) == 0) {
+        real_sys_listen = (mattx_sys_listen_fn)kp.addr;
+        unregister_kprobe(&kp);
+    }
+
+    // 8. sendto
+    memset(&kp, 0, sizeof(kp));
+    kp.symbol_name = "__x64_sys_sendto";
+    if (register_kprobe(&kp) == 0) {
+        real_sys_sendto = (mattx_sys_sendto_fn)kp.addr;
+        unregister_kprobe(&kp);
+    }
+
+    // 9. recvfrom
+    memset(&kp, 0, sizeof(kp));
+    kp.symbol_name = "__x64_sys_recvfrom";
+    if (register_kprobe(&kp) == 0) {
+        real_sys_recvfrom = (mattx_sys_recvfrom_fn)kp.addr;
+        unregister_kprobe(&kp);
+    }
+
+    memset(&kp, 0, sizeof(kp)); 
+    kp.symbol_name = "__x64_sys_socket";
+    if (register_kprobe(&kp) == 0) {
+        real_sys_socket = (mattx_sys_socket_fn)kp.addr;
+        unregister_kprobe(&kp); 
+    }
+
+    memset(&kp, 0, sizeof(kp)); 
+    kp.symbol_name = "__x64_sys_accept4";
+    if (register_kprobe(&kp) == 0) {
+        real_sys_accept4 = (mattx_sys_accept4_fn)kp.addr;
+        unregister_kprobe(&kp); 
+    }
+
+    memset(&kp, 0, sizeof(kp));
+    kp.symbol_name = "__x64_sys_getsockname";
+    if (register_kprobe(&kp) == 0) {
+        real_sys_getsockname = (mattx_sys_getsockname_fn)kp.addr;
+        unregister_kprobe(&kp); 
+    }
+
+    memset(&kp, 0, sizeof(kp)); 
+    kp.symbol_name = "__x64_sys_getpeername";
+    if (register_kprobe(&kp) == 0) { 
+        real_sys_getpeername = (mattx_sys_getpeername_fn)kp.addr; 
+        unregister_kprobe(&kp); 
+    }
+
+    memset(&kp, 0, sizeof(kp)); 
+    kp.symbol_name = "__x64_sys_setsockopt";
+    if (register_kprobe(&kp) == 0) { 
+        real_sys_setsockopt = (mattx_sys_setsockopt_fn)kp.addr; 
+        unregister_kprobe(&kp); 
+    }
+
+    memset(&kp, 0, sizeof(kp)); 
+    kp.symbol_name = "__x64_sys_getsockopt";
+    if (register_kprobe(&kp) == 0) { 
+        real_sys_getsockopt = (mattx_sys_getsockopt_fn)kp.addr; 
+        unregister_kprobe(&kp); 
+    }
+
+    memset(&kp, 0, sizeof(kp)); 
+    kp.symbol_name = "__x64_sys_sendmsg";
+    if (register_kprobe(&kp) == 0) { real_sys_sendmsg = (mattx_sys_sendmsg_fn)kp.addr; unregister_kprobe(&kp); }
+
+    memset(&kp, 0, sizeof(kp)); 
+    kp.symbol_name = "__x64_sys_recvmsg";
+    if (register_kprobe(&kp) == 0) { 
+        real_sys_recvmsg = (mattx_sys_recvmsg_fn)kp.addr; 
+        unregister_kprobe(&kp); 
+    }
+
+
+}
+
+
+
 
 static struct mattx_migration_req *local_migration_req = NULL;
 static struct task_struct *migrating_task = NULL;
@@ -65,7 +222,12 @@ static void mattx_freeze_task_safely(struct task_struct *task) {
     init_completion(&ctx.done);
     init_task_work(&ctx.cb, mattx_drain_callback);
 
-    ret = task_work_add(task, &ctx.cb, TWA_SIGNAL);
+    // Call the dynamically resolved pointer! ---
+    if (real_task_work_add) {
+        ret = real_task_work_add(task, &ctx.cb, TWA_SIGNAL);
+    } else {
+        ret = -ENOSYS; // Force the fallback if the resolver failed
+    }
     if (ret == 0) {
         mattx_dbg("[DRAIN] Injected Task Work into PID %d. Waiting for stable state...\n", task->pid);
         
@@ -88,6 +250,7 @@ static void mattx_freeze_task_safely(struct task_struct *task) {
         }
     }
 }
+
 
 void mattx_capture_and_send_state(struct task_struct *task, int target_node) {
     struct pt_regs *regs;
@@ -166,7 +329,10 @@ void mattx_capture_and_send_state(struct task_struct *task, int target_node) {
         mmap_read_lock(mm);
         VMA_ITERATOR(vmi, mm, 0);
         for_each_vma(vmi, vma) {
-            if (vma_count >= MAX_VMAS) break;
+            if (vma_count >= MAX_VMAS) {
+                printk(KERN_ERR "MattX: [EXTRACT] FATAL: Process %d exceeded MAX_VMAS (%d)! Blueprint truncated.\n", task->pid, MAX_VMAS);
+                break;
+            }
             req->vmas[vma_count].vm_start = vma->vm_start;
             req->vmas[vma_count].vm_end = vma->vm_end;
             req->vmas[vma_count].vm_flags = vma->vm_flags;
@@ -248,7 +414,10 @@ void mattx_capture_and_return_state(struct task_struct *task, u32 orig_pid, int 
         mmap_read_lock(mm);
         VMA_ITERATOR(vmi, mm, 0);
         for_each_vma(vmi, vma) {
-            if (vma_count >= MAX_VMAS) break;
+            if (vma_count >= MAX_VMAS) {
+                printk(KERN_ERR "MattX: [EXTRACT] FATAL: Surrogate %d exceeded MAX_VMAS (%d)! Return Blueprint truncated.\n", task->pid, MAX_VMAS);
+                break;
+            }
             req->vmas[vma_count].vm_start = vma->vm_start;
             req->vmas[vma_count].vm_end = vma->vm_end;
             req->vmas[vma_count].vm_flags = vma->vm_flags;
@@ -343,40 +512,18 @@ void mattx_send_vma_data(void) {
     mattx_dbg("[MIGRATE] Pipeline stats: %d total, %d sent, %d skipped, %d net errors\n", 
            total_pages, sent_pages, skipped_pages, network_errors);
 
-           
-
     if (is_returning) {
         mattx_dbg("[MIGRATE] Return pipeline complete. Sending RETURN_DONE signal.\n");
         mattx_comm_send(cluster_map[migrating_target_node], MATTX_MSG_RETURN_DONE, NULL, 0);
         
         mattx_dbg("[RECALL] Executing local Surrogate PID %d...\n", migrating_task->pid);
-        
-        // --- THE ULTIMATE SHIELD ---
-        // Detach the Fake FDs before killing the task so mattx_fake_release does nothing!
-        if (migrating_task->files) {
-            spin_lock(&migrating_task->files->file_lock);
-            struct fdtable *fdt = files_fdtable(migrating_task->files);
-            for (int i = 0; i < fdt->max_fds; i++) {
-                struct file *f = rcu_dereference_raw(fdt->fd[i]);
-                if (f && f->f_op == &mattx_fops) {
-                    struct mattx_fake_fd_info *fd_info = f->private_data;
-                    f->private_data = NULL; // Detach!
-                    if (fd_info) kfree(fd_info);
-                }
-            }
-            spin_unlock(&migrating_task->files->file_lock);
-        }
-
         send_sig(SIGKILL, migrating_task, 0);
         
-        spin_lock(&guest_lock);
-        for (int i = 0; i < guest_count; i++) {
-            if (guest_registry[i].local_pid == migrating_task->pid) {
-                remove_guest_process(i);
-                break;
-            }
-        }
-        spin_unlock(&guest_lock);
+        // --- FIXED: The Patient Shield ---
+        // DO NOT remove the guest from the registry here! 
+        // If we remove it now, mattx_fake_release will think it's a normal death and assassinate the Deputy's FDs!
+        // We leave it in the registry, and let the Balancer's Guest Watcher clean it up naturally later.
+
     } else {
         mattx_dbg("[MIGRATE] Data pipeline complete. Sending DONE signal.\n");
         mattx_comm_send(cluster_map[migrating_target_node], MATTX_MSG_MIGRATE_DONE, NULL, 0);
@@ -387,9 +534,10 @@ void mattx_send_vma_data(void) {
     
     put_task_struct(migrating_task);
     migrating_task = NULL;
-    kfree(local_migration_req);
+    kvfree(local_migration_req);
     local_migration_req = NULL;
 }
+
 
 void mattx_trigger_recall(pid_t orig_pid) {
     int target_node = get_export_target(orig_pid);
@@ -455,6 +603,9 @@ static void handle_recall_req(struct mattx_link *link, struct mattx_header *hdr,
 }
 
 void mattx_migr_init_handlers(void) {
+    // Resolve hidden kernel 7.x symbols before we do anything else!
+    mattx_resolve_hidden_symbols();
+
     mattx_register_handler(MATTX_MSG_READY_FOR_DATA, handle_ready_for_data);
     mattx_register_handler(MATTX_MSG_RECALL_REQ, handle_recall_req);
     mattx_dbg(" [EXPORT] Network handlers registered.\n");

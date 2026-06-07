@@ -62,6 +62,7 @@ static int nodes_show(struct seq_file *m, void *v) {
     seq_printf(m, "Debug Mode: %s\n", config_debug_mode ? "ON" : "OFF");
     seq_printf(m, "Node Affinity: %u (0 = Auto)\n", config_node_affinity);
     seq_printf(m, "Migration Excludes: %s\n", config_migration_excludes);
+    seq_printf(m, "Migration Includes: %s\n", config_migration_includes);
     return 0;
 }
 
@@ -141,6 +142,10 @@ static ssize_t admin_write(struct file *file, const char __user *ubuf, size_t co
     if (strncmp(buf, "exclude ", 8) == 0) {
         strscpy(config_migration_excludes, buf + 8, sizeof(config_migration_excludes));
         mattx_dbg(" [ADMIN] Migration excludes set to '%s'\n", config_migration_excludes);
+        return count;
+    } else if (strncmp(buf, "include ", 8) == 0) {
+        strscpy(config_migration_includes, buf + 8, sizeof(config_migration_includes));
+        mattx_dbg(" [ADMIN] Migration includes set to '%s'\n", config_migration_includes);
         return count;
     } else if (strncmp(buf, "affinity ", 9) == 0) {
         u32 val;

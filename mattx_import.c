@@ -59,24 +59,48 @@ static void handle_page_transfer(struct mattx_link *link, struct mattx_header *h
         void *data = (char *)payload + sizeof(struct mattx_page_header);
         unsigned long target_addr = pending_migration->vmas[ph->vma_index].vm_start + ph->offset;
         int res;
+        struct mm_struct *mm = hijacked_stub_task->mm;
+        bool unprotect = false;
 
-        // REMOVED the dangerous vm_flags_set hack! 
-        // FOLL_FORCE | FOLL_WRITE safely handles read-only memory via the page fault handler.
-        res = access_process_vm(hijacked_stub_task, target_addr, data, ph->length, FOLL_WRITE | FOLL_FORCE);
-        
-        if (res != ph->length) {
-            if (ph->offset == 0) {
-                if (res == 0) {
-                    mattx_dbg("[IMPORT] Skipped injecting %u bytes at 0x%lx (Protected page)\n", ph->length, target_addr);
-                } else {
-                    printk(KERN_ERR "MattX:[IMPORT] Failed to inject %u bytes at 0x%lx (res: %d)\n", ph->length, target_addr, res);
+        // --- THE W^X SECURITY BYPASS ---
+        // Kernel 7.0 refuses to write to Read-Only/Executable memory.
+        // We must temporarily force the VMA to be writable!
+        if (mm) {
+            mmap_write_lock(mm);
+            struct vm_area_struct *vma = find_vma(mm, target_addr);
+            if (vma && target_addr >= vma->vm_start) {
+                if (!(vma->vm_flags & VM_WRITE)) {
+                    vm_flags_set(vma, vma->vm_flags | VM_WRITE);
+                    unprotect = true;
                 }
             }
+            mmap_write_unlock(mm);
+        }
+
+        // Inject the memory!
+        res = access_process_vm(hijacked_stub_task, target_addr, data, ph->length, FOLL_WRITE | FOLL_FORCE);
+        
+        // Lock the memory back up!
+        if (unprotect && mm) {
+            mmap_write_lock(mm);
+            struct vm_area_struct *vma = find_vma(mm, target_addr);
+            if (vma && target_addr >= vma->vm_start) {
+                vm_flags_clear(vma, VM_WRITE);
+            }
+            mmap_write_unlock(mm);
+        }
+
+        // --- REMOVED THE SILENT TRAP ---
+        // We now log EVERY failure, not just offset 0!
+        if (res != ph->length) {
+            printk(KERN_ERR "MattX:[IMPORT] FATAL: Failed to inject %u bytes at 0x%lx (res: %d)\n", 
+                   ph->length, target_addr, res);
         } else {
             injected_pages_count++;
         }
     }
 }
+
 
 static void handle_migrate_done(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
     mattx_dbg("[IMPORT] All memory transferred! Total pages injected: %d\n", injected_pages_count);
@@ -214,8 +238,19 @@ static void handle_return_blueprint(struct mattx_link *link, struct mattx_header
         if (deputy) {
             mattx_dbg("[RECALL] Found frozen Deputy PID %d. Preparing for injection...\n", deputy->pid);
             
+            // --- THE KWORKER KILL-SWITCH ---
+            // Tell any pending RPC workers on VM1 to abort immediately!
+            spin_lock(&export_lock);
+            for (int i = 0; i < export_count; i++) {
+                if (export_registry[i].orig_pid == req->orig_pid) {
+                    export_registry[i].abort_rpc = true;
+                    break;
+                }
+            }
+            spin_unlock(&export_lock);
+
             if (hijacked_stub_task) put_task_struct(hijacked_stub_task);
-            hijacked_stub_task = deputy; 
+            hijacked_stub_task = deputy;
 
             mattx_dbg(" [RECALL] Sending READY_FOR_DATA signal to Node %d...\n", pending_source_node);
             mattx_comm_send(cluster_map[pending_source_node], MATTX_MSG_READY_FOR_DATA, NULL, 0);

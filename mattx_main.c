@@ -21,6 +21,9 @@
  * Commercial licensing options are available upon request.
  */
  
+
+#include <linux/timekeeping.h>
+#include <linux/time.h>
 #include "mattx.h"
 
 MODULE_LICENSE("GPL v2");
@@ -55,6 +58,7 @@ enum { MATTX_ATTR_UNSPEC, MATTX_ATTR_NODE_ID, MATTX_ATTR_IPV4_ADDR, MATTX_ATTR_S
 
 enum { MATTX_CMD_UNSPEC, MATTX_CMD_NODE_JOIN, MATTX_CMD_NODE_LEAVE, MATTX_CMD_HIJACK_ME, MATTX_CMD_GET_BLUEPRINT, MATTX_CMD_SET_LOCAL_IP, MATTX_CMD_SET_CONFIG, __MATTX_CMD_MAX };
 #define MATTX_CMD_MAX (__MATTX_CMD_MAX - 1)
+
 
 static const struct nla_policy mattx_genl_policy[MATTX_ATTR_MAX + 1] = {[MATTX_ATTR_NODE_ID] = { .type = NLA_U32 },[MATTX_ATTR_IPV4_ADDR] = { .type = NLA_U32 },
     [MATTX_ATTR_STUB_PID] = { .type = NLA_U32 },
@@ -155,6 +159,13 @@ static int mattx_nl_cmd_set_local_ip(struct sk_buff *skb, struct genl_info *info
         my_ip_addr = nla_get_u32(info->attrs[MATTX_ATTR_LOCAL_IP]);
         mattx_dbg(" [NL] Daemon registered local IP: %pI4\n", &my_ip_addr);
     }
+    
+    // Read the Node ID during initial registration! ---
+    if (info->attrs[MATTX_ATTR_MY_NODE_ID]) {
+        my_node_id = nla_get_u32(info->attrs[MATTX_ATTR_MY_NODE_ID]);
+        mattx_dbg(" [NL] Daemon registered local Node ID: %u\n", my_node_id);
+    }
+    
     return 0;
 }
 
@@ -213,10 +224,14 @@ int mattx_get_active_nodes(int *node_array, int max_nodes) {
 }
 EXPORT_SYMBOL(mattx_get_active_nodes); 
 
+
 static int __init mattx_init(void) { 
-    int rc = genl_register_family(&mattx_genl_family);
+    int rc;
+
+    // 3. Proceed with normal initialization
+    rc = genl_register_family(&mattx_genl_family);
     if (rc) return rc;
-    
+        
     if (mattx_proc_init() < 0) {
         printk(KERN_ERR "MattX: Failed to create /proc/mattx interface\n");
     }

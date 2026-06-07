@@ -55,6 +55,8 @@ struct mattx_config {
     uint8_t migrate_net_io;
     uint8_t mattxfs_enabled;
     char dfsa_dir[256];
+    char autodiscovery[32]; // Discovery Mode ---
+
 };
 
 struct mattx_beacon {
@@ -87,7 +89,7 @@ int init_netlink() {
     return 0;
 }
 
-// Tell the kernel our IP address ---
+// Tell the kernel our IP address and Node ID ---
 void register_local_ip(uint32_t ip_addr) {
     struct nl_msg *msg;
     
@@ -96,11 +98,15 @@ void register_local_ip(uint32_t ip_addr) {
     msg = nlmsg_alloc();
     genlmsg_put(msg, NL_AUTO_PORT, NL_AUTO_SEQ, mattx_family_id, 0, 0, MATTX_CMD_SET_LOCAL_IP, 1);
     nla_put_u32(msg, MATTX_ATTR_LOCAL_IP, ip_addr);
+    
+    // Pack the Node ID so the kernel knows who it is! ---
+    nla_put_u32(msg, MATTX_ATTR_MY_NODE_ID, config.node_id);
 
     if (nl_send_auto(nl_sock, msg) < 0) {
         printf("ERROR: Failed to register local IP with kernel.\n");
     } else {
-        printf("SUCCESS: Registered local IP %s with kernel.\n", inet_ntoa(*(struct in_addr*)&ip_addr));
+        printf("SUCCESS: Registered local IP %s and Node ID %u with kernel.\n", 
+               inet_ntoa(*(struct in_addr*)&ip_addr), config.node_id);
     }
     fflush(stdout);
     nlmsg_free(msg);
@@ -185,10 +191,20 @@ uint32_t get_interface_ip(const char *iface) {
     return ((struct sockaddr_in *)&ifr.ifr_addr)->sin_addr.s_addr;
 }
 
+uint32_t get_interface_netmask(const char *iface) {
+    struct ifreq ifr;
+    int s = socket(AF_INET, SOCK_DGRAM, 0);
+    strncpy(ifr.ifr_name, iface, IFNAMSIZ);
+    if (ioctl(s, SIOCGIFNETMASK, &ifr) < 0) { close(s); return 0; }
+    close(s);
+    return ((struct sockaddr_in *)&ifr.ifr_addr)->sin_addr.s_addr;
+}
+
 void load_config() {
     // Set defaults
     strcpy(config.interface, DEFAULT_IFACE);
     strcpy(config.group, DEFAULT_GROUP);
+    strcpy(config.autodiscovery, "multicast"); // Default to classic multicast
     config.port = DEFAULT_PORT;
     config.node_id = 0;
     config.migrate_file_io = 1;
@@ -205,6 +221,7 @@ void load_config() {
         if (line[0] == '#' || line[0] == '\n') continue;
         if (sscanf(line, "INTERFACE=%s", config.interface)) continue;
         if (sscanf(line, "MULTICAST_GROUP=%s", config.group)) continue;
+        if (sscanf(line, "AUTODISCOVERY=%31s", config.autodiscovery)) continue;
         if (sscanf(line, "PORT=%d", &config.port)) continue;
         if (sscanf(line, "NODE_ID=%u", &config.node_id)) continue;
         
@@ -230,18 +247,40 @@ void* beacon_sender(void* arg) {
     int s = socket(AF_INET, SOCK_DGRAM, 0);
     struct sockaddr_in addr;
     struct mattx_beacon beacon;
-    uint32_t my_ip = get_interface_ip(config.interface);
     
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(config.port);
-    addr.sin_addr.s_addr = inet_addr(config.group);
+    uint32_t my_ip = get_interface_ip(config.interface);
+    uint32_t my_mask = get_interface_netmask(config.interface);
     
     beacon.node_id = config.node_id;
     beacon.ip_addr = my_ip;
     
     while (1) {
-        sendto(s, &beacon, sizeof(beacon), 0, (struct sockaddr*)&addr, sizeof(addr));
+        if (strcmp(config.autodiscovery, "sweep") == 0) {
+            // --- THE UNICAST SWEEP ---
+            // Calculate the base network address (e.g., 192.168.122.0)
+            uint32_t network = ntohl(my_ip) & ntohl(my_mask);
+            
+            // Fire a tiny UDP packet at .1 through .254
+            for (int i = 1; i < 255; i++) {
+                uint32_t target_ip = htonl(network | i);
+                if (target_ip == my_ip) continue; // Don't sweep ourselves!
+                
+                memset(&addr, 0, sizeof(addr));
+                addr.sin_family = AF_INET;
+                addr.sin_port = htons(config.port);
+                addr.sin_addr.s_addr = target_ip;
+                
+                sendto(s, &beacon, sizeof(beacon), 0, (struct sockaddr*)&addr, sizeof(addr));
+            }
+        } else {
+            // --- CLASSIC MULTICAST ---
+            memset(&addr, 0, sizeof(addr));
+            addr.sin_family = AF_INET;
+            addr.sin_port = htons(config.port);
+            addr.sin_addr.s_addr = inet_addr(config.group);
+            
+            sendto(s, &beacon, sizeof(beacon), 0, (struct sockaddr*)&addr, sizeof(addr));
+        }
         sleep(5);
     }
     return NULL;
@@ -289,8 +328,8 @@ int main() {
 
     pthread_create(&tid, NULL, beacon_sender, NULL);
 
-    printf("MattX Discovery Daemon running. My Node ID: %u\n", config.node_id);
-    fflush(stdout);
+    printf("MattX Discovery Daemon running. My Node ID: %u (Mode: %s)\n", config.node_id, config.autodiscovery);
+    fflush(stdout);    
 
     while (1) {
         struct sockaddr_in client_addr;

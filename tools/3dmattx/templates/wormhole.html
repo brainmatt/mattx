@@ -1,0 +1,299 @@
+<!--
+#
+# MattX - The Modern Single System Image (SSI) Cluster
+# 
+# Copyright (c) 2026 by Matthias Rechenburg
+# All rights reserved.
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 2 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
+#
+# Commercial licensing options are available upon request.
+#
+-->
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>MattX - Wormhole Viewer</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #050505; font-family: 'Courier New', Courier, monospace; }
+        #canvas-container { width: 100vw; height: 100vh; }
+        #hud {
+            position: absolute; top: 20px; left: 20px; color: #00ffcc;
+            text-shadow: 0 0 5px #00ffcc; pointer-events: none;
+        }
+        h1 { margin: 0; font-size: 24px; letter-spacing: 2px; }
+        p { margin: 5px 0; font-size: 14px; }
+    </style>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
+</head>
+<body>
+
+<div id="hud">
+    <h1>MATTX // WORMHOLE VIEWER</h1>
+    <p>Live Process Teleportation Tracking</p>
+    <p id="stats">Active Migrations: 0</p>
+</div>
+
+<div id="canvas-container"></div>
+
+<script>
+    // --- 1. SCENE SETUP ---
+    const scene = new THREE.Scene();
+    scene.fog = new THREE.FogExp2(0x050505, 0.002);
+
+    const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 1000);
+    camera.position.set(0, 40, 60);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    document.getElementById('canvas-container').appendChild(renderer.domElement);
+
+    const ambientLight = new THREE.AmbientLight(0x222222);
+    scene.add(ambientLight);
+    const pointLight = new THREE.PointLight(0x00ffcc, 1.5, 200);
+    pointLight.position.set(0, 50, 0);
+    scene.add(pointLight);
+
+    const gridHelper = new THREE.GridHelper(150, 30, 0x00ffcc, 0x222222);
+    gridHelper.position.y = -0.1;
+    scene.add(gridHelper);
+
+    // --- 2. DYNAMIC CHESSBOARD (NODES) ---
+    const nodePositions = {};
+    const nodeMeshes = {};
+
+    // Helper to create glowing 3D Text Labels
+    function createLabel(text, isLocal) {
+        const canvas = document.createElement('canvas');
+        const ctx = canvas.getContext('2d');
+        canvas.width = 256; canvas.height = 128;
+        ctx.font = "Bold 30px Courier New";
+        ctx.fillStyle = isLocal ? "#00ffff" : "#ff00ff";
+        ctx.textAlign = "center";
+        ctx.fillText(text, 128, 64);
+        
+        const texture = new THREE.CanvasTexture(canvas);
+        const spriteMat = new THREE.SpriteMaterial({ map: texture, transparent: true });
+        const sprite = new THREE.Sprite(spriteMat);
+        sprite.scale.set(15, 7.5, 1);
+        return sprite;
+    }
+
+    function buildGrid(nodes) {
+        // Calculate NxN grid size
+        let gridSize = Math.ceil(Math.sqrt(nodes.length));
+        if (gridSize < 2) gridSize = 2; // Minimum 2x2 board
+        
+        const spacing = 20; // Distance between nodes
+        const offset = (gridSize - 1) * spacing / 2;
+
+        nodes.forEach((node, index) => {
+            if (nodeMeshes[node.id]) return; // Already built
+
+            const x = (index % gridSize) * spacing - offset;
+            const z = Math.floor(index / gridSize) * spacing - offset;
+
+            // The Glowing Square Pedestal
+            const geo = new THREE.BoxGeometry(8, 1, 8);
+            const color = node.is_local ? 0x004444 : 0x440044; // Blue for local, Purple for remote
+            const emissive = node.is_local ? 0x00ffff : 0xff00ff;
+            
+            const mat = new THREE.MeshStandardMaterial({ 
+                color: color, emissive: emissive, emissiveIntensity: 0.2, metalness: 0.8, roughness: 0.2 
+            });
+            
+            const mesh = new THREE.Mesh(geo, mat);
+            mesh.position.set(x, 0.5, z);
+            scene.add(mesh);
+
+            // Add the 3D Label
+            const label = createLabel(`NODE ${node.id}`, node.is_local);
+            label.position.set(x, 4, z); // Float above the node
+            scene.add(label);
+
+            nodePositions[node.id] = new THREE.Vector3(x, 1, z);
+            nodeMeshes[node.id] = mesh;
+        });
+    }
+
+    // --- 3. THE SILVER SPHERES & 3D ARCHWAYS ---
+    const activeMigrations = {}; 
+    const sphereGeo = new THREE.SphereGeometry(1.5, 32, 32);
+    const silverMat = new THREE.MeshStandardMaterial({ color: 0xffffff, metalness: 1.0, roughness: 0.1 });
+    const tetherMat = new THREE.LineBasicMaterial({ color: 0x00ffcc, transparent: true, opacity: 0.8, linewidth: 2 });
+
+    // Sequential counter for perfect Golden Angle distribution! ---
+    let spawnCounter = 0;
+
+    function spawnMigration(pid, homeNode, targetNode) {
+        if (!nodePositions[homeNode] || !nodePositions[targetNode]) return;
+
+        // --- THE CIRCULAR LAYOUT (Math into Art) ---
+        // Use our internal counter instead of the chaotic Linux PID!
+        const angle = spawnCounter * 137.5 * (Math.PI / 180);
+        spawnCounter++; // Increment for the next process!
+        
+        const radius = 3.0; // Fits perfectly inside our 8x8 node square
+        const offsetX = Math.cos(angle) * radius;
+        const offsetZ = Math.sin(angle) * radius;
+
+        // Add the offsets to the base node positions!
+        const startPos = new THREE.Vector3(
+            nodePositions[homeNode].x + offsetX, 
+            1, 
+            nodePositions[homeNode].z + offsetZ
+        );
+        const endPos = new THREE.Vector3(
+            nodePositions[targetNode].x + offsetX, 
+            1, 
+            nodePositions[targetNode].z + offsetZ
+        );
+
+        const sphere = new THREE.Mesh(sphereGeo, silverMat);
+        sphere.position.copy(startPos);
+        scene.add(sphere);
+
+        // Calculate the 3D Arc (Quadratic Bezier)
+        const midX = (startPos.x + endPos.x) / 2;
+        const midZ = (startPos.z + endPos.z) / 2;
+        const distance = startPos.distanceTo(endPos);
+        const controlPoint = new THREE.Vector3(midX, Math.max(15, distance * 0.6), midZ);
+        const curve = new THREE.QuadraticBezierCurve3(startPos, controlPoint, endPos);
+
+        // Create the 3D Archway Tether (Pre-calculate 50 points along the curve)
+        const points = curve.getPoints(50);
+        const lineGeo = new THREE.BufferGeometry().setFromPoints(points);
+        lineGeo.setDrawRange(0, 0); // Start invisible!
+        const tether = new THREE.Line(lineGeo, tetherMat);
+        scene.add(tether);
+
+        activeMigrations[pid] = {
+            sphere: sphere,
+            tether: tether,
+            curve: curve,
+            progress: 0.0,
+            isReturning: false // Track return state! ---
+        };
+    }
+
+    function removeMigration(pid) {
+        const mig = activeMigrations[pid];
+        if (mig) {
+            scene.remove(mig.sphere);
+            scene.remove(mig.tether);
+            mig.sphere.geometry.dispose();
+            mig.tether.geometry.dispose();
+            delete activeMigrations[pid];
+        }
+    }
+
+    // Trigger the return flight! ---
+    function triggerReturn(pid) {
+        const mig = activeMigrations[pid];
+        if (mig && !mig.isReturning) {
+            mig.isReturning = true;
+            mig.tether.material.opacity = 0.8; // Stop pulsing, make it solid for the flight home
+        }
+    }
+
+    // --- 4. ANIMATION LOOP ---
+    function animate() {
+        requestAnimationFrame(animate);
+
+        for (const pid in activeMigrations) {
+            const mig = activeMigrations[pid];
+            
+            if (mig.isReturning) {
+                // --- FLYING BACK HOME ---
+                mig.progress -= 0.015; // Fly backwards!
+                if (mig.progress <= 0) {
+                    removeMigration(pid); // Delete meshes when it arrives home!
+                    continue;
+                }
+                const currentPos = mig.curve.getPoint(mig.progress);
+                mig.sphere.position.copy(currentPos);
+                const drawCount = Math.floor(mig.progress * 51);
+                mig.tether.geometry.setDrawRange(0, drawCount);
+            } else {
+                // --- FLYING FORWARD ---
+                if (mig.progress < 1.0) {
+                    mig.progress += 0.015; 
+                    if (mig.progress > 1.0) mig.progress = 1.0;
+                    
+                    const currentPos = mig.curve.getPoint(mig.progress);
+                    mig.sphere.position.copy(currentPos);
+                    
+                    const drawCount = Math.floor(mig.progress * 51);
+                    mig.tether.geometry.setDrawRange(0, drawCount);
+                } else {
+                    // Landed! Pulse the 3D Archway
+                    mig.tether.material.opacity = 0.4 + Math.sin(Date.now() * 0.005) * 0.4;
+                }
+            }
+        }
+
+        // Cinematic Camera Rotation
+        camera.position.x = Math.sin(Date.now() * 0.0001) * 70;
+        camera.position.z = Math.cos(Date.now() * 0.0001) * 70;
+        camera.lookAt(0, 0, 0);
+
+        renderer.render(scene, camera);
+    }
+
+    animate();
+
+    // --- 5. THE DIFFING ENGINE (POLLING) ---
+    function pollCluster() {
+        // 1. Fetch Nodes to build the grid
+        $.getJSON('/api/nodes', function(nodes) {
+            buildGrid(nodes);
+            
+            // 2. Fetch Migrations to animate spheres
+            $.getJSON('/api/migrations', function(data) {
+                const currentPids = new Set();
+                
+                data.forEach(mig => {
+                    currentPids.add(mig.pid);
+                    if (!activeMigrations[mig.pid]) {
+                        spawnMigration(mig.pid, mig.home_node, mig.target_node);
+                    }
+                });
+
+                // Check for dead/recalled migrations
+                for (const pid in activeMigrations) {
+                    if (!currentPids.has(parseInt(pid))) {
+                        // Trigger return animation instead of instant deletion! ---
+                        triggerReturn(pid);
+                    }
+                }
+
+                $('#stats').text(`Active Migrations: ${data.length}`);
+            });
+        });
+    }
+
+    setInterval(pollCluster, 1000);
+
+    window.addEventListener('resize', () => {
+        camera.aspect = window.innerWidth / window.innerHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+</script>
+</body>
+</html>

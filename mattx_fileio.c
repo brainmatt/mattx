@@ -29,7 +29,7 @@
 // --- The VFS Proxy (Fake FDs) ---
 
 // Helper to safely check if the RPC is done while we are sleeping
-static bool check_rpc_done(pid_t pid) {
+bool check_rpc_done(pid_t pid) {
     bool done = false;
     spin_lock(&guest_lock);
     for (int i = 0; i < guest_count; i++) {
@@ -419,11 +419,20 @@ static int mattx_fake_release(struct inode *inode, struct file *file) {
     return 0;
 }
 
+// "Yes, this Fake FD is always ready for read/write!" - THE PACIFIER!
+// When the app actually tries to read/write, our Kprobes will intercept it
+// and do the real blocking over the TCP Wormhole!
+static __poll_t mattx_fake_poll(struct file *file, struct poll_table_struct *wait) {
+    return EPOLLIN | EPOLLOUT | EPOLLERR | EPOLLHUP;
+}
+
+
 const struct file_operations mattx_fops = {
     .llseek = mattx_fake_llseek,
     .fsync = mattx_fake_fsync,
     .read = mattx_fake_read,
     .write = mattx_fake_write,
+    .poll = mattx_fake_poll, // THE PACIFIER!
     .release = mattx_fake_release, 
 };
 
@@ -587,10 +596,10 @@ static void handle_sys_open_reply(struct mattx_link *link, struct mattx_header *
     }
 }
 
+
 static void handle_sys_close_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
     if (payload) {
-        struct mattx_sys_close_req *req = (struct mattx_sys_close_req *)payload;
-        int i;
+        struct mattx_sys_close_req *req = payload;
         struct file *f_to_close = NULL;
         
         mattx_dbg("[RPC] Received CLOSE request for Remote FD %u from Node %u\n", req->remote_fd, hdr->sender_id);
@@ -598,7 +607,7 @@ static void handle_sys_close_req(struct mattx_link *link, struct mattx_header *h
         if (req->remote_fd >= 1000) {
             int slot = req->remote_fd - 1000;
             spin_lock(&export_lock);
-            for (i = 0; i < export_count; i++) {
+            for (int i = 0; i < export_count; i++) {
                 if (export_registry[i].orig_pid == req->orig_pid) {
                     if (slot < MAX_FDS && export_registry[i].remote_files[slot]) {
                         f_to_close = export_registry[i].remote_files[slot];
@@ -608,15 +617,36 @@ static void handle_sys_close_req(struct mattx_link *link, struct mattx_header *h
                 }
             }
             spin_unlock(&export_lock);
-            
-            // Call fput safely OUTSIDE the spinlock!
-            if (f_to_close) {
-                fput(f_to_close);
-                mattx_dbg("[RPC] Successfully closed Remote FD %u\n", req->remote_fd);
+        } else if (req->remote_fd >= 0) {
+            // --- THE NATIVE CLOSE UPGRADE ---
+            struct task_struct *deputy = NULL;
+            rcu_read_lock();
+            deputy = pid_task(find_vpid(req->orig_pid), PIDTYPE_PID);
+            if (deputy) get_task_struct(deputy);
+            rcu_read_unlock();
+
+            if (deputy && deputy->files) {
+                spin_lock(&deputy->files->file_lock);
+                struct fdtable *fdt = files_fdtable(deputy->files);
+                if (req->remote_fd < fdt->max_fds) {
+                    f_to_close = rcu_dereference_raw(fdt->fd[req->remote_fd]);
+                    if (f_to_close) {
+                        rcu_assign_pointer(fdt->fd[req->remote_fd], NULL);
+                        __clear_bit(req->remote_fd, fdt->open_fds);
+                    }
+                }
+                spin_unlock(&deputy->files->file_lock);
+                put_task_struct(deputy);
             }
+        }
+        
+        if (f_to_close) {
+            fput(f_to_close);
+            mattx_dbg("[RPC] Successfully closed Remote FD %u\n", req->remote_fd);
         }
     }
 }
+
 
 static void handle_sys_read_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
     if (payload) {
@@ -1083,17 +1113,91 @@ static void handle_sys_fsync_req(struct mattx_link *link, struct mattx_header *h
     }
 }
 
+
+
+// --- UNIVERSAL REMOTE FILE FETCHER ---
+// Safely retrieves a struct file* whether it's a MattXFS file (>= 1000) or a Native Socket (< 1000)
+static struct file *mattx_get_remote_file(u32 orig_pid, int remote_fd) {
+    struct file *file = NULL;
+    
+    if (remote_fd >= 1000) {
+        int slot = remote_fd - 1000;
+        spin_lock(&export_lock);
+        for (int i = 0; i < export_count; i++) {
+            if (export_registry[i].orig_pid == orig_pid) {
+                if (slot < MAX_FDS && export_registry[i].remote_files[slot]) {
+                    file = export_registry[i].remote_files[slot];
+                    get_file(file); 
+                }
+                break;
+            }
+        }
+        spin_unlock(&export_lock);
+    } else if (remote_fd >= 0) {
+        // Native Deputy FD!
+        struct task_struct *deputy = NULL;
+        rcu_read_lock();
+        deputy = pid_task(find_vpid(orig_pid), PIDTYPE_PID);
+        if (deputy) get_task_struct(deputy);
+        rcu_read_unlock();
+
+        if (deputy) {
+            if (deputy->files) {
+                spin_lock(&deputy->files->file_lock);
+                struct fdtable *fdt = files_fdtable(deputy->files);
+                if (remote_fd < fdt->max_fds) {
+                    file = rcu_dereference_raw(fdt->fd[remote_fd]);
+                    if (file) get_file(file); 
+                }
+                spin_unlock(&deputy->files->file_lock);
+            }
+            put_task_struct(deputy);
+        }
+    }
+    return file;
+}
+
+
+// --- THE DEPUTY HIJACK: SOCKET ---
+struct mattx_socket_ctx {
+    struct callback_head cb;
+    struct mattx_sys_socket_req req;
+    int target_node;
+};
+
+static void mattx_socket_cb(struct callback_head *cb) {
+    struct mattx_socket_ctx *ctx = container_of(cb, struct mattx_socket_ctx, cb);
+    struct pt_regs regs;
+    int ret = -ENOSYS;
+    struct mattx_sys_socket_reply reply;
+
+    memset(&regs, 0, sizeof(regs));
+    regs.di = ctx->req.domain;
+    regs.si = ctx->req.type;
+    regs.dx = ctx->req.protocol;
+
+    if (real_sys_socket) {
+        ret = real_sys_socket(&regs);
+        mattx_dbg("[HIJACK] Deputy executed socket natively. Result FD: %d\n", ret);
+    }
+
+    reply.orig_pid = ctx->req.orig_pid;
+    reply.remote_fd = (ret >= 0) ? ret : -1;
+    reply.error = (ret < 0) ? ret : 0;
+
+    if (cluster_map[ctx->target_node]) {
+        mattx_comm_send(cluster_map[ctx->target_node], MATTX_MSG_SYS_SOCKET_REPLY, &reply, sizeof(reply));
+    }
+
+    kfree(ctx);
+    set_current_state(TASK_STOPPED);
+    schedule();
+}
+
 static void handle_sys_socket_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
     if (payload) {
-        struct mattx_sys_socket_req *req = (struct mattx_sys_socket_req *)payload;
-        struct mattx_sys_socket_reply reply;
-        struct socket *sock = NULL;
+        struct mattx_sys_socket_req *req = payload;
         struct task_struct *deputy = NULL;
-        int remote_fd = -1;
-        int i, j;
-
-        mattx_dbg("[NETWORK] Received SOCKET request from Node %u (domain: %d, type: %d, protocol: %d)\n", 
-               hdr->sender_id, req->domain, req->type, req->protocol);
 
         rcu_read_lock();
         deputy = pid_task(find_vpid(req->orig_pid), PIDTYPE_PID);
@@ -1101,125 +1205,253 @@ static void handle_sys_socket_req(struct mattx_link *link, struct mattx_header *
         rcu_read_unlock();
 
         if (deputy) {
-            const struct cred *old_cred;
-            if (deputy->mm) kthread_use_mm(deputy->mm);
-            old_cred = override_creds(deputy->cred);
-
-            // Create the real socket on VM1
-            int err = sock_create(req->domain, req->type, req->protocol, &sock);
-            
-            revert_creds(old_cred);
-            if (deputy->mm) kthread_unuse_mm(deputy->mm);
-
-            if (err < 0) {
-                printk(KERN_ERR "MattX:[NETWORK] Failed to create socket on Home Node (err: %d)\n", err);
-                reply.error = err;
-            } else {
-                // Map the newly created socket to a file and store it in the export registry
-                struct file *filp = sock_alloc_file(sock, 0, NULL);
-                if (IS_ERR(filp)) {
-                    sock_release(sock);
-                    reply.error = PTR_ERR(filp);
-                } else {
-                    spin_lock(&export_lock);
-                    for (i = 0; i < export_count; i++) {
-                        if (export_registry[i].orig_pid == req->orig_pid) {
-                            for (j = 0; j < MAX_FDS; j++) {
-                                if (export_registry[i].remote_files[j] == NULL) {
-                                    export_registry[i].remote_files[j] = filp;
-                                    remote_fd = j + 1000; 
-                                    break;
-                                }
-                            }
-                            break;
-                        }
-                    }
-                    spin_unlock(&export_lock);
-                    
-                    if (remote_fd == -1) {
-                        fput(filp); 
-                        reply.error = -ENFILE;
-                    } else {
-                        reply.error = 0;
-                    }
-                }
+            struct mattx_socket_ctx *ctx = kmalloc(sizeof(*ctx), GFP_KERNEL);
+            if (ctx) {
+                memcpy(&ctx->req, req, sizeof(*req));
+                ctx->target_node = hdr->sender_id;
+                
+                init_task_work(&ctx->cb, mattx_socket_cb);
+                if (real_task_work_add) {
+                    real_task_work_add(deputy, &ctx->cb, TWA_SIGNAL);
+                    send_sig(SIGCONT, deputy, 0);
+                } else { kfree(ctx); }
             }
             put_task_struct(deputy);
-        } else {
-            reply.error = -ESRCH;
+        }
+    }
+}
+
+
+
+// --- THE SMART CONNECTOR: Blocking Waiter ---
+struct mattx_connect_wait_ctx {
+    struct work_struct work;
+    u32 orig_pid;
+    int fd; // Native FD on the Deputy
+    int target_node;
+};
+
+static void mattx_connect_wait_worker(struct work_struct *work) {
+    struct mattx_connect_wait_ctx *ctx = container_of(work, struct mattx_connect_wait_ctx, work);
+    struct mattx_sys_connect_reply reply;
+    struct file *file = NULL;
+    struct task_struct *deputy = NULL;
+    int err = -EBADF;
+
+    mattx_dbg("[CONNECT_DEBUG] Kworker started for PID %u, Native FD %d\n", ctx->orig_pid, ctx->fd);
+
+    memset(&reply, 0, sizeof(reply));
+    reply.orig_pid = ctx->orig_pid;
+
+    // 1. Safely get the file from the Deputy's Native FD table
+    rcu_read_lock();
+    deputy = pid_task(find_vpid(ctx->orig_pid), PIDTYPE_PID);
+    if (deputy) get_task_struct(deputy);
+    rcu_read_unlock();
+
+    if (deputy) {
+        if (deputy->files) {
+            spin_lock(&deputy->files->file_lock);
+            struct fdtable *fdt = files_fdtable(deputy->files);
+            if (ctx->fd < fdt->max_fds) {
+                file = rcu_dereference_raw(fdt->fd[ctx->fd]);
+                if (file) get_file(file);
+            }
+            spin_unlock(&deputy->files->file_lock);
+        }
+        put_task_struct(deputy);
+    }
+
+    if (file) {
+        mattx_dbg("[CONNECT_DEBUG] Successfully retrieved struct file for FD %d. Entering poll loop...\n", ctx->fd);
+        
+        // 2. Wait for the TCP Handshake to finish (EPOLLOUT)
+        while (1) {
+            struct poll_wqueues table;
+            poll_initwait(&table);
+            __poll_t mask = vfs_poll(file, &table.pt);
+            
+            mattx_dbg("[CONNECT_DEBUG] vfs_poll returned mask: 0x%x\n", mask);
+
+            if (mask & (EPOLLOUT | EPOLLERR | EPOLLHUP)) {
+                mattx_dbg("[CONNECT_DEBUG] Socket is ready! Breaking poll loop.\n");
+                poll_freewait(&table);
+                break;
+            }
+            
+            schedule_timeout_interruptible(msecs_to_jiffies(50));
+            poll_freewait(&table);
         }
 
-        reply.orig_pid = req->orig_pid;
-        reply.remote_fd = remote_fd;
+        // 3. Check the socket error state to see if it succeeded!
+        struct socket *sock = sock_from_file(file);
+        if (sock && sock->sk) {
+            err = sock_error(sock->sk);
+            mattx_dbg("[CONNECT_DEBUG] sock_error returned: %d\n", err);
+            if (err) err = -err; // sock_error returns positive codes, we need negative!
+        } else {
+            mattx_dbg("[CONNECT_DEBUG] ERROR: Could not extract socket from file!\n");
+            err = -ENOTSOCK;
+        }
+        fput(file);
+    } else {
+        mattx_dbg("[CONNECT_DEBUG] ERROR: Could not find file for FD %d in Deputy!\n", ctx->fd);
+    }
 
-        if (cluster_map[hdr->sender_id]) {
-            mattx_comm_send(cluster_map[hdr->sender_id], MATTX_MSG_SYS_SOCKET_REPLY, &reply, sizeof(reply));
+    reply.error = err;
+    mattx_dbg("[CONNECT_DEBUG] Sending CONNECT_REPLY to Node %d with Error: %d\n", ctx->target_node, err);
+    
+    if (cluster_map[ctx->target_node]) {
+        mattx_comm_send(cluster_map[ctx->target_node], MATTX_MSG_SYS_CONNECT_REPLY, &reply, sizeof(reply));
+    }
+    kfree(ctx);
+}
+
+
+// --- THE DEPUTY HIJACK: BIND & CONNECT ---
+struct mattx_net_setup_ctx {
+    struct callback_head cb;
+    u32 orig_pid;
+    int fd;
+    struct sockaddr_storage addr;
+    int addrlen;
+    int target_node;
+    bool is_connect;
+};
+
+
+static void mattx_net_setup_cb(struct callback_head *cb) {
+    struct mattx_net_setup_ctx *ctx = container_of(cb, struct mattx_net_setup_ctx, cb);
+    struct pt_regs *task_regs = task_pt_regs(current);
+    struct pt_regs regs;
+    int ret = -EFAULT;
+    struct mattx_sys_connect_reply reply; 
+    bool is_nonblock = false;
+
+    // --- CHECK NATIVE FLAGS ---
+    // We check if the socket is non-blocking natively on the Deputy!
+    struct file *f = fget(ctx->fd);
+    if (f) {
+        is_nonblock = (f->f_flags & O_NONBLOCK) != 0;
+        fput(f);
+    }
+
+    unsigned long user_ptr = task_regs->sp - 128 - ctx->addrlen;
+
+    if (copy_to_user((void __user *)user_ptr, &ctx->addr, ctx->addrlen) == 0) {
+        memset(&regs, 0, sizeof(regs));
+        regs.di = ctx->fd;
+        regs.si = user_ptr;
+        regs.dx = ctx->addrlen;
+
+        if (ctx->is_connect && real_sys_connect) {
+            ret = real_sys_connect(&regs);
+            if (ret == -ERESTARTSYS) ret = -EINPROGRESS;
+            mattx_dbg("[HIJACK] Deputy executed connect natively. Result: %d (NonBlock: %d)\n", ret, is_nonblock);
+        } else if (!ctx->is_connect && real_sys_bind) {
+            ret = real_sys_bind(&regs);
+            mattx_dbg("[HIJACK] Deputy executed bind natively. Result: %d\n", ret);
+        }
+    }
+
+    // --- THE SMART CONNECTOR ---
+    // If it's a blocking socket and the handshake is in progress, hand it to the Kworker!
+    if (ctx->is_connect && ret == -EINPROGRESS && !is_nonblock) {
+        mattx_dbg("[CONNECT_DEBUG] Blocking connect returned -EINPROGRESS. Spawning Kworker...\n");
+        struct mattx_connect_wait_ctx *wait_ctx = kmalloc(sizeof(*wait_ctx), GFP_KERNEL);
+        if (wait_ctx) {
+            wait_ctx->orig_pid = ctx->orig_pid;
+            wait_ctx->fd = ctx->fd;
+            wait_ctx->target_node = ctx->target_node;
+            
+            INIT_WORK(&wait_ctx->work, mattx_connect_wait_worker);
+            schedule_work(&wait_ctx->work);
+            
+            kfree(ctx);
+            set_current_state(TASK_STOPPED);
+            schedule();
+            return; // Exit early! The Kworker will send the reply!
+        } else {
+            mattx_dbg("[CONNECT_DEBUG] ERROR: Failed to allocate Kworker context!\n");
+            ret = -ENOMEM;
+        }
+    }
+
+    reply.orig_pid = ctx->orig_pid;
+    reply.error = ret;
+    if (cluster_map[ctx->target_node]) {
+        u32 msg_type = ctx->is_connect ? MATTX_MSG_SYS_CONNECT_REPLY : MATTX_MSG_SYS_BIND_REPLY;
+        mattx_comm_send(cluster_map[ctx->target_node], msg_type, &reply, sizeof(reply));
+    }
+
+    kfree(ctx);
+    set_current_state(TASK_STOPPED);
+    schedule();
+}
+
+
+static void handle_sys_bind_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    if (payload) {
+        struct mattx_sys_bind_req *req = payload;
+        struct task_struct *deputy = NULL;
+
+        rcu_read_lock();
+        deputy = pid_task(find_vpid(req->orig_pid), PIDTYPE_PID);
+        if (deputy) get_task_struct(deputy);
+        rcu_read_unlock();
+
+        if (deputy) {
+            struct mattx_net_setup_ctx *ctx = kmalloc(sizeof(*ctx), GFP_KERNEL);
+            if (ctx) {
+                ctx->orig_pid = req->orig_pid;
+                ctx->fd = req->fd;
+                ctx->addrlen = req->addrlen;
+                memcpy(&ctx->addr, &req->addr, req->addrlen);
+                ctx->target_node = hdr->sender_id;
+                ctx->is_connect = false;
+                
+                init_task_work(&ctx->cb, mattx_net_setup_cb);
+                if (real_task_work_add) {
+                    real_task_work_add(deputy, &ctx->cb, TWA_SIGNAL);
+                    send_sig(SIGCONT, deputy, 0);
+                } else { kfree(ctx); }
+            }
+            put_task_struct(deputy);
         }
     }
 }
 
 static void handle_sys_connect_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
     if (payload) {
-        struct mattx_sys_connect_req *req = (struct mattx_sys_connect_req *)payload;
-        struct mattx_sys_connect_reply reply;
+        struct mattx_sys_connect_req *req = payload;
         struct task_struct *deputy = NULL;
-        struct file *file = NULL;
-        int i;
 
-        reply.orig_pid = req->orig_pid;
-        reply.error = -EBADF;
+        rcu_read_lock();
+        deputy = pid_task(find_vpid(req->orig_pid), PIDTYPE_PID);
+        if (deputy) get_task_struct(deputy);
+        rcu_read_unlock();
 
-        mattx_dbg("[NETWORK] Received CONNECT request for FD %u from Node %u\n", req->fd, hdr->sender_id);
-
-        if (req->fd >= 1000) {
-            int slot = req->fd - 1000;
-            spin_lock(&export_lock);
-            for (i = 0; i < export_count; i++) {
-                if (export_registry[i].orig_pid == req->orig_pid) {
-                    if (slot < MAX_FDS && export_registry[i].remote_files[slot]) {
-                        file = export_registry[i].remote_files[slot];
-                        get_file(file); 
-                    }
-                    break;
-                }
-            }
-            spin_unlock(&export_lock);
-        }
-
-        if (file) {
-            struct socket *sock = sock_from_file(file);
-            if (sock) {
-                const struct cred *old_cred = NULL;
+        if (deputy) {
+            struct mattx_net_setup_ctx *ctx = kmalloc(sizeof(*ctx), GFP_KERNEL);
+            if (ctx) {
+                ctx->orig_pid = req->orig_pid;
+                ctx->fd = req->fd;
+                ctx->addrlen = req->addrlen;
+                memcpy(&ctx->addr, &req->addr, req->addrlen);
+                ctx->target_node = hdr->sender_id;
+                ctx->is_connect = true;
                 
-                rcu_read_lock();
-                deputy = pid_task(find_vpid(req->orig_pid), PIDTYPE_PID);
-                if (deputy) get_task_struct(deputy);
-                rcu_read_unlock();
-
-                if (deputy) {
-                    if (deputy->mm) kthread_use_mm(deputy->mm);
-                    old_cred = override_creds(deputy->cred);
-                }
-
-                // Execute the connect operation on the real socket!
-                reply.error = sock->ops->connect(sock, MATTX_SA_CAST(&req->addr), req->addrlen, file->f_flags);
-
-                if (deputy) {
-                    revert_creds(old_cred);
-                    if (deputy->mm) kthread_unuse_mm(deputy->mm);
-                    put_task_struct(deputy);
-                }
-            } else {
-                reply.error = -ENOTSOCK;
+                init_task_work(&ctx->cb, mattx_net_setup_cb);
+                if (real_task_work_add) {
+                    real_task_work_add(deputy, &ctx->cb, TWA_SIGNAL);
+                    send_sig(SIGCONT, deputy, 0);
+                } else { kfree(ctx); }
             }
-            fput(file); 
-        }
-        
-        if (cluster_map[hdr->sender_id]) {
-            mattx_comm_send(cluster_map[hdr->sender_id], MATTX_MSG_SYS_CONNECT_REPLY, &reply, sizeof(reply));
+            put_task_struct(deputy);
         }
     }
 }
+
 
 static void handle_sys_lseek_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
     if (payload) {
@@ -1366,129 +1598,67 @@ static void handle_sys_connect_reply(struct mattx_link *link, struct mattx_heade
     }
 }
 
-static void handle_sys_bind_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
-    if (payload) {
-        struct mattx_sys_bind_req *req = (struct mattx_sys_bind_req *)payload;
-        struct mattx_sys_bind_reply reply;
-        struct task_struct *deputy = NULL;
-        struct file *file = NULL;
-        int i;
 
-        reply.orig_pid = req->orig_pid;
-        reply.error = -EBADF;
+// --- THE DEPUTY HIJACK: LISTEN ---
+struct mattx_listen_ctx {
+    struct callback_head cb;
+    struct mattx_sys_listen_req req;
+    int target_node;
+};
 
-        mattx_dbg("[NETWORK] Received BIND request for FD %u from Node %u\n", req->fd, hdr->sender_id);
+static void mattx_listen_cb(struct callback_head *cb) {
+    struct mattx_listen_ctx *ctx = container_of(cb, struct mattx_listen_ctx, cb);
+    struct pt_regs regs;
+    int ret = -ENOSYS;
+    struct mattx_sys_listen_reply reply;
 
-        if (req->fd >= 1000) {
-            int slot = req->fd - 1000;
-            spin_lock(&export_lock);
-            for (i = 0; i < export_count; i++) {
-                if (export_registry[i].orig_pid == req->orig_pid) {
-                    if (slot < MAX_FDS && export_registry[i].remote_files[slot]) {
-                        file = export_registry[i].remote_files[slot];
-                        get_file(file); 
-                    }
-                    break;
-                }
-            }
-            spin_unlock(&export_lock);
-        }
+    memset(&regs, 0, sizeof(regs));
+    regs.di = ctx->req.fd;
+    regs.si = ctx->req.backlog;
 
-        if (file) {
-            struct socket *sock = sock_from_file(file);
-            if (sock && sock->ops && sock->ops->bind) {
-                const struct cred *old_cred = NULL;
-                
-                rcu_read_lock();
-                deputy = pid_task(find_vpid(req->orig_pid), PIDTYPE_PID);
-                if (deputy) get_task_struct(deputy);
-                rcu_read_unlock();
-
-                if (deputy) {
-                    if (deputy->mm) kthread_use_mm(deputy->mm);
-                    old_cred = override_creds(deputy->cred);
-                }
-
-                reply.error = sock->ops->bind(sock, MATTX_SA_CAST(&req->addr), req->addrlen);
-
-                if (deputy) {
-                    revert_creds(old_cred);
-                    if (deputy->mm) kthread_unuse_mm(deputy->mm);
-                    put_task_struct(deputy);
-                }
-            } else {
-                reply.error = -ENOTSOCK;
-            }
-            fput(file); 
-        }
-        
-        if (cluster_map[hdr->sender_id]) {
-            mattx_comm_send(cluster_map[hdr->sender_id], MATTX_MSG_SYS_BIND_REPLY, &reply, sizeof(reply));
-        }
+    if (real_sys_listen) {
+        ret = real_sys_listen(&regs);
+        mattx_dbg("[HIJACK] Deputy executed listen natively. Result: %d\n", ret);
     }
+
+    reply.orig_pid = ctx->req.orig_pid;
+    reply.error = ret;
+    if (cluster_map[ctx->target_node]) {
+        mattx_comm_send(cluster_map[ctx->target_node], MATTX_MSG_SYS_LISTEN_REPLY, &reply, sizeof(reply));
+    }
+
+    kfree(ctx);
+    set_current_state(TASK_STOPPED);
+    schedule();
 }
 
 static void handle_sys_listen_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
     if (payload) {
-        struct mattx_sys_listen_req *req = (struct mattx_sys_listen_req *)payload;
-        struct mattx_sys_listen_reply reply;
+        struct mattx_sys_listen_req *req = payload;
         struct task_struct *deputy = NULL;
-        struct file *file = NULL;
-        int i;
 
-        reply.orig_pid = req->orig_pid;
-        reply.error = -EBADF;
+        rcu_read_lock();
+        deputy = pid_task(find_vpid(req->orig_pid), PIDTYPE_PID);
+        if (deputy) get_task_struct(deputy);
+        rcu_read_unlock();
 
-        mattx_dbg("[NETWORK] Received LISTEN request for FD %u from Node %u\n", req->fd, hdr->sender_id);
-
-        if (req->fd >= 1000) {
-            int slot = req->fd - 1000;
-            spin_lock(&export_lock);
-            for (i = 0; i < export_count; i++) {
-                if (export_registry[i].orig_pid == req->orig_pid) {
-                    if (slot < MAX_FDS && export_registry[i].remote_files[slot]) {
-                        file = export_registry[i].remote_files[slot];
-                        get_file(file); 
-                    }
-                    break;
-                }
-            }
-            spin_unlock(&export_lock);
-        }
-
-        if (file) {
-            struct socket *sock = sock_from_file(file);
-            if (sock && sock->ops && sock->ops->listen) {
-                const struct cred *old_cred = NULL;
+        if (deputy) {
+            struct mattx_listen_ctx *ctx = kmalloc(sizeof(*ctx), GFP_KERNEL);
+            if (ctx) {
+                memcpy(&ctx->req, req, sizeof(*req));
+                ctx->target_node = hdr->sender_id;
                 
-                rcu_read_lock();
-                deputy = pid_task(find_vpid(req->orig_pid), PIDTYPE_PID);
-                if (deputy) get_task_struct(deputy);
-                rcu_read_unlock();
-
-                if (deputy) {
-                    if (deputy->mm) kthread_use_mm(deputy->mm);
-                    old_cred = override_creds(deputy->cred);
-                }
-
-                reply.error = sock->ops->listen(sock, req->backlog);
-
-                if (deputy) {
-                    revert_creds(old_cred);
-                    if (deputy->mm) kthread_unuse_mm(deputy->mm);
-                    put_task_struct(deputy);
-                }
-            } else {
-                reply.error = -ENOTSOCK;
+                init_task_work(&ctx->cb, mattx_listen_cb);
+                if (real_task_work_add) {
+                    real_task_work_add(deputy, &ctx->cb, TWA_SIGNAL);
+                    send_sig(SIGCONT, deputy, 0);
+                } else { kfree(ctx); }
             }
-            fput(file); 
-        }
-        
-        if (cluster_map[hdr->sender_id]) {
-            mattx_comm_send(cluster_map[hdr->sender_id], MATTX_MSG_SYS_LISTEN_REPLY, &reply, sizeof(reply));
+            put_task_struct(deputy);
         }
     }
 }
+
 
 static void handle_sys_generic_int_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
     // We can reuse this logic for bind, listen, connect, fsync since they all return an integer
@@ -1514,163 +1684,165 @@ static void handle_sys_generic_int_reply(struct mattx_link *link, struct mattx_h
     }
 }
 
-static void handle_sys_send_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
-    if (payload) {
-        struct mattx_sys_send_req *req = (struct mattx_sys_send_req *)payload;
-        struct mattx_sys_send_reply reply;
-        struct task_struct *deputy = NULL;
-        struct file *file = NULL;
-        int i;
 
-        reply.orig_pid = req->orig_pid;
-        reply.bytes_sent = -EBADF;
-        reply.error = -EBADF;
+// --- THE DEPUTY HIJACK: SENDTO ---
+struct mattx_sendto_ctx {
+    struct callback_head cb;
+    u32 orig_pid;
+    int fd;
+    int flags;
+    size_t len;
+    int target_node;
+    char data[]; // Flexible array for the payload!
+};
 
-        if (req->fd >= 1000) {
-            int slot = req->fd - 1000;
-            spin_lock(&export_lock);
-            for (i = 0; i < export_count; i++) {
-                if (export_registry[i].orig_pid == req->orig_pid) {
-                    if (slot < MAX_FDS && export_registry[i].remote_files[slot]) {
-                        file = export_registry[i].remote_files[slot];
-                        get_file(file); 
-                    }
-                    break;
-                }
-            }
-            spin_unlock(&export_lock);
-        }
+static void mattx_sendto_cb(struct callback_head *cb) {
+    struct mattx_sendto_ctx *ctx = container_of(cb, struct mattx_sendto_ctx, cb);
+    struct pt_regs *task_regs = task_pt_regs(current);
+    struct pt_regs regs;
+    int ret = -EFAULT;
+    struct mattx_sys_send_reply reply;
 
-        if (file) {
-            struct socket *sock = sock_from_file(file);
-            if (sock) {
-                struct msghdr msg = {0};
-                struct kvec iov;
-                const struct cred *old_cred = NULL;
+    unsigned long user_ptr = task_regs->sp - 128 - ctx->len;
 
-                rcu_read_lock();
-                deputy = pid_task(find_vpid(req->orig_pid), PIDTYPE_PID);
-                if (deputy) get_task_struct(deputy);
-                rcu_read_unlock();
+    if (copy_to_user((void __user *)user_ptr, ctx->data, ctx->len) == 0) {
+        memset(&regs, 0, sizeof(regs));
+        regs.di = ctx->fd;
+        regs.si = user_ptr;
+        regs.dx = ctx->len;
+        regs.r10 = ctx->flags; // 4th arg is flags
+        regs.r8 = 0; // 5th arg (addr) is NULL for now
+        regs.r9 = 0; // 6th arg (addrlen) is 0
 
-                if (deputy) {
-                    if (deputy->mm) kthread_use_mm(deputy->mm);
-                    old_cred = override_creds(deputy->cred);
-                }
-
-                iov.iov_base = req->data;
-                iov.iov_len = req->len;
-                
-                reply.bytes_sent = kernel_sendmsg(sock, &msg, &iov, 1, req->len);
-                reply.error = (reply.bytes_sent < 0) ? reply.bytes_sent : 0;
-
-                if (deputy) {
-                    revert_creds(old_cred);
-                    if (deputy->mm) kthread_unuse_mm(deputy->mm);
-                    put_task_struct(deputy);
-                }
-            } else {
-                reply.bytes_sent = -ENOTSOCK;
-                reply.error = -ENOTSOCK;
-            }
-            fput(file);
-        }
-
-        if (cluster_map[hdr->sender_id]) {
-            mattx_comm_send(cluster_map[hdr->sender_id], MATTX_MSG_SYS_SEND_REPLY, &reply, sizeof(reply));
+        if (real_sys_sendto) {
+            ret = real_sys_sendto(&regs);
         }
     }
+
+    reply.orig_pid = ctx->orig_pid;
+    reply.bytes_sent = ret;
+    reply.error = (ret < 0) ? ret : 0;
+
+    if (cluster_map[ctx->target_node]) {
+        mattx_comm_send(cluster_map[ctx->target_node], MATTX_MSG_SYS_SEND_REPLY, &reply, sizeof(reply));
+    }
+
+    kfree(ctx);
+    set_current_state(TASK_STOPPED);
+    schedule();
+}
+
+static void handle_sys_send_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    if (payload) {
+        struct mattx_sys_send_req *req = payload;
+        struct task_struct *deputy = NULL;
+
+        rcu_read_lock();
+        deputy = pid_task(find_vpid(req->orig_pid), PIDTYPE_PID);
+        if (deputy) get_task_struct(deputy);
+        rcu_read_unlock();
+
+        if (deputy) {
+            struct mattx_sendto_ctx *ctx = kmalloc(sizeof(*ctx) + req->len, GFP_KERNEL);
+            if (ctx) {
+                ctx->orig_pid = req->orig_pid;
+                ctx->fd = req->fd;
+                ctx->flags = req->flags;
+                ctx->len = req->len;
+                ctx->target_node = hdr->sender_id;
+                memcpy(ctx->data, req->data, req->len);
+                
+                init_task_work(&ctx->cb, mattx_sendto_cb);
+                if (real_task_work_add) {
+                    real_task_work_add(deputy, &ctx->cb, TWA_SIGNAL);
+                    send_sig(SIGCONT, deputy, 0);
+                } else { kfree(ctx); }
+            }
+            put_task_struct(deputy);
+        }
+    }
+}
+
+
+// --- THE DEPUTY HIJACK: RECVFROM ---
+struct mattx_recvfrom_ctx {
+    struct callback_head cb;
+    struct mattx_sys_recv_req req;
+    int target_node;
+};
+
+static void mattx_recvfrom_cb(struct callback_head *cb) {
+    struct mattx_recvfrom_ctx *ctx = container_of(cb, struct mattx_recvfrom_ctx, cb);
+    struct pt_regs *task_regs = task_pt_regs(current);
+    struct pt_regs regs;
+    int ret = -EFAULT;
+
+    unsigned long user_ptr = task_regs->sp - 128 - ctx->req.size;
+
+    memset(&regs, 0, sizeof(regs));
+    regs.di = ctx->req.fd;
+    regs.si = user_ptr;
+    regs.dx = ctx->req.size;
+    regs.r10 = ctx->req.flags;
+    regs.r8 = 0;
+    regs.r9 = 0;
+
+    if (real_sys_recvfrom) {
+        ret = real_sys_recvfrom(&regs);
+    }
+
+    size_t reply_size = sizeof(struct mattx_sys_recv_reply) + (ret > 0 ? ret : 0);
+    struct mattx_sys_recv_reply *reply = kzalloc(reply_size, GFP_KERNEL);
+    
+    if (reply) {
+        reply->orig_pid = ctx->req.orig_pid;
+        reply->bytes_recv = ret;
+        reply->error = (ret < 0) ? ret : 0;
+
+        if (ret > 0) {
+            if (copy_from_user(reply->data, (void __user *)user_ptr, ret)) {
+                mattx_dbg("[HIJACK] Warning: Failed to copy recvfrom data from user scratchpad!\n");
+            }
+        }
+
+        if (cluster_map[ctx->target_node]) {
+            mattx_comm_send(cluster_map[ctx->target_node], MATTX_MSG_SYS_RECV_REPLY, reply, reply_size);
+        }
+        kfree(reply);
+    }
+
+    kfree(ctx);
+    set_current_state(TASK_STOPPED);
+    schedule();
 }
 
 static void handle_sys_recv_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
     if (payload) {
-        struct mattx_sys_recv_req *req = (struct mattx_sys_recv_req *)payload;
+        struct mattx_sys_recv_req *req = payload;
         struct task_struct *deputy = NULL;
-        struct file *file = NULL;
-        int i;
 
-        if (req->fd >= 1000) {
-            int slot = req->fd - 1000;
-            spin_lock(&export_lock);
-            for (i = 0; i < export_count; i++) {
-                if (export_registry[i].orig_pid == req->orig_pid) {
-                    if (slot < MAX_FDS && export_registry[i].remote_files[slot]) {
-                        file = export_registry[i].remote_files[slot];
-                        get_file(file); 
-                    }
-                    break;
-                }
+        rcu_read_lock();
+        deputy = pid_task(find_vpid(req->orig_pid), PIDTYPE_PID);
+        if (deputy) get_task_struct(deputy);
+        rcu_read_unlock();
+
+        if (deputy) {
+            struct mattx_recvfrom_ctx *ctx = kmalloc(sizeof(*ctx), GFP_KERNEL);
+            if (ctx) {
+                memcpy(&ctx->req, req, sizeof(*req));
+                ctx->target_node = hdr->sender_id;
+                
+                init_task_work(&ctx->cb, mattx_recvfrom_cb);
+                if (real_task_work_add) {
+                    real_task_work_add(deputy, &ctx->cb, TWA_SIGNAL);
+                    send_sig(SIGCONT, deputy, 0);
+                } else { kfree(ctx); }
             }
-            spin_unlock(&export_lock);
-        }
-
-        if (file) {
-            struct socket *sock = sock_from_file(file);
-            if (sock) {
-                struct msghdr msg = {0};
-                struct kvec iov;
-                const struct cred *old_cred = NULL;
-                void *recv_buf = kmalloc(req->size, GFP_KERNEL);
-
-                if (recv_buf) {
-                    rcu_read_lock();
-                    deputy = pid_task(find_vpid(req->orig_pid), PIDTYPE_PID);
-                    if (deputy) get_task_struct(deputy);
-                    rcu_read_unlock();
-
-                    if (deputy) {
-                        if (deputy->mm) kthread_use_mm(deputy->mm);
-                        old_cred = override_creds(deputy->cred);
-                    }
-
-                    iov.iov_base = recv_buf;
-                    iov.iov_len = req->size;
-                    
-                    ssize_t ret = kernel_recvmsg(sock, &msg, &iov, 1, req->size, req->flags);
-
-                    if (deputy) {
-                        revert_creds(old_cred);
-                        if (deputy->mm) kthread_unuse_mm(deputy->mm);
-                        put_task_struct(deputy);
-                    }
-
-                    size_t reply_size = sizeof(struct mattx_sys_recv_reply) + (ret > 0 ? ret : 0);
-                    struct mattx_sys_recv_reply *reply = kmalloc(reply_size, GFP_KERNEL);
-                    if (reply) {
-                        reply->orig_pid = req->orig_pid;
-                        reply->bytes_recv = ret;
-                        reply->error = (ret < 0) ? ret : 0;
-                        if (ret > 0) {
-                            memcpy(reply->data, recv_buf, ret);
-                        }
-                        if (cluster_map[hdr->sender_id]) {
-                            mattx_comm_send(cluster_map[hdr->sender_id], MATTX_MSG_SYS_RECV_REPLY, reply, reply_size);
-                        }
-                        kfree(reply);
-                    }
-                    kfree(recv_buf);
-                }
-            } else {
-                struct mattx_sys_recv_reply reply;
-                reply.orig_pid = req->orig_pid;
-                reply.bytes_recv = -ENOTSOCK;
-                reply.error = -ENOTSOCK;
-                if (cluster_map[hdr->sender_id]) {
-                    mattx_comm_send(cluster_map[hdr->sender_id], MATTX_MSG_SYS_RECV_REPLY, &reply, sizeof(reply));
-                }
-            }
-            fput(file);
-        } else {
-            struct mattx_sys_recv_reply reply;
-            reply.orig_pid = req->orig_pid;
-            reply.bytes_recv = -EBADF;
-            reply.error = -EBADF;
-            if (cluster_map[hdr->sender_id]) {
-                mattx_comm_send(cluster_map[hdr->sender_id], MATTX_MSG_SYS_RECV_REPLY, &reply, sizeof(reply));
-            }
+            put_task_struct(deputy);
         }
     }
 }
+
 
 static void handle_sys_recv_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
     if (payload) {
@@ -1708,170 +1880,107 @@ static void handle_sys_recv_reply(struct mattx_link *link, struct mattx_header *
     }
 }
 
-// Background Worker for Accept (Runs on Node 1) ---
-static void mattx_accept_worker(struct work_struct *work) {
-    struct mattx_rpc_work *rpc = container_of(work, struct mattx_rpc_work, work);
+
+// --- THE DEPUTY HIJACK: ACCEPT4 ---
+struct mattx_accept_ctx {
+    struct callback_head cb;
+    struct mattx_sys_accept_req req;
+    int target_node;
+};
+
+static void mattx_accept_cb(struct callback_head *cb) {
+    struct mattx_accept_ctx *ctx = container_of(cb, struct mattx_accept_ctx, cb);
+    struct pt_regs *task_regs = task_pt_regs(current);
+    struct pt_regs regs;
+    int ret = -EFAULT;
     struct mattx_sys_accept_reply reply;
-    struct file *file = NULL;
-    struct task_struct *deputy = NULL;
-    int i, j;
+    sigset_t old_set, block_set;
 
     memset(&reply, 0, sizeof(reply));
-    reply.orig_pid = rpc->orig_pid;
+    reply.orig_pid = ctx->req.orig_pid;
     reply.remote_fd = -EBADF;
     reply.error = -EBADF;
 
-    mattx_dbg("[RPC] Accept Worker started for Deputy PID %u\n", rpc->orig_pid);
+    // --- THE USER-SPACE SCRATCHPAD HACK ---
+    // We need space for a sockaddr_storage (128 bytes) AND an int (4 bytes)
+    unsigned long addr_ptr = task_regs->sp - 128 - sizeof(struct sockaddr_storage) - sizeof(int);
+    unsigned long len_ptr = addr_ptr + sizeof(struct sockaddr_storage);
+    int initial_len = sizeof(struct sockaddr_storage);
 
-    if (rpc->remote_fd >= 1000) {
-        int slot = rpc->remote_fd - 1000;
-        spin_lock(&export_lock);
-        for (i = 0; i < export_count; i++) {
-            if (export_registry[i].orig_pid == rpc->orig_pid) {
-                if (slot < MAX_FDS && export_registry[i].remote_files[slot]) {
-                    file = export_registry[i].remote_files[slot];
-                    get_file(file); 
-                }
-                break;
-            }
-        }
-        spin_unlock(&export_lock);
-    } else {
-        // look up native FDs!
-        rcu_read_lock();
-        deputy = pid_task(find_vpid(rpc->orig_pid), PIDTYPE_PID);
-        if (deputy) get_task_struct(deputy);
-        rcu_read_unlock();
-        
-        if (deputy) {
-            struct files_struct *files = deputy->files;
-            if (files) {
-                spin_lock(&files->file_lock);
-                struct fdtable *fdt = files_fdtable(files);
-                if (rpc->remote_fd < fdt->max_fds) {
-                    file = rcu_dereference_raw(fdt->fd[rpc->remote_fd]);
-                    if (file) get_file(file); 
-                }
-                spin_unlock(&files->file_lock);
-            }
-            put_task_struct(deputy);
-            deputy = NULL; // Reset deputy pointer for the next block!
-        }
-    }
+    // Write the initial length to the scratchpad
+    if (copy_to_user((void __user *)len_ptr, &initial_len, sizeof(int)) == 0) {
+        memset(&regs, 0, sizeof(regs));
+        regs.di = ctx->req.fd;
+        regs.si = addr_ptr;
+        regs.dx = len_ptr;
+        regs.r10 = ctx->req.flags; // accept4 flags
 
-    if (file) {
-        struct socket *sock = sock_from_file(file);
-        if (sock && sock->ops && sock->ops->accept) {
-            const struct cred *old_cred = NULL;
+        // Signal shield for non-blocking accept!
+        sigfillset(&block_set);
+        sigprocmask(SIG_BLOCK, &block_set, &old_set);
+
+        if (real_sys_accept4) {
+            ret = real_sys_accept4(&regs);
+            if (ret == -ERESTARTSYS) ret = -EAGAIN; // Standard non-blocking behavior
+            mattx_dbg("[HIJACK] Deputy executed accept4 natively. Result FD: %d\n", ret);
+        }
+
+        sigprocmask(SIG_SETMASK, &old_set, NULL);
+
+        if (ret >= 0) {
+            reply.remote_fd = ret;
+            reply.error = 0;
             
-            rcu_read_lock();
-            deputy = pid_task(find_vpid(rpc->orig_pid), PIDTYPE_PID);
-            if (deputy) get_task_struct(deputy);
-            rcu_read_unlock();
-
-            if (deputy) {
-                if (deputy->mm) kthread_use_mm(deputy->mm);
-                old_cred = override_creds(deputy->cred);
-            }
-
-            // The Clean Accept ---
-            // We do NOT use sock_create here, because it initializes the internal 'sk' struct.
-            // inet_accept expects a completely blank socket shell!
-            struct socket *newsock = sock_alloc();
-            if (newsock) {
-                struct proto_accept_arg accept_arg = {
-                    .flags = rpc->flags,
-                    .kern = true,
-                };
-                
-                newsock->type = sock->type;
-                newsock->ops = sock->ops;
-                
-                // THIS WILL SAFELY BLOCK UNTIL A CONNECTION ARRIVES!
-                int err = sock->ops->accept(sock, newsock, &accept_arg);
-                if (err == 0) {
-                    if (newsock->ops->getname) {
-                        // Pass 2 instead of 1 to bypass the strict state check!
-                        int addr_len = newsock->ops->getname(newsock, MATTX_SA_CAST(&reply.addr), 2);
-                        // Only save the length if it's a valid positive number!
-                        if (addr_len > 0) {
-                            reply.addrlen = addr_len;
-                        } else {
-                            reply.addrlen = 0;
-                        }
+            // Read back the populated sockaddr and length from the scratchpad!
+            int final_len = 0;
+            if (copy_from_user(&final_len, (void __user *)len_ptr, sizeof(int)) == 0) {
+                if (final_len > 0 && final_len <= sizeof(struct sockaddr_storage)) {
+                    if (copy_from_user(&reply.addr, (void __user *)addr_ptr, final_len) == 0) {
+                        reply.addrlen = final_len;
                     }
-
-                    struct file *newfilp = sock_alloc_file(newsock, 0, NULL);
-                    if (!IS_ERR(newfilp)) {
-                        spin_lock(&export_lock);
-                        for (i = 0; i < export_count; i++) {
-                            if (export_registry[i].orig_pid == rpc->orig_pid) {
-                                for (j = 0; j < MAX_FDS; j++) {
-                                    if (export_registry[i].remote_files[j] == NULL) {
-                                        export_registry[i].remote_files[j] = newfilp;
-                                        reply.remote_fd = j + 1000; 
-                                        reply.error = 0;
-                                        break;
-                                    }
-                                }
-                                break;
-                            }
-                        }
-                        spin_unlock(&export_lock);
-                        
-                        if (reply.remote_fd == -EBADF) {
-                            fput(newfilp);
-                            reply.error = -ENFILE;
-                        }
-                    } else {
-                        sock_release(newsock);
-                        reply.error = PTR_ERR(newfilp);
-                    }
-                } else {
-                    sock_release(newsock);
-                    reply.error = err;
                 }
-            } else {
-                reply.error = -ENOMEM;
-            }
-
-            if (deputy) {
-                revert_creds(old_cred);
-                if (deputy->mm) kthread_unuse_mm(deputy->mm);
-                put_task_struct(deputy);
             }
         } else {
-            reply.error = -ENOTSOCK;
+            reply.error = ret;
         }
-        fput(file); 
     }
 
-    if (cluster_map[rpc->home_node]) {
-        mattx_dbg("[RPC] Sending ACCEPT_REPLY (Remote FD: %d) back to Node %u...\n", reply.remote_fd, rpc->home_node);
-        mattx_comm_send(cluster_map[rpc->home_node], MATTX_MSG_SYS_ACCEPT_REPLY, &reply, sizeof(reply));
+    if (cluster_map[ctx->target_node]) {
+        mattx_comm_send(cluster_map[ctx->target_node], MATTX_MSG_SYS_ACCEPT_REPLY, &reply, sizeof(reply));
     }
-    
-    kfree(rpc);
+
+    kfree(ctx);
+    set_current_state(TASK_STOPPED);
+    schedule();
 }
 
 static void handle_sys_accept_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
     if (payload) {
-        struct mattx_sys_accept_req *req = (struct mattx_sys_accept_req *)payload;
-        
-        mattx_dbg("[RPC] Received ACCEPT request from Node %u. Escaping to Workqueue...\n", hdr->sender_id);
+        struct mattx_sys_accept_req *req = payload;
+        struct task_struct *deputy = NULL;
 
-        // Throw the blocking accept call onto a background worker!
-        struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC);
-        if (rpc) {
-            INIT_WORK(&rpc->work, mattx_accept_worker);
-            rpc->orig_pid = req->orig_pid;
-            rpc->remote_fd = req->fd;
-            rpc->flags = req->flags;
-            rpc->home_node = hdr->sender_id;
-            schedule_work(&rpc->work);
+        rcu_read_lock();
+        deputy = pid_task(find_vpid(req->orig_pid), PIDTYPE_PID);
+        if (deputy) get_task_struct(deputy);
+        rcu_read_unlock();
+
+        if (deputy) {
+            struct mattx_accept_ctx *ctx = kmalloc(sizeof(*ctx), GFP_KERNEL);
+            if (ctx) {
+                memcpy(&ctx->req, req, sizeof(*req));
+                ctx->target_node = hdr->sender_id;
+                
+                init_task_work(&ctx->cb, mattx_accept_cb);
+                if (real_task_work_add) {
+                    real_task_work_add(deputy, &ctx->cb, TWA_SIGNAL);
+                    send_sig(SIGCONT, deputy, 0);
+                } else { kfree(ctx); }
+            }
+            put_task_struct(deputy);
         }
     }
 }
+
 
 static void handle_sys_accept_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
     if (payload) {
@@ -1913,17 +2022,30 @@ static void handle_sys_accept_reply(struct mattx_link *link, struct mattx_header
 }
 
 
+// --- THE TRUE POLL WORKER (Stack Diet Edition) ---
 static void mattx_poll_worker(struct work_struct *work) {
     struct mattx_rpc_work *rpc = container_of(work, struct mattx_rpc_work, work);
-    struct mattx_sys_poll_reply reply;
+    struct mattx_sys_poll_reply *reply;
+    struct file **poll_files;
     int i;
     unsigned long expire;
     bool has_timeout = (rpc->timeout >= 0);
     
-    memset(&reply, 0, sizeof(reply));
-    reply.orig_pid = rpc->orig_pid;
-    reply.nfds = rpc->nfds;
-    memcpy(reply.fds, rpc->poll_fds, sizeof(struct mattx_pollfd) * rpc->nfds);
+    // --- THE STACK DIET FIX ---
+    // Move large structs off the kernel stack and onto the heap!
+    reply = kzalloc(sizeof(*reply), GFP_KERNEL);
+    poll_files = kcalloc(16, sizeof(struct file *), GFP_KERNEL);
+
+    if (!reply || !poll_files) {
+        if (reply) kfree(reply);
+        if (poll_files) kfree(poll_files);
+        kfree(rpc);
+        return;
+    }
+
+    reply->orig_pid = rpc->orig_pid;
+    reply->nfds = rpc->nfds;
+    memcpy(reply->fds, rpc->poll_fds, sizeof(struct mattx_pollfd) * rpc->nfds);
 
     mattx_dbg("[RPC] Poll Worker started for Deputy PID %u (Timeout: %dms)\n", rpc->orig_pid, rpc->timeout);
 
@@ -1931,59 +2053,29 @@ static void mattx_poll_worker(struct work_struct *work) {
         expire = jiffies + msecs_to_jiffies(rpc->timeout);
     }
 
-    // --- THE LAZY POLL LOOP ---
+    // --- THE WAIT QUEUE LOOP ---
     while (1) {
         int ready_count = 0;
         bool deputy_alive = false;
+        
+        // Clear the poll_files array for this iteration
+        memset(poll_files, 0, 16 * sizeof(struct file *));
 
-        // 1. Check if the Deputy is still alive in the export registry!
+// 1. Check if the Deputy is still alive and grab the files!
         spin_lock(&export_lock);
         for (i = 0; i < export_count; i++) {
             if (export_registry[i].orig_pid == rpc->orig_pid) {
                 deputy_alive = true;
-
-                // 2. Check every FD in the array
+                
+                // Standard poll logic (No more epoll Master Watch List!)
                 for (int j = 0; j < rpc->nfds; j++) {
-                    int remote_fd = reply.fds[j].fd;
-                    struct file *f = NULL;
-                    struct task_struct *deputy = NULL;
-
+                    int remote_fd = reply->fds[j].fd;
                     if (remote_fd >= 1000) {
                         int slot = remote_fd - 1000;
                         if (slot < MAX_FDS && export_registry[i].remote_files[slot]) {
-                            f = export_registry[i].remote_files[slot];
-                            get_file(f);
+                            poll_files[j] = export_registry[i].remote_files[slot];
+                            get_file(poll_files[j]); 
                         }
-                    } else if (remote_fd >= 0) {
-                        // Native Deputy FD!
-                        rcu_read_lock();
-                        deputy = pid_task(find_vpid(rpc->orig_pid), PIDTYPE_PID);
-                        if (deputy) get_task_struct(deputy);
-                        rcu_read_unlock();
-
-                        if (deputy) {
-                            struct files_struct *files = deputy->files;
-                            if (files) {
-                                spin_lock(&files->file_lock);
-                                struct fdtable *fdt = files_fdtable(files);
-                                if (remote_fd < fdt->max_fds) {
-                                    f = rcu_dereference_raw(fdt->fd[remote_fd]);
-                                    if (f) get_file(f);
-                                }
-                                spin_unlock(&files->file_lock);
-                            }
-                            put_task_struct(deputy);
-                        }
-                    }
-
-                    if (f) {
-                        // vfs_poll with NULL doesn't sleep, it just returns the current state!
-                        __poll_t mask = vfs_poll(f, NULL);
-                        reply.fds[j].revents = mask & reply.fds[j].events;
-                        if (reply.fds[j].revents) {
-                            ready_count++;
-                        }
-                        fput(f);
                     }
                 }
                 break;
@@ -1992,31 +2084,85 @@ static void mattx_poll_worker(struct work_struct *work) {
         spin_unlock(&export_lock);
 
         if (!deputy_alive) {
-            reply.error = -ESRCH;
+            reply->error = -ESRCH;
             break;
         }
 
+        // 2. Do the actual polling SAFELY OUTSIDE the spinlock!
+        for (int j = 0; j < rpc->nfds; j++) {
+            int remote_fd = reply->fds[j].fd;
+            struct file *f = poll_files[j];
+            struct task_struct *deputy = NULL;
+
+            if (!f && remote_fd >= 0 && remote_fd < 1000) {
+                rcu_read_lock();
+                deputy = pid_task(find_vpid(rpc->orig_pid), PIDTYPE_PID);
+                if (deputy) get_task_struct(deputy);
+                rcu_read_unlock();
+
+                if (deputy) {
+                    struct files_struct *files = deputy->files;
+                    if (files) {
+                        spin_lock(&files->file_lock);
+                        struct fdtable *fdt = files_fdtable(files);
+                        if (remote_fd < fdt->max_fds) {
+                            f = rcu_dereference_raw(fdt->fd[remote_fd]);
+                            if (f) get_file(f);
+                        }
+                        spin_unlock(&files->file_lock);
+                    }
+                    put_task_struct(deputy);
+                }
+            }
+
+            if (f) {
+                struct poll_wqueues table;
+                poll_initwait(&table);
+                
+                __poll_t mask = vfs_poll(f, &table.pt);
+                
+                if (rpc->is_epoll_wait) {
+                    mattx_dbg("[EPOLL_DEBUG] Polled FD %d. Mask returned: %x. Looking for: %x\n", 
+                           remote_fd, mask, reply->fds[j].events);
+                }
+                
+                reply->fds[j].revents = mask & reply->fds[j].events;
+                if (reply->fds[j].revents) {
+                    ready_count++;
+                }
+                
+                poll_freewait(&table);
+                fput(f); 
+            } else {
+                if (rpc->is_epoll_wait) mattx_dbg("[EPOLL_DEBUG] ERROR: Could not find struct file for FD %d!\n", remote_fd);
+            }
+        }
+
         if (ready_count > 0) {
-            reply.retval = ready_count;
+            reply->retval = ready_count;
             break;
         }
 
         if (has_timeout && time_after(jiffies, expire)) {
-            reply.retval = 0; // Timeout reached, 0 FDs ready
+            reply->retval = 0; 
             break;
         }
 
-        // Sleep for 10ms and check again!
-        msleep(10);
+        // Sleep for a tiny fraction of a second to let the CPU breathe, 
+        // but rely on the poll_table to catch the events!
+        schedule_timeout_interruptible(msecs_to_jiffies(10));
     }
 
     if (cluster_map[rpc->home_node]) {
-        mattx_dbg("[RPC] Sending POLL_REPLY (Ready: %d) back to Node %u...\n", reply.retval, rpc->home_node);
-        mattx_comm_send(cluster_map[rpc->home_node], MATTX_MSG_SYS_POLL_REPLY, &reply, sizeof(reply));
+        mattx_dbg("[RPC] Sending POLL_REPLY (Ready: %d) back to Node %u...\n", reply->retval, rpc->home_node);
+        mattx_comm_send_ctrl(cluster_map[rpc->home_node], MATTX_MSG_SYS_POLL_REPLY, reply, sizeof(*reply));
     }
     
+    kfree(reply);
+    kfree(poll_files);
     kfree(rpc);
 }
+
 
 static void handle_sys_poll_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
     if (payload) {
@@ -2064,6 +2210,905 @@ static void handle_sys_poll_reply(struct mattx_link *link, struct mattx_header *
         spin_unlock(&guest_lock);
     }
 }
+
+
+// --- THE DEPUTY HIJACK: Epoll Create ---
+struct mattx_epoll_hijack_ctx {
+    struct callback_head cb;
+    int flags;
+    u32 orig_pid;
+    int target_node;
+};
+
+// This runs INSIDE the Deputy on VM1!
+static void mattx_epoll_hijack_cb(struct callback_head *cb) {
+    struct mattx_epoll_hijack_ctx *ctx = container_of(cb, struct mattx_epoll_hijack_ctx, cb);
+    struct pt_regs regs;
+    int fd = -ENOSYS;
+    struct mattx_sys_epoll_create_reply reply;
+
+    // Build a dummy pt_regs to pass the flags to the x86_64 syscall wrapper
+    memset(&regs, 0, sizeof(regs));
+    regs.di = ctx->flags;
+
+    if (real_sys_epoll_create1) {
+        fd = real_sys_epoll_create1(&regs);
+        mattx_dbg("[HIJACK] Deputy executed epoll_create1 natively. Result FD: %d\n", fd);
+    }
+
+    reply.orig_pid = ctx->orig_pid;
+    reply.remote_fd = fd;
+    reply.error = (fd < 0) ? fd : 0;
+
+    if (cluster_map[ctx->target_node]) {
+        mattx_comm_send(cluster_map[ctx->target_node], MATTX_MSG_SYS_EPOLL_CREATE_REPLY, &reply, sizeof(reply));
+    }
+
+    kfree(ctx);
+    
+    // The Puppet goes back to sleep!
+    set_current_state(TASK_STOPPED);
+    schedule();
+}
+
+static void handle_sys_epoll_create_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    if (payload) {
+        struct mattx_sys_epoll_create_req *req = payload;
+        struct task_struct *deputy = NULL;
+
+        mattx_dbg("[RPC] Received EPOLL_CREATE_REQ from Node %u for PID %u\n", hdr->sender_id, req->orig_pid);
+
+        rcu_read_lock();
+        deputy = pid_task(find_vpid(req->orig_pid), PIDTYPE_PID);
+        if (deputy) get_task_struct(deputy);
+        rcu_read_unlock();
+
+        if (deputy) {
+            struct mattx_epoll_hijack_ctx *ctx = kmalloc(sizeof(*ctx), GFP_KERNEL);
+            if (ctx) {
+                ctx->flags = req->flags;
+                ctx->orig_pid = req->orig_pid;
+                ctx->target_node = hdr->sender_id;
+                
+                init_task_work(&ctx->cb, mattx_epoll_hijack_cb);
+                if (real_task_work_add) {
+                    real_task_work_add(deputy, &ctx->cb, TWA_SIGNAL);
+                    // Nudge the Deputy to wake up and execute our injected code!
+                    send_sig(SIGCONT, deputy, 0);
+                } else {
+                    kfree(ctx);
+                }
+            }
+            put_task_struct(deputy);
+        }
+    }
+}
+
+
+static void handle_sys_epoll_create_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    if (payload) {
+        struct mattx_sys_epoll_create_reply *reply = payload;
+        int i;
+        spin_lock(&guest_lock);
+        for (i = 0; i < guest_count; i++) {
+            if (guest_registry[i].orig_pid == reply->orig_pid && guest_registry[i].home_node == hdr->sender_id) {
+                guest_registry[i].rpc_remote_fd = reply->remote_fd; // Actually save the FD!
+                guest_registry[i].rpc_fsync_res = reply->error;
+                guest_registry[i].rpc_done = true;
+                if (guest_registry[i].rpc_wq) wake_up_interruptible(guest_registry[i].rpc_wq);
+                break;
+            }
+        }
+        spin_unlock(&guest_lock);
+    }
+}
+
+
+// --- THE DEPUTY HIJACK: Epoll Ctl ---
+struct mattx_epoll_ctl_ctx {
+    struct callback_head cb;
+    struct mattx_sys_epoll_ctl_req req;
+    int target_node;
+};
+
+
+static void mattx_epoll_ctl_cb(struct callback_head *cb) {
+    struct mattx_epoll_ctl_ctx *ctx = container_of(cb, struct mattx_epoll_ctl_ctx, cb);
+    struct pt_regs *task_regs = task_pt_regs(current); // We are the Deputy!
+    struct pt_regs regs;
+    int ret = -EFAULT;
+    struct mattx_sys_connect_reply reply; 
+
+    // --- THE USER-SPACE SCRATCHPAD HACK ---
+    // x86_64 has a 128-byte "red zone" below the stack pointer.
+    // We safely allocate space below that to pass our struct!
+    unsigned long user_ptr = task_regs->sp - 128 - sizeof(struct epoll_event);
+
+    // Copy the event struct to the Deputy's user-space stack
+    if (copy_to_user((void __user *)user_ptr, &ctx->req.event, sizeof(struct epoll_event)) == 0) {
+        memset(&regs, 0, sizeof(regs));
+        regs.di = ctx->req.epfd;
+        regs.si = ctx->req.op;
+        regs.dx = ctx->req.fd;
+        regs.r10 = user_ptr; // Pass the perfectly valid USER pointer!
+
+        if (real_sys_epoll_ctl) {
+            ret = real_sys_epoll_ctl(&regs);
+            mattx_dbg("[HIJACK] Deputy executed epoll_ctl natively. Result: %d\n", ret);
+        }
+    }
+
+    reply.orig_pid = ctx->req.orig_pid;
+    reply.error = ret;
+
+    if (cluster_map[ctx->target_node]) {
+        mattx_comm_send(cluster_map[ctx->target_node], MATTX_MSG_SYS_EPOLL_CTL_REPLY, &reply, sizeof(reply));
+    }
+
+    kfree(ctx);
+    set_current_state(TASK_STOPPED);
+    schedule();
+}
+
+
+static void handle_sys_epoll_ctl_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    if (payload) {
+        struct mattx_sys_epoll_ctl_req *req = payload;
+        struct task_struct *deputy = NULL;
+
+        rcu_read_lock();
+        deputy = pid_task(find_vpid(req->orig_pid), PIDTYPE_PID);
+        if (deputy) get_task_struct(deputy);
+        rcu_read_unlock();
+
+        if (deputy) {
+            struct mattx_epoll_ctl_ctx *ctx = kmalloc(sizeof(*ctx), GFP_KERNEL);
+            if (ctx) {
+                memcpy(&ctx->req, req, sizeof(*req));
+                ctx->target_node = hdr->sender_id;
+                
+                init_task_work(&ctx->cb, mattx_epoll_ctl_cb);
+                if (real_task_work_add) {
+                    real_task_work_add(deputy, &ctx->cb, TWA_SIGNAL);
+                    send_sig(SIGCONT, deputy, 0);
+                } else {
+                    kfree(ctx);
+                }
+            }
+            put_task_struct(deputy);
+        }
+    }
+}
+
+// --- THE DEPUTY HIJACK: Epoll Wait ---
+struct mattx_epoll_wait_ctx {
+    struct callback_head cb;
+    struct mattx_sys_epoll_wait_req req;
+    int target_node;
+};
+
+
+static void mattx_epoll_wait_cb(struct callback_head *cb) {
+    struct mattx_epoll_wait_ctx *ctx = container_of(cb, struct mattx_epoll_wait_ctx, cb);
+    struct pt_regs *task_regs = task_pt_regs(current);
+    struct pt_regs regs;
+    int ret = -EFAULT;
+    struct epoll_event *events_buf = NULL;
+    
+    // --- THE USER-SPACE SCRATCHPAD HACK ---
+    size_t alloc_size = ctx->req.maxevents * sizeof(struct epoll_event);
+    unsigned long user_ptr = task_regs->sp - 128 - alloc_size;
+
+    memset(&regs, 0, sizeof(regs));
+    regs.di = ctx->req.epfd;
+    regs.si = user_ptr; // Pass the perfectly valid USER pointer!
+    regs.dx = ctx->req.maxevents;
+    regs.r10 = ctx->req.timeout;
+
+    if (real_sys_epoll_wait) {
+        ret = real_sys_epoll_wait(&regs);
+        mattx_dbg("[HIJACK] Deputy executed epoll_wait natively. Result: %d\n", ret);
+    }
+
+    size_t reply_size = sizeof(struct mattx_sys_epoll_wait_reply) + (ret > 0 ? ret * sizeof(struct epoll_event) : 0);
+    struct mattx_sys_epoll_wait_reply *reply = kzalloc(reply_size, GFP_KERNEL);
+    
+    if (reply) {
+        reply->orig_pid = ctx->req.orig_pid;
+        reply->retval = ret;
+        
+        // Read the results back from the user-space scratchpad!
+        if (ret > 0) {
+            events_buf = kzalloc(alloc_size, GFP_KERNEL);
+            if (events_buf) {
+                if (copy_from_user(events_buf, (void __user *)user_ptr, ret * sizeof(struct epoll_event)) == 0) {
+                    memcpy(reply->events, events_buf, ret * sizeof(struct epoll_event));
+                }
+                kfree(events_buf);
+            }
+        }
+
+        if (cluster_map[ctx->target_node]) {
+            mattx_comm_send(cluster_map[ctx->target_node], MATTX_MSG_SYS_EPOLL_WAIT_REPLY, reply, reply_size);
+        }
+        kfree(reply);
+    }
+
+    kfree(ctx);
+    set_current_state(TASK_STOPPED);
+    schedule();
+}
+
+
+// --- THE HYBRID WAITER: Kworker Wait Queue ---
+static void mattx_epoll_wait_kworker(struct work_struct *work) {
+    struct mattx_rpc_work *rpc = container_of(work, struct mattx_rpc_work, work);
+    struct file *epoll_file = mattx_get_remote_file(rpc->orig_pid, rpc->remote_fd);
+    unsigned long expire = jiffies + msecs_to_jiffies(rpc->timeout_ms);
+    bool has_timeout = (rpc->timeout_ms >= 0);
+    bool ready = false;
+
+    // 1. The Kworker sleeps and waits for the epoll instance to trigger!
+    if (epoll_file) {
+
+        // --- THE WAIT QUEUE LOOP ---
+        while (1) {
+            bool abort = false;
+            
+            // Check the Kill-Switch!
+            spin_lock(&export_lock);
+            for (int k = 0; k < export_count; k++) {
+                if (export_registry[k].orig_pid == rpc->orig_pid) {
+                    abort = export_registry[k].abort_rpc;
+                    break;
+                }
+            }
+            spin_unlock(&export_lock);
+
+            if (abort) {
+                mattx_dbg("[RPC] Kill-Switch activated! Aborting orphaned kworker for PID %d\n", rpc->orig_pid);
+                kfree(rpc);
+                return; // Exit cleanly without touching the Deputy!
+            }
+
+            struct poll_wqueues table;
+            poll_initwait(&table);
+            __poll_t mask = vfs_poll(epoll_file, &table.pt);
+            
+            if (mask & (EPOLLIN | EPOLLERR | EPOLLHUP)) {
+                ready = true;
+                poll_freewait(&table);
+                break;
+            }
+            
+            if (has_timeout && time_after(jiffies, expire)) {
+                poll_freewait(&table);
+                break;
+            }
+            
+            schedule_timeout_interruptible(msecs_to_jiffies(10));
+            poll_freewait(&table);
+        }
+        fput(epoll_file);
+    }
+
+    // 2. The events are ready!
+    // --- THE LATE ABORT SHIELD ---
+    // Check the Kill-Switch ONE LAST TIME before injecting the task_work!
+    // If a Recall happened while we were breaking out of the loop, we must abort!
+    bool late_abort = false;
+    spin_lock(&export_lock);
+    for (int k = 0; k < export_count; k++) {
+        if (export_registry[k].orig_pid == rpc->orig_pid) {
+            late_abort = export_registry[k].abort_rpc;
+            break;
+        }
+    }
+    spin_unlock(&export_lock);
+
+    if (late_abort) {
+        mattx_dbg("[RPC] Late Kill-Switch activated! Aborting orphaned kworker for PID %d\n", rpc->orig_pid);
+        kfree(rpc);
+        return; // Exit cleanly without touching the Deputy!
+    }
+
+    // Inject task_work into the Deputy to grab them instantly!
+    struct task_struct *deputy = NULL;
+    rcu_read_lock();
+    deputy = pid_task(find_vpid(rpc->orig_pid), PIDTYPE_PID);
+    if (deputy) get_task_struct(deputy);
+    rcu_read_unlock();
+
+    if (deputy) {
+        struct mattx_epoll_wait_ctx *ctx = kmalloc(sizeof(*ctx), GFP_KERNEL);
+        if (ctx) {
+            ctx->req.orig_pid = rpc->orig_pid;
+            ctx->req.epfd = rpc->remote_fd;
+            ctx->req.maxevents = rpc->epoll_maxevents;
+            ctx->req.timeout = 0; // INSTANT GRAB! No sleeping, no -EINTR!
+            ctx->target_node = rpc->home_node; 
+            
+            init_task_work(&ctx->cb, mattx_epoll_wait_cb);
+            if (real_task_work_add) {
+                real_task_work_add(deputy, &ctx->cb, TWA_SIGNAL);
+                send_sig(SIGCONT, deputy, 0);
+            } else {
+                kfree(ctx);
+            }
+        }
+        put_task_struct(deputy);
+    } else {
+        // Deputy died while we were waiting!
+        size_t reply_size = sizeof(struct mattx_sys_epoll_wait_reply);
+        struct mattx_sys_epoll_wait_reply *reply = kzalloc(reply_size, GFP_KERNEL);
+        if (reply) {
+            reply->orig_pid = rpc->orig_pid;
+            reply->retval = -ESRCH;
+            if (cluster_map[rpc->home_node]) {
+                mattx_comm_send(cluster_map[rpc->home_node], MATTX_MSG_SYS_EPOLL_WAIT_REPLY, reply, reply_size);
+            }
+            kfree(reply);
+        }
+    }
+    kfree(rpc);
+}
+
+static void handle_sys_epoll_wait_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    if (payload) {
+        struct mattx_sys_epoll_wait_req *req = payload;
+        
+        // Spawn the Kworker to do the waiting so the Deputy stays free!
+        struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC);
+        if (rpc) {
+            INIT_WORK(&rpc->work, mattx_epoll_wait_kworker);
+            rpc->orig_pid = req->orig_pid;
+            rpc->remote_fd = req->epfd;
+            rpc->epoll_maxevents = req->maxevents;
+            rpc->timeout_ms = req->timeout;
+            rpc->home_node = hdr->sender_id; // Target node to send reply to
+            schedule_work(&rpc->work);
+        }
+    }
+}
+
+
+static void handle_sys_epoll_wait_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    if (payload) {
+        struct mattx_sys_epoll_wait_reply *reply = payload;
+        int i;
+
+        spin_lock(&guest_lock);
+        for (i = 0; i < guest_count; i++) {
+            if (guest_registry[i].orig_pid == reply->orig_pid && guest_registry[i].home_node == hdr->sender_id) {
+                guest_registry[i].rpc_fsync_res = reply->retval; 
+                
+                if (reply->retval > 0) {
+                    size_t data_size = reply->retval * sizeof(struct epoll_event);
+                    guest_registry[i].rpc_read_buf = kmalloc(data_size, GFP_ATOMIC);
+                    if (guest_registry[i].rpc_read_buf) {
+                        memcpy(guest_registry[i].rpc_read_buf, reply->events, data_size);
+                    }
+                }
+                
+                guest_registry[i].rpc_done = true;
+                if (guest_registry[i].rpc_wq) wake_up_interruptible(guest_registry[i].rpc_wq);
+                break;
+            }
+        }
+        spin_unlock(&guest_lock);
+    }
+}
+
+
+// --- THE DEPUTY HIJACK: GETSOCKNAME & GETPEERNAME ---
+struct mattx_sockname_ctx {
+    struct callback_head cb;
+    u32 orig_pid;
+    int fd;
+    int target_node;
+    bool is_peer;
+};
+
+static void mattx_sockname_cb(struct callback_head *cb) {
+    struct mattx_sockname_ctx *ctx = container_of(cb, struct mattx_sockname_ctx, cb);
+    struct pt_regs *task_regs = task_pt_regs(current);
+    struct pt_regs regs;
+    int ret = -EFAULT;
+    struct mattx_sys_getsockname_reply reply; // Reuse for both
+
+    memset(&reply, 0, sizeof(reply));
+    reply.orig_pid = ctx->orig_pid;
+
+    unsigned long addr_ptr = task_regs->sp - 128 - sizeof(struct sockaddr_storage) - sizeof(int);
+    unsigned long len_ptr = addr_ptr + sizeof(struct sockaddr_storage);
+    int initial_len = sizeof(struct sockaddr_storage);
+
+    if (copy_to_user((void __user *)len_ptr, &initial_len, sizeof(int)) == 0) {
+        memset(&regs, 0, sizeof(regs));
+        regs.di = ctx->fd;
+        regs.si = addr_ptr;
+        regs.dx = len_ptr;
+
+        if (ctx->is_peer && real_sys_getpeername) {
+            ret = real_sys_getpeername(&regs);
+        } else if (!ctx->is_peer && real_sys_getsockname) {
+            ret = real_sys_getsockname(&regs);
+        }
+
+        if (ret == 0) {
+            int final_len = 0;
+            if (copy_from_user(&final_len, (void __user *)len_ptr, sizeof(int)) == 0) {
+                if (final_len > 0 && final_len <= sizeof(struct sockaddr_storage)) {
+                    if (copy_from_user(&reply.addr, (void __user *)addr_ptr, final_len) == 0) {
+                        reply.addrlen = final_len;
+                    }
+                }
+            }
+        }
+    }
+
+    reply.error = ret;
+    if (cluster_map[ctx->target_node]) {
+        u32 msg_type = ctx->is_peer ? MATTX_MSG_SYS_GETPEERNAME_REPLY : MATTX_MSG_SYS_GETSOCKNAME_REPLY;
+        mattx_comm_send(cluster_map[ctx->target_node], msg_type, &reply, sizeof(reply));
+    }
+
+    kfree(ctx);
+    set_current_state(TASK_STOPPED);
+    schedule();
+}
+
+static void handle_sys_getsockname_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    struct mattx_sys_getsockname_req *req = payload;
+    struct task_struct *deputy = NULL;
+    rcu_read_lock(); deputy = pid_task(find_vpid(req->orig_pid), PIDTYPE_PID); if (deputy) get_task_struct(deputy); rcu_read_unlock();
+    if (deputy) {
+        struct mattx_sockname_ctx *ctx = kmalloc(sizeof(*ctx), GFP_KERNEL);
+        if (ctx) {
+            ctx->orig_pid = req->orig_pid; ctx->fd = req->fd; ctx->target_node = hdr->sender_id; ctx->is_peer = false;
+            init_task_work(&ctx->cb, mattx_sockname_cb);
+            if (real_task_work_add) { real_task_work_add(deputy, &ctx->cb, TWA_SIGNAL); send_sig(SIGCONT, deputy, 0); } else { kfree(ctx); }
+        }
+        put_task_struct(deputy);
+    }
+}
+
+static void handle_sys_getpeername_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    struct mattx_sys_getsockname_req *req = payload; // Same struct layout
+    struct task_struct *deputy = NULL;
+    rcu_read_lock(); deputy = pid_task(find_vpid(req->orig_pid), PIDTYPE_PID); if (deputy) get_task_struct(deputy); rcu_read_unlock();
+    if (deputy) {
+        struct mattx_sockname_ctx *ctx = kmalloc(sizeof(*ctx), GFP_KERNEL);
+        if (ctx) {
+            ctx->orig_pid = req->orig_pid; ctx->fd = req->fd; ctx->target_node = hdr->sender_id; ctx->is_peer = true;
+            init_task_work(&ctx->cb, mattx_sockname_cb);
+            if (real_task_work_add) { real_task_work_add(deputy, &ctx->cb, TWA_SIGNAL); send_sig(SIGCONT, deputy, 0); } else { kfree(ctx); }
+        }
+        put_task_struct(deputy);
+    }
+}
+
+
+// --- THE NATIVE NETWORK REPLIES ---
+static void handle_sys_sockname_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    struct mattx_sys_getsockname_reply *reply = payload;
+    spin_lock(&guest_lock);
+    for (int i = 0; i < guest_count; i++) {
+        if (guest_registry[i].orig_pid == reply->orig_pid && guest_registry[i].home_node == hdr->sender_id) {
+            guest_registry[i].rpc_fsync_res = reply->error;
+            if (reply->error == 0) {
+                // Allocate enough space for the sockaddr AND the integer length!
+                guest_registry[i].rpc_read_buf = kmalloc(sizeof(struct sockaddr_storage) + sizeof(int), GFP_ATOMIC);
+                if (guest_registry[i].rpc_read_buf) {
+                    memcpy(guest_registry[i].rpc_read_buf, &reply->addr, sizeof(struct sockaddr_storage));
+                    memcpy((char *)guest_registry[i].rpc_read_buf + sizeof(struct sockaddr_storage), &reply->addrlen, sizeof(int));
+                }
+            }
+            guest_registry[i].rpc_done = true;
+            break;
+        }
+    }
+    spin_unlock(&guest_lock);
+}
+
+
+// --- THE DEPUTY HIJACK: SETSOCKOPT ---
+struct mattx_setsockopt_ctx {
+    struct callback_head cb;
+    u32 orig_pid;
+    int fd;
+    int level;
+    int optname;
+    int optlen;
+    int target_node;
+    char optval[];
+};
+
+static void mattx_setsockopt_cb(struct callback_head *cb) {
+    struct mattx_setsockopt_ctx *ctx = container_of(cb, struct mattx_setsockopt_ctx, cb);
+    struct pt_regs *task_regs = task_pt_regs(current);
+    struct pt_regs regs;
+    int ret = -EFAULT;
+    struct mattx_sys_setsockopt_reply reply;
+
+    unsigned long user_ptr = task_regs->sp - 128 - ctx->optlen;
+
+    if (copy_to_user((void __user *)user_ptr, ctx->optval, ctx->optlen) == 0) {
+        memset(&regs, 0, sizeof(regs));
+        regs.di = ctx->fd;
+        regs.si = ctx->level;
+        regs.dx = ctx->optname;
+        regs.r10 = user_ptr;
+        regs.r8 = ctx->optlen;
+
+        if (real_sys_setsockopt) ret = real_sys_setsockopt(&regs);
+    }
+
+    reply.orig_pid = ctx->orig_pid;
+    reply.error = ret;
+    if (cluster_map[ctx->target_node]) mattx_comm_send(cluster_map[ctx->target_node], MATTX_MSG_SYS_SETSOCKOPT_REPLY, &reply, sizeof(reply));
+
+    kfree(ctx);
+    set_current_state(TASK_STOPPED);
+    schedule();
+}
+
+static void handle_sys_setsockopt_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    struct mattx_sys_setsockopt_req *req = payload;
+    struct task_struct *deputy = NULL;
+    rcu_read_lock(); deputy = pid_task(find_vpid(req->orig_pid), PIDTYPE_PID); if (deputy) get_task_struct(deputy); rcu_read_unlock();
+    if (deputy) {
+        struct mattx_setsockopt_ctx *ctx = kmalloc(sizeof(*ctx) + req->optlen, GFP_KERNEL);
+        if (ctx) {
+            ctx->orig_pid = req->orig_pid; ctx->fd = req->fd; ctx->level = req->level; ctx->optname = req->optname;
+            ctx->optlen = req->optlen; ctx->target_node = hdr->sender_id; memcpy(ctx->optval, req->optval, req->optlen);
+            init_task_work(&ctx->cb, mattx_setsockopt_cb);
+            if (real_task_work_add) { real_task_work_add(deputy, &ctx->cb, TWA_SIGNAL); send_sig(SIGCONT, deputy, 0); } else { kfree(ctx); }
+        }
+        put_task_struct(deputy);
+    }
+}
+
+// --- THE DEPUTY HIJACK: GETSOCKOPT ---
+struct mattx_getsockopt_ctx {
+    struct callback_head cb;
+    u32 orig_pid;
+    int fd;
+    int level;
+    int optname;
+    int optlen;
+    int target_node;
+};
+
+static void mattx_getsockopt_cb(struct callback_head *cb) {
+    struct mattx_getsockopt_ctx *ctx = container_of(cb, struct mattx_getsockopt_ctx, cb);
+    struct pt_regs *task_regs = task_pt_regs(current);
+    struct pt_regs regs;
+    int ret = -EFAULT;
+
+    unsigned long val_ptr = task_regs->sp - 128 - ctx->optlen - sizeof(int);
+    unsigned long len_ptr = val_ptr + ctx->optlen;
+    int initial_len = ctx->optlen;
+
+    if (copy_to_user((void __user *)len_ptr, &initial_len, sizeof(int)) == 0) {
+        memset(&regs, 0, sizeof(regs));
+        regs.di = ctx->fd;
+        regs.si = ctx->level;
+        regs.dx = ctx->optname;
+        regs.r10 = val_ptr;
+        regs.r8 = len_ptr;
+
+        if (real_sys_getsockopt) ret = real_sys_getsockopt(&regs);
+    }
+
+    size_t reply_size = sizeof(struct mattx_sys_getsockopt_reply) + (ret == 0 ? ctx->optlen : 0);
+    struct mattx_sys_getsockopt_reply *reply = kzalloc(reply_size, GFP_KERNEL);
+    
+    if (reply) {
+        reply->orig_pid = ctx->orig_pid;
+        reply->error = ret;
+        if (ret == 0) {
+            int final_len = 0;
+            if (copy_from_user(&final_len, (void __user *)len_ptr, sizeof(int)) == 0) {
+                reply->optlen = final_len;
+                if (final_len > 0 && final_len <= ctx->optlen) {
+                    // --- FIXED: Appease the compiler warning! ---
+                    if (copy_from_user(reply->optval, (void __user *)val_ptr, final_len)) {
+                        mattx_dbg("[HIJACK] Warning: Failed to copy getsockopt val\n");
+                    }
+                }
+            }
+        }
+        if (cluster_map[ctx->target_node]) mattx_comm_send(cluster_map[ctx->target_node], MATTX_MSG_SYS_GETSOCKOPT_REPLY, reply, reply_size);
+        kfree(reply);
+    }
+
+    kfree(ctx);
+    set_current_state(TASK_STOPPED);
+    schedule();
+}
+
+
+static void handle_sys_getsockopt_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    struct mattx_sys_getsockopt_req *req = payload;
+    struct task_struct *deputy = NULL;
+    rcu_read_lock(); deputy = pid_task(find_vpid(req->orig_pid), PIDTYPE_PID); if (deputy) get_task_struct(deputy); rcu_read_unlock();
+    if (deputy) {
+        struct mattx_getsockopt_ctx *ctx = kmalloc(sizeof(*ctx), GFP_KERNEL);
+        if (ctx) {
+            ctx->orig_pid = req->orig_pid; ctx->fd = req->fd; ctx->level = req->level; ctx->optname = req->optname;
+            ctx->optlen = req->optlen; ctx->target_node = hdr->sender_id;
+            init_task_work(&ctx->cb, mattx_getsockopt_cb);
+            if (real_task_work_add) { real_task_work_add(deputy, &ctx->cb, TWA_SIGNAL); send_sig(SIGCONT, deputy, 0); } else { kfree(ctx); }
+        }
+        put_task_struct(deputy);
+    }
+}
+
+
+static void handle_sys_getsockopt_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    struct mattx_sys_getsockopt_reply *reply = payload;
+    spin_lock(&guest_lock);
+    for (int i = 0; i < guest_count; i++) {
+        if (guest_registry[i].orig_pid == reply->orig_pid && guest_registry[i].home_node == hdr->sender_id) {
+            guest_registry[i].rpc_fsync_res = reply->error;
+            guest_registry[i].rpc_lseek_res = reply->optlen; // Store the length here!
+            if (reply->error == 0 && reply->optlen > 0) {
+                guest_registry[i].rpc_read_buf = kmalloc(reply->optlen, GFP_ATOMIC);
+                if (guest_registry[i].rpc_read_buf) {
+                    memcpy(guest_registry[i].rpc_read_buf, reply->optval, reply->optlen);
+                }
+            }
+            guest_registry[i].rpc_done = true;
+            break;
+        }
+    }
+    spin_unlock(&guest_lock);
+}
+
+
+// --- THE DEPUTY HIJACK: SENDMSG ---
+struct mattx_sendmsg_ctx { struct callback_head cb; struct mattx_sys_sendmsg_req *req; int target_node; };
+
+static void mattx_sendmsg_cb(struct callback_head *cb) {
+    struct mattx_sendmsg_ctx *ctx = container_of(cb, struct mattx_sendmsg_ctx, cb);
+    struct pt_regs *task_regs = task_pt_regs(current);
+    struct pt_regs regs;
+    int ret = -EFAULT;
+    struct mattx_sys_sendmsg_reply reply;
+
+    // --- FIXED: Use user_msghdr for the scratchpad! ---
+    unsigned long data_ptr = task_regs->sp - 128 - ctx->req->datalen;
+    unsigned long addr_ptr = data_ptr - sizeof(struct sockaddr_storage);
+    unsigned long iov_ptr = addr_ptr - sizeof(struct iovec);
+    unsigned long msg_ptr = iov_ptr - sizeof(struct user_msghdr); 
+
+    struct iovec iov = { .iov_base = (void __user *)data_ptr, .iov_len = ctx->req->datalen };
+    struct user_msghdr msg = {0}; // FIXED!
+    
+    if (ctx->req->addrlen > 0) {
+        msg.msg_name = (void __user *)addr_ptr;
+        msg.msg_namelen = ctx->req->addrlen;
+    }
+    msg.msg_iov = (struct iovec __user *)iov_ptr;
+    msg.msg_iovlen = 1; // We flattened it into 1 iovec!
+
+    if (copy_to_user((void __user *)data_ptr, ctx->req->data, ctx->req->datalen) == 0 &&
+        copy_to_user((void __user *)addr_ptr, &ctx->req->addr, sizeof(struct sockaddr_storage)) == 0 &&
+        copy_to_user((void __user *)iov_ptr, &iov, sizeof(iov)) == 0 &&
+        copy_to_user((void __user *)msg_ptr, &msg, sizeof(msg)) == 0) {
+        
+        memset(&regs, 0, sizeof(regs));
+        regs.di = ctx->req->fd;
+        regs.si = msg_ptr;
+        regs.dx = ctx->req->flags;
+
+        // --- THE SIGNAL SHIELD ---
+        sigset_t old_set, block_set;
+        sigfillset(&block_set);
+        sigprocmask(SIG_BLOCK, &block_set, &old_set);
+
+        if (real_sys_sendmsg) {
+            ret = real_sys_sendmsg(&regs);
+            if (ret == -ERESTARTSYS) ret = -EAGAIN; // Convert interruption to standard non-blocking error
+            mattx_dbg("[HIJACK] Deputy executed sendmsg natively. Result: %d\n", ret);
+        }
+
+        sigprocmask(SIG_SETMASK, &old_set, NULL);
+    }
+
+    reply.orig_pid = ctx->req->orig_pid;
+    reply.bytes_sent = ret;
+    reply.error = (ret < 0) ? ret : 0;
+    if (cluster_map[ctx->target_node]) mattx_comm_send(cluster_map[ctx->target_node], MATTX_MSG_SYS_SENDMSG_REPLY, &reply, sizeof(reply));
+
+    kfree(ctx->req); kfree(ctx);
+    set_current_state(TASK_STOPPED); schedule();
+}
+
+
+static void handle_sys_sendmsg_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    struct mattx_sys_sendmsg_req *req = payload;
+    struct task_struct *deputy = NULL;
+    rcu_read_lock(); deputy = pid_task(find_vpid(req->orig_pid), PIDTYPE_PID); if (deputy) get_task_struct(deputy); rcu_read_unlock();
+    if (deputy) {
+        struct mattx_sendmsg_ctx *ctx = kmalloc(sizeof(*ctx), GFP_KERNEL);
+        struct mattx_sys_sendmsg_req *req_copy = kmemdup(req, sizeof(*req) + req->datalen, GFP_KERNEL);
+        if (ctx && req_copy) {
+            ctx->req = req_copy; ctx->target_node = hdr->sender_id;
+            init_task_work(&ctx->cb, mattx_sendmsg_cb);
+            if (real_task_work_add) { real_task_work_add(deputy, &ctx->cb, TWA_SIGNAL); send_sig(SIGCONT, deputy, 0); }
+        } else { kfree(ctx); kfree(req_copy); }
+        put_task_struct(deputy);
+    }
+}
+
+static void handle_sys_sendmsg_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    if (payload) {
+        struct mattx_sys_sendmsg_reply *reply = payload;
+        int i;
+        
+        mattx_dbg("[RPC] Received SENDMSG_REPLY for Orig PID %u. Bytes sent: %zd\n", reply->orig_pid, reply->bytes_sent);
+
+        spin_lock(&guest_lock);
+        for (i = 0; i < guest_count; i++) {
+            if (guest_registry[i].orig_pid == reply->orig_pid && guest_registry[i].home_node == hdr->sender_id) {
+                // Store the result (bytes sent if successful, or the negative error code)
+                guest_registry[i].rpc_fsync_res = (reply->bytes_sent >= 0) ? reply->bytes_sent : reply->error;
+                guest_registry[i].rpc_done = true;
+                
+                if (guest_registry[i].rpc_wq) {
+                    wake_up_interruptible(guest_registry[i].rpc_wq);
+                }
+                break;
+            }
+        }
+        spin_unlock(&guest_lock);
+    }
+}
+
+
+// --- THE DEPUTY HIJACK: RECVMSG ---
+struct mattx_recvmsg_ctx { struct callback_head cb; struct mattx_sys_recvmsg_req req; int target_node; };
+
+static void mattx_recvmsg_cb(struct callback_head *cb) {
+    struct mattx_recvmsg_ctx *ctx = container_of(cb, struct mattx_recvmsg_ctx, cb);
+    struct pt_regs *task_regs = task_pt_regs(current);
+    struct pt_regs regs;
+    int ret = -EFAULT;
+
+    // --- FIXED: Use user_msghdr for the scratchpad! ---
+    unsigned long data_ptr = task_regs->sp - 128 - ctx->req.datalen;
+    unsigned long addr_ptr = data_ptr - sizeof(struct sockaddr_storage);
+    unsigned long iov_ptr = addr_ptr - sizeof(struct iovec);
+    unsigned long msg_ptr = iov_ptr - sizeof(struct user_msghdr); 
+
+    struct iovec iov = { .iov_base = (void __user *)data_ptr, .iov_len = ctx->req.datalen };
+    struct user_msghdr msg = {0}; // FIXED!
+    
+    if (ctx->req.addrlen > 0) {
+        msg.msg_name = (void __user *)addr_ptr;
+        msg.msg_namelen = ctx->req.addrlen;
+    }
+    msg.msg_iov = (struct iovec __user *)iov_ptr;
+    msg.msg_iovlen = 1;
+
+if (copy_to_user((void __user *)iov_ptr, &iov, sizeof(iov)) == 0 &&
+        copy_to_user((void __user *)msg_ptr, &msg, sizeof(msg)) == 0) {
+        
+        memset(&regs, 0, sizeof(regs));
+        regs.di = ctx->req.fd;
+        regs.si = msg_ptr;
+        regs.dx = ctx->req.flags;
+
+        // --- THE SIGNAL SHIELD ---
+        sigset_t old_set, block_set;
+        sigfillset(&block_set);
+        sigprocmask(SIG_BLOCK, &block_set, &old_set);
+
+        if (real_sys_recvmsg) {
+            ret = real_sys_recvmsg(&regs);
+            if (ret == -ERESTARTSYS) ret = -EAGAIN; // Convert interruption to standard non-blocking error
+            mattx_dbg("[HIJACK] Deputy executed recvmsg natively. Result: %d\n", ret);
+        }
+
+        sigprocmask(SIG_SETMASK, &old_set, NULL);
+    }
+
+    size_t reply_size = sizeof(struct mattx_sys_recvmsg_reply) + (ret > 0 ? ret : 0);
+    struct mattx_sys_recvmsg_reply *reply = kzalloc(reply_size, GFP_KERNEL);
+    if (reply) {
+        reply->orig_pid = ctx->req.orig_pid;
+        reply->bytes_recv = ret;
+        reply->error = (ret < 0) ? ret : 0;
+        if (ret > 0) {
+            // --- FIXED: Appease the compiler warnings! ---
+            if (copy_from_user(reply->data, (void __user *)data_ptr, ret)) {
+                mattx_dbg("[HIJACK] Warning: Failed to copy recvmsg data\n");
+            }
+            if (copy_from_user(&msg, (void __user *)msg_ptr, sizeof(msg))) {
+                mattx_dbg("[HIJACK] Warning: Failed to copy recvmsg msghdr\n");
+            }
+            reply->addrlen = msg.msg_namelen;
+            if (reply->addrlen > 0) {
+                if (copy_from_user(&reply->addr, (void __user *)addr_ptr, reply->addrlen)) {
+                    mattx_dbg("[HIJACK] Warning: Failed to copy recvmsg addr\n");
+                }
+            }
+        }
+        if (cluster_map[ctx->target_node]) mattx_comm_send(cluster_map[ctx->target_node], MATTX_MSG_SYS_RECVMSG_REPLY, reply, reply_size);
+        kfree(reply);
+    }
+    kfree(ctx);
+    set_current_state(TASK_STOPPED); schedule();
+}
+
+
+static void handle_sys_recvmsg_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    struct mattx_sys_recvmsg_req *req = payload;
+    struct task_struct *deputy = NULL;
+    rcu_read_lock(); deputy = pid_task(find_vpid(req->orig_pid), PIDTYPE_PID); if (deputy) get_task_struct(deputy); rcu_read_unlock();
+    if (deputy) {
+        struct mattx_recvmsg_ctx *ctx = kmalloc(sizeof(*ctx), GFP_KERNEL);
+        if (ctx) {
+            memcpy(&ctx->req, req, sizeof(*req)); ctx->target_node = hdr->sender_id;
+            init_task_work(&ctx->cb, mattx_recvmsg_cb);
+            if (real_task_work_add) { real_task_work_add(deputy, &ctx->cb, TWA_SIGNAL); send_sig(SIGCONT, deputy, 0); } else { kfree(ctx); }
+        }
+        put_task_struct(deputy);
+    }
+}
+
+static void handle_sys_recvmsg_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    if (payload) {
+        struct mattx_sys_recvmsg_reply *reply = payload;
+        int i;
+
+        mattx_dbg("[RPC] Received RECVMSG_REPLY for Orig PID %u. Bytes recv: %zd\n", reply->orig_pid, reply->bytes_recv);
+
+        spin_lock(&guest_lock);
+        for (i = 0; i < guest_count; i++) {
+            if (guest_registry[i].orig_pid == reply->orig_pid && guest_registry[i].home_node == hdr->sender_id) {
+                
+                int retval = (reply->bytes_recv >= 0) ? reply->bytes_recv : reply->error;
+                guest_registry[i].rpc_fsync_res = retval;
+                
+                if (retval > 0) {
+                    // --- THE MEMORY PACKING TRICK ---
+                    // We allocate one contiguous block for: [DATA] + [SOCKADDR] + [ADDRLEN]
+                    size_t buf_size = retval + sizeof(struct sockaddr_storage) + sizeof(int);
+                    guest_registry[i].rpc_read_buf = kmalloc(buf_size, GFP_ATOMIC);
+                    
+                    if (guest_registry[i].rpc_read_buf) {
+                        char *ptr = (char *)guest_registry[i].rpc_read_buf;
+                        
+                        // 1. Copy the flattened data payload
+                        memcpy(ptr, reply->data, retval);
+                        ptr += retval;
+                        
+                        // 2. Copy the sockaddr struct
+                        memcpy(ptr, &reply->addr, sizeof(struct sockaddr_storage));
+                        ptr += sizeof(struct sockaddr_storage);
+                        
+                        // 3. Copy the addrlen integer
+                        memcpy(ptr, &reply->addrlen, sizeof(int));
+                    }
+                } else {
+                    guest_registry[i].rpc_read_buf = NULL;
+                }
+
+                guest_registry[i].rpc_done = true;
+                if (guest_registry[i].rpc_wq) {
+                    wake_up_interruptible(guest_registry[i].rpc_wq);
+                }
+                break;
+            }
+        }
+        spin_unlock(&guest_lock);
+    }
+}
+
+
 
 
 // --- VFS RPC Registry ---
@@ -3254,6 +4299,25 @@ void mattx_fileio_init_handlers(void) {
     mattx_register_handler(MATTX_MSG_VFS_LSEEK_REPLY, handle_vfs_lseek_reply);
     mattx_register_handler(MATTX_MSG_VFS_FSYNC_REQ, handle_vfs_fsync_req);
     mattx_register_handler(MATTX_MSG_VFS_FSYNC_REPLY, handle_vfs_fsync_reply);
+    mattx_register_handler(MATTX_MSG_SYS_EPOLL_CREATE_REQ, handle_sys_epoll_create_req);
+    mattx_register_handler(MATTX_MSG_SYS_EPOLL_CREATE_REPLY, handle_sys_epoll_create_reply);
+    mattx_register_handler(MATTX_MSG_SYS_EPOLL_CTL_REQ, handle_sys_epoll_ctl_req);
+    mattx_register_handler(MATTX_MSG_SYS_EPOLL_CTL_REPLY, handle_sys_generic_int_reply);
+    mattx_register_handler(MATTX_MSG_SYS_EPOLL_WAIT_REQ, handle_sys_epoll_wait_req);
+    mattx_register_handler(MATTX_MSG_SYS_EPOLL_WAIT_REPLY, handle_sys_epoll_wait_reply);
+    mattx_register_handler(MATTX_MSG_SYS_GETSOCKNAME_REQ, handle_sys_getsockname_req);
+    mattx_register_handler(MATTX_MSG_SYS_GETSOCKNAME_REPLY, handle_sys_sockname_reply);
+    mattx_register_handler(MATTX_MSG_SYS_GETPEERNAME_REQ, handle_sys_getpeername_req);
+    mattx_register_handler(MATTX_MSG_SYS_GETPEERNAME_REPLY, handle_sys_sockname_reply); // Reuses the same handler!
+    mattx_register_handler(MATTX_MSG_SYS_SETSOCKOPT_REQ, handle_sys_setsockopt_req);
+    mattx_register_handler(MATTX_MSG_SYS_SETSOCKOPT_REPLY, handle_sys_generic_int_reply);
+    mattx_register_handler(MATTX_MSG_SYS_GETSOCKOPT_REQ, handle_sys_getsockopt_req);
+    mattx_register_handler(MATTX_MSG_SYS_GETSOCKOPT_REPLY, handle_sys_getsockopt_reply);
+    mattx_register_handler(MATTX_MSG_SYS_SENDMSG_REQ, handle_sys_sendmsg_req);
+    mattx_register_handler(MATTX_MSG_SYS_SENDMSG_REPLY, handle_sys_sendmsg_reply);
+    mattx_register_handler(MATTX_MSG_SYS_RECVMSG_REQ, handle_sys_recvmsg_req);
+    mattx_register_handler(MATTX_MSG_SYS_RECVMSG_REPLY, handle_sys_recvmsg_reply);
+
 
     mattx_dbg(" [FILEIO] Network handlers registered.\n");
 }

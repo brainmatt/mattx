@@ -6,9 +6,9 @@
 </div>
 
 [![License: GPL v2](https://img.shields.io/badge/License-GPL%20v2-blue.svg)](https://www.gnu.org/licenses/old-licenses/gpl-2.0.en.html)
-[![Kernel: 6.x](https://img.shields.io/badge/Linux_Kernel-6.12+-orange.svg)]()
+[![Kernel: 7.x](https://img.shields.io/badge/Linux_Kernel-7.0+-green.svg)]()
 
-**MattX** is a modern, out-of-tree Linux kernel module that brings the magic of **Single System Image (SSI)** clustering to the Linux 6.x era. 
+**MattX** is a modern, out-of-tree Linux kernel module that brings the magic of **Single System Image (SSI)** clustering to the Linux 7.x era. 
 
 Inspired by the legendary openMosix project, MattX allows multiple physical or virtual machines to act as one massive, unified computer. It autonomously load-balances CPU-bound tasks by seamlessly teleporting running processes across the network—preserving their memory, CPU registers, file descriptors, and network sockets—without requiring any modifications to the Linux kernel source code.
 
@@ -92,7 +92,7 @@ echo "migrate 1234 home" > /proc/mattx/admin
 
 ## Requirements and Kernel Support 
 
-**MattX** has currently only been tested on Debian Trixie, support for Kernels more recent than 6.12 has not been implemented yet.
+**MattX** has currently only been tested on Debian Trixie, support for Kernels more recent than 7.12 has not been implemented yet.
 
 
 

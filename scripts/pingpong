@@ -2,21 +2,27 @@
 
 PID=$1
 NODEID=$2
+DELAY=$3
+DELAY_DEFAULT=5
 LOOP=0
 
 if [ "$PID" == "" ] || [ "$NODEID" == "" ]; then
-	echo "usage: $0 <pid> <node_id>"
+	echo "usage: $0 <pid> <node_id> [delay]"
 	exit
+fi
+
+if [ "$DELAY" == "" ]; then
+	DELAY=$DELAY_DEFAULT
 fi
 
 while true; do 
 	LOOP=$(( LOOP + 1))
 	echo "migrating foward - migration: $LOOP"
 	echo "migrate $PID $NODEID" > /proc/mattx/admin
-	sleep 5 
+	sleep $DELAY 
 	LOOP=$(( LOOP + 1))
 	echo "migrating backwards - migration $LOOP"
 	echo "migrate $PID home" > /proc/mattx/admin
-	sleep 5 
+	sleep $DELAY 
 done
 

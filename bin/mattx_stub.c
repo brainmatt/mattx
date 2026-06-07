@@ -111,8 +111,13 @@ static int blueprint_cb(struct nl_msg *msg, void *arg) {
 }
 
 int main() {
-    freopen("/tmp/mattx_stub.log", "a", stdout);
-    freopen("/tmp/mattx_stub.log", "a", stderr);
+    // Redirect stdout and stderr to a log file for debugging
+    if (freopen("/tmp/mattx_stub.log", "a", stdout) == NULL) {
+        perror("MattX Stub: Failed to redirect stdout");
+    }
+    if (freopen("/tmp/mattx_stub.log", "a", stderr) == NULL) {
+        perror("MattX Stub: Failed to redirect stderr");
+    }
     setvbuf(stdout, NULL, _IONBF, 0); 
     setvbuf(stderr, NULL, _IONBF, 0);
 
@@ -225,7 +230,10 @@ int main() {
             // ---------------------------------------
 
             if (chroot(mfs_path) == 0) {
-                chdir("/"); 
+                // 4. Pivot into the new root!
+                if (chdir("/") < 0) {
+                    perror("MattX Stub: Failed to chdir to new root");
+                }                
                 mkdir("/proc", 0755);
                 mount("proc", "/proc", "proc", 0, NULL);
                 printf("MattX-Stub: Illusion complete! Trapped in %s\n", mfs_path);

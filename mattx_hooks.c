@@ -24,10 +24,15 @@
 #include "mattx.h"
 #include <linux/wait.h> 
 #include <linux/poll.h>
+#include <linux/eventpoll.h>
 
 // Helper for modern x86_64 syscall wrappers (__x64_sys_*)
 // The first argument (regs->di) is a pointer to the real pt_regs!
 #define SYSCALL_REGS(regs) ((struct pt_regs *)(regs)->di)
+
+extern char config_migration_excludes[512];
+extern char config_migration_includes[512];
+
 
 static struct kretprobe openat_kprobe;
 
@@ -84,6 +89,60 @@ static void mattx_rpc_worker(struct work_struct *work) {
         if (cluster_map[rpc->home_node]) {
             mattx_comm_send(cluster_map[rpc->home_node], MATTX_MSG_SYS_SOCKET_REQ, &req, sizeof(req));
         }
+
+    // EPOLL_CREATE WORKER ---
+    } else if (rpc->is_epoll_create) {
+        struct mattx_sys_epoll_create_req req;
+        memset(&req, 0, sizeof(req));
+        req.orig_pid = rpc->orig_pid;
+        req.flags = rpc->epoll_flags;
+
+        mattx_dbg("[RPC] Worker sending EPOLL_CREATE_REQ to Node %d...\n", rpc->home_node);
+        if (cluster_map[rpc->home_node]) {
+            mattx_comm_send(cluster_map[rpc->home_node], MATTX_MSG_SYS_EPOLL_CREATE_REQ, &req, sizeof(req));
+        }
+
+    // EPOLL_CTL WORKER ---
+    } else if (rpc->is_epoll_ctl) {
+        struct mattx_sys_epoll_ctl_req req;
+        memset(&req, 0, sizeof(req));
+        req.orig_pid = rpc->orig_pid;
+        req.epfd = rpc->remote_fd;
+        req.op = rpc->epoll_op;
+        req.fd = rpc->new_local_fd;
+
+        if (rpc->epoll_op == EPOLL_CTL_ADD || rpc->epoll_op == EPOLL_CTL_MOD) {
+            struct task_struct *s = NULL;
+            rcu_read_lock();
+            s = pid_task(find_vpid(rpc->local_pid), PIDTYPE_PID);
+            if (s) get_task_struct(s);
+            rcu_read_unlock();
+
+            if (s) {
+                if (access_process_vm(s, (unsigned long)rpc->epoll_events_ptr, &req.event, sizeof(struct epoll_event), FOLL_FORCE) != sizeof(struct epoll_event)) {
+                    mattx_dbg("[RPC] Warning: Failed to read epoll_event from Surrogate!\n");
+                }
+                put_task_struct(s);
+            }
+        }
+
+        if (cluster_map[rpc->home_node]) {
+            mattx_comm_send(cluster_map[rpc->home_node], MATTX_MSG_SYS_EPOLL_CTL_REQ, &req, sizeof(req));
+        }
+
+    // EPOLL_WAIT WORKER ---
+    } else if (rpc->is_epoll_wait) {
+        struct mattx_sys_epoll_wait_req req;
+        memset(&req, 0, sizeof(req));
+        req.orig_pid = rpc->orig_pid;
+        req.epfd = rpc->remote_fd;
+        req.maxevents = rpc->epoll_maxevents;
+        req.timeout = rpc->timeout_ms;
+
+        if (cluster_map[rpc->home_node]) {
+            mattx_comm_send(cluster_map[rpc->home_node], MATTX_MSG_SYS_EPOLL_WAIT_REQ, &req, sizeof(req));
+        }
+
     } else if (rpc->is_connect) {
         struct mattx_sys_connect_req req;
         memset(&req, 0, sizeof(req));
@@ -245,7 +304,7 @@ static void mattx_rpc_worker(struct work_struct *work) {
             mattx_comm_send(cluster_map[rpc->home_node], MATTX_MSG_SYS_POLL_REQ, &req, sizeof(req));
         }
 
-// SELECT & PSELECT6 WORKER
+    // SELECT & PSELECT6 WORKER
     } else if (rpc->is_select || rpc->is_pselect6) {
         struct mattx_sys_poll_req req;
         int poll_idx = 0;
@@ -299,6 +358,133 @@ static void mattx_rpc_worker(struct work_struct *work) {
         if (cluster_map[rpc->home_node]) {
             mattx_comm_send(cluster_map[rpc->home_node], MATTX_MSG_SYS_POLL_REQ, &req, sizeof(req));
         }
+
+    // SOCKNAME WORKER ---
+    } else if (rpc->is_getsockname || rpc->is_getpeername) {
+        struct mattx_sys_getsockname_req req;
+        memset(&req, 0, sizeof(req));
+        req.orig_pid = rpc->orig_pid;
+        req.fd = rpc->remote_fd;
+        u32 msg_type = rpc->is_getsockname ? MATTX_MSG_SYS_GETSOCKNAME_REQ : MATTX_MSG_SYS_GETPEERNAME_REQ;
+        if (cluster_map[rpc->home_node]) mattx_comm_send(cluster_map[rpc->home_node], msg_type, &req, sizeof(req));
+
+    // SETSOCKOPT WORKER ---
+    } else if (rpc->is_setsockopt) {
+        size_t req_size = sizeof(struct mattx_sys_setsockopt_req) + rpc->sock_optlen;
+        struct mattx_sys_setsockopt_req *req = kzalloc(req_size, GFP_KERNEL);
+        if (req) {
+            req->orig_pid = rpc->orig_pid; req->fd = rpc->remote_fd; req->level = rpc->sock_level;
+            req->optname = rpc->sock_optname; req->optlen = rpc->sock_optlen;
+            
+            // Safely read the optval from user-space!
+            struct task_struct *s = NULL; rcu_read_lock(); s = pid_task(find_vpid(rpc->local_pid), PIDTYPE_PID); if (s) get_task_struct(s); rcu_read_unlock();
+            if (s) { access_process_vm(s, (unsigned long)rpc->buff, req->optval, rpc->sock_optlen, FOLL_FORCE); put_task_struct(s); }
+            
+            if (cluster_map[rpc->home_node]) mattx_comm_send(cluster_map[rpc->home_node], MATTX_MSG_SYS_SETSOCKOPT_REQ, req, req_size);
+            kfree(req);
+        }
+
+    // GETSOCKOPT WORKER ---
+    } else if (rpc->is_getsockopt) {
+        struct mattx_sys_getsockopt_req req;
+        memset(&req, 0, sizeof(req));
+        // FIXED: Use dots instead of arrows!
+        req.orig_pid = rpc->orig_pid; req.fd = rpc->remote_fd; req.level = rpc->sock_level; req.optname = rpc->sock_optname;
+        
+        struct task_struct *s = NULL; rcu_read_lock(); s = pid_task(find_vpid(rpc->local_pid), PIDTYPE_PID); if (s) get_task_struct(s); rcu_read_unlock();
+        if (s) { access_process_vm(s, (unsigned long)rpc->size, &req.optlen, sizeof(int), FOLL_FORCE); put_task_struct(s); }
+        
+        if (cluster_map[rpc->home_node]) mattx_comm_send(cluster_map[rpc->home_node], MATTX_MSG_SYS_GETSOCKOPT_REQ, &req, sizeof(req));
+
+    // SENDMSG WORKER ---
+    } else if (rpc->is_sendmsg) {
+        struct user_msghdr msg; 
+        struct task_struct *s = NULL; rcu_read_lock(); s = pid_task(find_vpid(rpc->local_pid), PIDTYPE_PID); if (s) get_task_struct(s); rcu_read_unlock();
+        
+        mattx_dbg("[MSG_DEBUG] Starting SENDMSG flattening for PID %d\n", rpc->local_pid);
+        
+        if (s) {
+            if (access_process_vm(s, (unsigned long)rpc->msg_ptr, &msg, sizeof(msg), FOLL_FORCE) == sizeof(msg)) {
+                mattx_dbg("[MSG_DEBUG] Successfully read user_msghdr. iovlen: %zu\n", (size_t)msg.msg_iovlen);
+                
+                struct iovec *iovs = kmalloc_array(msg.msg_iovlen, sizeof(struct iovec), GFP_KERNEL);
+                if (iovs) {
+                    if (access_process_vm(s, (unsigned long)msg.msg_iov, iovs, msg.msg_iovlen * sizeof(struct iovec), FOLL_FORCE) > 0) {
+                        mattx_dbg("[MSG_DEBUG] Successfully read iovec array.\n");
+                        
+                        size_t total_len = 0;
+                        for (int i = 0; i < msg.msg_iovlen; i++) total_len += iovs[i].iov_len;
+                        size_t to_send = min_t(size_t, total_len, 4096);
+                        mattx_dbg("[MSG_DEBUG] Total data length to send: %zu (capped at %zu)\n", total_len, to_send);
+                        
+                        size_t req_size = sizeof(struct mattx_sys_sendmsg_req) + to_send;
+                        struct mattx_sys_sendmsg_req *req = kzalloc(req_size, GFP_KERNEL);
+                        if (req) {
+                            req->orig_pid = rpc->orig_pid; req->fd = rpc->remote_fd; req->flags = rpc->flags;
+                            
+                            if (msg.msg_name && msg.msg_namelen > 0) {
+                                if (access_process_vm(s, (unsigned long)msg.msg_name, &req->addr, msg.msg_namelen, FOLL_FORCE) == msg.msg_namelen) {
+                                    req->addrlen = msg.msg_namelen;
+                                    mattx_dbg("[MSG_DEBUG] Successfully read msg_name (addrlen: %d)\n", req->addrlen);
+                                } else {
+                                    mattx_dbg("[MSG_DEBUG] ERROR: Failed to read msg_name!\n");
+                                }
+                            }
+                            
+                            size_t copied = 0;
+                            for (int i = 0; i < msg.msg_iovlen && copied < to_send; i++) {
+                                size_t chunk = min_t(size_t, iovs[i].iov_len, to_send - copied);
+                                if (access_process_vm(s, (unsigned long)iovs[i].iov_base, req->data + copied, chunk, FOLL_FORCE) != chunk) {
+                                    mattx_dbg("[MSG_DEBUG] ERROR: Failed to read iov_base at index %d!\n", i);
+                                }
+                                copied += chunk;
+                            }
+                            req->datalen = copied;
+                            mattx_dbg("[MSG_DEBUG] Flattened %zu bytes of data. Sending RPC...\n", copied);
+                            
+                            if (cluster_map[rpc->home_node]) mattx_comm_send(cluster_map[rpc->home_node], MATTX_MSG_SYS_SENDMSG_REQ, req, req_size);
+                            kfree(req);
+                        } else { mattx_dbg("[MSG_DEBUG] ERROR: Failed to allocate SENDMSG_REQ!\n"); }
+                    } else { mattx_dbg("[MSG_DEBUG] ERROR: Failed to read iovec array from 0x%lx!\n", (unsigned long)msg.msg_iov); }
+                    kfree(iovs);
+                } else { mattx_dbg("[MSG_DEBUG] ERROR: Failed to allocate iovs array!\n"); }
+            } else { mattx_dbg("[MSG_DEBUG] ERROR: Failed to read user_msghdr from 0x%lx!\n", (unsigned long)rpc->msg_ptr); }
+            put_task_struct(s);
+        } else { mattx_dbg("[MSG_DEBUG] ERROR: Surrogate task not found!\n"); }
+
+    // RECVMSG WORKER ---
+    } else if (rpc->is_recvmsg) {
+        struct user_msghdr msg; 
+        struct task_struct *s = NULL; rcu_read_lock(); s = pid_task(find_vpid(rpc->local_pid), PIDTYPE_PID); if (s) get_task_struct(s); rcu_read_unlock();
+        
+        mattx_dbg("[MSG_DEBUG] Starting RECVMSG flattening for PID %d\n", rpc->local_pid);
+
+        if (s) {
+            if (access_process_vm(s, (unsigned long)rpc->msg_ptr, &msg, sizeof(msg), FOLL_FORCE) == sizeof(msg)) {
+                struct iovec *iovs = kmalloc_array(msg.msg_iovlen, sizeof(struct iovec), GFP_KERNEL);
+                if (iovs) {
+                    if (access_process_vm(s, (unsigned long)msg.msg_iov, iovs, msg.msg_iovlen * sizeof(struct iovec), FOLL_FORCE) > 0) {
+                        size_t total_len = 0;
+                        for (int i = 0; i < msg.msg_iovlen; i++) total_len += iovs[i].iov_len;
+                        
+                        mattx_dbg("[MSG_DEBUG] RECVMSG expects up to %zu bytes across %zu iovecs.\n", total_len, (size_t)msg.msg_iovlen);
+
+                        struct mattx_sys_recvmsg_req req;
+                        memset(&req, 0, sizeof(req));
+                        req.orig_pid = rpc->orig_pid; req.fd = rpc->remote_fd; req.flags = rpc->flags;
+                        req.addrlen = msg.msg_namelen;
+                        req.datalen = min_t(size_t, total_len, 4096);
+                        
+                        mattx_dbg("[MSG_DEBUG] Sending RECVMSG_REQ to Node %d...\n", rpc->home_node);
+                        if (cluster_map[rpc->home_node]) mattx_comm_send(cluster_map[rpc->home_node], MATTX_MSG_SYS_RECVMSG_REQ, &req, sizeof(req));
+                    } else { mattx_dbg("[MSG_DEBUG] ERROR: Failed to read RECVMSG iovec array!\n"); }
+                    kfree(iovs);
+                }
+            } else { mattx_dbg("[MSG_DEBUG] ERROR: Failed to read RECVMSG user_msghdr!\n"); }
+            put_task_struct(s);
+        }
+
+
 
     // OPEN WORKER (DEFAULT FALLBACK)
     } else {
@@ -646,14 +832,32 @@ static void mattx_rpc_worker(struct work_struct *work) {
                         if (revents & (POLLPRI | POLLERR | POLLHUP)) __set_bit(local_fd, (unsigned long *)&rpc->ex_fds);
                     }
 
-                    // --- THE STACK SMASH FIX ---
+                    // --- THE STACK SMASH FIX (V2: Kernel 7.0 Guard) ---
                     // Only write the exact number of bytes the user allocated!
                     size_t copy_size = (rpc->select_nfds + 7) / 8;
                     if (copy_size > sizeof(fd_set)) copy_size = sizeof(fd_set);
 
-                    if (rpc->select_readfds_ptr) access_process_vm(surrogate, (unsigned long)rpc->select_readfds_ptr, &rpc->in_fds, copy_size, FOLL_WRITE | FOLL_FORCE);
-                    if (rpc->select_writefds_ptr) access_process_vm(surrogate, (unsigned long)rpc->select_writefds_ptr, &rpc->out_fds, copy_size, FOLL_WRITE | FOLL_FORCE);
-                    if (rpc->select_exceptfds_ptr) access_process_vm(surrogate, (unsigned long)rpc->select_exceptfds_ptr, &rpc->ex_fds, copy_size, FOLL_WRITE | FOLL_FORCE);
+                    mattx_dbg("[RPC] Injecting %zu bytes into Surrogate %d. RIP: 0x%lx\n", 
+                           copy_size, rpc->local_pid, regs->ip);
+
+                    if (rpc->select_readfds_ptr) {
+                        mattx_dbg("[RPC] Writing readfds to 0x%lx\n", (unsigned long)rpc->select_readfds_ptr);
+                        if (access_process_vm(surrogate, (unsigned long)rpc->select_readfds_ptr, &rpc->in_fds, copy_size, FOLL_WRITE | FOLL_FORCE) != copy_size) {
+                            mattx_dbg("[RPC] ERROR: Failed to write readfds!\n");
+                        }
+                    }
+                    if (rpc->select_writefds_ptr) {
+                        mattx_dbg("[RPC] Writing writefds to 0x%lx\n", (unsigned long)rpc->select_writefds_ptr);
+                        if (access_process_vm(surrogate, (unsigned long)rpc->select_writefds_ptr, &rpc->out_fds, copy_size, FOLL_WRITE | FOLL_FORCE) != copy_size) {
+                            mattx_dbg("[RPC] ERROR: Failed to write writefds!\n");
+                        }
+                    }
+                    if (rpc->select_exceptfds_ptr) {
+                        mattx_dbg("[RPC] Writing exceptfds to 0x%lx\n", (unsigned long)rpc->select_exceptfds_ptr);
+                        if (access_process_vm(surrogate, (unsigned long)rpc->select_exceptfds_ptr, &rpc->ex_fds, copy_size, FOLL_WRITE | FOLL_FORCE) != copy_size) {
+                            mattx_dbg("[RPC] ERROR: Failed to write exceptfds!\n");
+                        }
+                    }
 
                     regs->ax = retval;
                     mattx_dbg("[RPC] Illusion Complete! select() returned %d\n", retval);
@@ -661,6 +865,242 @@ static void mattx_rpc_worker(struct work_struct *work) {
                 } else {
                     regs->ax = -EBADF;
                 }
+
+            // --- EPOLL_CREATE AWAKENING ---
+            } else if (rpc->is_epoll_create) {
+                struct pt_regs *regs = task_pt_regs(surrogate);
+                int local_fd = -1;
+                
+                if (remote_fd >= 0) {
+                    struct mattx_fake_fd_info *fd_info = kmalloc(sizeof(*fd_info), GFP_KERNEL);
+                    if (fd_info) {
+                        fd_info->home_node = rpc->home_node;
+                        fd_info->orig_pid = rpc->orig_pid;
+                        fd_info->remote_fd = remote_fd;
+                        
+                        struct file *fake_file = anon_inode_getfile("mattx_epoll_proxy", &mattx_fops, fd_info, O_RDWR);
+                        
+                        if (!IS_ERR(fake_file) && surrogate->files) {
+                            spin_lock(&surrogate->files->file_lock);
+                            struct fdtable *fdt = files_fdtable(surrogate->files);
+                            for (int j = 3; j < fdt->max_fds; j++) {
+                                if (!rcu_dereference_raw(fdt->fd[j])) {
+                                    rcu_assign_pointer(fdt->fd[j], fake_file);
+                                    __set_bit(j, fdt->open_fds);
+                                    local_fd = j;
+                                    break;
+                                }
+                            }
+                            spin_unlock(&surrogate->files->file_lock);
+                            
+                            if (local_fd >= 0) {
+                                regs->ax = local_fd; 
+                                mattx_dbg("[RPC] Illusion Complete! Mapped Remote Epoll FD %d to Local FD %d\n", remote_fd, local_fd);
+                            } else {
+                                fput(fake_file);
+                                regs->ax = -EMFILE;
+                            }
+                        } else {
+                            kfree(fd_info);
+                            regs->ax = -ENFILE;
+                        }
+                    }
+                } else {
+                    regs->ax = remote_fd; // Pass the error code (e.g., -ENOSYS)
+                }
+
+            // --- EPOLL_CTL AWAKENING ---
+            } else if (rpc->is_epoll_ctl) {
+                struct pt_regs *regs = task_pt_regs(surrogate);
+                int error = -EINTR; // Default to clean interruption!
+
+                spin_lock(&guest_lock);
+                for (i = 0; i < guest_count; i++) {
+                    if (guest_registry[i].local_pid == rpc->local_pid) {
+                        if (guest_registry[i].rpc_done) {
+                            error = guest_registry[i].rpc_fsync_res; 
+                        }
+                        break;
+                    }
+                }
+                spin_unlock(&guest_lock);
+
+                // Inject the result back into the Surrogate's Brain!
+                if (regs) regs->ax = error;
+
+            // --- EPOLL_WAIT AWAKENING ---
+            } else if (rpc->is_epoll_wait) {
+                struct pt_regs *regs = task_pt_regs(surrogate);
+                int retval = -EINTR; // Default to clean interruption!
+                void *read_buf = NULL;
+
+                spin_lock(&guest_lock);
+                for (i = 0; i < guest_count; i++) {
+                    if (guest_registry[i].local_pid == rpc->local_pid) {
+                        if (guest_registry[i].rpc_done) {
+                            retval = guest_registry[i].rpc_fsync_res; 
+                            read_buf = guest_registry[i].rpc_read_buf; 
+                        }
+                        guest_registry[i].rpc_read_buf = NULL;
+                        break;
+                    }
+                }
+                spin_unlock(&guest_lock);
+
+                if (retval > 0 && read_buf) {
+                    size_t copy_size = retval * sizeof(struct epoll_event);
+                    // Safely inject the events into user-space memory!
+                    if (access_process_vm(surrogate, (unsigned long)rpc->epoll_events_ptr, read_buf, copy_size, FOLL_WRITE | FOLL_FORCE) != copy_size) {
+                        retval = -EFAULT;
+                    }
+                }
+                
+                if (read_buf) kfree(read_buf);
+                
+                // Inject the result back into the Surrogate's Brain!
+                if (regs) regs->ax = retval;
+
+            // --- SOCKNAME AWAKENING ---
+            } else if (rpc->is_getsockname || rpc->is_getpeername) {
+                struct pt_regs *regs = task_pt_regs(surrogate);
+                int error = -EINTR;
+                void *read_buf = NULL;
+
+                spin_lock(&guest_lock);
+                for (i = 0; i < guest_count; i++) {
+                    if (guest_registry[i].local_pid == rpc->local_pid) {
+                        if (guest_registry[i].rpc_done) {
+                            error = guest_registry[i].rpc_fsync_res; 
+                            read_buf = guest_registry[i].rpc_read_buf; 
+                        }
+                        guest_registry[i].rpc_read_buf = NULL;
+                        break;
+                    }
+                }
+                spin_unlock(&guest_lock);
+
+                if (error == 0 && read_buf) {
+                    struct sockaddr_storage *addr = read_buf;
+                    int *addrlen = (int *)((char *)read_buf + sizeof(struct sockaddr_storage));
+                    // Inject the struct and the length back into user-space!
+                    access_process_vm(surrogate, (unsigned long)rpc->buff, addr, *addrlen, FOLL_WRITE | FOLL_FORCE);
+                    access_process_vm(surrogate, (unsigned long)rpc->size, addrlen, sizeof(int), FOLL_WRITE | FOLL_FORCE);
+                }
+                if (read_buf) kfree(read_buf);
+                if (regs) regs->ax = error;
+
+            // --- SETSOCKOPT AWAKENING ---
+            } else if (rpc->is_setsockopt) {
+                struct pt_regs *regs = task_pt_regs(surrogate);
+                int error = -EINTR;
+                spin_lock(&guest_lock);
+                for (i = 0; i < guest_count; i++) {
+                    if (guest_registry[i].local_pid == rpc->local_pid) {
+                        if (guest_registry[i].rpc_done) error = guest_registry[i].rpc_fsync_res; 
+                        break;
+                    }
+                }
+                spin_unlock(&guest_lock);
+                if (regs) regs->ax = error;
+
+            // --- GETSOCKOPT AWAKENING ---
+            } else if (rpc->is_getsockopt) {
+                struct pt_regs *regs = task_pt_regs(surrogate);
+                int error = -EINTR;
+                int optlen = 0;
+                void *read_buf = NULL;
+
+                spin_lock(&guest_lock);
+                for (i = 0; i < guest_count; i++) {
+                    if (guest_registry[i].local_pid == rpc->local_pid) {
+                        if (guest_registry[i].rpc_done) {
+                            error = guest_registry[i].rpc_fsync_res; 
+                            optlen = guest_registry[i].rpc_lseek_res; // We stored the length here!
+                            read_buf = guest_registry[i].rpc_read_buf; 
+                        }
+                        guest_registry[i].rpc_read_buf = NULL;
+                        break;
+                    }
+                }
+                spin_unlock(&guest_lock);
+
+                if (error == 0) {
+                    if (read_buf && optlen > 0) {
+                        access_process_vm(surrogate, (unsigned long)rpc->buff, read_buf, optlen, FOLL_WRITE | FOLL_FORCE);
+                    }
+                    access_process_vm(surrogate, (unsigned long)rpc->size, &optlen, sizeof(int), FOLL_WRITE | FOLL_FORCE);
+                }
+                if (read_buf) kfree(read_buf);
+                if (regs) regs->ax = error;
+
+            // --- SENDMSG AWAKENING ---
+            } else if (rpc->is_sendmsg) {
+                struct pt_regs *regs = task_pt_regs(surrogate);
+                int error = -EINTR;
+                spin_lock(&guest_lock);
+                for (i = 0; i < guest_count; i++) {
+                    if (guest_registry[i].local_pid == rpc->local_pid) {
+                        if (guest_registry[i].rpc_done) error = guest_registry[i].rpc_fsync_res; 
+                        break;
+                    }
+                }
+                spin_unlock(&guest_lock);
+                if (regs) regs->ax = error;
+
+            // --- RECVMSG AWAKENING ---
+            } else if (rpc->is_recvmsg) {
+                struct pt_regs *regs = task_pt_regs(surrogate);
+                int retval = -EINTR;
+                void *read_buf = NULL;
+                struct sockaddr_storage addr;
+                int addrlen = 0;
+
+                spin_lock(&guest_lock);
+                for (i = 0; i < guest_count; i++) {
+                    if (guest_registry[i].local_pid == rpc->local_pid) {
+                        if (guest_registry[i].rpc_done) {
+                            retval = guest_registry[i].rpc_fsync_res; 
+                            read_buf = guest_registry[i].rpc_read_buf; 
+                            if (read_buf && retval > 0) {
+                                // Extract the sockaddr from the end of the buffer!
+                                memcpy(&addr, (char *)read_buf + retval, sizeof(struct sockaddr_storage));
+                                memcpy(&addrlen, (char *)read_buf + retval + sizeof(struct sockaddr_storage), sizeof(int));
+                            }
+                        }
+                        guest_registry[i].rpc_read_buf = NULL;
+                        break;
+                    }
+                }
+                spin_unlock(&guest_lock);
+
+                if (retval > 0 && read_buf) {
+                    // --- FIXED: Use user_msghdr to match the user-space layout! ---
+                    struct user_msghdr msg; 
+                    if (access_process_vm(surrogate, (unsigned long)rpc->msg_ptr, &msg, sizeof(msg), FOLL_FORCE) == sizeof(msg)) {
+                        
+                        // Un-flatten the data back into the iovecs!
+                        struct iovec *iovs = kmalloc_array(msg.msg_iovlen, sizeof(struct iovec), GFP_KERNEL);
+                        if (iovs && access_process_vm(surrogate, (unsigned long)msg.msg_iov, iovs, msg.msg_iovlen * sizeof(struct iovec), FOLL_FORCE) > 0) {
+                            size_t copied = 0;
+                            for (int j = 0; j < msg.msg_iovlen && copied < retval; j++) {
+                                size_t chunk = min_t(size_t, iovs[j].iov_len, retval - copied);
+                                access_process_vm(surrogate, (unsigned long)iovs[j].iov_base, (char *)read_buf + copied, chunk, FOLL_WRITE | FOLL_FORCE);
+                                copied += chunk;
+                            }
+                        }
+                        if (iovs) kfree(iovs);
+
+                        // Inject the sockaddr back!
+                        if (msg.msg_name && addrlen > 0) {
+                            access_process_vm(surrogate, (unsigned long)msg.msg_name, &addr, addrlen, FOLL_WRITE | FOLL_FORCE);
+                            msg.msg_namelen = addrlen;
+                            access_process_vm(surrogate, (unsigned long)rpc->msg_ptr, &msg, sizeof(msg), FOLL_WRITE | FOLL_FORCE);
+                        }
+                    }
+                }
+                if (read_buf) kfree(read_buf);
+                if (regs) regs->ax = retval;
+                
 
             // --- FD-Creating Syscalls (open, socket, dup) fall through here! ---
             } else if (remote_fd >= 0) {
@@ -844,6 +1284,14 @@ static int ret_handler_openat(struct kretprobe_instance *ri, struct pt_regs *reg
                 return 0;
             }
 
+            // --- THE ATOMIC SHIELD ---
+            // If the process is dying (SIGKILL) or exiting, DO NOT freeze it!
+            // Freezing a dying process inside a Kretprobe causes a "scheduling while atomic" BUG!
+            if (fatal_signal_pending(current) || (current->flags & PF_EXITING)) {
+                mattx_dbg("[HOOK] Surrogate %s is dying. Aborting RPC.\n", current->comm);
+                return 0;
+            }
+
             struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
             if (rpc) {
                 INIT_WORK(&rpc->work, mattx_rpc_worker);
@@ -939,6 +1387,14 @@ static int ret_handler_dup(struct kretprobe_instance *ri, struct pt_regs *regs) 
     spin_unlock(&guest_lock);
 
     if (home_node != -1) {
+        // --- THE ATOMIC SHIELD ---
+        // If the process is dying (SIGKILL) or exiting, DO NOT freeze it!
+        // Freezing a dying process inside a Kretprobe causes a "scheduling while atomic" BUG!
+        if (fatal_signal_pending(current) || (current->flags & PF_EXITING)) {
+            mattx_dbg("[HOOK] Surrogate %s is dying. Aborting RPC.\n", current->comm);
+            return 0;
+        }
+
         struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
         if (rpc) {
             INIT_WORK(&rpc->work, mattx_rpc_worker);
@@ -1015,6 +1471,14 @@ static int ret_handler_unlinkat(struct kretprobe_instance *ri, struct pt_regs *r
         spin_unlock(&guest_lock);
 
         if (home_node != -1) {
+            // --- THE ATOMIC SHIELD ---
+            // If the process is dying (SIGKILL) or exiting, DO NOT freeze it!
+            // Freezing a dying process inside a Kretprobe causes a "scheduling while atomic" BUG!
+            if (fatal_signal_pending(current) || (current->flags & PF_EXITING)) {
+                mattx_dbg("[HOOK] Surrogate %s is dying. Aborting RPC.\n", current->comm);
+                return 0;
+            }
+
             struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
             if (rpc) {
                 INIT_WORK(&rpc->work, mattx_rpc_worker);
@@ -1078,6 +1542,15 @@ static int ret_handler_socket(struct kretprobe_instance *ri, struct pt_regs *reg
     spin_unlock(&guest_lock);
 
     if (home_node != -1) {
+
+        // --- THE ATOMIC SHIELD ---
+        // If the process is dying (SIGKILL) or exiting, DO NOT freeze it!
+        // Freezing a dying process inside a Kretprobe causes a "scheduling while atomic" BUG!
+        if (fatal_signal_pending(current) || (current->flags & PF_EXITING)) {
+            mattx_dbg("[HOOK] Surrogate %s is dying. Aborting RPC.\n", current->comm);
+            return 0;
+        }
+
         struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
         if (rpc) {
             INIT_WORK(&rpc->work, mattx_rpc_worker);
@@ -1156,6 +1629,15 @@ static int ret_handler_connect(struct kretprobe_instance *ri, struct pt_regs *re
     spin_unlock(&guest_lock);
 
     if (home_node != -1) {
+
+        // --- THE ATOMIC SHIELD ---
+        // If the process is dying (SIGKILL) or exiting, DO NOT freeze it!
+        // Freezing a dying process inside a Kretprobe causes a "scheduling while atomic" BUG!
+        if (fatal_signal_pending(current) || (current->flags & PF_EXITING)) {
+            mattx_dbg("[HOOK] Surrogate %s is dying. Aborting RPC.\n", current->comm);
+            return 0;
+        }
+
         struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
         if (rpc) {
             INIT_WORK(&rpc->work, mattx_rpc_worker);
@@ -1223,6 +1705,15 @@ static int ret_handler_bind(struct kretprobe_instance *ri, struct pt_regs *regs)
     spin_unlock(&guest_lock);
 
     if (home_node != -1) {
+
+        // --- THE ATOMIC SHIELD ---
+        // If the process is dying (SIGKILL) or exiting, DO NOT freeze it!
+        // Freezing a dying process inside a Kretprobe causes a "scheduling while atomic" BUG!
+        if (fatal_signal_pending(current) || (current->flags & PF_EXITING)) {
+            mattx_dbg("[HOOK] Surrogate %s is dying. Aborting RPC.\n", current->comm);
+            return 0;
+        }
+
         struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
         if (rpc) {
             INIT_WORK(&rpc->work, mattx_rpc_worker);
@@ -1290,6 +1781,15 @@ static int ret_handler_listen(struct kretprobe_instance *ri, struct pt_regs *reg
     spin_unlock(&guest_lock);
 
     if (home_node != -1) {
+
+        // --- THE ATOMIC SHIELD ---
+        // If the process is dying (SIGKILL) or exiting, DO NOT freeze it!
+        // Freezing a dying process inside a Kretprobe causes a "scheduling while atomic" BUG!
+        if (fatal_signal_pending(current) || (current->flags & PF_EXITING)) {
+            mattx_dbg("[HOOK] Surrogate %s is dying. Aborting RPC.\n", current->comm);
+            return 0;
+        }
+
         struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
         if (rpc) {
             INIT_WORK(&rpc->work, mattx_rpc_worker);
@@ -1331,7 +1831,7 @@ static int entry_handler_sendto(struct kretprobe_instance *ri, struct pt_regs *r
     data->fd = (int)regs->di;
     data->buff = (void __user *)regs->si;
     data->len = (size_t)regs->dx;
-    data->flags = (unsigned int)regs->cx;
+    data->flags = (unsigned int)regs->r10;
     data->remote_fd = -1;
     
     data->is_wormhole_fd = is_wormhole_fd(data->fd, &data->remote_fd);
@@ -1360,6 +1860,15 @@ static int ret_handler_sendto(struct kretprobe_instance *ri, struct pt_regs *reg
     spin_unlock(&guest_lock);
 
     if (home_node != -1) {
+
+        // --- THE ATOMIC SHIELD ---
+        // If the process is dying (SIGKILL) or exiting, DO NOT freeze it!
+        // Freezing a dying process inside a Kretprobe causes a "scheduling while atomic" BUG!
+        if (fatal_signal_pending(current) || (current->flags & PF_EXITING)) {
+            mattx_dbg("[HOOK] Surrogate %s is dying. Aborting RPC.\n", current->comm);
+            return 0;
+        }
+
         struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
         if (rpc) {
             INIT_WORK(&rpc->work, mattx_rpc_worker);
@@ -1403,7 +1912,7 @@ static int entry_handler_recvfrom(struct kretprobe_instance *ri, struct pt_regs 
     data->fd = (int)regs->di;
     data->ubuf = (void __user *)regs->si;
     data->size = (size_t)regs->dx;
-    data->flags = (unsigned int)regs->cx;
+    data->flags = (unsigned int)regs->r10;
     data->remote_fd = -1;
 
     data->is_wormhole_fd = is_wormhole_fd(data->fd, &data->remote_fd);
@@ -1432,6 +1941,15 @@ static int ret_handler_recvfrom(struct kretprobe_instance *ri, struct pt_regs *r
     spin_unlock(&guest_lock);
 
     if (home_node != -1) {
+
+        // --- THE ATOMIC SHIELD ---
+        // If the process is dying (SIGKILL) or exiting, DO NOT freeze it!
+        // Freezing a dying process inside a Kretprobe causes a "scheduling while atomic" BUG!
+        if (fatal_signal_pending(current) || (current->flags & PF_EXITING)) {
+            mattx_dbg("[HOOK] Surrogate %s is dying. Aborting RPC.\n", current->comm);
+            return 0;
+        }
+
         struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
         if (rpc) {
             INIT_WORK(&rpc->work, mattx_rpc_worker);
@@ -1475,7 +1993,7 @@ static int entry_handler_accept(struct kretprobe_instance *ri, struct pt_regs *r
     data->fd = (int)regs->di;
     data->upeer_sockaddr = (struct sockaddr __user *)regs->si;
     data->upeer_addrlen = (int __user *)regs->dx;
-    data->flags = (int)regs->cx;
+    data->flags = (int)regs->r10;
     data->remote_fd = -1;
 
     data->is_wormhole_fd = is_wormhole_fd(data->fd, &data->remote_fd);
@@ -1504,6 +2022,15 @@ static int ret_handler_accept(struct kretprobe_instance *ri, struct pt_regs *reg
     spin_unlock(&guest_lock);
 
     if (home_node != -1) {
+
+        // --- THE ATOMIC SHIELD ---
+        // If the process is dying (SIGKILL) or exiting, DO NOT freeze it!
+        // Freezing a dying process inside a Kretprobe causes a "scheduling while atomic" BUG!
+        if (fatal_signal_pending(current) || (current->flags & PF_EXITING)) {
+            mattx_dbg("[HOOK] Surrogate %s is dying. Aborting RPC.\n", current->comm);
+            return 0;
+        }
+
         struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
         if (rpc) {
             INIT_WORK(&rpc->work, mattx_rpc_worker);
@@ -1589,6 +2116,15 @@ static int ret_handler_poll(struct kretprobe_instance *ri, struct pt_regs *regs)
     spin_unlock(&guest_lock);
 
     if (home_node != -1) {
+
+        // --- THE ATOMIC SHIELD ---
+        // If the process is dying (SIGKILL) or exiting, DO NOT freeze it!
+        // Freezing a dying process inside a Kretprobe causes a "scheduling while atomic" BUG!
+        if (fatal_signal_pending(current) || (current->flags & PF_EXITING)) {
+            mattx_dbg("[HOOK] Surrogate %s is dying. Aborting RPC.\n", current->comm);
+            return 0;
+        }
+
         struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
         if (rpc) {
             INIT_WORK(&rpc->work, mattx_rpc_worker);
@@ -1633,7 +2169,7 @@ static int entry_handler_select(struct kretprobe_instance *ri, struct pt_regs *r
     data->n = (int)sys_regs->di;
     data->inp = (void __user *)sys_regs->si;
     data->outp = (void __user *)sys_regs->dx;
-    data->exp = (void __user *)sys_regs->cx;
+    data->exp = (void __user *)sys_regs->r10;
     data->tvp = (void __user *)sys_regs->r8;
 
     sys_regs->di = -1; // Sabotage inner FD count!
@@ -1661,6 +2197,15 @@ static int ret_handler_select(struct kretprobe_instance *ri, struct pt_regs *reg
     spin_unlock(&guest_lock);
 
     if (home_node != -1) {
+
+        // --- THE ATOMIC SHIELD ---
+        // If the process is dying (SIGKILL) or exiting, DO NOT freeze it!
+        // Freezing a dying process inside a Kretprobe causes a "scheduling while atomic" BUG!
+        if (fatal_signal_pending(current) || (current->flags & PF_EXITING)) {
+            mattx_dbg("[HOOK] Surrogate %s is dying. Aborting RPC.\n", current->comm);
+            return 0;
+        }
+
         struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
         if (rpc) {
             INIT_WORK(&rpc->work, mattx_rpc_worker);
@@ -1735,7 +2280,7 @@ static int entry_handler_pselect6(struct kretprobe_instance *ri, struct pt_regs 
     data->n = (int)sys_regs->di;
     data->inp = (void __user *)sys_regs->si;
     data->outp = (void __user *)sys_regs->dx;
-    data->exp = (void __user *)sys_regs->cx;
+    data->exp = (void __user *)sys_regs->r10;
     data->tsp = (void __user *)sys_regs->r8;
     data->sig = (void __user *)sys_regs->r9;
 
@@ -1764,6 +2309,15 @@ static int ret_handler_pselect6(struct kretprobe_instance *ri, struct pt_regs *r
     spin_unlock(&guest_lock);
 
     if (home_node != -1) {
+
+        // --- THE ATOMIC SHIELD ---
+        // If the process is dying (SIGKILL) or exiting, DO NOT freeze it!
+        // Freezing a dying process inside a Kretprobe causes a "scheduling while atomic" BUG!
+        if (fatal_signal_pending(current) || (current->flags & PF_EXITING)) {
+            mattx_dbg("[HOOK] Surrogate %s is dying. Aborting RPC.\n", current->comm);
+            return 0;
+        }
+
         struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
         if (rpc) {
             INIT_WORK(&rpc->work, mattx_rpc_worker);
@@ -1869,6 +2423,15 @@ static int ret_handler_read(struct kretprobe_instance *ri, struct pt_regs *regs)
     spin_unlock(&guest_lock);
 
     if (home_node != -1) {
+
+        // --- THE ATOMIC SHIELD ---
+        // If the process is dying (SIGKILL) or exiting, DO NOT freeze it!
+        // Freezing a dying process inside a Kretprobe causes a "scheduling while atomic" BUG!
+        if (fatal_signal_pending(current) || (current->flags & PF_EXITING)) {
+            mattx_dbg("[HOOK] Surrogate %s is dying. Aborting RPC.\n", current->comm);
+            return 0;
+        }
+
         struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
         if (rpc) {
             INIT_WORK(&rpc->work, mattx_rpc_worker);
@@ -1943,6 +2506,15 @@ static int ret_handler_write(struct kretprobe_instance *ri, struct pt_regs *regs
     spin_unlock(&guest_lock);
 
     if (home_node != -1) {
+
+        // --- THE ATOMIC SHIELD ---
+        // If the process is dying (SIGKILL) or exiting, DO NOT freeze it!
+        // Freezing a dying process inside a Kretprobe causes a "scheduling while atomic" BUG!
+        if (fatal_signal_pending(current) || (current->flags & PF_EXITING)) {
+            mattx_dbg("[HOOK] Surrogate %s is dying. Aborting RPC.\n", current->comm);
+            return 0;
+        }
+
         struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
         if (rpc) {
             INIT_WORK(&rpc->work, mattx_rpc_worker);
@@ -1963,7 +2535,431 @@ static int ret_handler_write(struct kretprobe_instance *ri, struct pt_regs *regs
 }
 
 
+// --- THE EPOLL TRANSLATOR: Create Interceptor (Sterile Lab) ---
+struct epoll_create_kretprobe_data {
+    int flags;
+    bool is_guest;
+    bool is_epolltest;
+};
 
+static struct kretprobe epoll_create_kprobe;
+static struct kretprobe epoll_create1_kprobe;
+
+static int entry_handler_epoll_create(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    struct epoll_create_kretprobe_data *data = (struct epoll_create_kretprobe_data *)ri->data;
+    struct pt_regs *sys_regs = SYSCALL_REGS(regs);
+    
+    data->is_guest = is_guest_process(current->pid);
+    data->is_epolltest = (strcmp(current->comm, "epolltest") == 0);
+
+    // STERILE LABORATORY: Only intercept if it's a guest AND it's exactly "epolltest"
+    if (data->is_guest && data->is_epolltest) {
+        // For epoll_create1, flags are in DI. For epoll_create, size is in DI.
+        // We just grab DI so we can pass it to the Home Node.
+        data->flags = (int)sys_regs->di;
+        sys_regs->di = -1; // Sabotage! Force the local syscall to fail.
+    }
+    return 0;
+}
+
+static int ret_handler_epoll_create(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    struct epoll_create_kretprobe_data *data = (struct epoll_create_kretprobe_data *)ri->data;
+    int home_node = -1;
+    u32 orig_pid = 0;
+    int i;
+
+    if (!data->is_guest || !data->is_epolltest) return 0;
+
+    spin_lock(&guest_lock);
+    for (i = 0; i < guest_count; i++) {
+        if (guest_registry[i].local_pid == current->pid) {
+            home_node = guest_registry[i].home_node;
+            orig_pid = guest_registry[i].orig_pid;
+            guest_registry[i].rpc_done = false; 
+            break;
+        }
+    }
+    spin_unlock(&guest_lock);
+
+    if (home_node != -1) {
+
+        // --- THE ATOMIC SHIELD ---
+        // If the process is dying (SIGKILL) or exiting, DO NOT freeze it!
+        // Freezing a dying process inside a Kretprobe causes a "scheduling while atomic" BUG!
+        if (fatal_signal_pending(current) || (current->flags & PF_EXITING)) {
+            mattx_dbg("[HOOK] Surrogate %s is dying. Aborting RPC.\n", current->comm);
+            return 0;
+        }
+
+        struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
+        if (rpc) {
+            INIT_WORK(&rpc->work, mattx_rpc_worker);
+            rpc->local_pid = current->pid;
+            rpc->orig_pid = orig_pid;
+            rpc->home_node = home_node;
+            
+            rpc->is_epoll_create = true;
+            rpc->epoll_flags = data->flags;
+
+            mattx_dbg("[HOOK] Intercepted epoll_create() for %s. Freezing Surrogate %d...\n", current->comm, current->pid);
+            send_sig(SIGSTOP, current, 0);
+            schedule_work(&rpc->work);
+        }
+    }
+    return 0;
+}
+
+
+static struct kretprobe epoll_ctl_kprobe;
+static struct kretprobe epoll_wait_kprobe;
+
+
+// --- THE EPOLL HIJACKER: Ctl ---
+struct epoll_ctl_kretprobe_data {
+    int epfd;
+    int op;
+    int fd;
+    struct epoll_event __user *event_ptr;
+    bool is_ghost;
+};
+
+static int entry_handler_epoll_ctl(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    struct epoll_ctl_kretprobe_data *data = (struct epoll_ctl_kretprobe_data *)ri->data;
+    struct pt_regs *sys_regs = SYSCALL_REGS(regs);
+    data->is_ghost = false;
+
+    if (is_guest_process(current->pid)) {
+        int epfd = (int)sys_regs->di;
+        if (is_wormhole_fd(epfd, NULL)) {
+            data->is_ghost = true;
+            data->epfd = epfd;
+            data->op = (int)sys_regs->si;
+            data->fd = (int)sys_regs->dx;
+            data->event_ptr = (struct epoll_event __user *)sys_regs->r10; // 4th arg is R10
+            sys_regs->di = -1; // Sabotage!
+        }
+    }
+    return 0;
+}
+
+static int ret_handler_epoll_ctl(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    struct epoll_ctl_kretprobe_data *data = (struct epoll_ctl_kretprobe_data *)ri->data;
+    int home_node = -1;
+    u32 orig_pid = 0;
+    int i;
+
+    if (!data->is_ghost) return 0;
+
+    // --- THE ATOMIC SHIELD ---
+    if (fatal_signal_pending(current) || (current->flags & PF_EXITING)) {
+        return 0;
+    }
+
+    spin_lock(&guest_lock);
+    for (i = 0; i < guest_count; i++) {
+        if (guest_registry[i].local_pid == current->pid) {
+            home_node = guest_registry[i].home_node;
+            orig_pid = guest_registry[i].orig_pid;
+            guest_registry[i].rpc_done = false; 
+            break;
+        }
+    }
+    spin_unlock(&guest_lock);
+
+    if (home_node != -1) {
+        struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
+        if (rpc) {
+            INIT_WORK(&rpc->work, mattx_rpc_worker);
+            rpc->local_pid = current->pid;
+            rpc->orig_pid = orig_pid;
+            rpc->home_node = home_node;
+            
+            rpc->is_epoll_ctl = true;
+            rpc->remote_fd = data->epfd;
+            rpc->epoll_op = data->op;
+            rpc->new_local_fd = data->fd; 
+            rpc->epoll_events_ptr = data->event_ptr; 
+
+            // --- THE RIP DRIFT FIX ---
+            // Use standard EINTR so the kernel doesn't rewind the Instruction Pointer!
+            regs->ax = -EINTR;
+
+            send_sig(SIGSTOP, current, 0);
+            schedule_work(&rpc->work);
+        }
+    }
+    return 0;
+}
+
+
+// --- THE EPOLL HIJACKER: Wait ---
+struct epoll_wait_kretprobe_data {
+    int epfd;
+    struct epoll_event __user *event_ptr;
+    int maxevents;
+    int timeout;
+    bool is_ghost;
+};
+
+static int entry_handler_epoll_wait(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    struct epoll_wait_kretprobe_data *data = (struct epoll_wait_kretprobe_data *)ri->data;
+    struct pt_regs *sys_regs = SYSCALL_REGS(regs);
+    data->is_ghost = false;
+
+    if (is_guest_process(current->pid)) {
+        int epfd = (int)sys_regs->di;
+        if (is_wormhole_fd(epfd, NULL)) {
+            data->is_ghost = true;
+            data->epfd = epfd;
+            data->event_ptr = (struct epoll_event __user *)sys_regs->si;
+            data->maxevents = (int)sys_regs->dx;
+            data->timeout = (int)sys_regs->r10; // 4th arg is R10
+            sys_regs->di = -1; // Sabotage!
+        }
+    }
+    return 0;
+}
+
+
+static int ret_handler_epoll_wait(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    struct epoll_wait_kretprobe_data *data = (struct epoll_wait_kretprobe_data *)ri->data;
+    int home_node = -1;
+    u32 orig_pid = 0;
+    int i;
+
+    if (!data->is_ghost) return 0;
+
+    // --- THE ATOMIC SHIELD ---
+    if (fatal_signal_pending(current) || (current->flags & PF_EXITING)) {
+        return 0;
+    }
+
+    spin_lock(&guest_lock);
+    for (i = 0; i < guest_count; i++) {
+        if (guest_registry[i].local_pid == current->pid) {
+            home_node = guest_registry[i].home_node;
+            orig_pid = guest_registry[i].orig_pid;
+            guest_registry[i].rpc_done = false; 
+            guest_registry[i].rpc_read_buf = NULL;
+            break;
+        }
+    }
+    spin_unlock(&guest_lock);
+
+    if (home_node != -1) {
+        struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
+        if (rpc) {
+            INIT_WORK(&rpc->work, mattx_rpc_worker);
+            rpc->local_pid = current->pid;
+            rpc->orig_pid = orig_pid;
+            rpc->home_node = home_node;
+            
+            rpc->is_epoll_wait = true;
+            rpc->remote_fd = data->epfd;
+            rpc->epoll_events_ptr = data->event_ptr;
+            rpc->epoll_maxevents = data->maxevents;
+            rpc->timeout_ms = data->timeout;
+
+            // --- THE RIP DRIFT FIX ---
+            regs->ax = -EINTR;
+
+            send_sig(SIGSTOP, current, 0);
+            schedule_work(&rpc->work);
+        }
+    }
+    return 0;
+}
+
+
+// --- THE NETWORK HIJACKERS: Sockopts & Names ---
+static struct kretprobe getsockname_kprobe;
+static struct kretprobe getpeername_kprobe;
+static struct kretprobe setsockopt_kprobe;
+static struct kretprobe getsockopt_kprobe;
+
+struct sockname_kretprobe_data { int fd; void __user *addr; void __user *len; bool is_ghost; int remote_fd; };
+struct sockopt_kretprobe_data { int fd; int level; int optname; void __user *optval; void __user *optlen; bool is_ghost; int remote_fd; };
+
+static int entry_handler_sockname(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    struct sockname_kretprobe_data *data = (struct sockname_kretprobe_data *)ri->data;
+    struct pt_regs *sys_regs = SYSCALL_REGS(regs);
+    data->is_ghost = false;
+    if (is_guest_process(current->pid)) {
+        data->fd = (int)sys_regs->di;
+        if (is_wormhole_fd(data->fd, &data->remote_fd)) {
+            data->is_ghost = true;
+            data->addr = (void __user *)sys_regs->si;
+            data->len = (void __user *)sys_regs->dx;
+            sys_regs->di = -1; // Sabotage!
+        }
+    }
+    return 0;
+}
+
+static int ret_handler_sockname(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    struct sockname_kretprobe_data *data = (struct sockname_kretprobe_data *)ri->data;
+    int home_node = -1; u32 orig_pid = 0;
+    if (!data->is_ghost) return 0;
+    if (fatal_signal_pending(current) || (current->flags & PF_EXITING)) return 0;
+
+    spin_lock(&guest_lock);
+    for (int i = 0; i < guest_count; i++) {
+        if (guest_registry[i].local_pid == current->pid) {
+            home_node = guest_registry[i].home_node; orig_pid = guest_registry[i].orig_pid;
+            guest_registry[i].rpc_done = false; break;
+        }
+    }
+    spin_unlock(&guest_lock);
+
+    if (home_node != -1) {
+        struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
+        if (rpc) {
+            INIT_WORK(&rpc->work, mattx_rpc_worker);
+            rpc->local_pid = current->pid; rpc->orig_pid = orig_pid; rpc->home_node = home_node;
+
+            // --- Use strstr to safely identify the syscall! ---
+            if (strstr(get_kretprobe(ri)->kp.symbol_name, "getsockname")) rpc->is_getsockname = true; 
+            else rpc->is_getpeername = true;            
+
+            rpc->remote_fd = data->remote_fd;
+            rpc->buff = data->addr;
+            rpc->size = (size_t)data->len; // Reuse size for the length pointer
+
+            regs->ax = -EINTR;
+            send_sig(SIGSTOP, current, 0);
+            schedule_work(&rpc->work);
+        }
+    }
+    return 0;
+}
+
+static int entry_handler_sockopt(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    struct sockopt_kretprobe_data *data = (struct sockopt_kretprobe_data *)ri->data;
+    struct pt_regs *sys_regs = SYSCALL_REGS(regs);
+    data->is_ghost = false;
+    if (is_guest_process(current->pid)) {
+        data->fd = (int)sys_regs->di;
+        if (is_wormhole_fd(data->fd, &data->remote_fd)) {
+            data->is_ghost = true;
+            data->level = (int)sys_regs->si;
+            data->optname = (int)sys_regs->dx;
+            data->optval = (void __user *)sys_regs->r10;
+            data->optlen = (void __user *)sys_regs->r8;
+            sys_regs->di = -1; // Sabotage!
+        }
+    }
+    return 0;
+}
+
+static int ret_handler_sockopt(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    struct sockopt_kretprobe_data *data = (struct sockopt_kretprobe_data *)ri->data;
+    int home_node = -1; u32 orig_pid = 0;
+    if (!data->is_ghost) return 0;
+    if (fatal_signal_pending(current) || (current->flags & PF_EXITING)) return 0;
+
+    spin_lock(&guest_lock);
+    for (int i = 0; i < guest_count; i++) {
+        if (guest_registry[i].local_pid == current->pid) {
+            home_node = guest_registry[i].home_node; orig_pid = guest_registry[i].orig_pid;
+            guest_registry[i].rpc_done = false; break;
+        }
+    }
+    spin_unlock(&guest_lock);
+
+    if (home_node != -1) {
+        struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
+        if (rpc) {
+            INIT_WORK(&rpc->work, mattx_rpc_worker);
+            rpc->local_pid = current->pid; rpc->orig_pid = orig_pid; rpc->home_node = home_node;
+
+            // --- Use strstr to safely identify the syscall! ---
+            if (strstr(get_kretprobe(ri)->kp.symbol_name, "setsockopt")) rpc->is_setsockopt = true;
+            else rpc->is_getsockopt = true;            
+            
+            rpc->remote_fd = data->remote_fd;
+            rpc->sock_level = data->level;
+            rpc->sock_optname = data->optname;
+            rpc->buff = data->optval;
+            
+            // For setsockopt, optlen is an integer. For getsockopt, it's a pointer!
+            if (rpc->is_setsockopt) rpc->sock_optlen = (int)(size_t)data->optlen;
+            else rpc->size = (size_t)data->optlen; // Reuse size for the pointer
+
+            regs->ax = -EINTR;
+            send_sig(SIGSTOP, current, 0);
+            schedule_work(&rpc->work);
+        }
+    }
+    return 0;
+}
+
+
+// --- THE NETWORK HIJACKERS: Sendmsg & Recvmsg ---
+static struct kretprobe sendmsg_kprobe;
+static struct kretprobe recvmsg_kprobe;
+
+struct msg_kretprobe_data { int fd; struct msghdr __user *msg; int flags; bool is_ghost; int remote_fd; };
+
+static int entry_handler_msg(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    struct msg_kretprobe_data *data = (struct msg_kretprobe_data *)ri->data;
+    struct pt_regs *sys_regs = SYSCALL_REGS(regs);
+    data->is_ghost = false;
+    if (is_guest_process(current->pid)) {
+        data->fd = (int)sys_regs->di;
+        if (is_wormhole_fd(data->fd, &data->remote_fd)) {
+            data->is_ghost = true;
+            data->msg = (struct msghdr __user *)sys_regs->si;
+            data->flags = (int)sys_regs->dx;
+            sys_regs->di = -1; // Sabotage!
+        }
+    }
+    return 0;
+}
+
+static int ret_handler_msg(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    struct msg_kretprobe_data *data = (struct msg_kretprobe_data *)ri->data;
+    int home_node = -1; u32 orig_pid = 0;
+    if (!data->is_ghost) return 0;
+    if (fatal_signal_pending(current) || (current->flags & PF_EXITING)) return 0;
+
+    spin_lock(&guest_lock);
+    for (int i = 0; i < guest_count; i++) {
+        if (guest_registry[i].local_pid == current->pid) {
+            home_node = guest_registry[i].home_node; orig_pid = guest_registry[i].orig_pid;
+            guest_registry[i].rpc_done = false; break;
+        }
+    }
+    spin_unlock(&guest_lock);
+
+    if (home_node != -1) {
+        struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
+        if (rpc) {
+            INIT_WORK(&rpc->work, mattx_rpc_worker);
+            rpc->local_pid = current->pid; rpc->orig_pid = orig_pid; rpc->home_node = home_node;
+            
+            // --- FIXED: Use strstr to safely identify the syscall! ---
+            if (strstr(get_kretprobe(ri)->kp.symbol_name, "sendmsg")) rpc->is_sendmsg = true;
+            else rpc->is_recvmsg = true;
+
+            rpc->remote_fd = data->remote_fd;
+            rpc->msg_ptr = data->msg;
+            rpc->flags = data->flags;
+
+            // --- FIXED: The Silent Ninja speaks! ---
+            mattx_dbg("[HOOK] Intercepted %s(fd=%d). Freezing Surrogate %d...\n", 
+                   rpc->is_sendmsg ? "sendmsg" : "recvmsg", data->fd, current->pid);
+
+            regs->ax = -EINTR;
+            send_sig(SIGSTOP, current, 0);
+            schedule_work(&rpc->work);
+        }
+    }
+    return 0;
+}
+
+
+
+// --- KPROBE REGISTRATION ---
 
 int mattx_hooks_init(void) {
     int ret;
@@ -2139,12 +3135,109 @@ int mattx_hooks_init(void) {
     ret = register_kretprobe(&write_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for write, returned %d\n", ret);
 
+    memset(&epoll_ctl_kprobe, 0, sizeof(epoll_ctl_kprobe));
+    epoll_ctl_kprobe.kp.symbol_name = "__x64_sys_epoll_ctl";
+    epoll_ctl_kprobe.entry_handler = entry_handler_epoll_ctl;
+    epoll_ctl_kprobe.handler = ret_handler_epoll_ctl;
+    epoll_ctl_kprobe.data_size = sizeof(struct epoll_ctl_kretprobe_data);
+    epoll_ctl_kprobe.maxactive = 64;
+    ret = register_kretprobe(&epoll_ctl_kprobe);
+    if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for epoll_ctl, returned %d\n", ret); 
+
+    memset(&epoll_wait_kprobe, 0, sizeof(epoll_wait_kprobe));
+    epoll_wait_kprobe.kp.symbol_name = "__x64_sys_epoll_wait";
+    epoll_wait_kprobe.entry_handler = entry_handler_epoll_wait;
+    epoll_wait_kprobe.handler = ret_handler_epoll_wait;
+    epoll_wait_kprobe.data_size = sizeof(struct epoll_wait_kretprobe_data); // <-- THIS ONE!
+    epoll_wait_kprobe.maxactive = 64;
+    ret = register_kretprobe(&epoll_wait_kprobe);
+    if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for epoll_wait, returned %d\n", ret);
+
+    memset(&epoll_create_kprobe, 0, sizeof(epoll_create_kprobe));
+    epoll_create_kprobe.kp.symbol_name = "__x64_sys_epoll_create";
+    epoll_create_kprobe.entry_handler = entry_handler_epoll_create;
+    epoll_create_kprobe.handler = ret_handler_epoll_create;
+    epoll_create_kprobe.data_size = sizeof(struct epoll_create_kretprobe_data);
+    epoll_create_kprobe.maxactive = 64;
+    ret = register_kretprobe(&epoll_create_kprobe);
+    if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for epoll_create, returned %d\n", ret);
+
+    memset(&epoll_create1_kprobe, 0, sizeof(epoll_create1_kprobe));
+    epoll_create1_kprobe.kp.symbol_name = "__x64_sys_epoll_create1";
+    epoll_create1_kprobe.entry_handler = entry_handler_epoll_create;
+    epoll_create1_kprobe.handler = ret_handler_epoll_create;
+    epoll_create1_kprobe.data_size = sizeof(struct epoll_create_kretprobe_data);
+    epoll_create1_kprobe.maxactive = 64;
+    ret = register_kretprobe(&epoll_create1_kprobe);
+    if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for epoll_create1, returned %d\n", ret   );
+
+    // --- SOCKNAME & PEERNAME ---
+    memset(&getsockname_kprobe, 0, sizeof(getsockname_kprobe));
+    getsockname_kprobe.kp.symbol_name = "__x64_sys_getsockname";
+    getsockname_kprobe.entry_handler = entry_handler_sockname;
+    getsockname_kprobe.handler = ret_handler_sockname;
+    getsockname_kprobe.data_size = sizeof(struct sockname_kretprobe_data);
+    getsockname_kprobe.maxactive = 64;
+    register_kretprobe(&getsockname_kprobe);
+
+    memset(&getpeername_kprobe, 0, sizeof(getpeername_kprobe));
+    getpeername_kprobe.kp.symbol_name = "__x64_sys_getpeername";
+    getpeername_kprobe.entry_handler = entry_handler_sockname; // Shared!
+    getpeername_kprobe.handler = ret_handler_sockname;         // Shared!
+    getpeername_kprobe.data_size = sizeof(struct sockname_kretprobe_data);
+    getpeername_kprobe.maxactive = 64;
+    register_kretprobe(&getpeername_kprobe);
+
+    // --- SOCKOPTS ---
+    memset(&setsockopt_kprobe, 0, sizeof(setsockopt_kprobe));
+    setsockopt_kprobe.kp.symbol_name = "__x64_sys_setsockopt";
+    setsockopt_kprobe.entry_handler = entry_handler_sockopt;
+    setsockopt_kprobe.handler = ret_handler_sockopt;
+    setsockopt_kprobe.data_size = sizeof(struct sockopt_kretprobe_data);
+    setsockopt_kprobe.maxactive = 64;
+    register_kretprobe(&setsockopt_kprobe);
+
+    memset(&getsockopt_kprobe, 0, sizeof(getsockopt_kprobe));
+    getsockopt_kprobe.kp.symbol_name = "__x64_sys_getsockopt";
+    getsockopt_kprobe.entry_handler = entry_handler_sockopt; // Shared!
+    getsockopt_kprobe.handler = ret_handler_sockopt;         // Shared!
+    getsockopt_kprobe.data_size = sizeof(struct sockopt_kretprobe_data);
+    getsockopt_kprobe.maxactive = 64;
+    register_kretprobe(&getsockopt_kprobe);
+
+    // --- SENDMSG & RECVMSG ---
+    memset(&sendmsg_kprobe, 0, sizeof(sendmsg_kprobe));
+    sendmsg_kprobe.kp.symbol_name = "__x64_sys_sendmsg";
+    sendmsg_kprobe.entry_handler = entry_handler_msg;
+    sendmsg_kprobe.handler = ret_handler_msg;
+    sendmsg_kprobe.data_size = sizeof(struct msg_kretprobe_data);
+    sendmsg_kprobe.maxactive = 64;
+    register_kretprobe(&sendmsg_kprobe);
+
+    memset(&recvmsg_kprobe, 0, sizeof(recvmsg_kprobe));
+    recvmsg_kprobe.kp.symbol_name = "__x64_sys_recvmsg";
+    recvmsg_kprobe.entry_handler = entry_handler_msg; // Shared!
+    recvmsg_kprobe.handler = ret_handler_msg;         // Shared!
+    recvmsg_kprobe.data_size = sizeof(struct msg_kretprobe_data);
+    recvmsg_kprobe.maxactive = 64;
+    register_kretprobe(&recvmsg_kprobe);
+
 
     mattx_dbg(" Syscall Hooks (Kprobes) registered successfully.\n");
     return 0;
 }
 
 void mattx_hooks_exit(void) {
+    unregister_kretprobe(&sendmsg_kprobe);
+    unregister_kretprobe(&recvmsg_kprobe);
+    unregister_kretprobe(&getsockname_kprobe);
+    unregister_kretprobe(&getpeername_kprobe);
+    unregister_kretprobe(&getsockopt_kprobe);
+    unregister_kretprobe(&setsockopt_kprobe);
+    unregister_kretprobe(&epoll_create_kprobe);
+    unregister_kretprobe(&epoll_create1_kprobe);
+    unregister_kretprobe(&epoll_wait_kprobe);
+    unregister_kretprobe(&epoll_ctl_kprobe);
     unregister_kretprobe(&pselect6_kprobe);    
     unregister_kretprobe(&write_kprobe);
     unregister_kretprobe(&read_kprobe);    
