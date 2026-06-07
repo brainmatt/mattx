@@ -47,6 +47,15 @@ mattx_sys_getsockopt_fn real_sys_getsockopt = NULL;
 mattx_sys_sendmsg_fn real_sys_sendmsg = NULL;
 mattx_sys_recvmsg_fn real_sys_recvmsg = NULL;
 
+
+// file io resolvers
+mattx_sys_openat_fn real_sys_openat = NULL;
+mattx_sys_read_fn real_sys_read = NULL;
+mattx_sys_write_fn real_sys_write = NULL;
+mattx_sys_close_fn real_sys_close = NULL;
+
+
+
 static void mattx_resolve_hidden_symbols(void) {
     struct kprobe kp; // Only ONE struct on the stack!
 
@@ -58,6 +67,8 @@ static void mattx_resolve_hidden_symbols(void) {
         unregister_kprobe(&kp);
         mattx_dbg("[MIGR] Hacker Magic: Resolved task_work_add at %p\n", real_task_work_add);
     }
+
+    // network ghost resolvers
 
     // 2. epoll_create1
     memset(&kp, 0, sizeof(kp));
@@ -123,6 +134,7 @@ static void mattx_resolve_hidden_symbols(void) {
         unregister_kprobe(&kp);
     }
 
+    // 10. socket
     memset(&kp, 0, sizeof(kp)); 
     kp.symbol_name = "__x64_sys_socket";
     if (register_kprobe(&kp) == 0) {
@@ -130,6 +142,7 @@ static void mattx_resolve_hidden_symbols(void) {
         unregister_kprobe(&kp); 
     }
 
+    // 11. accept4
     memset(&kp, 0, sizeof(kp)); 
     kp.symbol_name = "__x64_sys_accept4";
     if (register_kprobe(&kp) == 0) {
@@ -137,6 +150,7 @@ static void mattx_resolve_hidden_symbols(void) {
         unregister_kprobe(&kp); 
     }
 
+    // 12. getsockname
     memset(&kp, 0, sizeof(kp));
     kp.symbol_name = "__x64_sys_getsockname";
     if (register_kprobe(&kp) == 0) {
@@ -144,6 +158,7 @@ static void mattx_resolve_hidden_symbols(void) {
         unregister_kprobe(&kp); 
     }
 
+    // 13. getpeername
     memset(&kp, 0, sizeof(kp)); 
     kp.symbol_name = "__x64_sys_getpeername";
     if (register_kprobe(&kp) == 0) { 
@@ -151,6 +166,7 @@ static void mattx_resolve_hidden_symbols(void) {
         unregister_kprobe(&kp); 
     }
 
+    // 14. setsockopt
     memset(&kp, 0, sizeof(kp)); 
     kp.symbol_name = "__x64_sys_setsockopt";
     if (register_kprobe(&kp) == 0) { 
@@ -158,6 +174,7 @@ static void mattx_resolve_hidden_symbols(void) {
         unregister_kprobe(&kp); 
     }
 
+    // 15. getsockopt
     memset(&kp, 0, sizeof(kp)); 
     kp.symbol_name = "__x64_sys_getsockopt";
     if (register_kprobe(&kp) == 0) { 
@@ -165,14 +182,53 @@ static void mattx_resolve_hidden_symbols(void) {
         unregister_kprobe(&kp); 
     }
 
+    // 16. sendmsg
     memset(&kp, 0, sizeof(kp)); 
     kp.symbol_name = "__x64_sys_sendmsg";
-    if (register_kprobe(&kp) == 0) { real_sys_sendmsg = (mattx_sys_sendmsg_fn)kp.addr; unregister_kprobe(&kp); }
+    if (register_kprobe(&kp) == 0) {
+        real_sys_sendmsg = (mattx_sys_sendmsg_fn)kp.addr; 
+        unregister_kprobe(&kp); 
+    }
 
+    // 17. recvmsg
     memset(&kp, 0, sizeof(kp)); 
     kp.symbol_name = "__x64_sys_recvmsg";
     if (register_kprobe(&kp) == 0) { 
         real_sys_recvmsg = (mattx_sys_recvmsg_fn)kp.addr; 
+        unregister_kprobe(&kp); 
+    }
+
+
+
+
+    // file io ghost resolvers
+
+    // 1. openat
+    memset(&kp, 0, sizeof(kp)); 
+    kp.symbol_name = "__x64_sys_openat";
+    if (register_kprobe(&kp) == 0) { 
+        real_sys_openat = (mattx_sys_openat_fn)kp.addr; 
+        unregister_kprobe(&kp); 
+    }
+
+    // 2. read
+    memset(&kp, 0, sizeof(kp)); kp.symbol_name = "__x64_sys_read";
+    if (register_kprobe(&kp) == 0) { 
+        real_sys_read = (mattx_sys_read_fn)kp.addr; 
+        unregister_kprobe(&kp); 
+    }
+
+    // 3. write
+    memset(&kp, 0, sizeof(kp)); kp.symbol_name = "__x64_sys_write";
+    if (register_kprobe(&kp) == 0) { 
+        real_sys_write = (mattx_sys_write_fn)kp.addr; 
+        unregister_kprobe(&kp); 
+    }
+
+    // 4. close
+    memset(&kp, 0, sizeof(kp)); kp.symbol_name = "__x64_sys_close";
+    if (register_kprobe(&kp) == 0) { 
+        real_sys_close = (mattx_sys_close_fn)kp.addr; 
         unregister_kprobe(&kp); 
     }
 

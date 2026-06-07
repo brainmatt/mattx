@@ -899,6 +899,21 @@ typedef long (*mattx_sys_recvmsg_fn)(const struct pt_regs *regs);
 extern mattx_sys_recvmsg_fn real_sys_recvmsg;
 
 
+// --- THE FILE I/O GHOST RESOLVERS ---
+typedef long (*mattx_sys_openat_fn)(const struct pt_regs *regs);
+extern mattx_sys_openat_fn real_sys_openat;
+
+typedef long (*mattx_sys_read_fn)(const struct pt_regs *regs);
+extern mattx_sys_read_fn real_sys_read;
+
+typedef long (*mattx_sys_write_fn)(const struct pt_regs *regs);
+extern mattx_sys_write_fn real_sys_write;
+
+typedef long (*mattx_sys_close_fn)(const struct pt_regs *regs);
+extern mattx_sys_close_fn real_sys_close;
+
+
+
 // The Extreme Debugging Macro ---
 // This replaces printk(KERN_INFO...). It checks the flag before printing!
 #define mattx_dbg(fmt, ...) \
