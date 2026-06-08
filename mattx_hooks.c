@@ -1225,33 +1225,30 @@ struct kretprobe_data {
     int mode;
 };
 
+
 static int entry_handler_openat(struct kretprobe_instance *ri, struct pt_regs *regs) {
     pid_t my_pid = current->pid;
     struct kretprobe_data *data = (struct kretprobe_data *)ri->data;
+    struct pt_regs *sys_regs = SYSCALL_REGS(regs); // Unwrap the registers! ---
 
     if (!is_guest_process(my_pid)) return 0; 
-
-    // The Bypass! ---
     if (config_mattxfs_enabled) return 0; 
 
-    // Extract the original arguments from do_sys_openat2
-    // args: dfd (di), filename (si), open_how (dx)
-    data->filename_ptr = (const char __user *)regs->si;
+    data->filename_ptr = (const char __user *)sys_regs->si;
     
-    // In do_sys_openat2, the third argument (dx) is a kernel-space pointer to struct open_how
-    struct open_how *how = (struct open_how *)regs->dx;
+    struct open_how *how = (struct open_how *)sys_regs->dx;
     if (how) {
         data->flags = how->flags;
         data->mode = how->mode;
     } else {
-        data->flags = O_RDONLY; // Safe default
+        data->flags = O_RDONLY; 
         data->mode = 0;
     }
 
-    regs->si = 0; // Sabotage the syscall!
-
+    sys_regs->si = 0; // Sabotage the inner syscall! ---
     return 0;
 }
+
 
 static int ret_handler_openat(struct kretprobe_instance *ri, struct pt_regs *regs) {
     pid_t my_pid = current->pid;
@@ -1436,16 +1433,17 @@ static struct kretprobe unlinkat_kprobe;
 static int entry_handler_unlinkat(struct kretprobe_instance *ri, struct pt_regs *regs) {
     pid_t my_pid = current->pid;
     struct unlinkat_kretprobe_data *data = (struct unlinkat_kretprobe_data *)ri->data;
-    struct pt_regs *sys_regs = SYSCALL_REGS(regs); // Unwrap!
+    struct pt_regs *sys_regs = SYSCALL_REGS(regs); // Unwrap! ---
 
     if (!is_guest_process(my_pid)) return 0; 
     if (config_mattxfs_enabled) return 0; 
 
     data->pathname = (const char __user *)sys_regs->si;
-    sys_regs->si = 0; // Sabotage inner pathname!
+    sys_regs->si = 0; // Sabotage! ---
 
     return 0;
 }
+
 
 static int ret_handler_unlinkat(struct kretprobe_instance *ri, struct pt_regs *regs) {
     pid_t my_pid = current->pid;
@@ -2384,7 +2382,10 @@ static int entry_handler_read(struct kretprobe_instance *ri, struct pt_regs *reg
     if (data->fd >= 0) {
         struct file *f = fget(data->fd);
         if (f) {
-            if (f->f_op != &mattx_fops) {
+            // --- FIXED: Intercept MattXFS files if VFS is disabled! ---
+            if (f->f_op == &mattx_fops && !config_mattxfs_enabled) {
+                data->is_wormhole = true;
+            } else if (f->f_op != &mattx_fops) {
                 struct inode *inode = file_inode(f);
                 if (S_ISFIFO(inode->i_mode) || S_ISSOCK(inode->i_mode)) {
                     data->is_wormhole = true;
@@ -2467,7 +2468,10 @@ static int entry_handler_write(struct kretprobe_instance *ri, struct pt_regs *re
     if (data->fd >= 0) {
         struct file *f = fget(data->fd);
         if (f) {
-            if (f->f_op != &mattx_fops) {
+            // --- FIXED: Intercept MattXFS files if VFS is disabled! ---
+            if (f->f_op == &mattx_fops && !config_mattxfs_enabled) {
+                data->is_wormhole = true;
+            } else if (f->f_op != &mattx_fops) {
                 struct inode *inode = file_inode(f);
                 if (S_ISFIFO(inode->i_mode) || S_ISSOCK(inode->i_mode)) {
                     data->is_wormhole = true;
