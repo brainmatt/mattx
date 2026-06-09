@@ -27,7 +27,7 @@
 #include <linux/kprobes.h>
 #include <linux/timekeeping.h>
 
-# twa resolver
+// twa resolver
 mattx_task_work_add_fn real_task_work_add = NULL;
 
 // network resolvers
@@ -48,7 +48,7 @@ mattx_sys_epoll_create1_fn real_sys_epoll_create1 = NULL;
 mattx_sys_epoll_ctl_fn real_sys_epoll_ctl = NULL;
 mattx_sys_epoll_wait_fn real_sys_epoll_wait = NULL;
 
-# file-io resolvers
+// file-io resolvers
 mattx_sys_dup_fn real_sys_dup = NULL;
 mattx_sys_dup2_fn real_sys_dup2 = NULL;
 
