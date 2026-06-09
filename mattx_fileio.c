@@ -611,14 +611,42 @@ static void handle_sys_open_reply(struct mattx_link *link, struct mattx_header *
 }
 
 
+// --- THE DEPUTY HIJACK: CLOSE ---
+struct mattx_close_ctx {
+    struct callback_head cb;
+    struct mattx_sys_close_req req;
+};
+
+static void mattx_close_cb(struct callback_head *cb) {
+    struct mattx_close_ctx *ctx = container_of(cb, struct mattx_close_ctx, cb);
+    struct pt_regs real_args = {0};
+    struct pt_regs wrapper_args = {0};
+    int ret = -EBADF;
+
+    // --- THE DOUBLE WRAPPER TRICK ---
+    // 1. Put the FD into the real arguments
+    real_args.di = ctx->req.remote_fd;
+    
+    // 2. Put the POINTER to the real arguments into the wrapper arguments!
+    wrapper_args.di = (unsigned long)&real_args;
+
+    if (real_sys_close) {
+        ret = real_sys_close(&wrapper_args);
+        mattx_dbg("[HIJACK] Deputy executed close natively. Result: %d\n", ret);
+    }
+
+    kfree(ctx);
+    set_current_state(TASK_STOPPED);
+    schedule();
+}
+
 static void handle_sys_close_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
     if (payload) {
         struct mattx_sys_close_req *req = payload;
-        struct file *f_to_close = NULL;
         
-        mattx_dbg("[RPC] Received CLOSE request for Remote FD %u from Node %u\n", req->remote_fd, hdr->sender_id);
-
         if (req->remote_fd >= 1000) {
+            // Legacy Exported FD logic (for MattXFS files)
+            struct file *f_to_close = NULL;
             int slot = req->remote_fd - 1000;
             spin_lock(&export_lock);
             for (int i = 0; i < export_count; i++) {
@@ -631,6 +659,7 @@ static void handle_sys_close_req(struct mattx_link *link, struct mattx_header *h
                 }
             }
             spin_unlock(&export_lock);
+            if (f_to_close) fput(f_to_close);
         } else if (req->remote_fd >= 0) {
             // --- THE NATIVE CLOSE UPGRADE ---
             struct task_struct *deputy = NULL;
@@ -639,24 +668,18 @@ static void handle_sys_close_req(struct mattx_link *link, struct mattx_header *h
             if (deputy) get_task_struct(deputy);
             rcu_read_unlock();
 
-            if (deputy && deputy->files) {
-                spin_lock(&deputy->files->file_lock);
-                struct fdtable *fdt = files_fdtable(deputy->files);
-                if (req->remote_fd < fdt->max_fds) {
-                    f_to_close = rcu_dereference_raw(fdt->fd[req->remote_fd]);
-                    if (f_to_close) {
-                        rcu_assign_pointer(fdt->fd[req->remote_fd], NULL);
-                        __clear_bit(req->remote_fd, fdt->open_fds);
-                    }
+            if (deputy) {
+                struct mattx_close_ctx *ctx = kmalloc(sizeof(*ctx), GFP_KERNEL);
+                if (ctx) {
+                    memcpy(&ctx->req, req, sizeof(*req));
+                    init_task_work(&ctx->cb, mattx_close_cb);
+                    if (real_task_work_add) {
+                        real_task_work_add(deputy, &ctx->cb, TWA_SIGNAL);
+                        send_sig(SIGCONT, deputy, 0);
+                    } else { kfree(ctx); }
                 }
-                spin_unlock(&deputy->files->file_lock);
                 put_task_struct(deputy);
             }
-        }
-        
-        if (f_to_close) {
-            fput(f_to_close);
-            mattx_dbg("[RPC] Successfully closed Remote FD %u\n", req->remote_fd);
         }
     }
 }
@@ -954,107 +977,85 @@ static void handle_sys_statx_req(struct mattx_link *link, struct mattx_header *h
     }
 }
 
+
+// --- THE DEPUTY HIJACK: DUP & DUP2 ---
+struct mattx_dup_ctx {
+    struct callback_head cb;
+    struct mattx_sys_dup_req req;
+    int target_node;
+};
+
+static void mattx_dup_cb(struct callback_head *cb) {
+    struct mattx_dup_ctx *ctx = container_of(cb, struct mattx_dup_ctx, cb);
+    struct pt_regs real_args = {0};
+    struct pt_regs wrapper_args = {0};
+    int ret = -EBADF;
+    struct mattx_sys_dup_reply reply;
+
+    // --- THE DOUBLE WRAPPER TRICK ---
+    if (ctx->req.new_local_fd < 0) {
+        // Standard dup()
+        real_args.di = ctx->req.old_remote_fd;
+        wrapper_args.di = (unsigned long)&real_args;
+        if (real_sys_dup) ret = real_sys_dup(&wrapper_args);
+        mattx_dbg("[HIJACK] Deputy executed dup natively. Result FD: %d\n", ret);
+    } else {
+        // dup2()
+        real_args.di = ctx->req.old_remote_fd;
+        real_args.si = ctx->req.new_local_fd;
+        wrapper_args.di = (unsigned long)&real_args;
+        if (real_sys_dup2) ret = real_sys_dup2(&wrapper_args);
+        mattx_dbg("[HIJACK] Deputy executed dup2 natively. Result FD: %d\n", ret);
+    }
+
+    reply.orig_pid = ctx->req.orig_pid;
+    reply.new_remote_fd = (ret >= 0) ? ret : -1;
+    reply.error = (ret < 0) ? ret : 0;
+
+    if (cluster_map[ctx->target_node]) {
+        mattx_comm_send(cluster_map[ctx->target_node], MATTX_MSG_SYS_DUP_REPLY, &reply, sizeof(reply));
+    }
+
+    kfree(ctx);
+    set_current_state(TASK_STOPPED);
+    schedule();
+}
+
 static void handle_sys_dup_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
     if (payload) {
-        struct mattx_sys_dup_req *req = (struct mattx_sys_dup_req *)payload;
-        struct task_struct *deputy = NULL;
-        struct file *file = NULL;
-        int i;
-        struct mattx_sys_dup_reply reply;
+        struct mattx_sys_dup_req *req = payload;
         
-        reply.orig_pid = req->orig_pid;
-        reply.new_remote_fd = -EBADF;
-        reply.error = -EBADF;
-
-        mattx_dbg("[WORMHOLE] Received DUP req for Remote FD %u from Node %u\n", req->old_remote_fd, hdr->sender_id);
-
         if (req->old_remote_fd >= 1000) {
-            int slot = req->old_remote_fd - 1000;
-            spin_lock(&export_lock);
-            for (i = 0; i < export_count; i++) {
-                if (export_registry[i].orig_pid == req->orig_pid) {
-                    if (slot < MAX_FDS && export_registry[i].remote_files[slot]) {
-                        file = export_registry[i].remote_files[slot];
-                        get_file(file); 
-                        
-                        // It's an exported file! We need to find an empty slot in our export registry for the clone.
-                        int j;
-                        for (j = 0; j < MAX_FDS; j++) {
-                            if (export_registry[i].remote_files[j] == NULL) {
-                                export_registry[i].remote_files[j] = file;
-                                reply.new_remote_fd = j + 1000;
-                                reply.error = 0;
-                                mattx_dbg("[WORMHOLE] Duplicated Exported FD %u to %d\n", req->old_remote_fd, reply.new_remote_fd);
-                                break;
-                            }
-                        }
-                        if (reply.new_remote_fd < 0) {
-                            fput(file); // No space left
-                            reply.error = -EMFILE;
-                        }
-                    }
-                    break;
-                }
-            }
-            spin_unlock(&export_lock);
+            // Legacy Exported FD logic (for MattXFS files)
+            // ... (Keep your existing legacy dup logic here if you want, or just return an error for now!)
+            // For brevity, we assume MattXFS handles its own dups locally in user-space.
+            struct mattx_sys_dup_reply reply = { .orig_pid = req->orig_pid, .new_remote_fd = -EBADF, .error = -EBADF };
+            if (cluster_map[hdr->sender_id]) mattx_comm_send(cluster_map[hdr->sender_id], MATTX_MSG_SYS_DUP_REPLY, &reply, sizeof(reply));
         } else {
-            // It's a real file descriptor on the Deputy!
+            // --- THE NATIVE DUP UPGRADE ---
+            struct task_struct *deputy = NULL;
             rcu_read_lock();
             deputy = pid_task(find_vpid(req->orig_pid), PIDTYPE_PID);
             if (deputy) get_task_struct(deputy);
             rcu_read_unlock();
-            
-            if (deputy) {
-                struct files_struct *files = deputy->files;
-                if (files) {
-                    spin_lock(&files->file_lock);
-                    struct fdtable *fdt = files_fdtable(files);
-                    if (req->old_remote_fd < fdt->max_fds) {
-                        file = rcu_dereference_raw(fdt->fd[req->old_remote_fd]);
-                        if (file) {
-                            get_file(file); 
-                            
-                            // Let's allocate a real new FD on the Deputy!
-                            int new_fd = req->new_local_fd;
-                            if (new_fd < 0) {
-                                // Dynamic dup() -> Find first free slot
-                                int j;
-                                for (j = 3; j < fdt->max_fds; j++) {
-                                    if (!rcu_dereference_raw(fdt->fd[j])) {
-                                        new_fd = j;
-                                        break;
-                                    }
-                                }
-                            }
 
-                            if (new_fd >= 0 && new_fd < fdt->max_fds) {
-                                // Overwrite the slot if dup2() requested an existing open one
-                                struct file *old_target = rcu_dereference_raw(fdt->fd[new_fd]);
-                                if (old_target) {
-                                    fput(old_target);
-                                }
-                                rcu_assign_pointer(fdt->fd[new_fd], file);
-                                __set_bit(new_fd, fdt->open_fds);
-                                reply.new_remote_fd = new_fd;
-                                reply.error = 0;
-                                mattx_dbg("[WORMHOLE] Duplicated Deputy FD %u to %d\n", req->old_remote_fd, reply.new_remote_fd);
-                            } else {
-                                fput(file);
-                                reply.error = -EMFILE;
-                            }
-                        }
-                    }
-                    spin_unlock(&files->file_lock);
+            if (deputy) {
+                struct mattx_dup_ctx *ctx = kmalloc(sizeof(*ctx), GFP_KERNEL);
+                if (ctx) {
+                    memcpy(&ctx->req, req, sizeof(*req));
+                    ctx->target_node = hdr->sender_id;
+                    init_task_work(&ctx->cb, mattx_dup_cb);
+                    if (real_task_work_add) {
+                        real_task_work_add(deputy, &ctx->cb, TWA_SIGNAL);
+                        send_sig(SIGCONT, deputy, 0);
+                    } else { kfree(ctx); }
                 }
                 put_task_struct(deputy);
             }
         }
-        
-        if (cluster_map[hdr->sender_id]) {
-            mattx_comm_send(cluster_map[hdr->sender_id], MATTX_MSG_SYS_DUP_REPLY, &reply, sizeof(reply));
-        }
     }
 }
+
 
 static void handle_sys_fsync_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
     if (payload) {

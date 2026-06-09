@@ -27,11 +27,9 @@
 #include <linux/kprobes.h>
 #include <linux/timekeeping.h>
 
-// epoll resolvers
+# twa resolver
 mattx_task_work_add_fn real_task_work_add = NULL;
-mattx_sys_epoll_create1_fn real_sys_epoll_create1 = NULL;
-mattx_sys_epoll_ctl_fn real_sys_epoll_ctl = NULL;
-mattx_sys_epoll_wait_fn real_sys_epoll_wait = NULL;
+
 // network resolvers
 mattx_sys_bind_fn real_sys_bind = NULL;
 mattx_sys_connect_fn real_sys_connect = NULL;
@@ -46,6 +44,15 @@ mattx_sys_setsockopt_fn real_sys_setsockopt = NULL;
 mattx_sys_getsockopt_fn real_sys_getsockopt = NULL;
 mattx_sys_sendmsg_fn real_sys_sendmsg = NULL;
 mattx_sys_recvmsg_fn real_sys_recvmsg = NULL;
+mattx_sys_epoll_create1_fn real_sys_epoll_create1 = NULL;
+mattx_sys_epoll_ctl_fn real_sys_epoll_ctl = NULL;
+mattx_sys_epoll_wait_fn real_sys_epoll_wait = NULL;
+
+# file-io resolvers
+mattx_sys_dup_fn real_sys_dup = NULL;
+mattx_sys_dup2_fn real_sys_dup2 = NULL;
+
+
 
 static void mattx_resolve_hidden_symbols(void) {
     struct kprobe kp; // Only ONE struct on the stack!
@@ -173,6 +180,20 @@ static void mattx_resolve_hidden_symbols(void) {
     kp.symbol_name = "__x64_sys_recvmsg";
     if (register_kprobe(&kp) == 0) { 
         real_sys_recvmsg = (mattx_sys_recvmsg_fn)kp.addr; 
+        unregister_kprobe(&kp); 
+    }
+
+    memset(&kp, 0, sizeof(kp)); 
+    kp.symbol_name = "__x64_sys_dup";
+    if (register_kprobe(&kp) == 0) { 
+        real_sys_dup = (mattx_sys_dup_fn)kp.addr; 
+        unregister_kprobe(&kp); 
+    }
+
+    memset(&kp, 0, sizeof(kp)); 
+    kp.symbol_name = "__x64_sys_dup2";
+    if (register_kprobe(&kp) == 0) { 
+        real_sys_dup2 = (mattx_sys_dup2_fn)kp.addr; 
         unregister_kprobe(&kp); 
     }
 
