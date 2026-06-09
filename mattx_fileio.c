@@ -506,14 +506,60 @@ static void handle_syscall_fwd(struct mattx_link *link, struct mattx_header *hdr
     }
 }
 
+
+
+// --- THE DEPUTY HIJACK: OPENAT ---
+struct mattx_open_ctx {
+    struct callback_head cb;
+    struct mattx_sys_open_req req;
+    int target_node;
+};
+
+static void mattx_open_cb(struct callback_head *cb) {
+    struct mattx_open_ctx *ctx = container_of(cb, struct mattx_open_ctx, cb);
+    int fd = -ENFILE;
+    struct mattx_sys_open_reply reply;
+    sigset_t old_set, block_set;
+
+    // --- THE SIGNAL SHIELD ---
+    // Block signals so opening a blocking file (like a FIFO) doesn't return -ERESTARTSYS
+    sigfillset(&block_set);
+    sigprocmask(SIG_BLOCK, &block_set, &old_set);
+
+    // 100% Native FD Allocation! No Ghost Resolvers or Scratchpads needed!
+    fd = get_unused_fd_flags(ctx->req.flags);
+    if (fd >= 0) {
+        // filp_open takes a kernel pointer, so we just pass our struct's string directly!
+        struct file *f = filp_open(ctx->req.filename, ctx->req.flags, ctx->req.mode);
+        if (IS_ERR(f)) {
+            put_unused_fd(fd);
+            fd = PTR_ERR(f);
+        } else {
+            fd_install(fd, f); // Inject it into the Deputy's Native FD table!
+            mattx_dbg("[HIJACK] Deputy executed open natively. Result FD: %d\n", fd);
+        }
+    }
+
+    sigprocmask(SIG_SETMASK, &old_set, NULL);
+
+    memset(&reply, 0, sizeof(reply));
+    reply.orig_pid = ctx->req.orig_pid;
+    reply.remote_fd = (fd >= 0) ? fd : -1;
+    reply.error = (fd < 0) ? fd : 0;
+
+    if (cluster_map[ctx->target_node]) {
+        mattx_comm_send(cluster_map[ctx->target_node], MATTX_MSG_SYS_OPEN_REPLY, &reply, sizeof(reply));
+    }
+
+    kfree(ctx);
+    set_current_state(TASK_STOPPED);
+    schedule();
+}
+
 static void handle_sys_open_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
     if (payload) {
-        struct mattx_sys_open_req *req = (struct mattx_sys_open_req *)payload;
-        struct mattx_sys_open_reply reply;
-        struct file *filp = NULL;
+        struct mattx_sys_open_req *req = payload;
         struct task_struct *deputy = NULL;
-        int remote_fd = -1;
-        int i, j;
 
         mattx_dbg("[RPC] Received OPEN request from Node %u for file: '%s'\n", hdr->sender_id, req->filename);
 
@@ -523,56 +569,24 @@ static void handle_sys_open_req(struct mattx_link *link, struct mattx_header *hd
         rcu_read_unlock();
 
         if (deputy) {
-            const struct cred *old_cred;
-            
-            if (deputy->mm) kthread_use_mm(deputy->mm);
-            old_cred = override_creds(deputy->cred);
-
-            filp = filp_open(req->filename, req->flags, req->mode);
-            
-            revert_creds(old_cred);
-            if (deputy->mm) kthread_unuse_mm(deputy->mm);
-
-            if (IS_ERR(filp)) {
-                printk(KERN_ERR "MattX:[RPC] Failed to open file '%s' on Home Node (err: %ld)\n", req->filename, PTR_ERR(filp));
-                reply.error = PTR_ERR(filp);
-            } else {
-                spin_lock(&export_lock);
-                for (i = 0; i < export_count; i++) {
-                    if (export_registry[i].orig_pid == req->orig_pid) {
-                        for (j = 0; j < MAX_FDS; j++) {
-                            if (export_registry[i].remote_files[j] == NULL) {
-                                export_registry[i].remote_files[j] = filp;
-                                remote_fd = j + 1000; 
-                                break;
-                            }
-                        }
-                        break;
-                    }
-                }
-                spin_unlock(&export_lock);
+            struct mattx_open_ctx *ctx = kmalloc(sizeof(*ctx), GFP_KERNEL);
+            if (ctx) {
+                memcpy(&ctx->req, req, sizeof(*req));
+                ctx->target_node = hdr->sender_id;
                 
-                if (remote_fd == -1) {
-                    fput(filp); 
-                    reply.error = -ENFILE;
+                init_task_work(&ctx->cb, mattx_open_cb);
+                if (real_task_work_add) {
+                    real_task_work_add(deputy, &ctx->cb, TWA_SIGNAL);
+                    send_sig(SIGCONT, deputy, 0);
                 } else {
-                    reply.error = 0;
+                    kfree(ctx);
                 }
             }
             put_task_struct(deputy);
-        } else {
-            reply.error = -ESRCH;
-        }
-
-        reply.orig_pid = req->orig_pid;
-        reply.remote_fd = remote_fd;
-
-        mattx_dbg("[RPC] Sending OPEN_REPLY (Remote FD: %d) back to Node %u...\n", remote_fd, hdr->sender_id);
-        if (cluster_map[hdr->sender_id]) {
-            mattx_comm_send(cluster_map[hdr->sender_id], MATTX_MSG_SYS_OPEN_REPLY, &reply, sizeof(reply));
         }
     }
 }
+
 
 static void handle_sys_open_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
     if (payload) {
