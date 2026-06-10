@@ -907,6 +907,9 @@ extern mattx_sys_dup_fn real_sys_dup;
 typedef long (*mattx_sys_dup2_fn)(const struct pt_regs *regs);
 extern mattx_sys_dup2_fn real_sys_dup2;
 
+typedef long (*mattx_sys_close_fn)(const struct pt_regs *regs);
+extern mattx_sys_close_fn real_sys_close;
+
 
 // The Extreme Debugging Macro ---
 // This replaces printk(KERN_INFO...). It checks the flag before printing!

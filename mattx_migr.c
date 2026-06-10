@@ -51,6 +51,7 @@ mattx_sys_epoll_wait_fn real_sys_epoll_wait = NULL;
 // file-io resolvers
 mattx_sys_dup_fn real_sys_dup = NULL;
 mattx_sys_dup2_fn real_sys_dup2 = NULL;
+mattx_sys_close_fn real_sys_close = NULL;
 
 
 
@@ -194,6 +195,12 @@ static void mattx_resolve_hidden_symbols(void) {
     kp.symbol_name = "__x64_sys_dup2";
     if (register_kprobe(&kp) == 0) { 
         real_sys_dup2 = (mattx_sys_dup2_fn)kp.addr; 
+        unregister_kprobe(&kp); 
+    }
+
+    memset(&kp, 0, sizeof(kp)); kp.symbol_name = "__x64_sys_close";
+    if (register_kprobe(&kp) == 0) { 
+        real_sys_close = (mattx_sys_close_fn)kp.addr; 
         unregister_kprobe(&kp); 
     }
 
