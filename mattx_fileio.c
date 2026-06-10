@@ -611,40 +611,15 @@ static void handle_sys_open_reply(struct mattx_link *link, struct mattx_header *
 }
 
 
-// --- THE DEPUTY HIJACK: CLOSE ---
-struct mattx_close_ctx {
-    struct callback_head cb;
-    struct mattx_sys_close_req req;
-};
-
-
-static void mattx_close_cb(struct callback_head *cb) {
-    struct mattx_close_ctx *ctx = container_of(cb, struct mattx_close_ctx, cb);
-    struct pt_regs regs;
-    int ret = -EBADF;
-
-    // --- FIXED: No more Double Wrapper! Just pass the FD directly! ---
-    memset(&regs, 0, sizeof(regs));
-    regs.di = ctx->req.remote_fd;
-
-    if (real_sys_close) {
-        ret = real_sys_close(&regs);
-        mattx_dbg("[HIJACK] Deputy executed close natively. Result: %d\n", ret);
-    }
-
-    kfree(ctx);
-    set_current_state(TASK_STOPPED);
-    schedule();
-}
-
-
 static void handle_sys_close_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
     if (payload) {
         struct mattx_sys_close_req *req = payload;
+        struct file *f_to_close = NULL;
         
+        mattx_dbg("[RPC] Received CLOSE request for Remote FD %u from Node %u\n", req->remote_fd, hdr->sender_id);
+
         if (req->remote_fd >= 1000) {
             // Legacy Exported FD logic (for MattXFS files)
-            struct file *f_to_close = NULL;
             int slot = req->remote_fd - 1000;
             spin_lock(&export_lock);
             for (int i = 0; i < export_count; i++) {
@@ -657,27 +632,34 @@ static void handle_sys_close_req(struct mattx_link *link, struct mattx_header *h
                 }
             }
             spin_unlock(&export_lock);
-            if (f_to_close) fput(f_to_close);
         } else if (req->remote_fd >= 0) {
-            // --- THE NATIVE CLOSE UPGRADE ---
+            // --- THE NATIVE CLOSE UPGRADE (Kworker Edition) ---
+            // We do NOT wake up the Deputy! The Kworker safely plucks the FD 
+            // out of the Deputy's table and closes it!
             struct task_struct *deputy = NULL;
             rcu_read_lock();
             deputy = pid_task(find_vpid(req->orig_pid), PIDTYPE_PID);
             if (deputy) get_task_struct(deputy);
             rcu_read_unlock();
 
-            if (deputy) {
-                struct mattx_close_ctx *ctx = kmalloc(sizeof(*ctx), GFP_KERNEL);
-                if (ctx) {
-                    memcpy(&ctx->req, req, sizeof(*req));
-                    init_task_work(&ctx->cb, mattx_close_cb);
-                    if (real_task_work_add) {
-                        real_task_work_add(deputy, &ctx->cb, TWA_SIGNAL);
-                        send_sig(SIGCONT, deputy, 0);
-                    } else { kfree(ctx); }
+            if (deputy && deputy->files) {
+                spin_lock(&deputy->files->file_lock);
+                struct fdtable *fdt = files_fdtable(deputy->files);
+                if (req->remote_fd < fdt->max_fds) {
+                    f_to_close = rcu_dereference_raw(fdt->fd[req->remote_fd]);
+                    if (f_to_close) {
+                        rcu_assign_pointer(fdt->fd[req->remote_fd], NULL);
+                        __clear_bit(req->remote_fd, fdt->open_fds);
+                    }
                 }
+                spin_unlock(&deputy->files->file_lock);
                 put_task_struct(deputy);
             }
+        }
+        
+        if (f_to_close) {
+            fput(f_to_close);
+            mattx_dbg("[RPC] Successfully closed Remote FD %u\n", req->remote_fd);
         }
     }
 }
