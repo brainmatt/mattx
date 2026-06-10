@@ -617,21 +617,18 @@ struct mattx_close_ctx {
     struct mattx_sys_close_req req;
 };
 
+
 static void mattx_close_cb(struct callback_head *cb) {
     struct mattx_close_ctx *ctx = container_of(cb, struct mattx_close_ctx, cb);
-    struct pt_regs real_args = {0};
-    struct pt_regs wrapper_args = {0};
+    struct pt_regs regs;
     int ret = -EBADF;
 
-    // --- THE DOUBLE WRAPPER TRICK ---
-    // 1. Put the FD into the real arguments
-    real_args.di = ctx->req.remote_fd;
-    
-    // 2. Put the POINTER to the real arguments into the wrapper arguments!
-    wrapper_args.di = (unsigned long)&real_args;
+    // --- FIXED: No more Double Wrapper! Just pass the FD directly! ---
+    memset(&regs, 0, sizeof(regs));
+    regs.di = ctx->req.remote_fd;
 
     if (real_sys_close) {
-        ret = real_sys_close(&wrapper_args);
+        ret = real_sys_close(&regs);
         mattx_dbg("[HIJACK] Deputy executed close natively. Result: %d\n", ret);
     }
 
@@ -639,6 +636,7 @@ static void mattx_close_cb(struct callback_head *cb) {
     set_current_state(TASK_STOPPED);
     schedule();
 }
+
 
 static void handle_sys_close_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
     if (payload) {
@@ -985,26 +983,26 @@ struct mattx_dup_ctx {
     int target_node;
 };
 
+
 static void mattx_dup_cb(struct callback_head *cb) {
     struct mattx_dup_ctx *ctx = container_of(cb, struct mattx_dup_ctx, cb);
-    struct pt_regs real_args = {0};
-    struct pt_regs wrapper_args = {0};
+    struct pt_regs regs;
     int ret = -EBADF;
     struct mattx_sys_dup_reply reply;
 
-    // --- THE DOUBLE WRAPPER TRICK ---
+    memset(&regs, 0, sizeof(regs));
+
+    // --- FIXED: No more Double Wrapper! ---
     if (ctx->req.new_local_fd < 0) {
         // Standard dup()
-        real_args.di = ctx->req.old_remote_fd;
-        wrapper_args.di = (unsigned long)&real_args;
-        if (real_sys_dup) ret = real_sys_dup(&wrapper_args);
+        regs.di = ctx->req.old_remote_fd;
+        if (real_sys_dup) ret = real_sys_dup(&regs);
         mattx_dbg("[HIJACK] Deputy executed dup natively. Result FD: %d\n", ret);
     } else {
         // dup2()
-        real_args.di = ctx->req.old_remote_fd;
-        real_args.si = ctx->req.new_local_fd;
-        wrapper_args.di = (unsigned long)&real_args;
-        if (real_sys_dup2) ret = real_sys_dup2(&wrapper_args);
+        regs.di = ctx->req.old_remote_fd;
+        regs.si = ctx->req.new_local_fd;
+        if (real_sys_dup2) ret = real_sys_dup2(&regs);
         mattx_dbg("[HIJACK] Deputy executed dup2 natively. Result FD: %d\n", ret);
     }
 
@@ -1020,6 +1018,7 @@ static void mattx_dup_cb(struct callback_head *cb) {
     set_current_state(TASK_STOPPED);
     schedule();
 }
+
 
 static void handle_sys_dup_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
     if (payload) {
