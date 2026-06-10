@@ -21,15 +21,12 @@
  * Commercial licensing options are available upon request.
  */
  
-/* pvmtest.c - The Master Process */
+/* mpitest.c - The MPI Master Process */
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdarg.h>
 #include <unistd.h>
-#include <pvm3.h>
-
-#define MSG_INIT 1
-#define MSG_DONE 2
+#include <mpi.h>
 
 void log_debug(const char *fmt, ...) {
     FILE *f;
@@ -43,7 +40,7 @@ void log_debug(const char *fmt, ...) {
     va_end(args);
 
     // Append to logfile
-    f = fopen("/tmp/pvmtest.log", "a");
+    f = fopen("/tmp/mpitest.log", "a");
     if (f) {
         va_start(args, fmt);
         fprintf(f, "[MASTER] ");
@@ -55,41 +52,42 @@ void log_debug(const char *fmt, ...) {
 }
 
 int main(int argc, char **argv) {
-    int my_tid, client_tid;
-    int numt;
+    MPI_Comm intercomm;
+    int my_rank;
     int start_val = 1;
     int result_val = 0;
+    int errcodes[1];
 
-    log_debug("Starting up. Enrolling in PVM...");
-    my_tid = pvm_mytid();
-    if (my_tid < 0) {
-        log_debug("ERROR: Failed to enroll in PVM. Is pvmd running?");
-        exit(1);
-    }
-    log_debug("Enrolled successfully. My TID is %x", my_tid);
+    log_debug("Starting up. Initializing MPI...");
+    MPI_Init(&argc, &argv);
+    MPI_Comm_rank(MPI_COMM_WORLD, &my_rank);
+    
+    log_debug("Initialized successfully. My Rank is %d", my_rank);
 
-    log_debug("Spawning 'pvmtest-client'...");
+    log_debug("Spawning 'mpitest-client'...");
     // Spawn 1 instance of the client
-    numt = pvm_spawn("pvmtest-client", NULL, PvmTaskDefault, "", 1, &client_tid);
-    if (numt != 1) {
-        log_debug("ERROR: Failed to spawn client! Return code: %d", numt);
-        pvm_exit();
+    int spawn_res = MPI_Comm_spawn("./mpitest-client", MPI_ARGV_NULL, 1, 
+                                   MPI_INFO_NULL, 0, MPI_COMM_SELF, 
+                                   &intercomm, errcodes);
+                                   
+    if (spawn_res != MPI_SUCCESS) {
+        log_debug("ERROR: Failed to spawn client! Error code: %d", spawn_res);
+        MPI_Finalize();
         exit(1);
     }
-    log_debug("Successfully spawned client. Client TID is %x", client_tid);
+    log_debug("Successfully spawned client.");
 
     log_debug("Packing and sending initial integer: %d", start_val);
-    pvm_initsend(PvmDataDefault);
-    pvm_pkint(&start_val, 1, 1);
-    pvm_send(client_tid, MSG_INIT);
+    // Send to rank 0 of the spawned children
+    MPI_Send(&start_val, 1, MPI_INT, 0, 0, intercomm);
     log_debug("Message sent. Entering retrieve mode (waiting for result)...");
 
-    // Wait for the final result
-    pvm_recv(client_tid, MSG_DONE);
-    pvm_upkint(&result_val, 1, 1);
+    // Wait for the final result from rank 0 of the children
+    MPI_Recv(&result_val, 1, MPI_INT, 0, 0, intercomm, MPI_STATUS_IGNORE);
     log_debug("Received final result from client: %d", result_val);
 
-    log_debug("Workflow complete. Shutting down PVM and exiting.");
-    pvm_exit();
+    log_debug("Workflow complete. Disconnecting communicator and shutting down MPI.");
+    MPI_Comm_disconnect(&intercomm);
+    MPI_Finalize();
     return 0;
 }
