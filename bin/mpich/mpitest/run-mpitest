@@ -1,3 +1,4 @@
+#!/bin/bash
 #
 # MattX - The Modern Single System Image (SSI) Cluster
 # 
@@ -21,25 +22,4 @@
 # Commercial licensing options are available upon request.
 #
 
-# Makefile for MattX MPI Debugging Suite
-
-# Use the standard MPI C compiler wrapper
-CC = mpicc
-CFLAGS = -g -Wall
-
-all: mpitest mpitest-client
-
-mpitest: mpitest.c
-	$(CC) $(CFLAGS) -o mpitest mpitest.c
-
-mpitest-client: mpitest-client.c
-	$(CC) $(CFLAGS) -o mpitest-client mpitest-client.c
-
-install: all
-	chmod +x run-mpitest
-
-clean:
-	rm -f mpitest mpitest-client
-	rm -f /tmp/mpitest.log
-
-.PHONY: all clean
+mpirun -np 1 ./mpitest
