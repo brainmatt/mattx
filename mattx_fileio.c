@@ -507,82 +507,93 @@ static void handle_syscall_fwd(struct mattx_link *link, struct mattx_header *hdr
 }
 
 
-
-// --- THE DEPUTY HIJACK: OPENAT ---
-struct mattx_open_ctx {
-    struct callback_head cb;
+// --- DATA PLANE: OPENAT (Kworker Native Injector) ---
+struct mattx_open_kworker_ctx {
+    struct work_struct work;
     struct mattx_sys_open_req req;
     int target_node;
 };
 
-static void mattx_open_cb(struct callback_head *cb) {
-    struct mattx_open_ctx *ctx = container_of(cb, struct mattx_open_ctx, cb);
-    int fd = -ENFILE;
+static void mattx_open_kworker(struct work_struct *work) {
+    struct mattx_open_kworker_ctx *ctx = container_of(work, struct mattx_open_kworker_ctx, work);
     struct mattx_sys_open_reply reply;
-    sigset_t old_set, block_set;
-
-    // --- THE SIGNAL SHIELD ---
-    // Block signals so opening a blocking file (like a FIFO) doesn't return -ERESTARTSYS
-    sigfillset(&block_set);
-    sigprocmask(SIG_BLOCK, &block_set, &old_set);
-
-    // 100% Native FD Allocation! No Ghost Resolvers or Scratchpads needed!
-    fd = get_unused_fd_flags(ctx->req.flags);
-    if (fd >= 0) {
-        // filp_open takes a kernel pointer, so we just pass our struct's string directly!
-        struct file *f = filp_open(ctx->req.filename, ctx->req.flags, ctx->req.mode);
-        if (IS_ERR(f)) {
-            put_unused_fd(fd);
-            fd = PTR_ERR(f);
-        } else {
-            fd_install(fd, f); // Inject it into the Deputy's Native FD table!
-            mattx_dbg("[HIJACK] Deputy executed open natively. Result FD: %d\n", fd);
-        }
-    }
-
-    sigprocmask(SIG_SETMASK, &old_set, NULL);
+    struct file *filp = NULL;
+    struct task_struct *deputy = NULL;
+    int remote_fd = -1;
+    int err = -EBADF;
 
     memset(&reply, 0, sizeof(reply));
     reply.orig_pid = ctx->req.orig_pid;
-    reply.remote_fd = (fd >= 0) ? fd : -1;
-    reply.error = (fd < 0) ? fd : 0;
+
+    rcu_read_lock();
+    deputy = pid_task(find_vpid(ctx->req.orig_pid), PIDTYPE_PID);
+    if (deputy) get_task_struct(deputy);
+    rcu_read_unlock();
+
+    if (deputy) {
+        // Temporarily wear the Deputy's face so file permissions are checked correctly!
+        const struct cred *old_cred = override_creds(deputy->cred);
+
+        // Open the file natively in the kernel! (No user-space scratchpad needed!)
+        filp = filp_open(ctx->req.filename, ctx->req.flags, ctx->req.mode);
+        
+        revert_creds(old_cred);
+
+        if (IS_ERR(filp)) {
+            err = PTR_ERR(filp);
+            mattx_dbg("[KWORKER] Failed to open file '%s' (err: %d)\n", ctx->req.filename, err);
+        } else {
+            // --- THE NATIVE INJECTOR ---
+            // Forcefully inject the open file into the sleeping Deputy's FD table!
+            if (deputy->files) {
+                spin_lock(&deputy->files->file_lock);
+                struct fdtable *fdt = files_fdtable(deputy->files);
+                for (int j = 3; j < fdt->max_fds; j++) {
+                    if (!rcu_dereference_raw(fdt->fd[j])) {
+                        rcu_assign_pointer(fdt->fd[j], filp);
+                        __set_bit(j, fdt->open_fds);
+                        remote_fd = j;
+                        err = 0;
+                        break;
+                    }
+                }
+                spin_unlock(&deputy->files->file_lock);
+            }
+            
+            if (remote_fd == -1) {
+                fput(filp);
+                err = -ENFILE;
+            } else {
+                mattx_dbg("[KWORKER] Successfully injected '%s' into Deputy Native FD: %d\n", ctx->req.filename, remote_fd);
+            }
+        }
+        put_task_struct(deputy);
+    } else {
+        err = -ESRCH;
+    }
+
+    reply.remote_fd = remote_fd;
+    reply.error = err;
 
     if (cluster_map[ctx->target_node]) {
         mattx_comm_send(cluster_map[ctx->target_node], MATTX_MSG_SYS_OPEN_REPLY, &reply, sizeof(reply));
     }
 
     kfree(ctx);
-    set_current_state(TASK_STOPPED);
-    schedule();
 }
 
 static void handle_sys_open_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
     if (payload) {
         struct mattx_sys_open_req *req = payload;
-        struct task_struct *deputy = NULL;
-
-        mattx_dbg("[RPC] Received OPEN request from Node %u for file: '%s'\n", hdr->sender_id, req->filename);
-
-        rcu_read_lock();
-        deputy = pid_task(find_vpid(req->orig_pid), PIDTYPE_PID);
-        if (deputy) get_task_struct(deputy);
-        rcu_read_unlock();
-
-        if (deputy) {
-            struct mattx_open_ctx *ctx = kmalloc(sizeof(*ctx), GFP_KERNEL);
-            if (ctx) {
-                memcpy(&ctx->req, req, sizeof(*req));
-                ctx->target_node = hdr->sender_id;
-                
-                init_task_work(&ctx->cb, mattx_open_cb);
-                if (real_task_work_add) {
-                    real_task_work_add(deputy, &ctx->cb, TWA_SIGNAL);
-                    send_sig(SIGCONT, deputy, 0);
-                } else {
-                    kfree(ctx);
-                }
-            }
-            put_task_struct(deputy);
+        struct mattx_open_kworker_ctx *ctx = kmalloc(sizeof(*ctx), GFP_ATOMIC);
+        
+        if (ctx) {
+            INIT_WORK(&ctx->work, mattx_open_kworker);
+            memcpy(&ctx->req, req, sizeof(*req));
+            ctx->target_node = hdr->sender_id;
+            
+            mattx_dbg("[RPC] Dispatching OPEN_REQ for '%s' to Kworker...\n", req->filename);
+            schedule_work(&ctx->work);
         }
     }
 }
