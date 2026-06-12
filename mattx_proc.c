@@ -167,6 +167,10 @@ static ssize_t admin_write(struct file *file, const char __user *ubuf, size_t co
             config_debug_mode = (arg1 != 0);
             mattx_dbg(" [ADMIN] Debug Mode set to: %s\n", config_debug_mode ? "ON" : "OFF");
         }        
+        else if (strcmp(cmd, "mattxfs") == 0 && arg1 != -1) {
+            config_mattxfs_enabled = (arg1 != 0);
+            mattx_dbg(" [ADMIN] MattXFS Mode set to: %s\n", config_mattxfs_enabled ? "ON" : "OFF");
+        }        
         else if (strcmp(cmd, "migrate") == 0 && arg1 != -1 && arg2_str[0] != '\0') {
             
             if (strcmp(arg2_str, "home") == 0) {
