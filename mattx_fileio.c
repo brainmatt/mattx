@@ -28,6 +28,9 @@
 
 // --- The VFS Proxy (Fake FDs) ---
 
+// Forward declaration for the universal remote file fetcher
+static struct file *mattx_get_remote_file(u32 orig_pid, int remote_fd);
+
 // Helper to safely check if the RPC is done while we are sleeping
 bool check_rpc_done(pid_t pid) {
     bool done = false;
