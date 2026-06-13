@@ -576,6 +576,17 @@ struct mattx_rpc_work {
     // For UNLINK
     bool is_unlink; // For the Kprobe worker
 
+    // For LSEEK
+    bool is_lseek;
+    loff_t offset;
+    int whence;
+
+    // For FSYNC
+    bool is_fsync;
+    loff_t fsync_start;
+    loff_t fsync_end;
+    int datasync;
+
     // For SOCKET
     bool is_socket;
     int domain;

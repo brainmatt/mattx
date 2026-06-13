@@ -805,320 +805,171 @@ static void handle_sys_read_reply(struct mattx_link *link, struct mattx_header *
     }
 }
 
-static void handle_sys_lseek_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
-    if (payload) {
-        struct mattx_sys_lseek_req *req = (struct mattx_sys_lseek_req *)payload;
-        struct task_struct *deputy = NULL;
-        struct file *file = NULL;
-        int i;
-        struct mattx_sys_lseek_reply reply;
-        
-        reply.orig_pid = req->orig_pid;
-        reply.result_offset = -EBADF;
-        reply.error = -EBADF;
 
-        mattx_dbg("[WORMHOLE] Received LSEEK req for FD %u from Node %u (offset %lld, whence %d)\n", req->fd, hdr->sender_id, req->offset, req->whence);
+// === DATA PLANE: LSEEK ===
+struct mattx_lseek_kworker_ctx { struct work_struct work; struct mattx_sys_lseek_req req; int target_node; };
 
-        if (req->fd >= 1000) {
-            int slot = req->fd - 1000;
-            spin_lock(&export_lock);
-            for (i = 0; i < export_count; i++) {
-                if (export_registry[i].orig_pid == req->orig_pid) {
-                    if (slot < MAX_FDS && export_registry[i].remote_files[slot]) {
-                        file = export_registry[i].remote_files[slot];
-                        get_file(file); 
-                    }
-                    break;
-                }
-            }
-            spin_unlock(&export_lock);
-        } else {
-            rcu_read_lock();
-            deputy = pid_task(find_vpid(req->orig_pid), PIDTYPE_PID);
-            if (deputy) get_task_struct(deputy);
-            rcu_read_unlock();
-            
-            if (deputy) {
-                struct files_struct *files = deputy->files;
-                if (files) {
-                    spin_lock(&files->file_lock);
-                    struct fdtable *fdt = files_fdtable(files);
-                    if (req->fd < fdt->max_fds) {
-                        file = rcu_dereference_raw(fdt->fd[req->fd]);
-                        if (file) get_file(file); 
-                    }
-                    spin_unlock(&files->file_lock);
-                }
-                put_task_struct(deputy);
-            }
-        }
-        
-        if (file) {
-            loff_t res = vfs_llseek(file, req->offset, req->whence);
-            reply.result_offset = res;
-            reply.error = (res < 0) ? res : 0;
-            fput(file); 
-        }
-        
-        if (cluster_map[hdr->sender_id]) {
-            mattx_comm_send(cluster_map[hdr->sender_id], MATTX_MSG_SYS_LSEEK_REPLY, &reply, sizeof(reply));
-        }
-    }
-}
+static void mattx_lseek_kworker(struct work_struct *work) {
+    struct mattx_lseek_kworker_ctx *ctx = container_of(work, struct mattx_lseek_kworker_ctx, work);
+    struct file *file = mattx_get_remote_file(ctx->req.orig_pid, ctx->req.fd);
+    struct mattx_sys_lseek_reply reply;
+    loff_t ret = -EBADF;
 
-static void handle_sys_statx_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
-    if (payload) {
-        struct mattx_sys_statx_req *req = (struct mattx_sys_statx_req *)payload;
-        struct task_struct *deputy = NULL;
-        struct file *file = NULL;
-        int i;
-        struct mattx_sys_statx_reply reply;
-        
-        reply.orig_pid = req->orig_pid;
-        reply.error = -EBADF;
-        memset(&reply.statx_buf, 0, sizeof(reply.statx_buf));
-
-        mattx_dbg("[WORMHOLE] Received STATX req for FD %u from Node %u\n", req->fd, hdr->sender_id);
-
-        if (req->fd >= 1000) {
-            int slot = req->fd - 1000;
-            spin_lock(&export_lock);
-            for (i = 0; i < export_count; i++) {
-                if (export_registry[i].orig_pid == req->orig_pid) {
-                    if (slot < MAX_FDS && export_registry[i].remote_files[slot]) {
-                        file = export_registry[i].remote_files[slot];
-                        get_file(file); 
-                    }
-                    break;
-                }
-            }
-            spin_unlock(&export_lock);
-        } else {
-            rcu_read_lock();
-            deputy = pid_task(find_vpid(req->orig_pid), PIDTYPE_PID);
-            if (deputy) get_task_struct(deputy);
-            rcu_read_unlock();
-            
-            if (deputy) {
-                struct files_struct *files = deputy->files;
-                if (files) {
-                    spin_lock(&files->file_lock);
-                    struct fdtable *fdt = files_fdtable(files);
-                    if (req->fd < fdt->max_fds) {
-                        file = rcu_dereference_raw(fdt->fd[req->fd]);
-                        if (file) get_file(file); 
-                    }
-                    spin_unlock(&files->file_lock);
-                }
-                put_task_struct(deputy);
-            }
-        }
-        
-        if (file) {
-            struct kstat stat;
-            int err;
-            const struct cred *old_cred = NULL;
-            
-            if (deputy) {
-                if (deputy->mm) kthread_use_mm(deputy->mm);
-                old_cred = override_creds(deputy->cred);
-            }
-
-            // Clean the flags! vfs_getattr only tolerates the sync flags when called directly on a struct path.
-            // Other flags like AT_EMPTY_PATH will cause an immediate -EINVAL or -EPERM!
-            err = vfs_getattr(&file->f_path, &stat, req->mask, req->flags & AT_STATX_SYNC_TYPE);
-            reply.error = err;
-            
-            if (deputy) {
-                revert_creds(old_cred);
-                if (deputy->mm) kthread_unuse_mm(deputy->mm);
-            }
-
-            if (err == 0) {
-                reply.statx_buf.stx_mask = stat.result_mask;
-                reply.statx_buf.stx_blksize = stat.blksize;
-                reply.statx_buf.stx_attributes = stat.attributes;
-                reply.statx_buf.stx_nlink = stat.nlink;
-                reply.statx_buf.stx_uid = from_kuid_munged(current_user_ns(), stat.uid);
-                reply.statx_buf.stx_gid = from_kgid_munged(current_user_ns(), stat.gid);
-                reply.statx_buf.stx_mode = stat.mode;
-                reply.statx_buf.stx_ino = stat.ino;
-                reply.statx_buf.stx_size = stat.size;
-                reply.statx_buf.stx_blocks = stat.blocks;
-                reply.statx_buf.stx_attributes_mask = stat.attributes_mask;
-                reply.statx_buf.stx_atime.tv_sec = stat.atime.tv_sec;
-                reply.statx_buf.stx_atime.tv_nsec = stat.atime.tv_nsec;
-                reply.statx_buf.stx_btime.tv_sec = stat.btime.tv_sec;
-                reply.statx_buf.stx_btime.tv_nsec = stat.btime.tv_nsec;
-                reply.statx_buf.stx_ctime.tv_sec = stat.ctime.tv_sec;
-                reply.statx_buf.stx_ctime.tv_nsec = stat.ctime.tv_nsec;
-                reply.statx_buf.stx_mtime.tv_sec = stat.mtime.tv_sec;
-                reply.statx_buf.stx_mtime.tv_nsec = stat.mtime.tv_nsec;
-                reply.statx_buf.stx_rdev_major = MAJOR(stat.rdev);
-                reply.statx_buf.stx_rdev_minor = MINOR(stat.rdev);
-                reply.statx_buf.stx_dev_major = MAJOR(stat.dev);
-                reply.statx_buf.stx_dev_minor = MINOR(stat.dev);
-            }
-            fput(file); 
-        }
-        
-        if (cluster_map[hdr->sender_id]) {
-            mattx_comm_send(cluster_map[hdr->sender_id], MATTX_MSG_SYS_STATX_REPLY, &reply, sizeof(reply));
-        }
-    }
-}
-
-
-// --- THE DEPUTY HIJACK: DUP & DUP2 ---
-struct mattx_dup_ctx {
-    struct callback_head cb;
-    struct mattx_sys_dup_req req;
-    int target_node;
-};
-
-
-static void mattx_dup_cb(struct callback_head *cb) {
-    struct mattx_dup_ctx *ctx = container_of(cb, struct mattx_dup_ctx, cb);
-    struct pt_regs regs;
-    int ret = -EBADF;
-    struct mattx_sys_dup_reply reply;
-
-    memset(&regs, 0, sizeof(regs));
-
-    // --- FIXED: No more Double Wrapper! ---
-    if (ctx->req.new_local_fd < 0) {
-        // Standard dup()
-        regs.di = ctx->req.old_remote_fd;
-        if (real_sys_dup) ret = real_sys_dup(&regs);
-        mattx_dbg("[HIJACK] Deputy executed dup natively. Result FD: %d\n", ret);
-    } else {
-        // dup2()
-        regs.di = ctx->req.old_remote_fd;
-        regs.si = ctx->req.new_local_fd;
-        if (real_sys_dup2) ret = real_sys_dup2(&regs);
-        mattx_dbg("[HIJACK] Deputy executed dup2 natively. Result FD: %d\n", ret);
+    if (file) {
+        ret = vfs_llseek(file, ctx->req.offset, ctx->req.whence);
+        fput(file);
     }
 
     reply.orig_pid = ctx->req.orig_pid;
-    reply.new_remote_fd = (ret >= 0) ? ret : -1;
+    reply.result_offset = ret;
     reply.error = (ret < 0) ? ret : 0;
-
-    if (cluster_map[ctx->target_node]) {
-        mattx_comm_send(cluster_map[ctx->target_node], MATTX_MSG_SYS_DUP_REPLY, &reply, sizeof(reply));
-    }
-
+    if (cluster_map[ctx->target_node]) mattx_comm_send(cluster_map[ctx->target_node], MATTX_MSG_SYS_LSEEK_REPLY, &reply, sizeof(reply));
     kfree(ctx);
-    set_current_state(TASK_STOPPED);
-    schedule();
 }
 
-
-static void handle_sys_dup_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
-    if (payload) {
-        struct mattx_sys_dup_req *req = payload;
-        
-        if (req->old_remote_fd >= 1000) {
-            // Legacy Exported FD logic (for MattXFS files)
-            // ... (Keep your existing legacy dup logic here if you want, or just return an error for now!)
-            // For brevity, we assume MattXFS handles its own dups locally in user-space.
-            struct mattx_sys_dup_reply reply = { .orig_pid = req->orig_pid, .new_remote_fd = -EBADF, .error = -EBADF };
-            if (cluster_map[hdr->sender_id]) mattx_comm_send(cluster_map[hdr->sender_id], MATTX_MSG_SYS_DUP_REPLY, &reply, sizeof(reply));
-        } else {
-            // --- THE NATIVE DUP UPGRADE ---
-            struct task_struct *deputy = NULL;
-            rcu_read_lock();
-            deputy = pid_task(find_vpid(req->orig_pid), PIDTYPE_PID);
-            if (deputy) get_task_struct(deputy);
-            rcu_read_unlock();
-
-            if (deputy) {
-                struct mattx_dup_ctx *ctx = kmalloc(sizeof(*ctx), GFP_KERNEL);
-                if (ctx) {
-                    memcpy(&ctx->req, req, sizeof(*req));
-                    ctx->target_node = hdr->sender_id;
-                    init_task_work(&ctx->cb, mattx_dup_cb);
-                    if (real_task_work_add) {
-                        real_task_work_add(deputy, &ctx->cb, TWA_SIGNAL);
-                        send_sig(SIGCONT, deputy, 0);
-                    } else { kfree(ctx); }
-                }
-                put_task_struct(deputy);
-            }
-        }
+static void handle_sys_lseek_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    struct mattx_sys_lseek_req *req = payload;
+    struct mattx_lseek_kworker_ctx *ctx = kmalloc(sizeof(*ctx), GFP_ATOMIC);
+    if (ctx) {
+        INIT_WORK(&ctx->work, mattx_lseek_kworker);
+        memcpy(&ctx->req, req, sizeof(*req)); ctx->target_node = hdr->sender_id;
+        schedule_work(&ctx->work);
     }
 }
 
+// === DATA PLANE: FSYNC ===
+struct mattx_fsync_kworker_ctx { struct work_struct work; struct mattx_sys_fsync_req req; int target_node; };
+
+static void mattx_fsync_kworker(struct work_struct *work) {
+    struct mattx_fsync_kworker_ctx *ctx = container_of(work, struct mattx_fsync_kworker_ctx, work);
+    struct file *file = mattx_get_remote_file(ctx->req.orig_pid, ctx->req.fd);
+    struct mattx_sys_fsync_reply reply;
+    int ret = -EBADF;
+
+    if (file) {
+        ret = vfs_fsync_range(file, ctx->req.start, ctx->req.end, ctx->req.datasync);
+        fput(file);
+    }
+
+    reply.orig_pid = ctx->req.orig_pid;
+    reply.error = ret;
+    if (cluster_map[ctx->target_node]) mattx_comm_send(cluster_map[ctx->target_node], MATTX_MSG_SYS_FSYNC_REPLY, &reply, sizeof(reply));
+    kfree(ctx);
+}
 
 static void handle_sys_fsync_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
-    if (payload) {
-        struct mattx_sys_fsync_req *req = (struct mattx_sys_fsync_req *)payload;
-        struct task_struct *deputy = NULL;
-        struct file *file = NULL;
-        int i;
-        struct mattx_sys_fsync_reply reply;
-        
-        reply.orig_pid = req->orig_pid;
-        reply.error = -EBADF;
-
-        mattx_dbg("[WORMHOLE] Received FSYNC req for FD %u from Node %u\n", req->fd, hdr->sender_id);
-
-        if (req->fd >= 1000) {
-            int slot = req->fd - 1000;
-            spin_lock(&export_lock);
-            for (i = 0; i < export_count; i++) {
-                if (export_registry[i].orig_pid == req->orig_pid) {
-                    if (slot < MAX_FDS && export_registry[i].remote_files[slot]) {
-                        file = export_registry[i].remote_files[slot];
-                        get_file(file); 
-                    }
-                    break;
-                }
-            }
-            spin_unlock(&export_lock);
-        } else {
-            rcu_read_lock();
-            deputy = pid_task(find_vpid(req->orig_pid), PIDTYPE_PID);
-            if (deputy) get_task_struct(deputy);
-            rcu_read_unlock();
-            
-            if (deputy) {
-                struct files_struct *files = deputy->files;
-                if (files) {
-                    spin_lock(&files->file_lock);
-                    struct fdtable *fdt = files_fdtable(files);
-                    if (req->fd < fdt->max_fds) {
-                        file = rcu_dereference_raw(fdt->fd[req->fd]);
-                        if (file) get_file(file); 
-                    }
-                    spin_unlock(&files->file_lock);
-                }
-                put_task_struct(deputy);
-            }
-        }
-        
-        if (file) {
-            const struct cred *old_cred = NULL;
-            
-            if (deputy) {
-                if (deputy->mm) kthread_use_mm(deputy->mm);
-                old_cred = override_creds(deputy->cred);
-            }
-
-            reply.error = vfs_fsync_range(file, req->start, req->end, req->datasync);
-            
-            if (deputy) {
-                revert_creds(old_cred);
-                if (deputy->mm) kthread_unuse_mm(deputy->mm);
-            }
-
-            fput(file); 
-        }
-        
-        if (cluster_map[hdr->sender_id]) {
-            mattx_comm_send(cluster_map[hdr->sender_id], MATTX_MSG_SYS_FSYNC_REPLY, &reply, sizeof(reply));
-        }
+    struct mattx_sys_fsync_req *req = payload;
+    struct mattx_fsync_kworker_ctx *ctx = kmalloc(sizeof(*ctx), GFP_ATOMIC);
+    if (ctx) {
+        INIT_WORK(&ctx->work, mattx_fsync_kworker);
+        memcpy(&ctx->req, req, sizeof(*req)); ctx->target_node = hdr->sender_id;
+        schedule_work(&ctx->work);
     }
 }
+
+// === DATA PLANE: STATX ===
+struct mattx_statx_kworker_ctx { struct work_struct work; struct mattx_sys_statx_req req; int target_node; };
+
+static void mattx_statx_kworker(struct work_struct *work) {
+    struct mattx_statx_kworker_ctx *ctx = container_of(work, struct mattx_statx_kworker_ctx, work);
+    struct file *file = mattx_get_remote_file(ctx->req.orig_pid, ctx->req.fd);
+    struct mattx_sys_statx_reply reply;
+    int ret = -EBADF;
+
+    memset(&reply, 0, sizeof(reply));
+    reply.orig_pid = ctx->req.orig_pid;
+
+    if (file) {
+        struct kstat stat;
+        ret = vfs_getattr(&file->f_path, &stat, ctx->req.mask, ctx->req.flags & AT_STATX_SYNC_TYPE);
+        if (ret == 0) {
+            reply.statx_buf.stx_mask = stat.result_mask;
+            reply.statx_buf.stx_blksize = stat.blksize;
+            reply.statx_buf.stx_attributes = stat.attributes;
+            reply.statx_buf.stx_nlink = stat.nlink;
+            reply.statx_buf.stx_uid = from_kuid_munged(&init_user_ns, stat.uid);
+            reply.statx_buf.stx_gid = from_kgid_munged(&init_user_ns, stat.gid);
+            reply.statx_buf.stx_mode = stat.mode;
+            reply.statx_buf.stx_ino = stat.ino;
+            reply.statx_buf.stx_size = stat.size;
+            reply.statx_buf.stx_blocks = stat.blocks;
+        }
+        fput(file);
+    }
+
+    reply.error = ret;
+    if (cluster_map[ctx->target_node]) mattx_comm_send(cluster_map[ctx->target_node], MATTX_MSG_SYS_STATX_REPLY, &reply, sizeof(reply));
+    kfree(ctx);
+}
+
+static void handle_sys_statx_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    struct mattx_sys_statx_req *req = payload;
+    struct mattx_statx_kworker_ctx *ctx = kmalloc(sizeof(*ctx), GFP_ATOMIC);
+    if (ctx) {
+        INIT_WORK(&ctx->work, mattx_statx_kworker);
+        memcpy(&ctx->req, req, sizeof(*req)); ctx->target_node = hdr->sender_id;
+        schedule_work(&ctx->work);
+    }
+}
+
+// === CONTROL PLANE: DUP (Kworker Native Injector) ===
+struct mattx_dup_kworker_ctx { struct work_struct work; struct mattx_sys_dup_req req; int target_node; };
+
+static void mattx_dup_kworker(struct work_struct *work) {
+    struct mattx_dup_kworker_ctx *ctx = container_of(work, struct mattx_dup_kworker_ctx, work);
+    struct file *file = mattx_get_remote_file(ctx->req.orig_pid, ctx->req.old_remote_fd);
+    struct mattx_sys_dup_reply reply;
+    int new_fd = -EBADF;
+    struct file *file_to_close = NULL;
+
+    if (file) {
+        struct task_struct *deputy = NULL;
+        rcu_read_lock(); deputy = pid_task(find_vpid(ctx->req.orig_pid), PIDTYPE_PID); if (deputy) get_task_struct(deputy); rcu_read_unlock();
+        
+        if (deputy && deputy->files) {
+            spin_lock(&deputy->files->file_lock);
+            struct fdtable *fdt = files_fdtable(deputy->files);
+            int target_fd = ctx->req.new_local_fd;
+            
+            if (target_fd < 0) { // Dynamic dup()
+                for (int j = 3; j < fdt->max_fds; j++) {
+                    if (!rcu_dereference_raw(fdt->fd[j])) { target_fd = j; break; }
+                }
+            }
+            
+            if (target_fd >= 0 && target_fd < fdt->max_fds) {
+                file_to_close = rcu_dereference_raw(fdt->fd[target_fd]); // In case dup2 overwrites an existing FD!
+                rcu_assign_pointer(fdt->fd[target_fd], file);
+                __set_bit(target_fd, fdt->open_fds);
+                get_file(file); // Increment refcount for the new FD slot!
+                new_fd = target_fd;
+            }
+            spin_unlock(&deputy->files->file_lock);
+            
+            // Safely close the overwritten file OUTSIDE the spinlock!
+            if (file_to_close) fput(file_to_close); 
+        }
+        if (deputy) put_task_struct(deputy);
+        fput(file); // Release the reference we got from mattx_get_remote_file
+    }
+
+    reply.orig_pid = ctx->req.orig_pid;
+    reply.new_remote_fd = new_fd;
+    reply.error = (new_fd < 0) ? new_fd : 0;
+    if (cluster_map[ctx->target_node]) mattx_comm_send(cluster_map[ctx->target_node], MATTX_MSG_SYS_DUP_REPLY, &reply, sizeof(reply));
+    kfree(ctx);
+}
+
+static void handle_sys_dup_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    struct mattx_sys_dup_req *req = payload;
+    struct mattx_dup_kworker_ctx *ctx = kmalloc(sizeof(*ctx), GFP_ATOMIC);
+    if (ctx) {
+        INIT_WORK(&ctx->work, mattx_dup_kworker);
+        memcpy(&ctx->req, req, sizeof(*req)); ctx->target_node = hdr->sender_id;
+        schedule_work(&ctx->work);
+    }
+}
+
 
 
 
