@@ -594,9 +594,8 @@ static void mattx_rpc_worker(struct work_struct *work) {
                 struct pt_regs *regs = task_pt_regs(surrogate);
                 if (regs) regs->ax = -EINTR; // Interrupted System Call
                 mattx_dbg("[RPC] Migration initiated! Aborted RPC for Surrogate %d\n", rpc->local_pid);
-            } 
-            // NOW it is safe to apply the Illusion!
 
+            // NOW it is safe to apply the Illusion!
             // --- LSEEK AWAKENING ---
             } else if (rpc->is_lseek) {
                 struct pt_regs *regs = task_pt_regs(surrogate);
@@ -3286,29 +3285,30 @@ int mattx_hooks_init(void) {
     ret = register_kretprobe(&write_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for write, returned %d\n", ret);
 
+// --- FILE I/O KPROBES: LSEEK, FSYNC, STATX ---
     memset(&lseek_kprobe, 0, sizeof(lseek_kprobe));
     lseek_kprobe.kp.symbol_name = "__x64_sys_lseek";
-    lseek_kprobe.entry_handler = entry_handler_lseek;
-    lseek_kprobe.handler = ret_handler_lseek;
-    lseek_kprobe.data_size = sizeof(struct lseek_kretprobe_data);
+    lseek_kprobe.entry_handler = entry_handler_fileio; // Use the unified handler!
+    lseek_kprobe.handler = ret_handler_fileio;         // Use the unified handler!
+    lseek_kprobe.data_size = sizeof(struct fileio_kretprobe_data);
     lseek_kprobe.maxactive = 64;
     ret = register_kretprobe(&lseek_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for lseek, returned %d\n", ret);
 
     memset(&fsync_kprobe, 0, sizeof(fsync_kprobe));
     fsync_kprobe.kp.symbol_name = "__x64_sys_fsync";
-    fsync_kprobe.entry_handler = entry_handler_fsync;
-    fsync_kprobe.handler = ret_handler_fsync;
-    fsync_kprobe.data_size = sizeof(struct fsync_kretprobe_data);
+    fsync_kprobe.entry_handler = entry_handler_fileio; // Use the unified handler!
+    fsync_kprobe.handler = ret_handler_fileio;         // Use the unified handler!
+    fsync_kprobe.data_size = sizeof(struct fileio_kretprobe_data);
     fsync_kprobe.maxactive = 64;
     ret = register_kretprobe(&fsync_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for fsync, returned %d\n", ret);
 
     memset(&statx_kprobe, 0, sizeof(statx_kprobe));
     statx_kprobe.kp.symbol_name = "__x64_sys_statx";
-    statx_kprobe.entry_handler = entry_handler_statx;
-    statx_kprobe.handler = ret_handler_statx;
-    statx_kprobe.data_size = sizeof(struct statx_kretprobe_data);
+    statx_kprobe.entry_handler = entry_handler_fileio; // Use the unified handler!
+    statx_kprobe.handler = ret_handler_fileio;         // Use the unified handler!
+    statx_kprobe.data_size = sizeof(struct fileio_kretprobe_data);
     statx_kprobe.maxactive = 64;
     ret = register_kretprobe(&statx_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for statx, returned %d\n", ret);
