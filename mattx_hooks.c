@@ -3285,7 +3285,6 @@ int mattx_hooks_init(void) {
     ret = register_kretprobe(&write_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for write, returned %d\n", ret);
 
-// --- FILE I/O KPROBES: LSEEK, FSYNC, STATX ---
     memset(&lseek_kprobe, 0, sizeof(lseek_kprobe));
     lseek_kprobe.kp.symbol_name = "__x64_sys_lseek";
     lseek_kprobe.entry_handler = entry_handler_fileio; // Use the unified handler!
