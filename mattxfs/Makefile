@@ -33,3 +33,4 @@ all:
 
 clean:
 	$(MAKE) -C $(KDIR) M=$(MY_DIR) clean
+	rm -f $(MY_DIR)/../Module.symvers

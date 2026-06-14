@@ -67,6 +67,7 @@ epolltest: bin/epolltest.c
 clean:
 	$(MAKE) -C $(KDIR) M=$(PWD) clean
 	rm -f bin/migtest bin/migtest2 bin/servertestpoll bin/servertestselect bin/mattx-stub sbin/mattx-discd bin/dfsatest bin/epolltest
+	rm -f mattxfs/Module.symvers
 
 install:
 	sudo rm -f /usr/local/bin/migtest
