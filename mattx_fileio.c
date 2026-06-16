@@ -1114,235 +1114,138 @@ static void handle_sys_socket_req(struct mattx_link *link, struct mattx_header *
 }
 
 
-
-// --- THE SMART CONNECTOR: Blocking Waiter ---
-struct mattx_connect_wait_ctx {
+// --- DATA PLANE: BIND (Kworker Native Injector) ---
+struct mattx_bind_kworker_ctx {
     struct work_struct work;
-    u32 orig_pid;
-    int fd; // Native FD on the Deputy
+    struct mattx_sys_bind_req req;
     int target_node;
 };
 
-static void mattx_connect_wait_worker(struct work_struct *work) {
-    struct mattx_connect_wait_ctx *ctx = container_of(work, struct mattx_connect_wait_ctx, work);
-    struct mattx_sys_connect_reply reply;
-    struct file *file = NULL;
-    struct task_struct *deputy = NULL;
+static void mattx_bind_kworker(struct work_struct *work) {
+    struct mattx_bind_kworker_ctx *ctx = container_of(work, struct mattx_bind_kworker_ctx, work);
+    struct mattx_sys_bind_reply reply;
+    struct file *file = mattx_get_remote_file(ctx->req.orig_pid, ctx->req.fd);
     int err = -EBADF;
 
-    mattx_dbg("[CONNECT_DEBUG] Kworker started for PID %u, Native FD %d\n", ctx->orig_pid, ctx->fd);
-
     memset(&reply, 0, sizeof(reply));
-    reply.orig_pid = ctx->orig_pid;
-
-    // 1. Safely get the file from the Deputy's Native FD table
-    rcu_read_lock();
-    deputy = pid_task(find_vpid(ctx->orig_pid), PIDTYPE_PID);
-    if (deputy) get_task_struct(deputy);
-    rcu_read_unlock();
-
-    if (deputy) {
-        if (deputy->files) {
-            spin_lock(&deputy->files->file_lock);
-            struct fdtable *fdt = files_fdtable(deputy->files);
-            if (ctx->fd < fdt->max_fds) {
-                file = rcu_dereference_raw(fdt->fd[ctx->fd]);
-                if (file) get_file(file);
-            }
-            spin_unlock(&deputy->files->file_lock);
-        }
-        put_task_struct(deputy);
-    }
+    reply.orig_pid = ctx->req.orig_pid;
 
     if (file) {
-        mattx_dbg("[CONNECT_DEBUG] Successfully retrieved struct file for FD %d. Entering poll loop...\n", ctx->fd);
-        
-        // 2. Wait for the TCP Handshake to finish (EPOLLOUT)
-        while (1) {
-            struct poll_wqueues table;
-            poll_initwait(&table);
-            __poll_t mask = vfs_poll(file, &table.pt);
-            
-            mattx_dbg("[CONNECT_DEBUG] vfs_poll returned mask: 0x%x\n", mask);
-
-            if (mask & (EPOLLOUT | EPOLLERR | EPOLLHUP)) {
-                mattx_dbg("[CONNECT_DEBUG] Socket is ready! Breaking poll loop.\n");
-                poll_freewait(&table);
-                break;
-            }
-            
-            schedule_timeout_interruptible(msecs_to_jiffies(50));
-            poll_freewait(&table);
-        }
-
-        // 3. Check the socket error state to see if it succeeded!
         struct socket *sock = sock_from_file(file);
-        if (sock && sock->sk) {
-            err = sock_error(sock->sk);
-            mattx_dbg("[CONNECT_DEBUG] sock_error returned: %d\n", err);
-            if (err) err = -err; // sock_error returns positive codes, we need negative!
+        if (sock) {
+            // Execute natively in the Kworker! No signals, no scratchpads!
+            err = kernel_bind(sock, (struct sockaddr *)&ctx->req.addr, ctx->req.addrlen);
+            mattx_dbg("[KWORKER] Executed kernel_bind natively. Result: %d\n", err);
         } else {
-            mattx_dbg("[CONNECT_DEBUG] ERROR: Could not extract socket from file!\n");
             err = -ENOTSOCK;
         }
         fput(file);
-    } else {
-        mattx_dbg("[CONNECT_DEBUG] ERROR: Could not find file for FD %d in Deputy!\n", ctx->fd);
     }
 
     reply.error = err;
-    mattx_dbg("[CONNECT_DEBUG] Sending CONNECT_REPLY to Node %d with Error: %d\n", ctx->target_node, err);
-    
+    if (cluster_map[ctx->target_node]) {
+        mattx_comm_send(cluster_map[ctx->target_node], MATTX_MSG_SYS_BIND_REPLY, &reply, sizeof(reply));
+    }
+    kfree(ctx);
+}
+
+static void handle_sys_bind_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    if (payload) {
+        struct mattx_sys_bind_req *req = payload;
+        struct mattx_bind_kworker_ctx *ctx = kmalloc(sizeof(*ctx), GFP_ATOMIC);
+        if (ctx) {
+            INIT_WORK(&ctx->work, mattx_bind_kworker);
+            memcpy(&ctx->req, req, sizeof(*req));
+            ctx->target_node = hdr->sender_id;
+            
+            mattx_dbg("[RPC] Dispatching BIND_REQ to Kworker...\n");
+            schedule_work(&ctx->work);
+        }
+    }
+}
+
+// --- DATA PLANE: CONNECT (Kworker Native Injector & Smart Waiter) ---
+struct mattx_connect_kworker_ctx {
+    struct work_struct work;
+    struct mattx_sys_connect_req req;
+    int target_node;
+};
+
+static void mattx_connect_kworker(struct work_struct *work) {
+    struct mattx_connect_kworker_ctx *ctx = container_of(work, struct mattx_connect_kworker_ctx, work);
+    struct mattx_sys_connect_reply reply;
+    struct file *file = mattx_get_remote_file(ctx->req.orig_pid, ctx->req.fd);
+    int err = -EBADF;
+
+    memset(&reply, 0, sizeof(reply));
+    reply.orig_pid = ctx->req.orig_pid;
+
+    if (file) {
+        struct socket *sock = sock_from_file(file);
+        if (sock) {
+            bool is_nonblock = (file->f_flags & O_NONBLOCK) != 0;
+            
+            // Execute natively!
+            err = kernel_connect(sock, (struct sockaddr *)&ctx->req.addr, ctx->req.addrlen, file->f_flags);
+            mattx_dbg("[KWORKER] Executed kernel_connect natively. Result: %d (NonBlock: %d)\n", err, is_nonblock);
+            
+            // --- THE SMART CONNECTOR WAIT LOOP ---
+            // If it's a blocking socket and the TCP handshake is in progress, we wait right here!
+            if (err == -EINPROGRESS && !is_nonblock) {
+                mattx_dbg("[CONNECT_DEBUG] Blocking connect returned -EINPROGRESS. Entering poll loop...\n");
+                
+                while (1) {
+                    struct poll_wqueues table;
+                    poll_initwait(&table);
+                    __poll_t mask = vfs_poll(file, &table.pt);
+                    
+                    if (mask & (EPOLLOUT | EPOLLERR | EPOLLHUP)) {
+                        mattx_dbg("[CONNECT_DEBUG] Socket handshake complete! Breaking poll loop.\n");
+                        poll_freewait(&table);
+                        break;
+                    }
+                    
+                    schedule_timeout_interruptible(msecs_to_jiffies(50));
+                    poll_freewait(&table);
+                }
+                
+                // Check the final socket error state to see if the handshake succeeded!
+                if (sock->sk) {
+                    err = sock_error(sock->sk);
+                    if (err) err = -err; // sock_error returns positive, we need negative!
+                    mattx_dbg("[CONNECT_DEBUG] Final handshake result: %d\n", err);
+                } else {
+                    err = -ENOTSOCK;
+                }
+            }
+        } else {
+            err = -ENOTSOCK;
+        }
+        fput(file);
+    }
+
+    reply.error = err;
     if (cluster_map[ctx->target_node]) {
         mattx_comm_send(cluster_map[ctx->target_node], MATTX_MSG_SYS_CONNECT_REPLY, &reply, sizeof(reply));
     }
     kfree(ctx);
 }
 
-
-// --- THE DEPUTY HIJACK: BIND & CONNECT ---
-struct mattx_net_setup_ctx {
-    struct callback_head cb;
-    u32 orig_pid;
-    int fd;
-    struct sockaddr_storage addr;
-    int addrlen;
-    int target_node;
-    bool is_connect;
-};
-
-
-static void mattx_net_setup_cb(struct callback_head *cb) {
-    struct mattx_net_setup_ctx *ctx = container_of(cb, struct mattx_net_setup_ctx, cb);
-    struct pt_regs *task_regs = task_pt_regs(current);
-    struct pt_regs regs;
-    int ret = -EFAULT;
-    struct mattx_sys_connect_reply reply; 
-    bool is_nonblock = false;
-
-    // --- CHECK NATIVE FLAGS ---
-    // We check if the socket is non-blocking natively on the Deputy!
-    struct file *f = fget(ctx->fd);
-    if (f) {
-        is_nonblock = (f->f_flags & O_NONBLOCK) != 0;
-        fput(f);
-    }
-
-    unsigned long user_ptr = task_regs->sp - 128 - ctx->addrlen;
-
-    if (copy_to_user((void __user *)user_ptr, &ctx->addr, ctx->addrlen) == 0) {
-        memset(&regs, 0, sizeof(regs));
-        regs.di = ctx->fd;
-        regs.si = user_ptr;
-        regs.dx = ctx->addrlen;
-
-        if (ctx->is_connect && real_sys_connect) {
-            ret = real_sys_connect(&regs);
-            if (ret == -ERESTARTSYS) ret = -EINPROGRESS;
-            mattx_dbg("[HIJACK] Deputy executed connect natively. Result: %d (NonBlock: %d)\n", ret, is_nonblock);
-        } else if (!ctx->is_connect && real_sys_bind) {
-            ret = real_sys_bind(&regs);
-            mattx_dbg("[HIJACK] Deputy executed bind natively. Result: %d\n", ret);
-        }
-    }
-
-    // --- THE SMART CONNECTOR ---
-    // If it's a blocking socket and the handshake is in progress, hand it to the Kworker!
-    if (ctx->is_connect && ret == -EINPROGRESS && !is_nonblock) {
-        mattx_dbg("[CONNECT_DEBUG] Blocking connect returned -EINPROGRESS. Spawning Kworker...\n");
-        struct mattx_connect_wait_ctx *wait_ctx = kmalloc(sizeof(*wait_ctx), GFP_KERNEL);
-        if (wait_ctx) {
-            wait_ctx->orig_pid = ctx->orig_pid;
-            wait_ctx->fd = ctx->fd;
-            wait_ctx->target_node = ctx->target_node;
-            
-            INIT_WORK(&wait_ctx->work, mattx_connect_wait_worker);
-            schedule_work(&wait_ctx->work);
-            
-            kfree(ctx);
-            set_current_state(TASK_STOPPED);
-            schedule();
-            return; // Exit early! The Kworker will send the reply!
-        } else {
-            mattx_dbg("[CONNECT_DEBUG] ERROR: Failed to allocate Kworker context!\n");
-            ret = -ENOMEM;
-        }
-    }
-
-    reply.orig_pid = ctx->orig_pid;
-    reply.error = ret;
-    if (cluster_map[ctx->target_node]) {
-        u32 msg_type = ctx->is_connect ? MATTX_MSG_SYS_CONNECT_REPLY : MATTX_MSG_SYS_BIND_REPLY;
-        mattx_comm_send(cluster_map[ctx->target_node], msg_type, &reply, sizeof(reply));
-    }
-
-    kfree(ctx);
-    set_current_state(TASK_STOPPED);
-    schedule();
-}
-
-
-static void handle_sys_bind_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
-    if (payload) {
-        struct mattx_sys_bind_req *req = payload;
-        struct task_struct *deputy = NULL;
-
-        rcu_read_lock();
-        deputy = pid_task(find_vpid(req->orig_pid), PIDTYPE_PID);
-        if (deputy) get_task_struct(deputy);
-        rcu_read_unlock();
-
-        if (deputy) {
-            struct mattx_net_setup_ctx *ctx = kmalloc(sizeof(*ctx), GFP_KERNEL);
-            if (ctx) {
-                ctx->orig_pid = req->orig_pid;
-                ctx->fd = req->fd;
-                ctx->addrlen = req->addrlen;
-                memcpy(&ctx->addr, &req->addr, req->addrlen);
-                ctx->target_node = hdr->sender_id;
-                ctx->is_connect = false;
-                
-                init_task_work(&ctx->cb, mattx_net_setup_cb);
-                if (real_task_work_add) {
-                    real_task_work_add(deputy, &ctx->cb, TWA_SIGNAL);
-                    send_sig(SIGCONT, deputy, 0);
-                } else { kfree(ctx); }
-            }
-            put_task_struct(deputy);
-        }
-    }
-}
-
 static void handle_sys_connect_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
     if (payload) {
         struct mattx_sys_connect_req *req = payload;
-        struct task_struct *deputy = NULL;
-
-        rcu_read_lock();
-        deputy = pid_task(find_vpid(req->orig_pid), PIDTYPE_PID);
-        if (deputy) get_task_struct(deputy);
-        rcu_read_unlock();
-
-        if (deputy) {
-            struct mattx_net_setup_ctx *ctx = kmalloc(sizeof(*ctx), GFP_KERNEL);
-            if (ctx) {
-                ctx->orig_pid = req->orig_pid;
-                ctx->fd = req->fd;
-                ctx->addrlen = req->addrlen;
-                memcpy(&ctx->addr, &req->addr, req->addrlen);
-                ctx->target_node = hdr->sender_id;
-                ctx->is_connect = true;
-                
-                init_task_work(&ctx->cb, mattx_net_setup_cb);
-                if (real_task_work_add) {
-                    real_task_work_add(deputy, &ctx->cb, TWA_SIGNAL);
-                    send_sig(SIGCONT, deputy, 0);
-                } else { kfree(ctx); }
-            }
-            put_task_struct(deputy);
+        struct mattx_connect_kworker_ctx *ctx = kmalloc(sizeof(*ctx), GFP_ATOMIC);
+        if (ctx) {
+            INIT_WORK(&ctx->work, mattx_connect_kworker);
+            memcpy(&ctx->req, req, sizeof(*req));
+            ctx->target_node = hdr->sender_id;
+            
+            mattx_dbg("[RPC] Dispatching CONNECT_REQ to Kworker...\n");
+            schedule_work(&ctx->work);
         }
     }
 }
+
 
 
 static void handle_sys_lseek_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
@@ -1491,65 +1394,56 @@ static void handle_sys_connect_reply(struct mattx_link *link, struct mattx_heade
 }
 
 
-// --- THE DEPUTY HIJACK: LISTEN ---
-struct mattx_listen_ctx {
-    struct callback_head cb;
+// --- DATA PLANE: LISTEN (Kworker Native Injector) ---
+struct mattx_listen_kworker_ctx {
+    struct work_struct work;
     struct mattx_sys_listen_req req;
     int target_node;
 };
 
-static void mattx_listen_cb(struct callback_head *cb) {
-    struct mattx_listen_ctx *ctx = container_of(cb, struct mattx_listen_ctx, cb);
-    struct pt_regs regs;
-    int ret = -ENOSYS;
+static void mattx_listen_kworker(struct work_struct *work) {
+    struct mattx_listen_kworker_ctx *ctx = container_of(work, struct mattx_listen_kworker_ctx, work);
     struct mattx_sys_listen_reply reply;
+    struct file *file = mattx_get_remote_file(ctx->req.orig_pid, ctx->req.fd);
+    int err = -EBADF;
 
-    memset(&regs, 0, sizeof(regs));
-    regs.di = ctx->req.fd;
-    regs.si = ctx->req.backlog;
+    memset(&reply, 0, sizeof(reply));
+    reply.orig_pid = ctx->req.orig_pid;
 
-    if (real_sys_listen) {
-        ret = real_sys_listen(&regs);
-        mattx_dbg("[HIJACK] Deputy executed listen natively. Result: %d\n", ret);
+    if (file) {
+        struct socket *sock = sock_from_file(file);
+        if (sock) {
+            // Execute natively in the Kworker!
+            err = kernel_listen(sock, ctx->req.backlog);
+            mattx_dbg("[KWORKER] Executed kernel_listen natively. Result: %d\n", err);
+        } else {
+            err = -ENOTSOCK;
+        }
+        fput(file);
     }
 
-    reply.orig_pid = ctx->req.orig_pid;
-    reply.error = ret;
+    reply.error = err;
     if (cluster_map[ctx->target_node]) {
         mattx_comm_send(cluster_map[ctx->target_node], MATTX_MSG_SYS_LISTEN_REPLY, &reply, sizeof(reply));
     }
-
     kfree(ctx);
-    set_current_state(TASK_STOPPED);
-    schedule();
 }
 
 static void handle_sys_listen_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
     if (payload) {
         struct mattx_sys_listen_req *req = payload;
-        struct task_struct *deputy = NULL;
-
-        rcu_read_lock();
-        deputy = pid_task(find_vpid(req->orig_pid), PIDTYPE_PID);
-        if (deputy) get_task_struct(deputy);
-        rcu_read_unlock();
-
-        if (deputy) {
-            struct mattx_listen_ctx *ctx = kmalloc(sizeof(*ctx), GFP_KERNEL);
-            if (ctx) {
-                memcpy(&ctx->req, req, sizeof(*req));
-                ctx->target_node = hdr->sender_id;
-                
-                init_task_work(&ctx->cb, mattx_listen_cb);
-                if (real_task_work_add) {
-                    real_task_work_add(deputy, &ctx->cb, TWA_SIGNAL);
-                    send_sig(SIGCONT, deputy, 0);
-                } else { kfree(ctx); }
-            }
-            put_task_struct(deputy);
+        struct mattx_listen_kworker_ctx *ctx = kmalloc(sizeof(*ctx), GFP_ATOMIC);
+        if (ctx) {
+            INIT_WORK(&ctx->work, mattx_listen_kworker);
+            memcpy(&ctx->req, req, sizeof(*req));
+            ctx->target_node = hdr->sender_id;
+            
+            mattx_dbg("[RPC] Dispatching LISTEN_REQ to Kworker...\n");
+            schedule_work(&ctx->work);
         }
     }
 }
+
 
 
 static void handle_sys_generic_int_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
