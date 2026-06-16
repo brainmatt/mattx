@@ -1134,7 +1134,7 @@ static void mattx_bind_kworker(struct work_struct *work) {
         struct socket *sock = sock_from_file(file);
         if (sock) {
             // Execute natively in the Kworker! No signals, no scratchpads!
-            err = kernel_bind(sock, (struct sockaddr *)&ctx->req.addr, ctx->req.addrlen);
+            err = kernel_bind(sock, MATTX_SA_CAST(&ctx->req.addr), ctx->req.addrlen);
             mattx_dbg("[KWORKER] Executed kernel_bind natively. Result: %d\n", err);
         } else {
             err = -ENOTSOCK;
@@ -1186,7 +1186,7 @@ static void mattx_connect_kworker(struct work_struct *work) {
             bool is_nonblock = (file->f_flags & O_NONBLOCK) != 0;
             
             // Execute natively!
-            err = kernel_connect(sock, (struct sockaddr *)&ctx->req.addr, ctx->req.addrlen, file->f_flags);
+            err = kernel_connect(sock, MATTX_SA_CAST(&ctx->req.addr), ctx->req.addrlen, file->f_flags);
             mattx_dbg("[KWORKER] Executed kernel_connect natively. Result: %d (NonBlock: %d)\n", err, is_nonblock);
             
             // --- THE SMART CONNECTOR WAIT LOOP ---
@@ -1710,7 +1710,7 @@ static void mattx_accept_kworker(struct work_struct *work) {
                         
                         // 3. Extract the peer name (client IP) natively!
                         if (newsock->ops && newsock->ops->getname) {
-                            int len = newsock->ops->getname(newsock, MATTX_SA_CAST(&reply.addr), 2); // 2 = peer
+                            int len = newsock->ops->getname(newsock, (struct sockaddr *)&reply.addr, 2); // 2 = peer
                             if (len > 0) {
                                 reply.addrlen = len;
                             }
