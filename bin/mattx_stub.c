@@ -168,15 +168,27 @@ int main() {
     printf("MattX-Stub: Blueprint received. Original PID: %u, Name: '%s', UID: %u, GID: %u, VMAs: %u, FDs: %u\n", 
            received_req->orig_pid, received_req->comm, received_req->uid, received_req->gid, received_req->vma_count, received_req->fd_count);
 
+    // Get the approximate memory address of our own code to prevent suicide!
+    uint64_t my_brain_addr = (uint64_t)&main & ~(0xFFFULL); 
+
     for (uint32_t i = 0; i < received_req->vma_count; i++) {
         struct mattx_vma_info *v = &received_req->vmas[i];
         size_t size = v->vm_end - v->vm_start;
+
+        // --- THE ALMA ANOMALY SHIELD ---
+        if (my_brain_addr >= v->vm_start && my_brain_addr < v->vm_end) {
+            fprintf(stderr, "\n=======================================================\n");
+            fprintf(stderr, "MattX-Stub: FATAL ALMA ANOMALY DETECTED! 🚨\n");
+            fprintf(stderr, "VMA 0x%lx - 0x%lx overlaps with my own brain (0x%lx)!\n", v->vm_start, v->vm_end, my_brain_addr);
+            fprintf(stderr, "I refuse to overwrite my own memory. Please compile mattx-stub with '-fPIE -pie'!\n");
+            fprintf(stderr, "=======================================================\n\n");
+            exit(1);
+        }
 
         int prot = PROT_READ | PROT_WRITE | PROT_EXEC;
         int flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED;
 
         // The Stack Growth Protector ---
-        // 0x0100 is the Linux kernel's internal value for VM_GROWSDOWN
         if (v->vm_flags & 0x0100) {
             flags |= MAP_GROWSDOWN;
         }
@@ -189,7 +201,7 @@ int main() {
                    i, v->vm_start, v->vm_end, (flags & MAP_GROWSDOWN) ? " + GROWSDOWN" : "");
         }
     }
-    
+
     // Clean, dynamic FD table expansion! ---
     for (int i = 3; i < MAX_FDS; i++) {
         dup2(0, i); 
