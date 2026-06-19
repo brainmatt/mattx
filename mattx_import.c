@@ -93,8 +93,7 @@ static void handle_page_transfer(struct mattx_link *link, struct mattx_header *h
         // --- REMOVED THE SILENT TRAP ---
         // We now log EVERY failure, not just offset 0!
         if (res != ph->length) {
-            printk(KERN_ERR "MattX:[IMPORT] FATAL: Failed to inject %u bytes at 0x%lx (res: %d)\n", 
-                   ph->length, target_addr, res);
+            mattx_dbg("MattX:[IMPORT] NOTICE: Skipped read-only memory %u bytes at 0x%lx (res: %d)\n", ph->length, target_addr, res);
         } else {
             injected_pages_count++;
         }

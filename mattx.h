@@ -576,6 +576,17 @@ struct mattx_rpc_work {
     // For UNLINK
     bool is_unlink; // For the Kprobe worker
 
+    // For LSEEK
+    bool is_lseek;
+    loff_t offset;
+    int whence;
+
+    // For FSYNC
+    bool is_fsync;
+    loff_t fsync_start;
+    loff_t fsync_end;
+    int datasync;
+
     // For SOCKET
     bool is_socket;
     int domain;
@@ -897,6 +908,18 @@ extern mattx_sys_sendmsg_fn real_sys_sendmsg;
 
 typedef long (*mattx_sys_recvmsg_fn)(const struct pt_regs *regs);
 extern mattx_sys_recvmsg_fn real_sys_recvmsg;
+
+
+
+// --- THE FILE-IO GHOST RESOLVERS ---
+typedef long (*mattx_sys_dup_fn)(const struct pt_regs *regs);
+extern mattx_sys_dup_fn real_sys_dup;
+
+typedef long (*mattx_sys_dup2_fn)(const struct pt_regs *regs);
+extern mattx_sys_dup2_fn real_sys_dup2;
+
+typedef long (*mattx_sys_close_fn)(const struct pt_regs *regs);
+extern mattx_sys_close_fn real_sys_close;
 
 
 // The Extreme Debugging Macro ---

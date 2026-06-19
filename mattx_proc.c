@@ -124,6 +124,24 @@ static const struct proc_ops guests_proc_ops = {
     .proc_release = single_release,
 };
 
+static int version_show(struct seq_file *m, void *v) {
+    seq_printf(m, "MattX Version: 1.7\n");
+    seq_printf(m, "MattX License: GPLv2\n");
+    seq_printf(m, "Copyright (c) 2026 by Matthias Rechenburg\n");
+    return 0;
+}
+
+static int version_open(struct inode *inode, struct file *file) {
+    return single_open(file, version_show, NULL);
+}
+
+static const struct proc_ops version_proc_ops = {
+    .proc_open = version_open,
+    .proc_read = seq_read,
+    .proc_lseek = seq_lseek,
+    .proc_release = single_release,
+};
+
 static ssize_t admin_write(struct file *file, const char __user *ubuf, size_t count, loff_t *ppos) {
     char buf[256]; // Increased size to handle long exclude lists!
     char cmd[32];
@@ -166,6 +184,10 @@ static ssize_t admin_write(struct file *file, const char __user *ubuf, size_t co
         else if (strcmp(cmd, "debug") == 0 && arg1 != -1) {
             config_debug_mode = (arg1 != 0);
             mattx_dbg(" [ADMIN] Debug Mode set to: %s\n", config_debug_mode ? "ON" : "OFF");
+        }        
+        else if (strcmp(cmd, "mattxfs") == 0 && arg1 != -1) {
+            config_mattxfs_enabled = (arg1 != 0);
+            mattx_dbg(" [ADMIN] MattXFS Mode set to: %s\n", config_mattxfs_enabled ? "ON" : "OFF");
         }        
         else if (strcmp(cmd, "migrate") == 0 && arg1 != -1 && arg2_str[0] != '\0') {
             
@@ -212,6 +234,7 @@ int mattx_proc_init(void) {
     mattx_proc_dir = proc_mkdir("mattx", NULL);
     if (!mattx_proc_dir) return -ENOMEM;
 
+    proc_create("version", 0444, mattx_proc_dir, &version_proc_ops);    
     proc_create("nodes", 0444, mattx_proc_dir, &nodes_proc_ops);
     proc_create("remote", 0444, mattx_proc_dir, &remote_proc_ops); 
     proc_create("guests", 0444, mattx_proc_dir, &guests_proc_ops); 
@@ -223,6 +246,7 @@ int mattx_proc_init(void) {
 
 void mattx_proc_exit(void) {
     if (mattx_proc_dir) {
+        remove_proc_entry("version", mattx_proc_dir);        
         remove_proc_entry("nodes", mattx_proc_dir);
         remove_proc_entry("remote", mattx_proc_dir); 
         remove_proc_entry("guests", mattx_proc_dir); 

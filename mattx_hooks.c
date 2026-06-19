@@ -53,8 +53,21 @@ static void mattx_rpc_worker(struct work_struct *work) {
     int i;
     int remote_fd = -1;
     
-    if (rpc->is_statx) {
-        // ... (statx logic, removed here since we deleted statx kprobe)
+    // LSEEK WORKER ---
+    if (rpc->is_lseek) {
+        struct mattx_sys_lseek_req req = { .orig_pid = rpc->orig_pid, .fd = rpc->remote_fd, .offset = rpc->offset, .whence = rpc->whence };
+        if (cluster_map[rpc->home_node]) mattx_comm_send(cluster_map[rpc->home_node], MATTX_MSG_SYS_LSEEK_REQ, &req, sizeof(req));
+
+    // FSYNC WORKER ---
+    } else if (rpc->is_fsync) {
+        struct mattx_sys_fsync_req req = { .orig_pid = rpc->orig_pid, .fd = rpc->remote_fd, .datasync = rpc->datasync };
+        if (cluster_map[rpc->home_node]) mattx_comm_send(cluster_map[rpc->home_node], MATTX_MSG_SYS_FSYNC_REQ, &req, sizeof(req));
+
+    // STATX WORKER ---
+    } else if (rpc->is_statx) {
+        struct mattx_sys_statx_req req = { .orig_pid = rpc->orig_pid, .fd = rpc->remote_fd, .mask = rpc->mask, .flags = rpc->flags };
+        if (cluster_map[rpc->home_node]) mattx_comm_send(cluster_map[rpc->home_node], MATTX_MSG_SYS_STATX_REQ, &req, sizeof(req));
+        
     } else if (rpc->is_dup) {
         struct mattx_sys_dup_req req;
         memset(&req, 0, sizeof(req));
@@ -581,11 +594,64 @@ static void mattx_rpc_worker(struct work_struct *work) {
                 struct pt_regs *regs = task_pt_regs(surrogate);
                 if (regs) regs->ax = -EINTR; // Interrupted System Call
                 mattx_dbg("[RPC] Migration initiated! Aborted RPC for Surrogate %d\n", rpc->local_pid);
-            } 
+
             // NOW it is safe to apply the Illusion!
-            else if (rpc->is_statx) {
-                // (Removed statx block since we deleted it)
-            // --- FIXED: Group ALL FD-Operating Syscalls together! ---
+            // --- LSEEK AWAKENING ---
+            } else if (rpc->is_lseek) {
+                struct pt_regs *regs = task_pt_regs(surrogate);
+                loff_t res = -EINTR;
+                spin_lock(&guest_lock);
+                for (i = 0; i < guest_count; i++) {
+                    if (guest_registry[i].local_pid == rpc->local_pid) {
+                        if (guest_registry[i].rpc_done) res = guest_registry[i].rpc_lseek_res; 
+                        break;
+                    }
+                }
+                spin_unlock(&guest_lock);
+                if (regs) regs->ax = res;
+
+            // --- FSYNC AWAKENING ---
+            } else if (rpc->is_fsync) {
+                struct pt_regs *regs = task_pt_regs(surrogate);
+                int error = -EINTR;
+                spin_lock(&guest_lock);
+                for (i = 0; i < guest_count; i++) {
+                    if (guest_registry[i].local_pid == rpc->local_pid) {
+                        if (guest_registry[i].rpc_done) error = guest_registry[i].rpc_fsync_res; 
+                        break;
+                    }
+                }
+                spin_unlock(&guest_lock);
+                if (regs) regs->ax = error;
+
+            // --- STATX AWAKENING ---
+            } else if (rpc->is_statx) {
+                struct pt_regs *regs = task_pt_regs(surrogate);
+                int error = -EINTR;
+                void *read_buf = NULL;
+
+                spin_lock(&guest_lock);
+                for (i = 0; i < guest_count; i++) {
+                    if (guest_registry[i].local_pid == rpc->local_pid) {
+                        if (guest_registry[i].rpc_done) {
+                            error = guest_registry[i].rpc_fsync_res; 
+                            read_buf = guest_registry[i].rpc_statx_buf; 
+                        }
+                        guest_registry[i].rpc_statx_buf = NULL;
+                        break;
+                    }
+                }
+                spin_unlock(&guest_lock);
+
+                if (error == 0 && read_buf) {
+                    if (access_process_vm(surrogate, (unsigned long)rpc->statx_buffer, read_buf, sizeof(struct statx), FOLL_WRITE | FOLL_FORCE) != sizeof(struct statx)) {
+                        error = -EFAULT;
+                    }
+                }
+                if (read_buf) kfree(read_buf);
+                if (regs) regs->ax = error;
+
+            // --- Group ALL FD-Operating Syscalls together! ---
             } else if (rpc->is_unlink || rpc->is_connect || rpc->is_bind || rpc->is_listen || rpc->is_sendto) {
                 struct pt_regs *regs = task_pt_regs(surrogate);
                 int error = -1;
@@ -2535,6 +2601,90 @@ static int ret_handler_write(struct kretprobe_instance *ri, struct pt_regs *regs
 }
 
 
+// --- FILE I/O KPROBES: LSEEK, FSYNC, STATX ---
+struct fileio_kretprobe_data { 
+    int fd; 
+    bool is_wormhole; 
+    loff_t offset; 
+    int whence; 
+    loff_t start; 
+    loff_t end; 
+    int datasync; 
+    u32 mask; 
+    int flags; 
+    void __user *buf; 
+};
+
+static struct kretprobe lseek_kprobe;
+static struct kretprobe fsync_kprobe;
+static struct kretprobe statx_kprobe;
+
+static int entry_handler_fileio(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    struct fileio_kretprobe_data *data = (struct fileio_kretprobe_data *)ri->data;
+    struct pt_regs *sys_regs = SYSCALL_REGS(regs);
+    data->is_wormhole = false;
+
+    if (is_guest_process(current->pid)) {
+        data->fd = (int)sys_regs->di;
+        if (data->fd >= 0) {
+            struct file *f = fget(data->fd);
+            if (f) {
+                if (f->f_op == &mattx_fops && !config_mattxfs_enabled) data->is_wormhole = true;
+                else if (f->f_op != &mattx_fops) {
+                    struct inode *inode = file_inode(f);
+                    if (S_ISFIFO(inode->i_mode) || S_ISSOCK(inode->i_mode)) data->is_wormhole = true;
+                }
+                fput(f);
+            } else { data->is_wormhole = true; }
+        }
+
+        if (data->is_wormhole) {
+            if (get_kretprobe(ri) == &lseek_kprobe) { data->offset = (loff_t)sys_regs->si; data->whence = (int)sys_regs->dx; }
+            else if (get_kretprobe(ri) == &fsync_kprobe) { data->datasync = (int)sys_regs->si; }
+            else if (get_kretprobe(ri) == &statx_kprobe) { data->flags = (int)sys_regs->dx; data->mask = (u32)sys_regs->r10; data->buf = (void __user *)sys_regs->r8; }
+            sys_regs->di = -1; // Sabotage!
+        }
+    }
+    return 0;
+}
+
+static int ret_handler_fileio(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    struct fileio_kretprobe_data *data = (struct fileio_kretprobe_data *)ri->data;
+    int home_node = -1; u32 orig_pid = 0;
+
+    if (!data->is_wormhole) return 0;
+    if (fatal_signal_pending(current) || (current->flags & PF_EXITING)) return 0; // THE ATOMIC SHIELD!
+
+    spin_lock(&guest_lock);
+    for (int i = 0; i < guest_count; i++) {
+        if (guest_registry[i].local_pid == current->pid) {
+            home_node = guest_registry[i].home_node; orig_pid = guest_registry[i].orig_pid;
+            guest_registry[i].rpc_done = false; break;
+        }
+    }
+    spin_unlock(&guest_lock);
+
+    if (home_node != -1) {
+        struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
+        if (rpc) {
+            INIT_WORK(&rpc->work, mattx_rpc_worker);
+            rpc->local_pid = current->pid; rpc->orig_pid = orig_pid; rpc->home_node = home_node; rpc->remote_fd = data->fd;
+            
+            if (get_kretprobe(ri) == &lseek_kprobe) { rpc->is_lseek = true; rpc->offset = data->offset; rpc->whence = data->whence; }
+            else if (get_kretprobe(ri) == &fsync_kprobe) { rpc->is_fsync = true; rpc->datasync = data->datasync; }
+            else if (get_kretprobe(ri) == &statx_kprobe) { rpc->is_statx = true; rpc->mask = data->mask; rpc->flags = data->flags; rpc->statx_buffer = data->buf; }
+
+            regs->ax = -EINTR;
+            send_sig(SIGSTOP, current, 0);
+            schedule_work(&rpc->work);
+        }
+    }
+    return 0;
+}
+
+
+
+
 // --- THE EPOLL TRANSLATOR: Create Interceptor (Sterile Lab) ---
 struct epoll_create_kretprobe_data {
     int flags;
@@ -3135,6 +3285,33 @@ int mattx_hooks_init(void) {
     ret = register_kretprobe(&write_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for write, returned %d\n", ret);
 
+    memset(&lseek_kprobe, 0, sizeof(lseek_kprobe));
+    lseek_kprobe.kp.symbol_name = "__x64_sys_lseek";
+    lseek_kprobe.entry_handler = entry_handler_fileio; // Use the unified handler!
+    lseek_kprobe.handler = ret_handler_fileio;         // Use the unified handler!
+    lseek_kprobe.data_size = sizeof(struct fileio_kretprobe_data);
+    lseek_kprobe.maxactive = 64;
+    ret = register_kretprobe(&lseek_kprobe);
+    if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for lseek, returned %d\n", ret);
+
+    memset(&fsync_kprobe, 0, sizeof(fsync_kprobe));
+    fsync_kprobe.kp.symbol_name = "__x64_sys_fsync";
+    fsync_kprobe.entry_handler = entry_handler_fileio; // Use the unified handler!
+    fsync_kprobe.handler = ret_handler_fileio;         // Use the unified handler!
+    fsync_kprobe.data_size = sizeof(struct fileio_kretprobe_data);
+    fsync_kprobe.maxactive = 64;
+    ret = register_kretprobe(&fsync_kprobe);
+    if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for fsync, returned %d\n", ret);
+
+    memset(&statx_kprobe, 0, sizeof(statx_kprobe));
+    statx_kprobe.kp.symbol_name = "__x64_sys_statx";
+    statx_kprobe.entry_handler = entry_handler_fileio; // Use the unified handler!
+    statx_kprobe.handler = ret_handler_fileio;         // Use the unified handler!
+    statx_kprobe.data_size = sizeof(struct fileio_kretprobe_data);
+    statx_kprobe.maxactive = 64;
+    ret = register_kretprobe(&statx_kprobe);
+    if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for statx, returned %d\n", ret);
+
     memset(&epoll_ctl_kprobe, 0, sizeof(epoll_ctl_kprobe));
     epoll_ctl_kprobe.kp.symbol_name = "__x64_sys_epoll_ctl";
     epoll_ctl_kprobe.entry_handler = entry_handler_epoll_ctl;
@@ -3241,6 +3418,9 @@ void mattx_hooks_exit(void) {
     unregister_kretprobe(&pselect6_kprobe);    
     unregister_kretprobe(&write_kprobe);
     unregister_kretprobe(&read_kprobe);    
+    unregister_kretprobe(&lseek_kprobe);    
+    unregister_kretprobe(&fsync_kprobe);    
+    unregister_kretprobe(&statx_kprobe);    
     unregister_kretprobe(&select_kprobe);
     unregister_kretprobe(&poll_kprobe);
     unregister_kretprobe(&accept_kprobe);

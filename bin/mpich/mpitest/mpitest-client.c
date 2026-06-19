@@ -21,15 +21,12 @@
  * Commercial licensing options are available upon request.
  */
  
-/* pvmtest-client.c - The Client/Worker Process */
+ /* mpitest-client.c - The MPI Client/Worker Process */
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdarg.h>
 #include <unistd.h>
-#include <pvm3.h>
-
-#define MSG_INIT 1
-#define MSG_DONE 2
+#include <mpi.h>
 
 void log_debug(const char *fmt, ...) {
     FILE *f;
@@ -43,7 +40,7 @@ void log_debug(const char *fmt, ...) {
     va_end(args);
 
     // Append to logfile
-    f = fopen("/tmp/pvmtest.log", "a");
+    f = fopen("/tmp/mpitest.log", "a");
     if (f) {
         va_start(args, fmt);
         fprintf(f, "[CLIENT] ");
@@ -55,28 +52,29 @@ void log_debug(const char *fmt, ...) {
 }
 
 int main(int argc, char **argv) {
-    int my_tid, master_tid;
+    MPI_Comm parent_comm;
+    int my_rank;
     int current_val = 0;
     int i;
 
-    log_debug("Starting up. Enrolling in PVM...");
-    my_tid = pvm_mytid();
-    if (my_tid < 0) {
-        log_debug("ERROR: Failed to enroll in PVM.");
+    log_debug("Starting up. Initializing MPI...");
+    MPI_Init(&argc, &argv);
+    
+    // Get the intercommunicator to talk to the master that spawned us
+    MPI_Comm_get_parent(&parent_comm);
+    
+    if (parent_comm == MPI_COMM_NULL) {
+        log_debug("ERROR: No parent communicator found! Was I spawned manually?");
+        MPI_Finalize();
         exit(1);
     }
 
-    master_tid = pvm_parent();
-    if (master_tid < 0) {
-        log_debug("ERROR: Failed to get parent TID. Was I spawned manually?");
-        pvm_exit();
-        exit(1);
-    }
-    log_debug("Enrolled successfully. My TID is %x. Master TID is %x", my_tid, master_tid);
+    MPI_Comm_rank(MPI_COMM_WORLD, &my_rank);
+    log_debug("Initialized successfully. My Rank is %d.", my_rank);
 
     log_debug("Waiting for initial message from Master...");
-    pvm_recv(master_tid, MSG_INIT);
-    pvm_upkint(&current_val, 1, 1);
+    // Receive from rank 0 of the parent
+    MPI_Recv(&current_val, 1, MPI_INT, 0, 0, parent_comm, MPI_STATUS_IGNORE);
     log_debug("Received starting integer: %d", current_val);
 
     log_debug("Beginning count-up to 1000...");
@@ -87,15 +85,12 @@ int main(int argc, char **argv) {
     }
 
     log_debug("Reached 1000! Packing and sending result to Master...");
-    pvm_initsend(PvmDataDefault);
-    pvm_pkint(&i, 1, 1); // Send the final value (which will be 1001 after the loop, or we can send 1000)
     
-    // Let's explicitly send 1000 as requested
     int final_result = 1000;
-    pvm_pkint(&final_result, 1, 1);
-    pvm_send(master_tid, MSG_DONE);
+    MPI_Send(&final_result, 1, MPI_INT, 0, 0, parent_comm);
 
-    log_debug("Result sent. Shutting down PVM and exiting.");
-    pvm_exit();
+    log_debug("Result sent. Disconnecting communicator and shutting down MPI.");
+    MPI_Comm_disconnect(&parent_comm);
+    MPI_Finalize();
     return 0;
 }

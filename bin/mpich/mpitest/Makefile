@@ -21,16 +21,25 @@
 # Commercial licensing options are available upon request.
 #
 
-obj-m += mattxfs.o
+# Makefile for MattX MPI Debugging Suite
 
-KDIR := /lib/modules/$(shell uname -r)/build
-# Use absolute path for the current directory
-MY_DIR := $(shell pwd)
+# Use the standard MPI C compiler wrapper
+CC = mpicc
+CFLAGS = -g -Wall
 
-all:
-	# Pass the exact, absolute path to the parent Module.symvers
-	$(MAKE) -C $(KDIR) M=$(MY_DIR) KBUILD_EXTRA_SYMBOLS="$(MY_DIR)/../Module.symvers" modules
+all: mpitest mpitest-client
+
+mpitest: mpitest.c
+	$(CC) $(CFLAGS) -o mpitest mpitest.c
+
+mpitest-client: mpitest-client.c
+	$(CC) $(CFLAGS) -o mpitest-client mpitest-client.c
+
+install: all
+	chmod +x run-mpitest
 
 clean:
-	$(MAKE) -C $(KDIR) M=$(MY_DIR) clean
-	rm -f $(MY_DIR)/../Module.symvers
+	rm -f mpitest mpitest-client
+	rm -f /tmp/mpitest.log
+
+.PHONY: all clean

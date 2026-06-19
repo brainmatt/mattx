@@ -30,7 +30,7 @@ KDIR := /lib/modules/$(shell uname -r)/build
 PWD := $(shell pwd)
 
 # --- User-Space Build Config ---
-CFLAGS_USER := -Wall -O2 $(shell pkg-config --cflags libnl-3.0 libnl-genl-3.0)
+CFLAGS_USER := -fPIE -pie -Wall -O2 $(shell pkg-config --cflags libnl-3.0 libnl-genl-3.0)
 LDFLAGS_USER := $(shell pkg-config --libs libnl-3.0 libnl-genl-3.0)
 
 all: module daemon stub migtest migtest2 servertestpoll servertestselect dfsatest epolltest
@@ -67,6 +67,7 @@ epolltest: bin/epolltest.c
 clean:
 	$(MAKE) -C $(KDIR) M=$(PWD) clean
 	rm -f bin/migtest bin/migtest2 bin/servertestpoll bin/servertestselect bin/mattx-stub sbin/mattx-discd bin/dfsatest bin/epolltest
+	rm -f mattxfs/Module.symvers
 
 install:
 	sudo rm -f /usr/local/bin/migtest

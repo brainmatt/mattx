@@ -28,6 +28,9 @@
 
 // --- The VFS Proxy (Fake FDs) ---
 
+// Forward declaration for the universal remote file fetcher
+static struct file *mattx_get_remote_file(u32 orig_pid, int remote_fd);
+
 // Helper to safely check if the RPC is done while we are sleeping
 bool check_rpc_done(pid_t pid) {
     bool done = false;
@@ -506,73 +509,98 @@ static void handle_syscall_fwd(struct mattx_link *link, struct mattx_header *hdr
     }
 }
 
-static void handle_sys_open_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
-    if (payload) {
-        struct mattx_sys_open_req *req = (struct mattx_sys_open_req *)payload;
-        struct mattx_sys_open_reply reply;
-        struct file *filp = NULL;
-        struct task_struct *deputy = NULL;
-        int remote_fd = -1;
-        int i, j;
 
-        mattx_dbg("[RPC] Received OPEN request from Node %u for file: '%s'\n", hdr->sender_id, req->filename);
+// --- DATA PLANE: OPENAT (Kworker Native Injector) ---
+struct mattx_open_kworker_ctx {
+    struct work_struct work;
+    struct mattx_sys_open_req req;
+    int target_node;
+};
 
-        rcu_read_lock();
-        deputy = pid_task(find_vpid(req->orig_pid), PIDTYPE_PID);
-        if (deputy) get_task_struct(deputy);
-        rcu_read_unlock();
+static void mattx_open_kworker(struct work_struct *work) {
+    struct mattx_open_kworker_ctx *ctx = container_of(work, struct mattx_open_kworker_ctx, work);
+    struct mattx_sys_open_reply reply;
+    struct file *filp = NULL;
+    struct task_struct *deputy = NULL;
+    int remote_fd = -1;
+    int err = -EBADF;
 
-        if (deputy) {
-            const struct cred *old_cred;
-            
-            if (deputy->mm) kthread_use_mm(deputy->mm);
-            old_cred = override_creds(deputy->cred);
+    memset(&reply, 0, sizeof(reply));
+    reply.orig_pid = ctx->req.orig_pid;
 
-            filp = filp_open(req->filename, req->flags, req->mode);
-            
-            revert_creds(old_cred);
-            if (deputy->mm) kthread_unuse_mm(deputy->mm);
+    rcu_read_lock();
+    deputy = pid_task(find_vpid(ctx->req.orig_pid), PIDTYPE_PID);
+    if (deputy) get_task_struct(deputy);
+    rcu_read_unlock();
 
-            if (IS_ERR(filp)) {
-                printk(KERN_ERR "MattX:[RPC] Failed to open file '%s' on Home Node (err: %ld)\n", req->filename, PTR_ERR(filp));
-                reply.error = PTR_ERR(filp);
-            } else {
-                spin_lock(&export_lock);
-                for (i = 0; i < export_count; i++) {
-                    if (export_registry[i].orig_pid == req->orig_pid) {
-                        for (j = 0; j < MAX_FDS; j++) {
-                            if (export_registry[i].remote_files[j] == NULL) {
-                                export_registry[i].remote_files[j] = filp;
-                                remote_fd = j + 1000; 
-                                break;
-                            }
-                        }
+    if (deputy) {
+        // Temporarily wear the Deputy's face so file permissions are checked correctly!
+        const struct cred *old_cred = override_creds(deputy->cred);
+
+        // Open the file natively in the kernel! (No user-space scratchpad needed!)
+        filp = filp_open(ctx->req.filename, ctx->req.flags, ctx->req.mode);
+        
+        revert_creds(old_cred);
+
+        if (IS_ERR(filp)) {
+            err = PTR_ERR(filp);
+            mattx_dbg("[KWORKER] Failed to open file '%s' (err: %d)\n", ctx->req.filename, err);
+        } else {
+            // --- THE NATIVE INJECTOR ---
+            // Forcefully inject the open file into the sleeping Deputy's FD table!
+            if (deputy->files) {
+                spin_lock(&deputy->files->file_lock);
+                struct fdtable *fdt = files_fdtable(deputy->files);
+                for (int j = 3; j < fdt->max_fds; j++) {
+                    if (!rcu_dereference_raw(fdt->fd[j])) {
+                        rcu_assign_pointer(fdt->fd[j], filp);
+                        __set_bit(j, fdt->open_fds);
+                        remote_fd = j;
+                        err = 0;
                         break;
                     }
                 }
-                spin_unlock(&export_lock);
-                
-                if (remote_fd == -1) {
-                    fput(filp); 
-                    reply.error = -ENFILE;
-                } else {
-                    reply.error = 0;
-                }
+                spin_unlock(&deputy->files->file_lock);
             }
-            put_task_struct(deputy);
-        } else {
-            reply.error = -ESRCH;
+            
+            if (remote_fd == -1) {
+                fput(filp);
+                err = -ENFILE;
+            } else {
+                mattx_dbg("[KWORKER] Successfully injected '%s' into Deputy Native FD: %d\n", ctx->req.filename, remote_fd);
+            }
         }
+        put_task_struct(deputy);
+    } else {
+        err = -ESRCH;
+    }
 
-        reply.orig_pid = req->orig_pid;
-        reply.remote_fd = remote_fd;
+    reply.remote_fd = remote_fd;
+    reply.error = err;
 
-        mattx_dbg("[RPC] Sending OPEN_REPLY (Remote FD: %d) back to Node %u...\n", remote_fd, hdr->sender_id);
-        if (cluster_map[hdr->sender_id]) {
-            mattx_comm_send(cluster_map[hdr->sender_id], MATTX_MSG_SYS_OPEN_REPLY, &reply, sizeof(reply));
+    if (cluster_map[ctx->target_node]) {
+        mattx_comm_send(cluster_map[ctx->target_node], MATTX_MSG_SYS_OPEN_REPLY, &reply, sizeof(reply));
+    }
+
+    kfree(ctx);
+}
+
+static void handle_sys_open_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    if (payload) {
+        struct mattx_sys_open_req *req = payload;
+        struct mattx_open_kworker_ctx *ctx = kmalloc(sizeof(*ctx), GFP_ATOMIC);
+        
+        if (ctx) {
+            INIT_WORK(&ctx->work, mattx_open_kworker);
+            memcpy(&ctx->req, req, sizeof(*req));
+            ctx->target_node = hdr->sender_id;
+            
+            mattx_dbg("[RPC] Dispatching OPEN_REQ for '%s' to Kworker...\n", req->filename);
+            schedule_work(&ctx->work);
         }
     }
 }
+
 
 static void handle_sys_open_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
     if (payload) {
@@ -605,6 +633,7 @@ static void handle_sys_close_req(struct mattx_link *link, struct mattx_header *h
         mattx_dbg("[RPC] Received CLOSE request for Remote FD %u from Node %u\n", req->remote_fd, hdr->sender_id);
 
         if (req->remote_fd >= 1000) {
+            // Legacy Exported FD logic (for MattXFS files)
             int slot = req->remote_fd - 1000;
             spin_lock(&export_lock);
             for (int i = 0; i < export_count; i++) {
@@ -618,7 +647,9 @@ static void handle_sys_close_req(struct mattx_link *link, struct mattx_header *h
             }
             spin_unlock(&export_lock);
         } else if (req->remote_fd >= 0) {
-            // --- THE NATIVE CLOSE UPGRADE ---
+            // --- THE NATIVE CLOSE UPGRADE (Kworker Edition) ---
+            // We do NOT wake up the Deputy! The Kworker safely plucks the FD 
+            // out of the Deputy's table and closes it!
             struct task_struct *deputy = NULL;
             rcu_read_lock();
             deputy = pid_task(find_vpid(req->orig_pid), PIDTYPE_PID);
@@ -777,341 +808,171 @@ static void handle_sys_read_reply(struct mattx_link *link, struct mattx_header *
     }
 }
 
+
+// === DATA PLANE: LSEEK ===
+struct mattx_lseek_kworker_ctx { struct work_struct work; struct mattx_sys_lseek_req req; int target_node; };
+
+static void mattx_lseek_kworker(struct work_struct *work) {
+    struct mattx_lseek_kworker_ctx *ctx = container_of(work, struct mattx_lseek_kworker_ctx, work);
+    struct file *file = mattx_get_remote_file(ctx->req.orig_pid, ctx->req.fd);
+    struct mattx_sys_lseek_reply reply;
+    loff_t ret = -EBADF;
+
+    if (file) {
+        ret = vfs_llseek(file, ctx->req.offset, ctx->req.whence);
+        fput(file);
+    }
+
+    reply.orig_pid = ctx->req.orig_pid;
+    reply.result_offset = ret;
+    reply.error = (ret < 0) ? ret : 0;
+    if (cluster_map[ctx->target_node]) mattx_comm_send(cluster_map[ctx->target_node], MATTX_MSG_SYS_LSEEK_REPLY, &reply, sizeof(reply));
+    kfree(ctx);
+}
+
 static void handle_sys_lseek_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
-    if (payload) {
-        struct mattx_sys_lseek_req *req = (struct mattx_sys_lseek_req *)payload;
-        struct task_struct *deputy = NULL;
-        struct file *file = NULL;
-        int i;
-        struct mattx_sys_lseek_reply reply;
-        
-        reply.orig_pid = req->orig_pid;
-        reply.result_offset = -EBADF;
-        reply.error = -EBADF;
-
-        mattx_dbg("[WORMHOLE] Received LSEEK req for FD %u from Node %u (offset %lld, whence %d)\n", req->fd, hdr->sender_id, req->offset, req->whence);
-
-        if (req->fd >= 1000) {
-            int slot = req->fd - 1000;
-            spin_lock(&export_lock);
-            for (i = 0; i < export_count; i++) {
-                if (export_registry[i].orig_pid == req->orig_pid) {
-                    if (slot < MAX_FDS && export_registry[i].remote_files[slot]) {
-                        file = export_registry[i].remote_files[slot];
-                        get_file(file); 
-                    }
-                    break;
-                }
-            }
-            spin_unlock(&export_lock);
-        } else {
-            rcu_read_lock();
-            deputy = pid_task(find_vpid(req->orig_pid), PIDTYPE_PID);
-            if (deputy) get_task_struct(deputy);
-            rcu_read_unlock();
-            
-            if (deputy) {
-                struct files_struct *files = deputy->files;
-                if (files) {
-                    spin_lock(&files->file_lock);
-                    struct fdtable *fdt = files_fdtable(files);
-                    if (req->fd < fdt->max_fds) {
-                        file = rcu_dereference_raw(fdt->fd[req->fd]);
-                        if (file) get_file(file); 
-                    }
-                    spin_unlock(&files->file_lock);
-                }
-                put_task_struct(deputy);
-            }
-        }
-        
-        if (file) {
-            loff_t res = vfs_llseek(file, req->offset, req->whence);
-            reply.result_offset = res;
-            reply.error = (res < 0) ? res : 0;
-            fput(file); 
-        }
-        
-        if (cluster_map[hdr->sender_id]) {
-            mattx_comm_send(cluster_map[hdr->sender_id], MATTX_MSG_SYS_LSEEK_REPLY, &reply, sizeof(reply));
-        }
+    struct mattx_sys_lseek_req *req = payload;
+    struct mattx_lseek_kworker_ctx *ctx = kmalloc(sizeof(*ctx), GFP_ATOMIC);
+    if (ctx) {
+        INIT_WORK(&ctx->work, mattx_lseek_kworker);
+        memcpy(&ctx->req, req, sizeof(*req)); ctx->target_node = hdr->sender_id;
+        schedule_work(&ctx->work);
     }
 }
 
-static void handle_sys_statx_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
-    if (payload) {
-        struct mattx_sys_statx_req *req = (struct mattx_sys_statx_req *)payload;
-        struct task_struct *deputy = NULL;
-        struct file *file = NULL;
-        int i;
-        struct mattx_sys_statx_reply reply;
-        
-        reply.orig_pid = req->orig_pid;
-        reply.error = -EBADF;
-        memset(&reply.statx_buf, 0, sizeof(reply.statx_buf));
+// === DATA PLANE: FSYNC ===
+struct mattx_fsync_kworker_ctx { struct work_struct work; struct mattx_sys_fsync_req req; int target_node; };
 
-        mattx_dbg("[WORMHOLE] Received STATX req for FD %u from Node %u\n", req->fd, hdr->sender_id);
+static void mattx_fsync_kworker(struct work_struct *work) {
+    struct mattx_fsync_kworker_ctx *ctx = container_of(work, struct mattx_fsync_kworker_ctx, work);
+    struct file *file = mattx_get_remote_file(ctx->req.orig_pid, ctx->req.fd);
+    struct mattx_sys_fsync_reply reply;
+    int ret = -EBADF;
 
-        if (req->fd >= 1000) {
-            int slot = req->fd - 1000;
-            spin_lock(&export_lock);
-            for (i = 0; i < export_count; i++) {
-                if (export_registry[i].orig_pid == req->orig_pid) {
-                    if (slot < MAX_FDS && export_registry[i].remote_files[slot]) {
-                        file = export_registry[i].remote_files[slot];
-                        get_file(file); 
-                    }
-                    break;
-                }
-            }
-            spin_unlock(&export_lock);
-        } else {
-            rcu_read_lock();
-            deputy = pid_task(find_vpid(req->orig_pid), PIDTYPE_PID);
-            if (deputy) get_task_struct(deputy);
-            rcu_read_unlock();
-            
-            if (deputy) {
-                struct files_struct *files = deputy->files;
-                if (files) {
-                    spin_lock(&files->file_lock);
-                    struct fdtable *fdt = files_fdtable(files);
-                    if (req->fd < fdt->max_fds) {
-                        file = rcu_dereference_raw(fdt->fd[req->fd]);
-                        if (file) get_file(file); 
-                    }
-                    spin_unlock(&files->file_lock);
-                }
-                put_task_struct(deputy);
-            }
-        }
-        
-        if (file) {
-            struct kstat stat;
-            int err;
-            const struct cred *old_cred = NULL;
-            
-            if (deputy) {
-                if (deputy->mm) kthread_use_mm(deputy->mm);
-                old_cred = override_creds(deputy->cred);
-            }
-
-            // Clean the flags! vfs_getattr only tolerates the sync flags when called directly on a struct path.
-            // Other flags like AT_EMPTY_PATH will cause an immediate -EINVAL or -EPERM!
-            err = vfs_getattr(&file->f_path, &stat, req->mask, req->flags & AT_STATX_SYNC_TYPE);
-            reply.error = err;
-            
-            if (deputy) {
-                revert_creds(old_cred);
-                if (deputy->mm) kthread_unuse_mm(deputy->mm);
-            }
-
-            if (err == 0) {
-                reply.statx_buf.stx_mask = stat.result_mask;
-                reply.statx_buf.stx_blksize = stat.blksize;
-                reply.statx_buf.stx_attributes = stat.attributes;
-                reply.statx_buf.stx_nlink = stat.nlink;
-                reply.statx_buf.stx_uid = from_kuid_munged(current_user_ns(), stat.uid);
-                reply.statx_buf.stx_gid = from_kgid_munged(current_user_ns(), stat.gid);
-                reply.statx_buf.stx_mode = stat.mode;
-                reply.statx_buf.stx_ino = stat.ino;
-                reply.statx_buf.stx_size = stat.size;
-                reply.statx_buf.stx_blocks = stat.blocks;
-                reply.statx_buf.stx_attributes_mask = stat.attributes_mask;
-                reply.statx_buf.stx_atime.tv_sec = stat.atime.tv_sec;
-                reply.statx_buf.stx_atime.tv_nsec = stat.atime.tv_nsec;
-                reply.statx_buf.stx_btime.tv_sec = stat.btime.tv_sec;
-                reply.statx_buf.stx_btime.tv_nsec = stat.btime.tv_nsec;
-                reply.statx_buf.stx_ctime.tv_sec = stat.ctime.tv_sec;
-                reply.statx_buf.stx_ctime.tv_nsec = stat.ctime.tv_nsec;
-                reply.statx_buf.stx_mtime.tv_sec = stat.mtime.tv_sec;
-                reply.statx_buf.stx_mtime.tv_nsec = stat.mtime.tv_nsec;
-                reply.statx_buf.stx_rdev_major = MAJOR(stat.rdev);
-                reply.statx_buf.stx_rdev_minor = MINOR(stat.rdev);
-                reply.statx_buf.stx_dev_major = MAJOR(stat.dev);
-                reply.statx_buf.stx_dev_minor = MINOR(stat.dev);
-            }
-            fput(file); 
-        }
-        
-        if (cluster_map[hdr->sender_id]) {
-            mattx_comm_send(cluster_map[hdr->sender_id], MATTX_MSG_SYS_STATX_REPLY, &reply, sizeof(reply));
-        }
+    if (file) {
+        ret = vfs_fsync_range(file, ctx->req.start, ctx->req.end, ctx->req.datasync);
+        fput(file);
     }
-}
 
-static void handle_sys_dup_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
-    if (payload) {
-        struct mattx_sys_dup_req *req = (struct mattx_sys_dup_req *)payload;
-        struct task_struct *deputy = NULL;
-        struct file *file = NULL;
-        int i;
-        struct mattx_sys_dup_reply reply;
-        
-        reply.orig_pid = req->orig_pid;
-        reply.new_remote_fd = -EBADF;
-        reply.error = -EBADF;
-
-        mattx_dbg("[WORMHOLE] Received DUP req for Remote FD %u from Node %u\n", req->old_remote_fd, hdr->sender_id);
-
-        if (req->old_remote_fd >= 1000) {
-            int slot = req->old_remote_fd - 1000;
-            spin_lock(&export_lock);
-            for (i = 0; i < export_count; i++) {
-                if (export_registry[i].orig_pid == req->orig_pid) {
-                    if (slot < MAX_FDS && export_registry[i].remote_files[slot]) {
-                        file = export_registry[i].remote_files[slot];
-                        get_file(file); 
-                        
-                        // It's an exported file! We need to find an empty slot in our export registry for the clone.
-                        int j;
-                        for (j = 0; j < MAX_FDS; j++) {
-                            if (export_registry[i].remote_files[j] == NULL) {
-                                export_registry[i].remote_files[j] = file;
-                                reply.new_remote_fd = j + 1000;
-                                reply.error = 0;
-                                mattx_dbg("[WORMHOLE] Duplicated Exported FD %u to %d\n", req->old_remote_fd, reply.new_remote_fd);
-                                break;
-                            }
-                        }
-                        if (reply.new_remote_fd < 0) {
-                            fput(file); // No space left
-                            reply.error = -EMFILE;
-                        }
-                    }
-                    break;
-                }
-            }
-            spin_unlock(&export_lock);
-        } else {
-            // It's a real file descriptor on the Deputy!
-            rcu_read_lock();
-            deputy = pid_task(find_vpid(req->orig_pid), PIDTYPE_PID);
-            if (deputy) get_task_struct(deputy);
-            rcu_read_unlock();
-            
-            if (deputy) {
-                struct files_struct *files = deputy->files;
-                if (files) {
-                    spin_lock(&files->file_lock);
-                    struct fdtable *fdt = files_fdtable(files);
-                    if (req->old_remote_fd < fdt->max_fds) {
-                        file = rcu_dereference_raw(fdt->fd[req->old_remote_fd]);
-                        if (file) {
-                            get_file(file); 
-                            
-                            // Let's allocate a real new FD on the Deputy!
-                            int new_fd = req->new_local_fd;
-                            if (new_fd < 0) {
-                                // Dynamic dup() -> Find first free slot
-                                int j;
-                                for (j = 3; j < fdt->max_fds; j++) {
-                                    if (!rcu_dereference_raw(fdt->fd[j])) {
-                                        new_fd = j;
-                                        break;
-                                    }
-                                }
-                            }
-
-                            if (new_fd >= 0 && new_fd < fdt->max_fds) {
-                                // Overwrite the slot if dup2() requested an existing open one
-                                struct file *old_target = rcu_dereference_raw(fdt->fd[new_fd]);
-                                if (old_target) {
-                                    fput(old_target);
-                                }
-                                rcu_assign_pointer(fdt->fd[new_fd], file);
-                                __set_bit(new_fd, fdt->open_fds);
-                                reply.new_remote_fd = new_fd;
-                                reply.error = 0;
-                                mattx_dbg("[WORMHOLE] Duplicated Deputy FD %u to %d\n", req->old_remote_fd, reply.new_remote_fd);
-                            } else {
-                                fput(file);
-                                reply.error = -EMFILE;
-                            }
-                        }
-                    }
-                    spin_unlock(&files->file_lock);
-                }
-                put_task_struct(deputy);
-            }
-        }
-        
-        if (cluster_map[hdr->sender_id]) {
-            mattx_comm_send(cluster_map[hdr->sender_id], MATTX_MSG_SYS_DUP_REPLY, &reply, sizeof(reply));
-        }
-    }
+    reply.orig_pid = ctx->req.orig_pid;
+    reply.error = ret;
+    if (cluster_map[ctx->target_node]) mattx_comm_send(cluster_map[ctx->target_node], MATTX_MSG_SYS_FSYNC_REPLY, &reply, sizeof(reply));
+    kfree(ctx);
 }
 
 static void handle_sys_fsync_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
-    if (payload) {
-        struct mattx_sys_fsync_req *req = (struct mattx_sys_fsync_req *)payload;
-        struct task_struct *deputy = NULL;
-        struct file *file = NULL;
-        int i;
-        struct mattx_sys_fsync_reply reply;
-        
-        reply.orig_pid = req->orig_pid;
-        reply.error = -EBADF;
-
-        mattx_dbg("[WORMHOLE] Received FSYNC req for FD %u from Node %u\n", req->fd, hdr->sender_id);
-
-        if (req->fd >= 1000) {
-            int slot = req->fd - 1000;
-            spin_lock(&export_lock);
-            for (i = 0; i < export_count; i++) {
-                if (export_registry[i].orig_pid == req->orig_pid) {
-                    if (slot < MAX_FDS && export_registry[i].remote_files[slot]) {
-                        file = export_registry[i].remote_files[slot];
-                        get_file(file); 
-                    }
-                    break;
-                }
-            }
-            spin_unlock(&export_lock);
-        } else {
-            rcu_read_lock();
-            deputy = pid_task(find_vpid(req->orig_pid), PIDTYPE_PID);
-            if (deputy) get_task_struct(deputy);
-            rcu_read_unlock();
-            
-            if (deputy) {
-                struct files_struct *files = deputy->files;
-                if (files) {
-                    spin_lock(&files->file_lock);
-                    struct fdtable *fdt = files_fdtable(files);
-                    if (req->fd < fdt->max_fds) {
-                        file = rcu_dereference_raw(fdt->fd[req->fd]);
-                        if (file) get_file(file); 
-                    }
-                    spin_unlock(&files->file_lock);
-                }
-                put_task_struct(deputy);
-            }
-        }
-        
-        if (file) {
-            const struct cred *old_cred = NULL;
-            
-            if (deputy) {
-                if (deputy->mm) kthread_use_mm(deputy->mm);
-                old_cred = override_creds(deputy->cred);
-            }
-
-            reply.error = vfs_fsync_range(file, req->start, req->end, req->datasync);
-            
-            if (deputy) {
-                revert_creds(old_cred);
-                if (deputy->mm) kthread_unuse_mm(deputy->mm);
-            }
-
-            fput(file); 
-        }
-        
-        if (cluster_map[hdr->sender_id]) {
-            mattx_comm_send(cluster_map[hdr->sender_id], MATTX_MSG_SYS_FSYNC_REPLY, &reply, sizeof(reply));
-        }
+    struct mattx_sys_fsync_req *req = payload;
+    struct mattx_fsync_kworker_ctx *ctx = kmalloc(sizeof(*ctx), GFP_ATOMIC);
+    if (ctx) {
+        INIT_WORK(&ctx->work, mattx_fsync_kworker);
+        memcpy(&ctx->req, req, sizeof(*req)); ctx->target_node = hdr->sender_id;
+        schedule_work(&ctx->work);
     }
 }
+
+// === DATA PLANE: STATX ===
+struct mattx_statx_kworker_ctx { struct work_struct work; struct mattx_sys_statx_req req; int target_node; };
+
+static void mattx_statx_kworker(struct work_struct *work) {
+    struct mattx_statx_kworker_ctx *ctx = container_of(work, struct mattx_statx_kworker_ctx, work);
+    struct file *file = mattx_get_remote_file(ctx->req.orig_pid, ctx->req.fd);
+    struct mattx_sys_statx_reply reply;
+    int ret = -EBADF;
+
+    memset(&reply, 0, sizeof(reply));
+    reply.orig_pid = ctx->req.orig_pid;
+
+    if (file) {
+        struct kstat stat;
+        ret = vfs_getattr(&file->f_path, &stat, ctx->req.mask, ctx->req.flags & AT_STATX_SYNC_TYPE);
+        if (ret == 0) {
+            reply.statx_buf.stx_mask = stat.result_mask;
+            reply.statx_buf.stx_blksize = stat.blksize;
+            reply.statx_buf.stx_attributes = stat.attributes;
+            reply.statx_buf.stx_nlink = stat.nlink;
+            reply.statx_buf.stx_uid = from_kuid_munged(&init_user_ns, stat.uid);
+            reply.statx_buf.stx_gid = from_kgid_munged(&init_user_ns, stat.gid);
+            reply.statx_buf.stx_mode = stat.mode;
+            reply.statx_buf.stx_ino = stat.ino;
+            reply.statx_buf.stx_size = stat.size;
+            reply.statx_buf.stx_blocks = stat.blocks;
+        }
+        fput(file);
+    }
+
+    reply.error = ret;
+    if (cluster_map[ctx->target_node]) mattx_comm_send(cluster_map[ctx->target_node], MATTX_MSG_SYS_STATX_REPLY, &reply, sizeof(reply));
+    kfree(ctx);
+}
+
+static void handle_sys_statx_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    struct mattx_sys_statx_req *req = payload;
+    struct mattx_statx_kworker_ctx *ctx = kmalloc(sizeof(*ctx), GFP_ATOMIC);
+    if (ctx) {
+        INIT_WORK(&ctx->work, mattx_statx_kworker);
+        memcpy(&ctx->req, req, sizeof(*req)); ctx->target_node = hdr->sender_id;
+        schedule_work(&ctx->work);
+    }
+}
+
+// === CONTROL PLANE: DUP (Kworker Native Injector) ===
+struct mattx_dup_kworker_ctx { struct work_struct work; struct mattx_sys_dup_req req; int target_node; };
+
+static void mattx_dup_kworker(struct work_struct *work) {
+    struct mattx_dup_kworker_ctx *ctx = container_of(work, struct mattx_dup_kworker_ctx, work);
+    struct file *file = mattx_get_remote_file(ctx->req.orig_pid, ctx->req.old_remote_fd);
+    struct mattx_sys_dup_reply reply;
+    int new_fd = -EBADF;
+    struct file *file_to_close = NULL;
+
+    if (file) {
+        struct task_struct *deputy = NULL;
+        rcu_read_lock(); deputy = pid_task(find_vpid(ctx->req.orig_pid), PIDTYPE_PID); if (deputy) get_task_struct(deputy); rcu_read_unlock();
+        
+        if (deputy && deputy->files) {
+            spin_lock(&deputy->files->file_lock);
+            struct fdtable *fdt = files_fdtable(deputy->files);
+            int target_fd = ctx->req.new_local_fd;
+            
+            if (target_fd < 0) { // Dynamic dup()
+                for (int j = 3; j < fdt->max_fds; j++) {
+                    if (!rcu_dereference_raw(fdt->fd[j])) { target_fd = j; break; }
+                }
+            }
+            
+            if (target_fd >= 0 && target_fd < fdt->max_fds) {
+                file_to_close = rcu_dereference_raw(fdt->fd[target_fd]); // In case dup2 overwrites an existing FD!
+                rcu_assign_pointer(fdt->fd[target_fd], file);
+                __set_bit(target_fd, fdt->open_fds);
+                get_file(file); // Increment refcount for the new FD slot!
+                new_fd = target_fd;
+            }
+            spin_unlock(&deputy->files->file_lock);
+            
+            // Safely close the overwritten file OUTSIDE the spinlock!
+            if (file_to_close) fput(file_to_close); 
+        }
+        if (deputy) put_task_struct(deputy);
+        fput(file); // Release the reference we got from mattx_get_remote_file
+    }
+
+    reply.orig_pid = ctx->req.orig_pid;
+    reply.new_remote_fd = new_fd;
+    reply.error = (new_fd < 0) ? new_fd : 0;
+    if (cluster_map[ctx->target_node]) mattx_comm_send(cluster_map[ctx->target_node], MATTX_MSG_SYS_DUP_REPLY, &reply, sizeof(reply));
+    kfree(ctx);
+}
+
+static void handle_sys_dup_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    struct mattx_sys_dup_req *req = payload;
+    struct mattx_dup_kworker_ctx *ctx = kmalloc(sizeof(*ctx), GFP_ATOMIC);
+    if (ctx) {
+        INIT_WORK(&ctx->work, mattx_dup_kworker);
+        memcpy(&ctx->req, req, sizeof(*req)); ctx->target_node = hdr->sender_id;
+        schedule_work(&ctx->work);
+    }
+}
+
 
 
 
@@ -1158,299 +1019,233 @@ static struct file *mattx_get_remote_file(u32 orig_pid, int remote_fd) {
 }
 
 
-// --- THE DEPUTY HIJACK: SOCKET ---
-struct mattx_socket_ctx {
-    struct callback_head cb;
+
+// --- DATA PLANE: SOCKET (Kworker Native Injector) ---
+struct mattx_socket_kworker_ctx {
+    struct work_struct work;
     struct mattx_sys_socket_req req;
     int target_node;
 };
 
-static void mattx_socket_cb(struct callback_head *cb) {
-    struct mattx_socket_ctx *ctx = container_of(cb, struct mattx_socket_ctx, cb);
-    struct pt_regs regs;
-    int ret = -ENOSYS;
+static void mattx_socket_kworker(struct work_struct *work) {
+    struct mattx_socket_kworker_ctx *ctx = container_of(work, struct mattx_socket_kworker_ctx, work);
     struct mattx_sys_socket_reply reply;
+    struct socket *sock = NULL;
+    struct file *file = NULL;
+    struct task_struct *deputy = NULL;
+    int remote_fd = -1;
+    int err;
 
-    memset(&regs, 0, sizeof(regs));
-    regs.di = ctx->req.domain;
-    regs.si = ctx->req.type;
-    regs.dx = ctx->req.protocol;
+    memset(&reply, 0, sizeof(reply));
+    reply.orig_pid = ctx->req.orig_pid;
 
-    if (real_sys_socket) {
-        ret = real_sys_socket(&regs);
-        mattx_dbg("[HIJACK] Deputy executed socket natively. Result FD: %d\n", ret);
+    // Strip non-type flags for sock_create, but keep them for the file!
+    int type = ctx->req.type & SOCK_TYPE_MASK;
+    int file_flags = ctx->req.type & (O_CLOEXEC | O_NONBLOCK);
+
+    // 1. Create the socket natively in the kernel!
+    err = sock_create(ctx->req.domain, type, ctx->req.protocol, &sock);
+    
+    if (err == 0) {
+        // 2. Allocate a file descriptor for the socket
+        file = sock_alloc_file(sock, file_flags, NULL);
+        
+        if (IS_ERR(file)) {
+            err = PTR_ERR(file);
+            mattx_dbg("[KWORKER] Failed to allocate file for socket (err: %d)\n", err);
+        } else {
+            // --- THE NATIVE INJECTOR ---
+            rcu_read_lock();
+            deputy = pid_task(find_vpid(ctx->req.orig_pid), PIDTYPE_PID);
+            if (deputy) get_task_struct(deputy);
+            rcu_read_unlock();
+
+            if (deputy && deputy->files) {
+                spin_lock(&deputy->files->file_lock);
+                struct fdtable *fdt = files_fdtable(deputy->files);
+                for (int j = 3; j < fdt->max_fds; j++) {
+                    if (!rcu_dereference_raw(fdt->fd[j])) {
+                        rcu_assign_pointer(fdt->fd[j], file);
+                        __set_bit(j, fdt->open_fds);
+                        remote_fd = j;
+                        err = 0;
+                        break;
+                    }
+                }
+                spin_unlock(&deputy->files->file_lock);
+            }
+            
+            if (remote_fd == -1) {
+                fput(file);
+                err = -ENFILE;
+            } else {
+                mattx_dbg("[KWORKER] Successfully injected socket into Deputy Native FD: %d\n", remote_fd);
+            }
+            if (deputy) put_task_struct(deputy);
+        }
+    } else {
+        mattx_dbg("[KWORKER] sock_create failed (err: %d)\n", err);
     }
 
-    reply.orig_pid = ctx->req.orig_pid;
-    reply.remote_fd = (ret >= 0) ? ret : -1;
-    reply.error = (ret < 0) ? ret : 0;
+    reply.remote_fd = remote_fd;
+    reply.error = err;
 
     if (cluster_map[ctx->target_node]) {
         mattx_comm_send(cluster_map[ctx->target_node], MATTX_MSG_SYS_SOCKET_REPLY, &reply, sizeof(reply));
     }
 
     kfree(ctx);
-    set_current_state(TASK_STOPPED);
-    schedule();
 }
 
 static void handle_sys_socket_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
     if (payload) {
         struct mattx_sys_socket_req *req = payload;
-        struct task_struct *deputy = NULL;
-
-        rcu_read_lock();
-        deputy = pid_task(find_vpid(req->orig_pid), PIDTYPE_PID);
-        if (deputy) get_task_struct(deputy);
-        rcu_read_unlock();
-
-        if (deputy) {
-            struct mattx_socket_ctx *ctx = kmalloc(sizeof(*ctx), GFP_KERNEL);
-            if (ctx) {
-                memcpy(&ctx->req, req, sizeof(*req));
-                ctx->target_node = hdr->sender_id;
-                
-                init_task_work(&ctx->cb, mattx_socket_cb);
-                if (real_task_work_add) {
-                    real_task_work_add(deputy, &ctx->cb, TWA_SIGNAL);
-                    send_sig(SIGCONT, deputy, 0);
-                } else { kfree(ctx); }
-            }
-            put_task_struct(deputy);
+        struct mattx_socket_kworker_ctx *ctx = kmalloc(sizeof(*ctx), GFP_ATOMIC);
+        
+        if (ctx) {
+            INIT_WORK(&ctx->work, mattx_socket_kworker);
+            memcpy(&ctx->req, req, sizeof(*req));
+            ctx->target_node = hdr->sender_id;
+            
+            mattx_dbg("[RPC] Dispatching SOCKET_REQ to Kworker...\n");
+            schedule_work(&ctx->work);
         }
     }
 }
 
 
-
-// --- THE SMART CONNECTOR: Blocking Waiter ---
-struct mattx_connect_wait_ctx {
+// --- DATA PLANE: BIND (Kworker Native Injector) ---
+struct mattx_bind_kworker_ctx {
     struct work_struct work;
-    u32 orig_pid;
-    int fd; // Native FD on the Deputy
+    struct mattx_sys_bind_req req;
     int target_node;
 };
 
-static void mattx_connect_wait_worker(struct work_struct *work) {
-    struct mattx_connect_wait_ctx *ctx = container_of(work, struct mattx_connect_wait_ctx, work);
-    struct mattx_sys_connect_reply reply;
-    struct file *file = NULL;
-    struct task_struct *deputy = NULL;
+static void mattx_bind_kworker(struct work_struct *work) {
+    struct mattx_bind_kworker_ctx *ctx = container_of(work, struct mattx_bind_kworker_ctx, work);
+    struct mattx_sys_bind_reply reply;
+    struct file *file = mattx_get_remote_file(ctx->req.orig_pid, ctx->req.fd);
     int err = -EBADF;
 
-    mattx_dbg("[CONNECT_DEBUG] Kworker started for PID %u, Native FD %d\n", ctx->orig_pid, ctx->fd);
-
     memset(&reply, 0, sizeof(reply));
-    reply.orig_pid = ctx->orig_pid;
-
-    // 1. Safely get the file from the Deputy's Native FD table
-    rcu_read_lock();
-    deputy = pid_task(find_vpid(ctx->orig_pid), PIDTYPE_PID);
-    if (deputy) get_task_struct(deputy);
-    rcu_read_unlock();
-
-    if (deputy) {
-        if (deputy->files) {
-            spin_lock(&deputy->files->file_lock);
-            struct fdtable *fdt = files_fdtable(deputy->files);
-            if (ctx->fd < fdt->max_fds) {
-                file = rcu_dereference_raw(fdt->fd[ctx->fd]);
-                if (file) get_file(file);
-            }
-            spin_unlock(&deputy->files->file_lock);
-        }
-        put_task_struct(deputy);
-    }
+    reply.orig_pid = ctx->req.orig_pid;
 
     if (file) {
-        mattx_dbg("[CONNECT_DEBUG] Successfully retrieved struct file for FD %d. Entering poll loop...\n", ctx->fd);
-        
-        // 2. Wait for the TCP Handshake to finish (EPOLLOUT)
-        while (1) {
-            struct poll_wqueues table;
-            poll_initwait(&table);
-            __poll_t mask = vfs_poll(file, &table.pt);
-            
-            mattx_dbg("[CONNECT_DEBUG] vfs_poll returned mask: 0x%x\n", mask);
-
-            if (mask & (EPOLLOUT | EPOLLERR | EPOLLHUP)) {
-                mattx_dbg("[CONNECT_DEBUG] Socket is ready! Breaking poll loop.\n");
-                poll_freewait(&table);
-                break;
-            }
-            
-            schedule_timeout_interruptible(msecs_to_jiffies(50));
-            poll_freewait(&table);
-        }
-
-        // 3. Check the socket error state to see if it succeeded!
         struct socket *sock = sock_from_file(file);
-        if (sock && sock->sk) {
-            err = sock_error(sock->sk);
-            mattx_dbg("[CONNECT_DEBUG] sock_error returned: %d\n", err);
-            if (err) err = -err; // sock_error returns positive codes, we need negative!
+        if (sock) {
+            // Execute natively in the Kworker! No signals, no scratchpads!
+            err = kernel_bind(sock, MATTX_SA_CAST(&ctx->req.addr), ctx->req.addrlen);
+            mattx_dbg("[KWORKER] Executed kernel_bind natively. Result: %d\n", err);
         } else {
-            mattx_dbg("[CONNECT_DEBUG] ERROR: Could not extract socket from file!\n");
             err = -ENOTSOCK;
         }
         fput(file);
-    } else {
-        mattx_dbg("[CONNECT_DEBUG] ERROR: Could not find file for FD %d in Deputy!\n", ctx->fd);
     }
 
     reply.error = err;
-    mattx_dbg("[CONNECT_DEBUG] Sending CONNECT_REPLY to Node %d with Error: %d\n", ctx->target_node, err);
-    
+    if (cluster_map[ctx->target_node]) {
+        mattx_comm_send(cluster_map[ctx->target_node], MATTX_MSG_SYS_BIND_REPLY, &reply, sizeof(reply));
+    }
+    kfree(ctx);
+}
+
+static void handle_sys_bind_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    if (payload) {
+        struct mattx_sys_bind_req *req = payload;
+        struct mattx_bind_kworker_ctx *ctx = kmalloc(sizeof(*ctx), GFP_ATOMIC);
+        if (ctx) {
+            INIT_WORK(&ctx->work, mattx_bind_kworker);
+            memcpy(&ctx->req, req, sizeof(*req));
+            ctx->target_node = hdr->sender_id;
+            
+            mattx_dbg("[RPC] Dispatching BIND_REQ to Kworker...\n");
+            schedule_work(&ctx->work);
+        }
+    }
+}
+
+// --- DATA PLANE: CONNECT (Kworker Native Injector & Smart Waiter) ---
+struct mattx_connect_kworker_ctx {
+    struct work_struct work;
+    struct mattx_sys_connect_req req;
+    int target_node;
+};
+
+static void mattx_connect_kworker(struct work_struct *work) {
+    struct mattx_connect_kworker_ctx *ctx = container_of(work, struct mattx_connect_kworker_ctx, work);
+    struct mattx_sys_connect_reply reply;
+    struct file *file = mattx_get_remote_file(ctx->req.orig_pid, ctx->req.fd);
+    int err = -EBADF;
+
+    memset(&reply, 0, sizeof(reply));
+    reply.orig_pid = ctx->req.orig_pid;
+
+    if (file) {
+        struct socket *sock = sock_from_file(file);
+        if (sock) {
+            bool is_nonblock = (file->f_flags & O_NONBLOCK) != 0;
+            
+            // Execute natively!
+            err = kernel_connect(sock, MATTX_SA_CAST(&ctx->req.addr), ctx->req.addrlen, file->f_flags);
+            mattx_dbg("[KWORKER] Executed kernel_connect natively. Result: %d (NonBlock: %d)\n", err, is_nonblock);
+            
+            // --- THE SMART CONNECTOR WAIT LOOP ---
+            // If it's a blocking socket and the TCP handshake is in progress, we wait right here!
+            if (err == -EINPROGRESS && !is_nonblock) {
+                mattx_dbg("[CONNECT_DEBUG] Blocking connect returned -EINPROGRESS. Entering poll loop...\n");
+                
+                while (1) {
+                    struct poll_wqueues table;
+                    poll_initwait(&table);
+                    __poll_t mask = vfs_poll(file, &table.pt);
+                    
+                    if (mask & (EPOLLOUT | EPOLLERR | EPOLLHUP)) {
+                        mattx_dbg("[CONNECT_DEBUG] Socket handshake complete! Breaking poll loop.\n");
+                        poll_freewait(&table);
+                        break;
+                    }
+                    
+                    schedule_timeout_interruptible(msecs_to_jiffies(50));
+                    poll_freewait(&table);
+                }
+                
+                // Check the final socket error state to see if the handshake succeeded!
+                if (sock->sk) {
+                    err = sock_error(sock->sk);
+                    if (err) err = -err; // sock_error returns positive, we need negative!
+                    mattx_dbg("[CONNECT_DEBUG] Final handshake result: %d\n", err);
+                } else {
+                    err = -ENOTSOCK;
+                }
+            }
+        } else {
+            err = -ENOTSOCK;
+        }
+        fput(file);
+    }
+
+    reply.error = err;
     if (cluster_map[ctx->target_node]) {
         mattx_comm_send(cluster_map[ctx->target_node], MATTX_MSG_SYS_CONNECT_REPLY, &reply, sizeof(reply));
     }
     kfree(ctx);
 }
 
-
-// --- THE DEPUTY HIJACK: BIND & CONNECT ---
-struct mattx_net_setup_ctx {
-    struct callback_head cb;
-    u32 orig_pid;
-    int fd;
-    struct sockaddr_storage addr;
-    int addrlen;
-    int target_node;
-    bool is_connect;
-};
-
-
-static void mattx_net_setup_cb(struct callback_head *cb) {
-    struct mattx_net_setup_ctx *ctx = container_of(cb, struct mattx_net_setup_ctx, cb);
-    struct pt_regs *task_regs = task_pt_regs(current);
-    struct pt_regs regs;
-    int ret = -EFAULT;
-    struct mattx_sys_connect_reply reply; 
-    bool is_nonblock = false;
-
-    // --- CHECK NATIVE FLAGS ---
-    // We check if the socket is non-blocking natively on the Deputy!
-    struct file *f = fget(ctx->fd);
-    if (f) {
-        is_nonblock = (f->f_flags & O_NONBLOCK) != 0;
-        fput(f);
-    }
-
-    unsigned long user_ptr = task_regs->sp - 128 - ctx->addrlen;
-
-    if (copy_to_user((void __user *)user_ptr, &ctx->addr, ctx->addrlen) == 0) {
-        memset(&regs, 0, sizeof(regs));
-        regs.di = ctx->fd;
-        regs.si = user_ptr;
-        regs.dx = ctx->addrlen;
-
-        if (ctx->is_connect && real_sys_connect) {
-            ret = real_sys_connect(&regs);
-            if (ret == -ERESTARTSYS) ret = -EINPROGRESS;
-            mattx_dbg("[HIJACK] Deputy executed connect natively. Result: %d (NonBlock: %d)\n", ret, is_nonblock);
-        } else if (!ctx->is_connect && real_sys_bind) {
-            ret = real_sys_bind(&regs);
-            mattx_dbg("[HIJACK] Deputy executed bind natively. Result: %d\n", ret);
-        }
-    }
-
-    // --- THE SMART CONNECTOR ---
-    // If it's a blocking socket and the handshake is in progress, hand it to the Kworker!
-    if (ctx->is_connect && ret == -EINPROGRESS && !is_nonblock) {
-        mattx_dbg("[CONNECT_DEBUG] Blocking connect returned -EINPROGRESS. Spawning Kworker...\n");
-        struct mattx_connect_wait_ctx *wait_ctx = kmalloc(sizeof(*wait_ctx), GFP_KERNEL);
-        if (wait_ctx) {
-            wait_ctx->orig_pid = ctx->orig_pid;
-            wait_ctx->fd = ctx->fd;
-            wait_ctx->target_node = ctx->target_node;
-            
-            INIT_WORK(&wait_ctx->work, mattx_connect_wait_worker);
-            schedule_work(&wait_ctx->work);
-            
-            kfree(ctx);
-            set_current_state(TASK_STOPPED);
-            schedule();
-            return; // Exit early! The Kworker will send the reply!
-        } else {
-            mattx_dbg("[CONNECT_DEBUG] ERROR: Failed to allocate Kworker context!\n");
-            ret = -ENOMEM;
-        }
-    }
-
-    reply.orig_pid = ctx->orig_pid;
-    reply.error = ret;
-    if (cluster_map[ctx->target_node]) {
-        u32 msg_type = ctx->is_connect ? MATTX_MSG_SYS_CONNECT_REPLY : MATTX_MSG_SYS_BIND_REPLY;
-        mattx_comm_send(cluster_map[ctx->target_node], msg_type, &reply, sizeof(reply));
-    }
-
-    kfree(ctx);
-    set_current_state(TASK_STOPPED);
-    schedule();
-}
-
-
-static void handle_sys_bind_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
-    if (payload) {
-        struct mattx_sys_bind_req *req = payload;
-        struct task_struct *deputy = NULL;
-
-        rcu_read_lock();
-        deputy = pid_task(find_vpid(req->orig_pid), PIDTYPE_PID);
-        if (deputy) get_task_struct(deputy);
-        rcu_read_unlock();
-
-        if (deputy) {
-            struct mattx_net_setup_ctx *ctx = kmalloc(sizeof(*ctx), GFP_KERNEL);
-            if (ctx) {
-                ctx->orig_pid = req->orig_pid;
-                ctx->fd = req->fd;
-                ctx->addrlen = req->addrlen;
-                memcpy(&ctx->addr, &req->addr, req->addrlen);
-                ctx->target_node = hdr->sender_id;
-                ctx->is_connect = false;
-                
-                init_task_work(&ctx->cb, mattx_net_setup_cb);
-                if (real_task_work_add) {
-                    real_task_work_add(deputy, &ctx->cb, TWA_SIGNAL);
-                    send_sig(SIGCONT, deputy, 0);
-                } else { kfree(ctx); }
-            }
-            put_task_struct(deputy);
-        }
-    }
-}
-
 static void handle_sys_connect_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
     if (payload) {
         struct mattx_sys_connect_req *req = payload;
-        struct task_struct *deputy = NULL;
-
-        rcu_read_lock();
-        deputy = pid_task(find_vpid(req->orig_pid), PIDTYPE_PID);
-        if (deputy) get_task_struct(deputy);
-        rcu_read_unlock();
-
-        if (deputy) {
-            struct mattx_net_setup_ctx *ctx = kmalloc(sizeof(*ctx), GFP_KERNEL);
-            if (ctx) {
-                ctx->orig_pid = req->orig_pid;
-                ctx->fd = req->fd;
-                ctx->addrlen = req->addrlen;
-                memcpy(&ctx->addr, &req->addr, req->addrlen);
-                ctx->target_node = hdr->sender_id;
-                ctx->is_connect = true;
-                
-                init_task_work(&ctx->cb, mattx_net_setup_cb);
-                if (real_task_work_add) {
-                    real_task_work_add(deputy, &ctx->cb, TWA_SIGNAL);
-                    send_sig(SIGCONT, deputy, 0);
-                } else { kfree(ctx); }
-            }
-            put_task_struct(deputy);
+        struct mattx_connect_kworker_ctx *ctx = kmalloc(sizeof(*ctx), GFP_ATOMIC);
+        if (ctx) {
+            INIT_WORK(&ctx->work, mattx_connect_kworker);
+            memcpy(&ctx->req, req, sizeof(*req));
+            ctx->target_node = hdr->sender_id;
+            
+            mattx_dbg("[RPC] Dispatching CONNECT_REQ to Kworker...\n");
+            schedule_work(&ctx->work);
         }
     }
 }
+
 
 
 static void handle_sys_lseek_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
@@ -1599,65 +1394,56 @@ static void handle_sys_connect_reply(struct mattx_link *link, struct mattx_heade
 }
 
 
-// --- THE DEPUTY HIJACK: LISTEN ---
-struct mattx_listen_ctx {
-    struct callback_head cb;
+// --- DATA PLANE: LISTEN (Kworker Native Injector) ---
+struct mattx_listen_kworker_ctx {
+    struct work_struct work;
     struct mattx_sys_listen_req req;
     int target_node;
 };
 
-static void mattx_listen_cb(struct callback_head *cb) {
-    struct mattx_listen_ctx *ctx = container_of(cb, struct mattx_listen_ctx, cb);
-    struct pt_regs regs;
-    int ret = -ENOSYS;
+static void mattx_listen_kworker(struct work_struct *work) {
+    struct mattx_listen_kworker_ctx *ctx = container_of(work, struct mattx_listen_kworker_ctx, work);
     struct mattx_sys_listen_reply reply;
+    struct file *file = mattx_get_remote_file(ctx->req.orig_pid, ctx->req.fd);
+    int err = -EBADF;
 
-    memset(&regs, 0, sizeof(regs));
-    regs.di = ctx->req.fd;
-    regs.si = ctx->req.backlog;
+    memset(&reply, 0, sizeof(reply));
+    reply.orig_pid = ctx->req.orig_pid;
 
-    if (real_sys_listen) {
-        ret = real_sys_listen(&regs);
-        mattx_dbg("[HIJACK] Deputy executed listen natively. Result: %d\n", ret);
+    if (file) {
+        struct socket *sock = sock_from_file(file);
+        if (sock) {
+            // Execute natively in the Kworker!
+            err = kernel_listen(sock, ctx->req.backlog);
+            mattx_dbg("[KWORKER] Executed kernel_listen natively. Result: %d\n", err);
+        } else {
+            err = -ENOTSOCK;
+        }
+        fput(file);
     }
 
-    reply.orig_pid = ctx->req.orig_pid;
-    reply.error = ret;
+    reply.error = err;
     if (cluster_map[ctx->target_node]) {
         mattx_comm_send(cluster_map[ctx->target_node], MATTX_MSG_SYS_LISTEN_REPLY, &reply, sizeof(reply));
     }
-
     kfree(ctx);
-    set_current_state(TASK_STOPPED);
-    schedule();
 }
 
 static void handle_sys_listen_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
     if (payload) {
         struct mattx_sys_listen_req *req = payload;
-        struct task_struct *deputy = NULL;
-
-        rcu_read_lock();
-        deputy = pid_task(find_vpid(req->orig_pid), PIDTYPE_PID);
-        if (deputy) get_task_struct(deputy);
-        rcu_read_unlock();
-
-        if (deputy) {
-            struct mattx_listen_ctx *ctx = kmalloc(sizeof(*ctx), GFP_KERNEL);
-            if (ctx) {
-                memcpy(&ctx->req, req, sizeof(*req));
-                ctx->target_node = hdr->sender_id;
-                
-                init_task_work(&ctx->cb, mattx_listen_cb);
-                if (real_task_work_add) {
-                    real_task_work_add(deputy, &ctx->cb, TWA_SIGNAL);
-                    send_sig(SIGCONT, deputy, 0);
-                } else { kfree(ctx); }
-            }
-            put_task_struct(deputy);
+        struct mattx_listen_kworker_ctx *ctx = kmalloc(sizeof(*ctx), GFP_ATOMIC);
+        if (ctx) {
+            INIT_WORK(&ctx->work, mattx_listen_kworker);
+            memcpy(&ctx->req, req, sizeof(*req));
+            ctx->target_node = hdr->sender_id;
+            
+            mattx_dbg("[RPC] Dispatching LISTEN_REQ to Kworker...\n");
+            schedule_work(&ctx->work);
         }
     }
 }
+
 
 
 static void handle_sys_generic_int_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
@@ -1685,38 +1471,37 @@ static void handle_sys_generic_int_reply(struct mattx_link *link, struct mattx_h
 }
 
 
-// --- THE DEPUTY HIJACK: SENDTO ---
-struct mattx_sendto_ctx {
-    struct callback_head cb;
+// === DATA PLANE: SENDTO ===
+struct mattx_sendto_kworker_ctx {
+    struct work_struct work;
     u32 orig_pid;
     int fd;
     int flags;
     size_t len;
     int target_node;
-    char data[]; // Flexible array for the payload!
+    char data[];
 };
 
-static void mattx_sendto_cb(struct callback_head *cb) {
-    struct mattx_sendto_ctx *ctx = container_of(cb, struct mattx_sendto_ctx, cb);
-    struct pt_regs *task_regs = task_pt_regs(current);
-    struct pt_regs regs;
-    int ret = -EFAULT;
+static void mattx_sendto_kworker(struct work_struct *work) {
+    struct mattx_sendto_kworker_ctx *ctx = container_of(work, struct mattx_sendto_kworker_ctx, work);
+    struct file *file = mattx_get_remote_file(ctx->orig_pid, ctx->fd);
     struct mattx_sys_send_reply reply;
+    int ret = -EBADF;
 
-    unsigned long user_ptr = task_regs->sp - 128 - ctx->len;
-
-    if (copy_to_user((void __user *)user_ptr, ctx->data, ctx->len) == 0) {
-        memset(&regs, 0, sizeof(regs));
-        regs.di = ctx->fd;
-        regs.si = user_ptr;
-        regs.dx = ctx->len;
-        regs.r10 = ctx->flags; // 4th arg is flags
-        regs.r8 = 0; // 5th arg (addr) is NULL for now
-        regs.r9 = 0; // 6th arg (addrlen) is 0
-
-        if (real_sys_sendto) {
-            ret = real_sys_sendto(&regs);
+    if (file) {
+        struct socket *sock = sock_from_file(file);
+        if (sock) {
+            struct msghdr msg = {0};
+            struct kvec iov;
+            iov.iov_base = ctx->data;
+            iov.iov_len = ctx->len;
+            
+            // Execute the send natively in the Kworker! No signals, no interruptions!
+            ret = kernel_sendmsg(sock, &msg, &iov, 1, ctx->len);
+        } else {
+            ret = -ENOTSOCK;
         }
+        fput(file);
     }
 
     reply.orig_pid = ctx->orig_pid;
@@ -1726,119 +1511,96 @@ static void mattx_sendto_cb(struct callback_head *cb) {
     if (cluster_map[ctx->target_node]) {
         mattx_comm_send(cluster_map[ctx->target_node], MATTX_MSG_SYS_SEND_REPLY, &reply, sizeof(reply));
     }
-
     kfree(ctx);
-    set_current_state(TASK_STOPPED);
-    schedule();
 }
 
 static void handle_sys_send_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
     if (payload) {
         struct mattx_sys_send_req *req = payload;
-        struct task_struct *deputy = NULL;
-
-        rcu_read_lock();
-        deputy = pid_task(find_vpid(req->orig_pid), PIDTYPE_PID);
-        if (deputy) get_task_struct(deputy);
-        rcu_read_unlock();
-
-        if (deputy) {
-            struct mattx_sendto_ctx *ctx = kmalloc(sizeof(*ctx) + req->len, GFP_KERNEL);
-            if (ctx) {
-                ctx->orig_pid = req->orig_pid;
-                ctx->fd = req->fd;
-                ctx->flags = req->flags;
-                ctx->len = req->len;
-                ctx->target_node = hdr->sender_id;
-                memcpy(ctx->data, req->data, req->len);
-                
-                init_task_work(&ctx->cb, mattx_sendto_cb);
-                if (real_task_work_add) {
-                    real_task_work_add(deputy, &ctx->cb, TWA_SIGNAL);
-                    send_sig(SIGCONT, deputy, 0);
-                } else { kfree(ctx); }
-            }
-            put_task_struct(deputy);
+        struct mattx_sendto_kworker_ctx *ctx = kmalloc(sizeof(*ctx) + req->len, GFP_ATOMIC);
+        if (ctx) {
+            INIT_WORK(&ctx->work, mattx_sendto_kworker);
+            ctx->orig_pid = req->orig_pid;
+            ctx->fd = req->fd;
+            ctx->flags = req->flags;
+            ctx->len = req->len;
+            ctx->target_node = hdr->sender_id;
+            memcpy(ctx->data, req->data, req->len);
+            
+            schedule_work(&ctx->work); // Dispatch to the Data Plane!
         }
     }
 }
 
 
-// --- THE DEPUTY HIJACK: RECVFROM ---
-struct mattx_recvfrom_ctx {
-    struct callback_head cb;
-    struct mattx_sys_recv_req req;
+// === DATA PLANE: RECVFROM ===
+struct mattx_recvfrom_kworker_ctx {
+    struct work_struct work;
+    u32 orig_pid;
+    int fd;
+    size_t size;
+    int flags;
     int target_node;
 };
 
-static void mattx_recvfrom_cb(struct callback_head *cb) {
-    struct mattx_recvfrom_ctx *ctx = container_of(cb, struct mattx_recvfrom_ctx, cb);
-    struct pt_regs *task_regs = task_pt_regs(current);
-    struct pt_regs regs;
-    int ret = -EFAULT;
+static void mattx_recvfrom_kworker(struct work_struct *work) {
+    struct mattx_recvfrom_kworker_ctx *ctx = container_of(work, struct mattx_recvfrom_kworker_ctx, work);
+    struct file *file = mattx_get_remote_file(ctx->orig_pid, ctx->fd);
+    int ret = -EBADF;
+    void *recv_buf = NULL;
 
-    unsigned long user_ptr = task_regs->sp - 128 - ctx->req.size;
-
-    memset(&regs, 0, sizeof(regs));
-    regs.di = ctx->req.fd;
-    regs.si = user_ptr;
-    regs.dx = ctx->req.size;
-    regs.r10 = ctx->req.flags;
-    regs.r8 = 0;
-    regs.r9 = 0;
-
-    if (real_sys_recvfrom) {
-        ret = real_sys_recvfrom(&regs);
+    if (file) {
+        struct socket *sock = sock_from_file(file);
+        if (sock) {
+            recv_buf = kmalloc(ctx->size, GFP_KERNEL);
+            if (recv_buf) {
+                struct msghdr msg = {0};
+                struct kvec iov;
+                iov.iov_base = recv_buf;
+                iov.iov_len = ctx->size;
+                
+                // Execute the recv natively in the Kworker!
+                ret = kernel_recvmsg(sock, &msg, &iov, 1, ctx->size, ctx->flags);
+            } else {
+                ret = -ENOMEM;
+            }
+        } else {
+            ret = -ENOTSOCK;
+        }
+        fput(file);
     }
 
     size_t reply_size = sizeof(struct mattx_sys_recv_reply) + (ret > 0 ? ret : 0);
     struct mattx_sys_recv_reply *reply = kzalloc(reply_size, GFP_KERNEL);
-    
     if (reply) {
-        reply->orig_pid = ctx->req.orig_pid;
+        reply->orig_pid = ctx->orig_pid;
         reply->bytes_recv = ret;
         reply->error = (ret < 0) ? ret : 0;
-
-        if (ret > 0) {
-            if (copy_from_user(reply->data, (void __user *)user_ptr, ret)) {
-                mattx_dbg("[HIJACK] Warning: Failed to copy recvfrom data from user scratchpad!\n");
-            }
+        if (ret > 0 && recv_buf) {
+            memcpy(reply->data, recv_buf, ret);
         }
-
         if (cluster_map[ctx->target_node]) {
             mattx_comm_send(cluster_map[ctx->target_node], MATTX_MSG_SYS_RECV_REPLY, reply, reply_size);
         }
         kfree(reply);
     }
-
+    if (recv_buf) kfree(recv_buf);
     kfree(ctx);
-    set_current_state(TASK_STOPPED);
-    schedule();
 }
 
 static void handle_sys_recv_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
     if (payload) {
         struct mattx_sys_recv_req *req = payload;
-        struct task_struct *deputy = NULL;
-
-        rcu_read_lock();
-        deputy = pid_task(find_vpid(req->orig_pid), PIDTYPE_PID);
-        if (deputy) get_task_struct(deputy);
-        rcu_read_unlock();
-
-        if (deputy) {
-            struct mattx_recvfrom_ctx *ctx = kmalloc(sizeof(*ctx), GFP_KERNEL);
-            if (ctx) {
-                memcpy(&ctx->req, req, sizeof(*req));
-                ctx->target_node = hdr->sender_id;
-                
-                init_task_work(&ctx->cb, mattx_recvfrom_cb);
-                if (real_task_work_add) {
-                    real_task_work_add(deputy, &ctx->cb, TWA_SIGNAL);
-                    send_sig(SIGCONT, deputy, 0);
-                } else { kfree(ctx); }
-            }
-            put_task_struct(deputy);
+        struct mattx_recvfrom_kworker_ctx *ctx = kmalloc(sizeof(*ctx), GFP_ATOMIC);
+        if (ctx) {
+            INIT_WORK(&ctx->work, mattx_recvfrom_kworker);
+            ctx->orig_pid = req->orig_pid;
+            ctx->fd = req->fd;
+            ctx->size = req->size;
+            ctx->flags = req->flags;
+            ctx->target_node = hdr->sender_id;
+            
+            schedule_work(&ctx->work); // Dispatch to the Data Plane!
         }
     }
 }
@@ -1881,102 +1643,110 @@ static void handle_sys_recv_reply(struct mattx_link *link, struct mattx_header *
 }
 
 
-// --- THE DEPUTY HIJACK: ACCEPT4 ---
-struct mattx_accept_ctx {
-    struct callback_head cb;
+// --- DATA PLANE: ACCEPT4 (Kworker Native Injector) ---
+struct mattx_accept_kworker_ctx {
+    struct work_struct work;
     struct mattx_sys_accept_req req;
     int target_node;
 };
 
-static void mattx_accept_cb(struct callback_head *cb) {
-    struct mattx_accept_ctx *ctx = container_of(cb, struct mattx_accept_ctx, cb);
-    struct pt_regs *task_regs = task_pt_regs(current);
-    struct pt_regs regs;
-    int ret = -EFAULT;
+static void mattx_accept_kworker(struct work_struct *work) {
+    struct mattx_accept_kworker_ctx *ctx = container_of(work, struct mattx_accept_kworker_ctx, work);
     struct mattx_sys_accept_reply reply;
-    sigset_t old_set, block_set;
+    struct file *file = mattx_get_remote_file(ctx->req.orig_pid, ctx->req.fd);
+    struct socket *sock = NULL;
+    struct socket *newsock = NULL;
+    struct file *newfile = NULL;
+    struct task_struct *deputy = NULL;
+    int remote_fd = -1;
+    int err = -EBADF;
 
     memset(&reply, 0, sizeof(reply));
     reply.orig_pid = ctx->req.orig_pid;
-    reply.remote_fd = -EBADF;
-    reply.error = -EBADF;
 
-    // --- THE USER-SPACE SCRATCHPAD HACK ---
-    // We need space for a sockaddr_storage (128 bytes) AND an int (4 bytes)
-    unsigned long addr_ptr = task_regs->sp - 128 - sizeof(struct sockaddr_storage) - sizeof(int);
-    unsigned long len_ptr = addr_ptr + sizeof(struct sockaddr_storage);
-    int initial_len = sizeof(struct sockaddr_storage);
-
-    // Write the initial length to the scratchpad
-    if (copy_to_user((void __user *)len_ptr, &initial_len, sizeof(int)) == 0) {
-        memset(&regs, 0, sizeof(regs));
-        regs.di = ctx->req.fd;
-        regs.si = addr_ptr;
-        regs.dx = len_ptr;
-        regs.r10 = ctx->req.flags; // accept4 flags
-
-        // Signal shield for non-blocking accept!
-        sigfillset(&block_set);
-        sigprocmask(SIG_BLOCK, &block_set, &old_set);
-
-        if (real_sys_accept4) {
-            ret = real_sys_accept4(&regs);
-            if (ret == -ERESTARTSYS) ret = -EAGAIN; // Standard non-blocking behavior
-            mattx_dbg("[HIJACK] Deputy executed accept4 natively. Result FD: %d\n", ret);
-        }
-
-        sigprocmask(SIG_SETMASK, &old_set, NULL);
-
-        if (ret >= 0) {
-            reply.remote_fd = ret;
-            reply.error = 0;
+    if (file) {
+        sock = sock_from_file(file);
+        if (sock) {
+            // 1. Use kernel_accept to do the heavy lifting!
+            // The flags passed to kernel_accept are the O_NONBLOCK from the listening socket's file
+            int accept_flags = file->f_flags & O_NONBLOCK;
+            err = kernel_accept(sock, &newsock, accept_flags);
             
-            // Read back the populated sockaddr and length from the scratchpad!
-            int final_len = 0;
-            if (copy_from_user(&final_len, (void __user *)len_ptr, sizeof(int)) == 0) {
-                if (final_len > 0 && final_len <= sizeof(struct sockaddr_storage)) {
-                    if (copy_from_user(&reply.addr, (void __user *)addr_ptr, final_len) == 0) {
-                        reply.addrlen = final_len;
+            if (err == 0 && newsock) {
+                // 2. Map accept4 flags (SOCK_NONBLOCK, SOCK_CLOEXEC) to file flags
+                int file_flags = ctx->req.flags & (O_CLOEXEC | O_NONBLOCK);
+                newfile = sock_alloc_file(newsock, file_flags, NULL);
+                
+                if (IS_ERR(newfile)) {
+                    err = PTR_ERR(newfile);
+                    sock_release(newsock);
+                } else {
+                    // --- THE NATIVE INJECTOR ---
+                    rcu_read_lock();
+                    deputy = pid_task(find_vpid(ctx->req.orig_pid), PIDTYPE_PID);
+                    if (deputy) get_task_struct(deputy);
+                    rcu_read_unlock();
+
+                    if (deputy && deputy->files) {
+                        spin_lock(&deputy->files->file_lock);
+                        struct fdtable *fdt = files_fdtable(deputy->files);
+                        for (int j = 3; j < fdt->max_fds; j++) {
+                            if (!rcu_dereference_raw(fdt->fd[j])) {
+                                rcu_assign_pointer(fdt->fd[j], newfile);
+                                __set_bit(j, fdt->open_fds);
+                                remote_fd = j;
+                                break;
+                            }
+                        }
+                        spin_unlock(&deputy->files->file_lock);
                     }
+                    
+                    if (remote_fd == -1) {
+                        fput(newfile);
+                        err = -ENFILE;
+                    } else {
+                        err = 0;
+                        mattx_dbg("[KWORKER] Successfully injected accepted socket into Deputy Native FD: %d\n", remote_fd);
+                        
+                        // 3. Extract the peer name (client IP) natively!
+                        if (newsock->ops && newsock->ops->getname) {
+                            int len = newsock->ops->getname(newsock, (struct sockaddr *)&reply.addr, 2); // 2 = peer
+                            if (len > 0) {
+                                reply.addrlen = len;
+                            }
+                        }
+                    }
+                    if (deputy) put_task_struct(deputy);
                 }
             }
         } else {
-            reply.error = ret;
+            err = -ENOTSOCK;
         }
+        fput(file);
     }
+
+    reply.remote_fd = remote_fd;
+    reply.error = err;
 
     if (cluster_map[ctx->target_node]) {
         mattx_comm_send(cluster_map[ctx->target_node], MATTX_MSG_SYS_ACCEPT_REPLY, &reply, sizeof(reply));
     }
 
     kfree(ctx);
-    set_current_state(TASK_STOPPED);
-    schedule();
 }
 
 static void handle_sys_accept_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
     if (payload) {
         struct mattx_sys_accept_req *req = payload;
-        struct task_struct *deputy = NULL;
-
-        rcu_read_lock();
-        deputy = pid_task(find_vpid(req->orig_pid), PIDTYPE_PID);
-        if (deputy) get_task_struct(deputy);
-        rcu_read_unlock();
-
-        if (deputy) {
-            struct mattx_accept_ctx *ctx = kmalloc(sizeof(*ctx), GFP_KERNEL);
-            if (ctx) {
-                memcpy(&ctx->req, req, sizeof(*req));
-                ctx->target_node = hdr->sender_id;
-                
-                init_task_work(&ctx->cb, mattx_accept_cb);
-                if (real_task_work_add) {
-                    real_task_work_add(deputy, &ctx->cb, TWA_SIGNAL);
-                    send_sig(SIGCONT, deputy, 0);
-                } else { kfree(ctx); }
-            }
-            put_task_struct(deputy);
+        struct mattx_accept_kworker_ctx *ctx = kmalloc(sizeof(*ctx), GFP_ATOMIC);
+        
+        if (ctx) {
+            INIT_WORK(&ctx->work, mattx_accept_kworker);
+            memcpy(&ctx->req, req, sizeof(*req));
+            ctx->target_node = hdr->sender_id;
+            
+            mattx_dbg("[RPC] Dispatching ACCEPT_REQ to Kworker...\n");
+            schedule_work(&ctx->work);
         }
     }
 }
@@ -2867,81 +2637,77 @@ static void handle_sys_getsockopt_reply(struct mattx_link *link, struct mattx_he
 }
 
 
-// --- THE DEPUTY HIJACK: SENDMSG ---
-struct mattx_sendmsg_ctx { struct callback_head cb; struct mattx_sys_sendmsg_req *req; int target_node; };
+// === DATA PLANE: SENDMSG (Scatter/Gather) ===
+struct mattx_sendmsg_kworker_ctx {
+    struct work_struct work;
+    u32 orig_pid;
+    int fd;
+    int flags;
+    int addrlen;
+    size_t datalen;
+    struct sockaddr_storage addr;
+    int target_node;
+    char data[];
+};
 
-static void mattx_sendmsg_cb(struct callback_head *cb) {
-    struct mattx_sendmsg_ctx *ctx = container_of(cb, struct mattx_sendmsg_ctx, cb);
-    struct pt_regs *task_regs = task_pt_regs(current);
-    struct pt_regs regs;
-    int ret = -EFAULT;
+static void mattx_sendmsg_kworker(struct work_struct *work) {
+    struct mattx_sendmsg_kworker_ctx *ctx = container_of(work, struct mattx_sendmsg_kworker_ctx, work);
+    struct file *file = mattx_get_remote_file(ctx->orig_pid, ctx->fd);
     struct mattx_sys_sendmsg_reply reply;
+    int ret = -EBADF;
 
-    // --- FIXED: Use user_msghdr for the scratchpad! ---
-    unsigned long data_ptr = task_regs->sp - 128 - ctx->req->datalen;
-    unsigned long addr_ptr = data_ptr - sizeof(struct sockaddr_storage);
-    unsigned long iov_ptr = addr_ptr - sizeof(struct iovec);
-    unsigned long msg_ptr = iov_ptr - sizeof(struct user_msghdr); 
-
-    struct iovec iov = { .iov_base = (void __user *)data_ptr, .iov_len = ctx->req->datalen };
-    struct user_msghdr msg = {0}; // FIXED!
-    
-    if (ctx->req->addrlen > 0) {
-        msg.msg_name = (void __user *)addr_ptr;
-        msg.msg_namelen = ctx->req->addrlen;
-    }
-    msg.msg_iov = (struct iovec __user *)iov_ptr;
-    msg.msg_iovlen = 1; // We flattened it into 1 iovec!
-
-    if (copy_to_user((void __user *)data_ptr, ctx->req->data, ctx->req->datalen) == 0 &&
-        copy_to_user((void __user *)addr_ptr, &ctx->req->addr, sizeof(struct sockaddr_storage)) == 0 &&
-        copy_to_user((void __user *)iov_ptr, &iov, sizeof(iov)) == 0 &&
-        copy_to_user((void __user *)msg_ptr, &msg, sizeof(msg)) == 0) {
-        
-        memset(&regs, 0, sizeof(regs));
-        regs.di = ctx->req->fd;
-        regs.si = msg_ptr;
-        regs.dx = ctx->req->flags;
-
-        // --- THE SIGNAL SHIELD ---
-        sigset_t old_set, block_set;
-        sigfillset(&block_set);
-        sigprocmask(SIG_BLOCK, &block_set, &old_set);
-
-        if (real_sys_sendmsg) {
-            ret = real_sys_sendmsg(&regs);
-            if (ret == -ERESTARTSYS) ret = -EAGAIN; // Convert interruption to standard non-blocking error
-            mattx_dbg("[HIJACK] Deputy executed sendmsg natively. Result: %d\n", ret);
+    if (file) {
+        struct socket *sock = sock_from_file(file);
+        if (sock) {
+            struct msghdr msg = {0};
+            struct kvec iov;
+            
+            if (ctx->addrlen > 0) {
+                msg.msg_name = &ctx->addr;
+                msg.msg_namelen = ctx->addrlen;
+            }
+            
+            iov.iov_base = ctx->data;
+            iov.iov_len = ctx->datalen;
+            
+            // The data is already flattened! Send it natively!
+            ret = kernel_sendmsg(sock, &msg, &iov, 1, ctx->datalen);
+        } else {
+            ret = -ENOTSOCK;
         }
-
-        sigprocmask(SIG_SETMASK, &old_set, NULL);
+        fput(file);
     }
 
-    reply.orig_pid = ctx->req->orig_pid;
+    reply.orig_pid = ctx->orig_pid;
     reply.bytes_sent = ret;
     reply.error = (ret < 0) ? ret : 0;
-    if (cluster_map[ctx->target_node]) mattx_comm_send(cluster_map[ctx->target_node], MATTX_MSG_SYS_SENDMSG_REPLY, &reply, sizeof(reply));
 
-    kfree(ctx->req); kfree(ctx);
-    set_current_state(TASK_STOPPED); schedule();
+    if (cluster_map[ctx->target_node]) {
+        mattx_comm_send(cluster_map[ctx->target_node], MATTX_MSG_SYS_SENDMSG_REPLY, &reply, sizeof(reply));
+    }
+    kfree(ctx);
 }
-
 
 static void handle_sys_sendmsg_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
-    struct mattx_sys_sendmsg_req *req = payload;
-    struct task_struct *deputy = NULL;
-    rcu_read_lock(); deputy = pid_task(find_vpid(req->orig_pid), PIDTYPE_PID); if (deputy) get_task_struct(deputy); rcu_read_unlock();
-    if (deputy) {
-        struct mattx_sendmsg_ctx *ctx = kmalloc(sizeof(*ctx), GFP_KERNEL);
-        struct mattx_sys_sendmsg_req *req_copy = kmemdup(req, sizeof(*req) + req->datalen, GFP_KERNEL);
-        if (ctx && req_copy) {
-            ctx->req = req_copy; ctx->target_node = hdr->sender_id;
-            init_task_work(&ctx->cb, mattx_sendmsg_cb);
-            if (real_task_work_add) { real_task_work_add(deputy, &ctx->cb, TWA_SIGNAL); send_sig(SIGCONT, deputy, 0); }
-        } else { kfree(ctx); kfree(req_copy); }
-        put_task_struct(deputy);
+    if (payload) {
+        struct mattx_sys_sendmsg_req *req = payload;
+        struct mattx_sendmsg_kworker_ctx *ctx = kmalloc(sizeof(*ctx) + req->datalen, GFP_ATOMIC);
+        if (ctx) {
+            INIT_WORK(&ctx->work, mattx_sendmsg_kworker);
+            ctx->orig_pid = req->orig_pid;
+            ctx->fd = req->fd;
+            ctx->flags = req->flags;
+            ctx->addrlen = req->addrlen;
+            ctx->datalen = req->datalen;
+            ctx->target_node = hdr->sender_id;
+            memcpy(&ctx->addr, &req->addr, sizeof(struct sockaddr_storage));
+            memcpy(ctx->data, req->data, req->datalen);
+            
+            schedule_work(&ctx->work); // Dispatch to the Data Plane!
+        }
     }
 }
+
 
 static void handle_sys_sendmsg_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
     if (payload) {
@@ -2968,96 +2734,96 @@ static void handle_sys_sendmsg_reply(struct mattx_link *link, struct mattx_heade
 }
 
 
-// --- THE DEPUTY HIJACK: RECVMSG ---
-struct mattx_recvmsg_ctx { struct callback_head cb; struct mattx_sys_recvmsg_req req; int target_node; };
 
-static void mattx_recvmsg_cb(struct callback_head *cb) {
-    struct mattx_recvmsg_ctx *ctx = container_of(cb, struct mattx_recvmsg_ctx, cb);
-    struct pt_regs *task_regs = task_pt_regs(current);
-    struct pt_regs regs;
-    int ret = -EFAULT;
+// === DATA PLANE: RECVMSG (Scatter/Gather) ===
+struct mattx_recvmsg_kworker_ctx {
+    struct work_struct work;
+    u32 orig_pid;
+    int fd;
+    int flags;
+    int addrlen;
+    size_t datalen;
+    int target_node;
+};
 
-    // --- FIXED: Use user_msghdr for the scratchpad! ---
-    unsigned long data_ptr = task_regs->sp - 128 - ctx->req.datalen;
-    unsigned long addr_ptr = data_ptr - sizeof(struct sockaddr_storage);
-    unsigned long iov_ptr = addr_ptr - sizeof(struct iovec);
-    unsigned long msg_ptr = iov_ptr - sizeof(struct user_msghdr); 
+static void mattx_recvmsg_kworker(struct work_struct *work) {
+    struct mattx_recvmsg_kworker_ctx *ctx = container_of(work, struct mattx_recvmsg_kworker_ctx, work);
+    struct file *file = mattx_get_remote_file(ctx->orig_pid, ctx->fd);
+    int ret = -EBADF;
+    void *recv_buf = NULL;
+    struct sockaddr_storage addr;
+    int addrlen = 0;
 
-    struct iovec iov = { .iov_base = (void __user *)data_ptr, .iov_len = ctx->req.datalen };
-    struct user_msghdr msg = {0}; // FIXED!
-    
-    if (ctx->req.addrlen > 0) {
-        msg.msg_name = (void __user *)addr_ptr;
-        msg.msg_namelen = ctx->req.addrlen;
-    }
-    msg.msg_iov = (struct iovec __user *)iov_ptr;
-    msg.msg_iovlen = 1;
+    memset(&addr, 0, sizeof(addr));
 
-if (copy_to_user((void __user *)iov_ptr, &iov, sizeof(iov)) == 0 &&
-        copy_to_user((void __user *)msg_ptr, &msg, sizeof(msg)) == 0) {
-        
-        memset(&regs, 0, sizeof(regs));
-        regs.di = ctx->req.fd;
-        regs.si = msg_ptr;
-        regs.dx = ctx->req.flags;
-
-        // --- THE SIGNAL SHIELD ---
-        sigset_t old_set, block_set;
-        sigfillset(&block_set);
-        sigprocmask(SIG_BLOCK, &block_set, &old_set);
-
-        if (real_sys_recvmsg) {
-            ret = real_sys_recvmsg(&regs);
-            if (ret == -ERESTARTSYS) ret = -EAGAIN; // Convert interruption to standard non-blocking error
-            mattx_dbg("[HIJACK] Deputy executed recvmsg natively. Result: %d\n", ret);
+    if (file) {
+        struct socket *sock = sock_from_file(file);
+        if (sock) {
+            recv_buf = kmalloc(ctx->datalen, GFP_KERNEL);
+            if (recv_buf) {
+                struct msghdr msg = {0};
+                struct kvec iov;
+                
+                if (ctx->addrlen > 0) {
+                    msg.msg_name = &addr;
+                    msg.msg_namelen = sizeof(addr);
+                }
+                
+                iov.iov_base = recv_buf;
+                iov.iov_len = ctx->datalen;
+                
+                ret = kernel_recvmsg(sock, &msg, &iov, 1, ctx->datalen, ctx->flags);
+                addrlen = msg.msg_namelen;
+            } else {
+                ret = -ENOMEM;
+            }
+        } else {
+            ret = -ENOTSOCK;
         }
-
-        sigprocmask(SIG_SETMASK, &old_set, NULL);
+        fput(file);
     }
 
     size_t reply_size = sizeof(struct mattx_sys_recvmsg_reply) + (ret > 0 ? ret : 0);
     struct mattx_sys_recvmsg_reply *reply = kzalloc(reply_size, GFP_KERNEL);
     if (reply) {
-        reply->orig_pid = ctx->req.orig_pid;
+        reply->orig_pid = ctx->orig_pid;
         reply->bytes_recv = ret;
         reply->error = (ret < 0) ? ret : 0;
-        if (ret > 0) {
-            // --- FIXED: Appease the compiler warnings! ---
-            if (copy_from_user(reply->data, (void __user *)data_ptr, ret)) {
-                mattx_dbg("[HIJACK] Warning: Failed to copy recvmsg data\n");
-            }
-            if (copy_from_user(&msg, (void __user *)msg_ptr, sizeof(msg))) {
-                mattx_dbg("[HIJACK] Warning: Failed to copy recvmsg msghdr\n");
-            }
-            reply->addrlen = msg.msg_namelen;
-            if (reply->addrlen > 0) {
-                if (copy_from_user(&reply->addr, (void __user *)addr_ptr, reply->addrlen)) {
-                    mattx_dbg("[HIJACK] Warning: Failed to copy recvmsg addr\n");
-                }
-            }
+        reply->addrlen = addrlen;
+        if (addrlen > 0) {
+            memcpy(&reply->addr, &addr, addrlen);
         }
-        if (cluster_map[ctx->target_node]) mattx_comm_send(cluster_map[ctx->target_node], MATTX_MSG_SYS_RECVMSG_REPLY, reply, reply_size);
+        if (ret > 0 && recv_buf) {
+            memcpy(reply->data, recv_buf, ret);
+        }
+        
+        if (cluster_map[ctx->target_node]) {
+            mattx_comm_send(cluster_map[ctx->target_node], MATTX_MSG_SYS_RECVMSG_REPLY, reply, reply_size);
+        }
         kfree(reply);
     }
+    if (recv_buf) kfree(recv_buf);
     kfree(ctx);
-    set_current_state(TASK_STOPPED); schedule();
 }
-
 
 static void handle_sys_recvmsg_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
-    struct mattx_sys_recvmsg_req *req = payload;
-    struct task_struct *deputy = NULL;
-    rcu_read_lock(); deputy = pid_task(find_vpid(req->orig_pid), PIDTYPE_PID); if (deputy) get_task_struct(deputy); rcu_read_unlock();
-    if (deputy) {
-        struct mattx_recvmsg_ctx *ctx = kmalloc(sizeof(*ctx), GFP_KERNEL);
+    if (payload) {
+        struct mattx_sys_recvmsg_req *req = payload;
+        struct mattx_recvmsg_kworker_ctx *ctx = kmalloc(sizeof(*ctx), GFP_ATOMIC);
         if (ctx) {
-            memcpy(&ctx->req, req, sizeof(*req)); ctx->target_node = hdr->sender_id;
-            init_task_work(&ctx->cb, mattx_recvmsg_cb);
-            if (real_task_work_add) { real_task_work_add(deputy, &ctx->cb, TWA_SIGNAL); send_sig(SIGCONT, deputy, 0); } else { kfree(ctx); }
+            INIT_WORK(&ctx->work, mattx_recvmsg_kworker);
+            ctx->orig_pid = req->orig_pid;
+            ctx->fd = req->fd;
+            ctx->flags = req->flags;
+            ctx->addrlen = req->addrlen;
+            ctx->datalen = req->datalen;
+            ctx->target_node = hdr->sender_id;
+            
+            schedule_work(&ctx->work); // Dispatch to the Data Plane!
         }
-        put_task_struct(deputy);
     }
 }
+
 
 static void handle_sys_recvmsg_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
     if (payload) {
