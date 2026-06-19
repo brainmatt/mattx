@@ -14,7 +14,26 @@ Inspired by the legendary openMosix project, MattX allows multiple physical or v
 
 ---
 
-## ✨ Key Features (MattX v1.6)
+## 📰 Latest News
+
+### 🚀 MattX v1.7 Released: The "Native Injector" & Alma Linux Support!
+*June 2026*
+MattX v1.7 is our most stable and architecturally advanced release yet! We have completely re-architected the system to cleanly separate the **Control Plane** (process migration, lifecycle) from the **Data Plane** (File and Network I/O). 
+* **Kworker + Native Injector:** We have moved away from the legacy "Deputy Hijack" (waking the sleeping home process via signals) for most syscalls. Instead, MattX now spawns background kernel threads (`kworkers`) that execute syscalls natively and forcefully inject the resulting `struct file *` directly into the sleeping Deputy's FD table. All core File and Network I/O syscalls have been refactored to this blazing-fast architecture!
+* **Alma Linux & SELinux Victory:** MattX is now fully supported on RPM/RHEL-based distributions like Alma Linux. Even better? Because our Native Injector perfectly mimics standard local process behavior, **MattX runs flawlessly with SELinux set to ENFORCING!**
+* **Version Interface:** You can now check your running cluster version via the new read-only `/proc/mattx/version` interface.
+
+### 🛠️ The New MattX-TestSuite by Kris Buytaert
+*June 2026*
+A massive shoutout to openMosix legend Kris Buytaert for contributing the official **MattX-TestSuite**! This powerful Makefile/Bash toolkit uses `libvirt` and official cloud images to fully automate the deployment of a MattX cluster. With a single `make debcluster` command, you can spin up a fully configured, multi-node MattX development environment in under 5 minutes. It currently supports Debian, Ubuntu, and Alma Linux!
+Please find it at: 
+https://github.com/KrisBuytaert/mattx-testsuite
+
+👉 **[Read older updates in our NEWS archive](./NEWS.md)**
+
+---
+
+## ✨ Key Features (MattX v1.7)
 
 ### 🧠 Live Process Teleportation & The Syscall Drainer
 MattX migrates running processes safely using a custom **Syscall Drainer**. Instead of violently freezing processes with `SIGSTOP` while they hold kernel locks, MattX uses modern `task_work_add(TWA_SIGNAL)` to gently guide the process to the user-space boundary. Once in a 100% stable state, its memory map (VMAs), CPU registers (`pt_regs`), and credentials (`struct cred`) are extracted and streamed over a custom TCP data pump to the target node.
@@ -64,6 +83,7 @@ MattX embraces the UNIX philosophy. The entire cluster can be monitored and cont
 * `cat /proc/mattx/nodes` - Displays a live table of all connected nodes, their IP addresses, CPU load, and Free Memory.
 * `cat /proc/mattx/remote` - Lists all processes that have been migrated *away* from this node (`<orig_pid>:<target_node>`).
 * `cat /proc/mattx/guests` - Lists all foreign processes currently running *on* this node (`<local_surrogate_pid>:<home_node>`).
+* `cat /proc/mattx/version` - Displays the current MattX version and license information.
 
 ### Real-Time Cluster Control
 You can control the cluster dynamically by echoing commands into `/proc/mattx/admin`:
@@ -92,10 +112,7 @@ echo "migrate 1234 home" > /proc/mattx/admin
 
 ## Requirements and Kernel Support 
 
-**MattX** is developed and tested on Debian Trixie for Kernel 6.x and Ubuntu 26.04 for Kernel 7.x.
-
-
-
+**MattX** is developed and tested on Debian Trixie for Kernel 6.x and Ubuntu 26.04 for Kernel 7.x. It is also fully supported on Alma Linux (Kernel 6.x) with SELinux enforcing!
 
 ---
 
