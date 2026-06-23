@@ -17,6 +17,18 @@ Inspired by the legendary openMosix project, MattX allows multiple physical or v
 ## 📰 Latest News
 
 ### 🚀 MattX v1.7 Released: The "Native Injector" & Alma Linux Support!
+
+<div style="display: inline-flex; align-items: center;">
+  <!-- Video Thumbnail -->
+  <a href="https://www.youtube.com/watch?v=am8meoc2H1s" target="_blank" style="display: inline-block;">
+    <img src="./web/mattx-1.7-youtube.png" style="width: 100%; display: block;">
+  </a>
+
+</div>
+
+
+---
+
 *June 2026*
 MattX v1.7 is our most stable and architecturally advanced release yet! We have completely re-architected the system to cleanly separate the **Control Plane** (process migration, lifecycle) from the **Data Plane** (File and Network I/O). 
 * **Kworker + Native Injector:** We have moved away from the legacy "Deputy Hijack" (waking the sleeping home process via signals) for most syscalls. Instead, MattX now spawns background kernel threads (`kworkers`) that execute syscalls natively and forcefully inject the resulting `struct file *` directly into the sleeping Deputy's FD table. All core File and Network I/O syscalls have been refactored to this blazing-fast architecture!
