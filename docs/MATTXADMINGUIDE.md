@@ -1196,7 +1196,7 @@ MattX is built for hackers. To compile the module and the user-space tools from 
 
 Run the following command on Debian/Ubuntu to install the required dependencies:
 ```bash
-sudo apt-get install build-essential linux-source bc kmod cpio flex libncurses5-dev libelf-dev libssl-dev dwarves bison libnl-3-dev libnl-genl-3-dev linux-headers-$(uname -r)
+sudo apt-get install build-essential pkg-config linux-source bc kmod cpio flex libncurses5-dev libelf-dev libssl-dev dwarves bison libnl-3-dev libnl-genl-3-dev linux-headers-$(uname -r)
 ```
 Once installed, simply run `make && sudo make install` in the MattX directory, and welcome to the cluster! 🛠️🌌
 
