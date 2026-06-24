@@ -468,11 +468,14 @@ void mattx_capture_and_return_state(struct task_struct *task, u32 orig_pid, int 
     migrating_target_node = target_node;
 
     if (cluster_map[target_node]) {
-        mattx_dbg("[MIGRATE] Sending RETURN blueprint to Node %d. Waiting for READY signal...\n", target_node);
-        mattx_comm_send(cluster_map[target_node], MATTX_MSG_RETURN_BLUEPRINT, req, actual_payload_size);
-    }
-    kvfree(req); // FIX: Use kvfree!
+            mattx_dbg("[MIGRATE] RETURN Blueprint built! VMA Count: %d, Total Payload Size: %zu bytes.\n", 
+                    vma_count, actual_payload_size);
+            mattx_dbg("[MIGRATE] Sending RETURN blueprint to Node %d. Waiting for READY signal...\n", target_node);
+            mattx_comm_send(cluster_map[target_node], MATTX_MSG_RETURN_BLUEPRINT, req, actual_payload_size);
+        }
+        kvfree(req); // FIX: Use kvfree!
 }
+
 
 void mattx_send_vma_data(void) {
     int total_pages = 0;
@@ -483,21 +486,32 @@ void mattx_send_vma_data(void) {
     if (!local_migration_req || !migrating_task || migrating_target_node == -1) return;
     if (!cluster_map[migrating_target_node]) return;
 
-    mattx_dbg(" [MIGRATE] Starting data pipeline to Node %d...\n", migrating_target_node);
+    mattx_dbg("[MIGRATE] =====================================================\n");
+    mattx_dbg("[MIGRATE] Starting data pipeline to Node %d...\n", migrating_target_node);
+    mattx_dbg("[MIGRATE] Blueprint Size: %zu bytes, VMA Count: %u, Is Returning: %d\n",
+              sizeof(struct mattx_migration_req) + (local_migration_req->vma_count * sizeof(struct mattx_vma_info)),
+              local_migration_req->vma_count, is_returning);
 
     for (int i = 0; i < local_migration_req->vma_count; i++) {
         unsigned long start = local_migration_req->vmas[i].vm_start;
         unsigned long end = local_migration_req->vmas[i].vm_end;
-        unsigned long vma_flags = local_migration_req->vmas[i].vm_flags; // Declared here!
+        unsigned long vma_flags = local_migration_req->vmas[i].vm_flags;
         unsigned long curr = start;
-        
+        unsigned long vma_size = end - start;
+        int vma_pages = (vma_size + PAGE_SIZE - 1) / PAGE_SIZE;
+        int pages_sent_this_vma = 0;
+
+        mattx_dbg("[MIGRATE] Processing VMA %d/%d: 0x%lx - 0x%lx (Size: %lu bytes, ~%d pages, Flags: 0x%lx)\n",
+                  i + 1, local_migration_req->vma_count, start, end, vma_size, vma_pages, vma_flags);
+
         // --- The Smart Return Optimization ---
-        // If we are returning to the Home Node, the Deputy already has the Read-Only code!
-        // We only need to send back the memory that could have changed (VM_WRITE).
         if (is_returning && !(vma_flags & VM_WRITE)) {
-            continue; // Skip this VMA entirely!
+            mattx_dbg("[MIGRATE] -> Skipping VMA %d (Read-Only during Return)\n", i);
+            continue;
         }
-        
+
+        mattx_dbg("[MIGRATE] -> VMA %d: Entering page extraction loop...\n", i);
+
         while (curr < end) {
             u32 chunk_size = PAGE_SIZE;
             if (curr + chunk_size > end) chunk_size = end - curr;
@@ -519,26 +533,42 @@ void mattx_send_vma_data(void) {
 
                         memcpy(payload_buf + sizeof(struct mattx_page_header), page_buf, bytes_read);
                         
+                        // EXTREME DEBUGGING: Pulse every 256 pages (1MB) to avoid console flood
+                        if (pages_sent_this_vma % 256 == 0) {
+                            mattx_dbg("[MIGRATE] -> VMA %d: Sending page %d/%d (Offset: 0x%lx, Payload: %zu bytes)...\n",
+                                      i, pages_sent_this_vma, vma_pages, curr - start, payload_size);
+                        }
+
                         int send_res = mattx_comm_send(cluster_map[migrating_target_node], MATTX_MSG_PAGE_TRANSFER, payload_buf, payload_size);
+                        
                         if (send_res < payload_size) {
+                            mattx_dbg("[MIGRATE] -> ERROR: Network send blocked/failed at VMA %d, Offset 0x%lx (Sent %d/%zu bytes)\n", 
+                                      i, curr - start, send_res, payload_size);
                             network_errors++;
                         } else {
                             sent_pages++;
+                            pages_sent_this_vma++;
                         }
                         
                         kfree(payload_buf);
+                    } else {
+                        mattx_dbg("[MIGRATE] -> ERROR: Failed to allocate payload_buf for VMA %d, Offset 0x%lx\n", i, curr - start);
                     }
                 } else {
                     skipped_pages++;
                 }
                 kfree(page_buf);
+            } else {
+                mattx_dbg("[MIGRATE] -> ERROR: Failed to allocate page_buf for VMA %d, Offset 0x%lx\n", i, curr - start);
             }
             curr += chunk_size;
         }
+        mattx_dbg("[MIGRATE] -> VMA %d finished. Sent %d pages.\n", i, pages_sent_this_vma);
     }
     
     mattx_dbg("[MIGRATE] Pipeline stats: %d total, %d sent, %d skipped, %d net errors\n", 
            total_pages, sent_pages, skipped_pages, network_errors);
+    mattx_dbg("[MIGRATE] =====================================================\n");
 
     if (is_returning) {
         mattx_dbg("[MIGRATE] Return pipeline complete. Sending RETURN_DONE signal.\n");
@@ -546,11 +576,6 @@ void mattx_send_vma_data(void) {
         
         mattx_dbg("[RECALL] Executing local Surrogate PID %d...\n", migrating_task->pid);
         send_sig(SIGKILL, migrating_task, 0);
-        
-        // --- FIXED: The Patient Shield ---
-        // DO NOT remove the guest from the registry here! 
-        // If we remove it now, mattx_fake_release will think it's a normal death and assassinate the Deputy's FDs!
-        // We leave it in the registry, and let the Balancer's Guest Watcher clean it up naturally later.
 
     } else {
         mattx_dbg("[MIGRATE] Data pipeline complete. Sending DONE signal.\n");
