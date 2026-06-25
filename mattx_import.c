@@ -257,18 +257,17 @@ static void handle_return_blueprint(struct mattx_link *link, struct mattx_header
                     unsigned long start = req->vmas[i].vm_start;
                     unsigned long size = req->vmas[i].vm_end - start;
                     unsigned long flags = req->vmas[i].vm_flags;
-                    
-                    // 1. Take the READ lock to check if the ENTIRE VMA exists
+
+                    // 1. Take the READ lock to check if the VMA exists
                     mmap_read_lock(deputy->mm);
                     struct vm_area_struct *vma = find_vma(deputy->mm, start);
-                    bool needs_mapping = true;
                     
-                    // It only exists if the start matches AND the end covers the whole size!
-                    if (vma && vma->vm_start <= start && vma->vm_end >= start + size) {
-                        needs_mapping = false; 
-                    }
+                    // ONLY carve if there is literally no memory mapped at this starting address!
+                    // If vma->vm_start > start, it means there is a hole in the memory map.
+                    bool needs_mapping = (!vma || vma->vm_start > start);
                     mmap_read_unlock(deputy->mm); // DROP THE LOCK!
-
+                    
+                    
                     // 2. If it's missing, carve it out safely!
                     if (needs_mapping) {
                         mattx_dbg("[RECALL] Carving NEW memory for Deputy: 0x%lx (Size: %lu)\n", start, size);
