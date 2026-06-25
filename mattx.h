@@ -211,8 +211,7 @@ struct mattx_migration_req {
 };
 
 struct mattx_page_header {
-    u32 vma_index;
-    u32 offset;
+    uint64_t absolute_addr; // <--: The exact memory address!
     u32 length;
 };
 

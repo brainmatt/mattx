@@ -525,10 +525,10 @@ void mattx_send_vma_data(void) {
                     void *payload_buf = kmalloc(payload_size, GFP_KERNEL);
                     
                     if (payload_buf) {
+
                         struct mattx_page_header *p_page_hdr = (struct mattx_page_header *)payload_buf;
                         
-                        p_page_hdr->vma_index = i;
-                        p_page_hdr->offset = curr - start;
+                        p_page_hdr->absolute_addr = curr; // <--: Send the exact address!
                         p_page_hdr->length = bytes_read;
 
                         memcpy(payload_buf + sizeof(struct mattx_page_header), page_buf, bytes_read);

@@ -57,7 +57,10 @@ static void handle_page_transfer(struct mattx_link *link, struct mattx_header *h
     if (payload && pending_migration && hijacked_stub_task) {
         struct mattx_page_header *ph = (struct mattx_page_header *)payload;
         void *data = (char *)payload + sizeof(struct mattx_page_header);
-        unsigned long target_addr = pending_migration->vmas[ph->vma_index].vm_start + ph->offset;
+        
+        // --- NEW: Use the absolute address directly! No more VMA index math! ---
+        unsigned long target_addr = ph->absolute_addr;
+        
         int res;
         struct mm_struct *mm = hijacked_stub_task->mm;
         bool unprotect = false;
@@ -90,8 +93,6 @@ static void handle_page_transfer(struct mattx_link *link, struct mattx_header *h
             mmap_write_unlock(mm);
         }
 
-        // --- REMOVED THE SILENT TRAP ---
-        // We now log EVERY failure, not just offset 0!
         if (res != ph->length) {
             mattx_dbg("MattX:[IMPORT] NOTICE: Skipped read-only memory %u bytes at 0x%lx (res: %d)\n", ph->length, target_addr, res);
         } else {
