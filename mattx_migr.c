@@ -507,10 +507,10 @@ void mattx_send_vma_data(void) {
         // --- The Smart Return Optimization ---
         // If returning, skip Read-Only memory (like the binary code).
         // BUT NEVER SKIP THE STACK! (VM_GROWSDOWN = 0x0100). The stack must always return!
-        if (is_returning && !(vma_flags & VM_WRITE) && !(vma_flags & 0x0100)) {
-            mattx_dbg("[MIGRATE] -> Skipping VMA %d (Read-Only during Return)\n", i);
-            continue;
-        }
+        // if (is_returning && !(vma_flags & VM_WRITE) && !(vma_flags & 0x0100)) {
+        //     mattx_dbg("[MIGRATE] -> Skipping VMA %d (Read-Only during Return)\n", i);
+        //     continue;
+        // }
 
         mattx_dbg("[MIGRATE] -> VMA %d: Entering page extraction loop...\n", i);
 
