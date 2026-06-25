@@ -94,7 +94,8 @@ static void handle_page_transfer(struct mattx_link *link, struct mattx_header *h
         }
 
         if (res != ph->length) {
-            mattx_dbg("MattX:[IMPORT] NOTICE: Skipped read-only memory %u bytes at 0x%lx (res: %d)\n", ph->length, target_addr, res);
+            mattx_dbg("MattX:[IMPORT] ERROR: Failed to inject %u bytes at 0x%lx (Injected: %d). VMA missing or protected!\n", 
+                      ph->length, target_addr, res);
         } else {
             injected_pages_count++;
         }
@@ -221,7 +222,6 @@ static void handle_return_blueprint(struct mattx_link *link, struct mattx_header
 
         if (pending_migration) kvfree(pending_migration);
         
-        // FIX: Use kvmalloc to guarantee allocation success!
         pending_migration = kvmalloc(hdr->length, GFP_KERNEL);
         if (pending_migration) {
             memcpy(pending_migration, req, hdr->length);
@@ -239,7 +239,6 @@ static void handle_return_blueprint(struct mattx_link *link, struct mattx_header
             mattx_dbg("[RECALL] Found frozen Deputy PID %d. Preparing for injection...\n", deputy->pid);
             
             // --- THE KWORKER KILL-SWITCH ---
-            // Tell any pending RPC workers on VM1 to abort immediately!
             spin_lock(&export_lock);
             for (int i = 0; i < export_count; i++) {
                 if (export_registry[i].orig_pid == req->orig_pid) {
@@ -248,6 +247,40 @@ static void handle_return_blueprint(struct mattx_link *link, struct mattx_header
                 }
             }
             spin_unlock(&export_lock);
+
+            // --- THE DYNAMIC BRAIN CARVER ---
+            // The Surrogate may have allocated NEW memory while running on VM2!
+            // We must ensure the Deputy has these VMAs mapped before we inject data.
+            if (deputy->mm) {
+                mmap_write_lock(deputy->mm);
+                for (int i = 0; i < req->vma_count; i++) {
+                    unsigned long start = req->vmas[i].vm_start;
+                    unsigned long size = req->vmas[i].vm_end - start;
+                    unsigned long flags = req->vmas[i].vm_flags;
+                    
+                    // Check if the VMA already exists
+                    struct vm_area_struct *vma = find_vma(deputy->mm, start);
+                    if (!vma || vma->vm_start > start) {
+                        mattx_dbg("[RECALL] Carving NEW memory for Deputy: 0x%lx (Size: %lu)\n", start, size);
+                        
+                        // We must temporarily adopt the Deputy's memory context to call vm_mmap
+                        kthread_use_mm(deputy->mm);
+                        
+                        unsigned long prot = PROT_READ | PROT_WRITE | PROT_EXEC;
+                        unsigned long map_flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED;
+                        
+                        if (flags & 0x0100) map_flags |= MAP_GROWSDOWN; // Stack protector
+                        
+                        unsigned long ret = vm_mmap(NULL, start, size, prot, map_flags, 0);
+                        if (IS_ERR_VALUE(ret)) {
+                            printk(KERN_ERR "MattX:[RECALL] FATAL: Failed to carve memory at 0x%lx (err: %ld)\n", start, ret);
+                        }
+                        
+                        kthread_unuse_mm(deputy->mm);
+                    }
+                }
+                mmap_write_unlock(deputy->mm);
+            }
 
             if (hijacked_stub_task) put_task_struct(hijacked_stub_task);
             hijacked_stub_task = deputy;
@@ -259,6 +292,7 @@ static void handle_return_blueprint(struct mattx_link *link, struct mattx_header
         }
     }
 }
+
 
 static void handle_return_done(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
     mattx_dbg("[IMPORT] Return memory transferred successfully! Pages: %d\n", injected_pages_count);
