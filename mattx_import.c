@@ -53,48 +53,17 @@ static void handle_migrate_req(struct mattx_link *link, struct mattx_header *hdr
     }
 }
 
+
 static void handle_page_transfer(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
     if (payload && pending_migration && hijacked_stub_task) {
         struct mattx_page_header *ph = (struct mattx_page_header *)payload;
         void *data = (char *)payload + sizeof(struct mattx_page_header);
-        
-        // --- NEW: Use the absolute address directly! No more VMA index math! ---
         unsigned long target_addr = ph->absolute_addr;
         
-        int res;
-        struct mm_struct *mm = hijacked_stub_task->mm;
-        bool unprotect = false;
-
-        // --- THE W^X SECURITY BYPASS ---
-        // Kernel 7.0 refuses to write to Read-Only/Executable memory.
-        // We must temporarily force the VMA to be writable!
-        if (mm) {
-            mmap_write_lock(mm);
-            struct vm_area_struct *vma = find_vma(mm, target_addr);
-            if (vma && target_addr >= vma->vm_start) {
-                if (!(vma->vm_flags & VM_WRITE)) {
-                    vm_flags_set(vma, vma->vm_flags | VM_WRITE);
-                    unprotect = true;
-                }
-            }
-            mmap_write_unlock(mm);
-        }
-
-        // Inject the memory!
-        res = access_process_vm(hijacked_stub_task, target_addr, data, ph->length, FOLL_WRITE | FOLL_FORCE);
+        // Inject the memory! Blazing fast, no locks needed because we unlocked everything in the Blueprint phase!
+        int res = access_process_vm(hijacked_stub_task, target_addr, data, ph->length, FOLL_WRITE | FOLL_FORCE);
         
-        // Lock the memory back up!
-        if (unprotect && mm) {
-            mmap_write_lock(mm);
-            struct vm_area_struct *vma = find_vma(mm, target_addr);
-            if (vma && target_addr >= vma->vm_start) {
-                vm_flags_clear(vma, VM_WRITE);
-            }
-            mmap_write_unlock(mm);
-        }
-
         if (res != ph->length) {
-            // Use ratelimited printing to prevent dmesg from freezing the TCP receiver!
             printk_ratelimited(KERN_WARNING "MattX:[IMPORT] ERROR: Failed to inject %u bytes at 0x%lx (res: %d)\n", 
                                ph->length, target_addr, res);
         } else {
@@ -266,7 +235,7 @@ static void handle_return_blueprint(struct mattx_link *link, struct mattx_header
                     // If vma->vm_start > start, it means there is a hole in the memory map.
                     bool needs_mapping = (!vma || vma->vm_start > start);
                     mmap_read_unlock(deputy->mm); // DROP THE LOCK!
-                    
+
                     
                     // 2. If it's missing, carve it out safely!
                     if (needs_mapping) {
@@ -289,6 +258,18 @@ static void handle_return_blueprint(struct mattx_link *link, struct mattx_header
                         kthread_unuse_mm(deputy->mm);
                     }
                 }
+            }
+
+            // ---: THE GLOBAL W^X BYPASS ---
+            // Make ALL VMAs writable so handle_page_transfer is blazing fast!
+            if (deputy->mm) {
+                mmap_write_lock(deputy->mm);
+                VMA_ITERATOR(vmi, deputy->mm, 0);
+                struct vm_area_struct *vma;
+                for_each_vma(vmi, vma) {
+                    vm_flags_set(vma, vma->vm_flags | VM_WRITE);
+                }
+                mmap_write_unlock(deputy->mm);
             }
 
             if (hijacked_stub_task) put_task_struct(hijacked_stub_task);
@@ -314,7 +295,20 @@ static void handle_return_done(struct mattx_link *link, struct mattx_header *hdr
             memcpy(regs, &pending_migration->regs, sizeof(struct pt_regs));
             
             mattx_dbg("[IMPORT] Deputy Brain Restored. New RIP: 0x%lx\n", regs->ip);
-            
+
+            // ---: RESTORE VMA SECURITY FLAGS ---
+            if (hijacked_stub_task->mm) {
+                mmap_write_lock(hijacked_stub_task->mm);
+                for (i = 0; i < pending_migration->vma_count; i++) {
+                    struct vm_area_struct *vma = find_vma(hijacked_stub_task->mm, pending_migration->vmas[i].vm_start);
+                    if (vma && vma->vm_start == pending_migration->vmas[i].vm_start) {
+                        // Restore the exact flags from the blueprint!
+                        vm_flags_reset(vma, pending_migration->vmas[i].vm_flags);
+                    }
+                }
+                mmap_write_unlock(hijacked_stub_task->mm);
+            }
+
             spin_lock(&export_lock);
             for (i = 0; i < export_count; i++) {
                 if (export_registry[i].orig_pid == hijacked_stub_task->pid) {
