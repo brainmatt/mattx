@@ -525,15 +525,13 @@ void mattx_send_vma_data(void) {
                     void *payload_buf = kmalloc(payload_size, GFP_KERNEL);
                     
                     if (payload_buf) {
-
                         struct mattx_page_header *p_page_hdr = (struct mattx_page_header *)payload_buf;
                         
-                        p_page_hdr->absolute_addr = curr; // <--: Send the exact address!
+                        p_page_hdr->absolute_addr = curr;
                         p_page_hdr->length = bytes_read;
 
                         memcpy(payload_buf + sizeof(struct mattx_page_header), page_buf, bytes_read);
                         
-                        // EXTREME DEBUGGING: Pulse every 256 pages (1MB) to avoid console flood
                         if (pages_sent_this_vma % 256 == 0) {
                             mattx_dbg("[MIGRATE] -> VMA %d: Sending page %d/%d (Offset: 0x%lx, Payload: %zu bytes)...\n",
                                       i, pages_sent_this_vma, vma_pages, curr - start, payload_size);
@@ -562,7 +560,16 @@ void mattx_send_vma_data(void) {
                 mattx_dbg("[MIGRATE] -> ERROR: Failed to allocate page_buf for VMA %d, Offset 0x%lx\n", i, curr - start);
             }
             curr += chunk_size;
+
+            // --- NEW: THE BREATHING PUMP ---
+            // Give the CPU a chance to process network ACKs and let VM1 catch up!
+            // We also add a tiny 1ms sleep every 1024 pages (4MB) to guarantee the TCP window stays open.
+            cond_resched();
+            if (pages_sent_this_vma % 1024 == 0) {
+                msleep(1);
+            }
         }
+
         mattx_dbg("[MIGRATE] -> VMA %d finished. Sent %d pages.\n", i, pages_sent_this_vma);
     }
     
