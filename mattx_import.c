@@ -248,19 +248,23 @@ static void handle_return_blueprint(struct mattx_link *link, struct mattx_header
             }
             spin_unlock(&export_lock);
 
-            // --- THE DYNAMIC BRAIN CARVER ---
+            // --- THE DYNAMIC BRAIN CARVER (Deadlock-Free Edition) ---
             // The Surrogate may have allocated NEW memory while running on VM2!
             // We must ensure the Deputy has these VMAs mapped before we inject data.
             if (deputy->mm) {
-                mmap_write_lock(deputy->mm);
                 for (int i = 0; i < req->vma_count; i++) {
                     unsigned long start = req->vmas[i].vm_start;
                     unsigned long size = req->vmas[i].vm_end - start;
                     unsigned long flags = req->vmas[i].vm_flags;
                     
-                    // Check if the VMA already exists
+                    // 1. Take the READ lock just to check if the VMA exists
+                    mmap_read_lock(deputy->mm);
                     struct vm_area_struct *vma = find_vma(deputy->mm, start);
-                    if (!vma || vma->vm_start > start) {
+                    bool needs_mapping = (!vma || vma->vm_start > start);
+                    mmap_read_unlock(deputy->mm); // DROP THE LOCK!
+
+                    // 2. If it's missing, carve it out safely!
+                    if (needs_mapping) {
                         mattx_dbg("[RECALL] Carving NEW memory for Deputy: 0x%lx (Size: %lu)\n", start, size);
                         
                         // We must temporarily adopt the Deputy's memory context to call vm_mmap
@@ -271,6 +275,7 @@ static void handle_return_blueprint(struct mattx_link *link, struct mattx_header
                         
                         if (flags & 0x0100) map_flags |= MAP_GROWSDOWN; // Stack protector
                         
+                        // vm_mmap handles its own locking internally!
                         unsigned long ret = vm_mmap(NULL, start, size, prot, map_flags, 0);
                         if (IS_ERR_VALUE(ret)) {
                             printk(KERN_ERR "MattX:[RECALL] FATAL: Failed to carve memory at 0x%lx (err: %ld)\n", start, ret);
@@ -279,7 +284,6 @@ static void handle_return_blueprint(struct mattx_link *link, struct mattx_header
                         kthread_unuse_mm(deputy->mm);
                     }
                 }
-                mmap_write_unlock(deputy->mm);
             }
 
             if (hijacked_stub_task) put_task_struct(hijacked_stub_task);
