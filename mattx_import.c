@@ -94,8 +94,9 @@ static void handle_page_transfer(struct mattx_link *link, struct mattx_header *h
         }
 
         if (res != ph->length) {
-            mattx_dbg("MattX:[IMPORT] ERROR: Failed to inject %u bytes at 0x%lx (Injected: %d). VMA missing or protected!\n", 
-                      ph->length, target_addr, res);
+            // Use ratelimited printing to prevent dmesg from freezing the TCP receiver!
+            printk_ratelimited(KERN_WARNING "MattX:[IMPORT] ERROR: Failed to inject %u bytes at 0x%lx (res: %d)\n", 
+                               ph->length, target_addr, res);
         } else {
             injected_pages_count++;
         }
@@ -257,10 +258,15 @@ static void handle_return_blueprint(struct mattx_link *link, struct mattx_header
                     unsigned long size = req->vmas[i].vm_end - start;
                     unsigned long flags = req->vmas[i].vm_flags;
                     
-                    // 1. Take the READ lock just to check if the VMA exists
+                    // 1. Take the READ lock to check if the ENTIRE VMA exists
                     mmap_read_lock(deputy->mm);
                     struct vm_area_struct *vma = find_vma(deputy->mm, start);
-                    bool needs_mapping = (!vma || vma->vm_start > start);
+                    bool needs_mapping = true;
+                    
+                    // It only exists if the start matches AND the end covers the whole size!
+                    if (vma && vma->vm_start <= start && vma->vm_end >= start + size) {
+                        needs_mapping = false; 
+                    }
                     mmap_read_unlock(deputy->mm); // DROP THE LOCK!
 
                     // 2. If it's missing, carve it out safely!
