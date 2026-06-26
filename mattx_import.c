@@ -273,11 +273,34 @@ static void handle_return_blueprint(struct mattx_link *link, struct mattx_header
                             mmap_read_unlock(deputy->mm); // Drop lock before carving!
 
                             mattx_dbg("[RECALL] Carving HOLE for Deputy: 0x%lx (Size: %lu)\n", curr, hole_size);
-                            
+
                             kthread_use_mm(deputy->mm);
                             unsigned long prot = PROT_READ | PROT_WRITE | PROT_EXEC;
-                            unsigned long map_flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED;
-                            if (flags & 0x0100) map_flags |= MAP_GROWSDOWN; // Stack protector
+                            
+                            // --- NEW: THE BLUEPRINT MIRROR ---
+                            // Translate internal vm_flags back to mmap flags!
+                            unsigned long map_flags = MAP_FIXED;
+                            
+                            // Is it Shared or Private? (VM_SHARED = 0x08)
+                            if (flags & 0x08) {
+                                map_flags |= MAP_SHARED;
+                            } else {
+                                map_flags |= MAP_PRIVATE;
+                            }
+                            
+                            // Is it Anonymous? (VM_ANON doesn't exist as a simple flag, 
+                            // but if it's a hole we are filling, it's almost certainly anonymous data)
+                            map_flags |= MAP_ANONYMOUS;
+                            
+                            // Is it a Huge Page? (VM_HUGETLB = 0x400000)
+                            if (flags & 0x400000) {
+                                map_flags |= MAP_HUGETLB;
+                            }
+                            
+                            // Is it the Stack? (VM_GROWSDOWN = 0x0100)
+                            if (flags & 0x0100) {
+                                map_flags |= MAP_GROWSDOWN; 
+                            }
                             
                             unsigned long ret = vm_mmap(NULL, curr, hole_size, prot, map_flags, 0);
                             if (IS_ERR_VALUE(ret)) {
