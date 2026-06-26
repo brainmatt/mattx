@@ -540,7 +540,7 @@ void mattx_send_vma_data(void) {
                         }
 
                         int send_res = mattx_comm_send(cluster_map[migrating_target_node], MATTX_MSG_PAGE_TRANSFER, payload_buf, payload_size);
-                        
+
                         if (send_res < payload_size) {
                             mattx_dbg("[MIGRATE] -> ERROR: Network send blocked/failed at VMA %d, Offset 0x%lx (Sent %d/%zu bytes)\n", 
                                       i, curr - start, send_res, payload_size);
@@ -563,13 +563,10 @@ void mattx_send_vma_data(void) {
             }
             curr += chunk_size;
 
-            // --- NEW: THE BREATHING PUMP ---
-            // Give the CPU a chance to process network ACKs and let VM1 catch up!
-            // We also add a tiny 1ms sleep every 1024 pages (4MB) to guarantee the TCP window stays open.
-            cond_resched();
-            if (pages_sent_this_vma % 1024 == 0) {
-                msleep(1);
-            }
+            // --- THE DIGITAL 0 OR 1 TEST: EXTREME SLOWDOWN ---
+            // Force a 1 millisecond sleep after EVERY SINGLE PAGE.
+            // This guarantees the Netlink buffer on VM1 will never overflow.
+            msleep(1);
         }
 
         mattx_dbg("[MIGRATE] -> VMA %d finished. Sent %d pages.\n", i, pages_sent_this_vma);
