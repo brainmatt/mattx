@@ -249,62 +249,49 @@ static void handle_return_blueprint(struct mattx_link *link, struct mattx_header
             }
             spin_unlock(&export_lock);
 
-            // --- THE DYNAMIC BRAIN CARVER (Deadlock-Free Edition) ---
-            // The Surrogate may have allocated NEW memory while running on VM2!
-            // We must ensure the Deputy has these VMAs mapped before we inject data.
+
+            // --- THE NON-DESTRUCTIVE HOLE FILLER ---
+            // We walk the requested memory range. We preserve existing VMAs (like file-backed code),
+            // and we only carve new anonymous memory into the empty gaps!
             if (deputy->mm) {
                 for (int i = 0; i < req->vma_count; i++) {
                     unsigned long start = req->vmas[i].vm_start;
                     unsigned long size = req->vmas[i].vm_end - start;
                     unsigned long flags = req->vmas[i].vm_flags;
-                    
+                    unsigned long curr = start;
+                    unsigned long end = start + size;
 
-                    // 1. Take the READ lock to check if the VMA exists
-                    mmap_read_lock(deputy->mm);
-                    struct vm_area_struct *vma = find_vma(deputy->mm, start);
-                    
-                    // ONLY carve if there is literally no memory mapped at this starting address!
-                    // If vma->vm_start > start, it means there is a hole in the memory map.
-                    bool needs_mapping = (!vma || vma->vm_start > start);
-                    mmap_read_unlock(deputy->mm); // DROP THE LOCK!
-
-
-
-
-
-                    // 1. Take the READ lock to check if the ENTIRE VMA exists
-//                    mmap_read_lock(deputy->mm);
-//                    struct vm_area_struct *vma = find_vma(deputy->mm, start);
-//                    bool needs_mapping = true;
-                    
-                    // It only exists if the start matches AND the end covers the whole size!
-//                    if (vma && vma->vm_start <= start && vma->vm_end >= start + size) {
-//                        needs_mapping = false; 
-//                    }
-//                    mmap_read_unlock(deputy->mm); // DROP THE LOCK!
-
-
-
-
-                    // 2. If it's missing, carve it out safely!
-                    if (needs_mapping) {
-                        mattx_dbg("[RECALL] Carving NEW memory for Deputy: 0x%lx (Size: %lu)\n", start, size);
+                    while (curr < end) {
+                        mmap_read_lock(deputy->mm);
+                        struct vm_area_struct *vma = find_vma(deputy->mm, curr);
                         
-                        // We must temporarily adopt the Deputy's memory context to call vm_mmap
-                        kthread_use_mm(deputy->mm);
-                        
-                        unsigned long prot = PROT_READ | PROT_WRITE | PROT_EXEC;
-                        unsigned long map_flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED;
-                        
-                        if (flags & 0x0100) map_flags |= MAP_GROWSDOWN; // Stack protector
-                        
-                        // vm_mmap handles its own locking internally!
-                        unsigned long ret = vm_mmap(NULL, start, size, prot, map_flags, 0);
-                        if (IS_ERR_VALUE(ret)) {
-                            printk(KERN_ERR "MattX:[RECALL] FATAL: Failed to carve memory at 0x%lx (err: %ld)\n", start, ret);
+                        if (!vma || vma->vm_start > curr) {
+                            // We found a hole! Calculate exactly how big the gap is.
+                            unsigned long hole_end = vma ? vma->vm_start : end;
+                            if (hole_end > end) hole_end = end;
+                            unsigned long hole_size = hole_end - curr;
+                            mmap_read_unlock(deputy->mm); // Drop lock before carving!
+
+                            mattx_dbg("[RECALL] Carving HOLE for Deputy: 0x%lx (Size: %lu)\n", curr, hole_size);
+                            
+                            kthread_use_mm(deputy->mm);
+                            unsigned long prot = PROT_READ | PROT_WRITE | PROT_EXEC;
+                            unsigned long map_flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED;
+                            if (flags & 0x0100) map_flags |= MAP_GROWSDOWN; // Stack protector
+                            
+                            unsigned long ret = vm_mmap(NULL, curr, hole_size, prot, map_flags, 0);
+                            if (IS_ERR_VALUE(ret)) {
+                                printk(KERN_ERR "MattX:[RECALL] FATAL: Failed to carve hole at 0x%lx (err: %ld)\n", curr, ret);
+                            }
+                            kthread_unuse_mm(deputy->mm);
+                            
+                            curr = hole_end;
+                        } else {
+                            // Memory already exists here! Skip over it to preserve file-backed mappings!
+                            unsigned long skip_to = vma->vm_end;
+                            mmap_read_unlock(deputy->mm);
+                            curr = skip_to;
                         }
-                        
-                        kthread_unuse_mm(deputy->mm);
                     }
                 }
             }
