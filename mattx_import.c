@@ -53,17 +53,21 @@ static void handle_migrate_req(struct mattx_link *link, struct mattx_header *hdr
     }
 }
 
-
 static void handle_page_transfer(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
     if (payload && pending_migration && hijacked_stub_task) {
         struct mattx_page_header *ph = (struct mattx_page_header *)payload;
         void *data = (char *)payload + sizeof(struct mattx_page_header);
+        
+        // --- NEW: Use the absolute address directly! No more VMA index math! ---
         unsigned long target_addr = ph->absolute_addr;
+        
         int res;
         struct mm_struct *mm = hijacked_stub_task->mm;
         bool unprotect = false;
 
-        // 1. Temporarily unprotect the memory (W^X Bypass)
+        // --- THE W^X SECURITY BYPASS ---
+        // Kernel 7.0 refuses to write to Read-Only/Executable memory.
+        // We must temporarily force the VMA to be writable!
         if (mm) {
             mmap_write_lock(mm);
             struct vm_area_struct *vma = find_vma(mm, target_addr);
@@ -73,13 +77,13 @@ static void handle_page_transfer(struct mattx_link *link, struct mattx_header *h
                     unprotect = true;
                 }
             }
-            mmap_write_unlock(mm); // DROP THE LOCK SO PAGE FAULTS CAN HAPPEN!
+            mmap_write_unlock(mm);
         }
 
-        // 2. Inject the memory! (Page faults can now safely trigger and allocate RAM)
+        // Inject the memory!
         res = access_process_vm(hijacked_stub_task, target_addr, data, ph->length, FOLL_WRITE | FOLL_FORCE);
         
-        // 3. Lock the memory back up!
+        // Lock the memory back up!
         if (unprotect && mm) {
             mmap_write_lock(mm);
             struct vm_area_struct *vma = find_vma(mm, target_addr);
@@ -90,6 +94,7 @@ static void handle_page_transfer(struct mattx_link *link, struct mattx_header *h
         }
 
         if (res != ph->length) {
+            // Use ratelimited printing to prevent dmesg from freezing the TCP receiver!
             printk_ratelimited(KERN_WARNING "MattX:[IMPORT] ERROR: Failed to inject %u bytes at 0x%lx (res: %d)\n", 
                                ph->length, target_addr, res);
         } else {
@@ -233,6 +238,16 @@ static void handle_return_blueprint(struct mattx_link *link, struct mattx_header
 
         if (deputy) {
             mattx_dbg("[RECALL] Found frozen Deputy PID %d. Preparing for injection...\n", deputy->pid);
+            
+            // --- THE KWORKER KILL-SWITCH ---
+            spin_lock(&export_lock);
+            for (int i = 0; i < export_count; i++) {
+                if (export_registry[i].orig_pid == req->orig_pid) {
+                    export_registry[i].abort_rpc = true;
+                    break;
+                }
+            }
+            spin_unlock(&export_lock);
 
             // --- THE DYNAMIC BRAIN CARVER (Deadlock-Free Edition) ---
             // The Surrogate may have allocated NEW memory while running on VM2!
@@ -242,17 +257,18 @@ static void handle_return_blueprint(struct mattx_link *link, struct mattx_header
                     unsigned long start = req->vmas[i].vm_start;
                     unsigned long size = req->vmas[i].vm_end - start;
                     unsigned long flags = req->vmas[i].vm_flags;
-
-                    // 1. Take the READ lock to check if the VMA exists
+                    
+                    // 1. Take the READ lock to check if the ENTIRE VMA exists
                     mmap_read_lock(deputy->mm);
                     struct vm_area_struct *vma = find_vma(deputy->mm, start);
+                    bool needs_mapping = true;
                     
-                    // ONLY carve if there is literally no memory mapped at this starting address!
-                    // If vma->vm_start > start, it means there is a hole in the memory map.
-                    bool needs_mapping = (!vma || vma->vm_start > start);
+                    // It only exists if the start matches AND the end covers the whole size!
+                    if (vma && vma->vm_start <= start && vma->vm_end >= start + size) {
+                        needs_mapping = false; 
+                    }
                     mmap_read_unlock(deputy->mm); // DROP THE LOCK!
 
-                    
                     // 2. If it's missing, carve it out safely!
                     if (needs_mapping) {
                         mattx_dbg("[RECALL] Carving NEW memory for Deputy: 0x%lx (Size: %lu)\n", start, size);
@@ -299,7 +315,7 @@ static void handle_return_done(struct mattx_link *link, struct mattx_header *hdr
             memcpy(regs, &pending_migration->regs, sizeof(struct pt_regs));
             
             mattx_dbg("[IMPORT] Deputy Brain Restored. New RIP: 0x%lx\n", regs->ip);
-
+            
             spin_lock(&export_lock);
             for (i = 0; i < export_count; i++) {
                 if (export_registry[i].orig_pid == hijacked_stub_task->pid) {

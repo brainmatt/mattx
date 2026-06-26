@@ -505,12 +505,10 @@ void mattx_send_vma_data(void) {
                   i + 1, local_migration_req->vma_count, start, end, vma_size, vma_pages, vma_flags);
 
         // --- The Smart Return Optimization ---
-        // If returning, skip Read-Only memory (like the binary code).
-        // BUT NEVER SKIP THE STACK! (VM_GROWSDOWN = 0x0100). The stack must always return!
-        // if (is_returning && !(vma_flags & VM_WRITE) && !(vma_flags & 0x0100)) {
-        //     mattx_dbg("[MIGRATE] -> Skipping VMA %d (Read-Only during Return)\n", i);
-        //     continue;
-        // }
+        if (is_returning && !(vma_flags & VM_WRITE)) {
+            mattx_dbg("[MIGRATE] -> Skipping VMA %d (Read-Only during Return)\n", i);
+            continue;
+        }
 
         mattx_dbg("[MIGRATE] -> VMA %d: Entering page extraction loop...\n", i);
 
@@ -540,7 +538,7 @@ void mattx_send_vma_data(void) {
                         }
 
                         int send_res = mattx_comm_send(cluster_map[migrating_target_node], MATTX_MSG_PAGE_TRANSFER, payload_buf, payload_size);
-
+                        
                         if (send_res < payload_size) {
                             mattx_dbg("[MIGRATE] -> ERROR: Network send blocked/failed at VMA %d, Offset 0x%lx (Sent %d/%zu bytes)\n", 
                                       i, curr - start, send_res, payload_size);
@@ -562,6 +560,14 @@ void mattx_send_vma_data(void) {
                 mattx_dbg("[MIGRATE] -> ERROR: Failed to allocate page_buf for VMA %d, Offset 0x%lx\n", i, curr - start);
             }
             curr += chunk_size;
+
+            // --- NEW: THE BREATHING PUMP ---
+            // Give the CPU a chance to process network ACKs and let VM1 catch up!
+            // We also add a tiny 1ms sleep every 1024 pages (4MB) to guarantee the TCP window stays open.
+            cond_resched();
+            if (pages_sent_this_vma % 1024 == 0) {
+                msleep(1);
+            }
         }
 
         mattx_dbg("[MIGRATE] -> VMA %d finished. Sent %d pages.\n", i, pages_sent_this_vma);
@@ -607,24 +613,11 @@ void mattx_trigger_recall(pid_t orig_pid) {
         return;
     }
 
-    // --- NEW: THE PRE-EMPTIVE KILL-SWITCH ---
-    // Abort any pending Kworkers on VM1 BEFORE we tell VM2 to freeze the Surrogate!
-    // This prevents the Surrogate from deadlocking while waiting for an RPC!
-    spin_lock(&export_lock);
-    for (int i = 0; i < export_count; i++) {
-        if (export_registry[i].orig_pid == orig_pid) {
-            export_registry[i].abort_rpc = true;
-            break;
-        }
-    }
-    spin_unlock(&export_lock);
-
     req.orig_pid = orig_pid;
 
     mattx_dbg(" [RECALL] Sending RECALL_REQ for PID %d to Node %d...\n", orig_pid, target_node);
     mattx_comm_send(cluster_map[target_node], MATTX_MSG_RECALL_REQ, &req, sizeof(req));
 }
-
 
 static void handle_ready_for_data(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
     mattx_dbg("[EXPORT] Received READY signal from Node %u. Starting data pump...\n", hdr->sender_id);
