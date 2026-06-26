@@ -233,16 +233,6 @@ static void handle_return_blueprint(struct mattx_link *link, struct mattx_header
 
         if (deputy) {
             mattx_dbg("[RECALL] Found frozen Deputy PID %d. Preparing for injection...\n", deputy->pid);
-            
-            // --- THE KWORKER KILL-SWITCH ---
-            spin_lock(&export_lock);
-            for (int i = 0; i < export_count; i++) {
-                if (export_registry[i].orig_pid == req->orig_pid) {
-                    export_registry[i].abort_rpc = true;
-                    break;
-                }
-            }
-            spin_unlock(&export_lock);
 
             // --- THE DYNAMIC BRAIN CARVER (Deadlock-Free Edition) ---
             // The Surrogate may have allocated NEW memory while running on VM2!

@@ -562,11 +562,6 @@ void mattx_send_vma_data(void) {
                 mattx_dbg("[MIGRATE] -> ERROR: Failed to allocate page_buf for VMA %d, Offset 0x%lx\n", i, curr - start);
             }
             curr += chunk_size;
-
-            // --- THE DIGITAL 0 OR 1 TEST: EXTREME SLOWDOWN ---
-            // Force a 1 millisecond sleep after EVERY SINGLE PAGE.
-            // This guarantees the Netlink buffer on VM1 will never overflow.
-            msleep(1);
         }
 
         mattx_dbg("[MIGRATE] -> VMA %d finished. Sent %d pages.\n", i, pages_sent_this_vma);
@@ -612,11 +607,24 @@ void mattx_trigger_recall(pid_t orig_pid) {
         return;
     }
 
+    // --- NEW: THE PRE-EMPTIVE KILL-SWITCH ---
+    // Abort any pending Kworkers on VM1 BEFORE we tell VM2 to freeze the Surrogate!
+    // This prevents the Surrogate from deadlocking while waiting for an RPC!
+    spin_lock(&export_lock);
+    for (int i = 0; i < export_count; i++) {
+        if (export_registry[i].orig_pid == orig_pid) {
+            export_registry[i].abort_rpc = true;
+            break;
+        }
+    }
+    spin_unlock(&export_lock);
+
     req.orig_pid = orig_pid;
 
     mattx_dbg(" [RECALL] Sending RECALL_REQ for PID %d to Node %d...\n", orig_pid, target_node);
     mattx_comm_send(cluster_map[target_node], MATTX_MSG_RECALL_REQ, &req, sizeof(req));
 }
+
 
 static void handle_ready_for_data(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
     mattx_dbg("[EXPORT] Received READY signal from Node %u. Starting data pump...\n", hdr->sender_id);
