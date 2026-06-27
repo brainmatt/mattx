@@ -249,75 +249,52 @@ static void handle_return_blueprint(struct mattx_link *link, struct mattx_header
             }
             spin_unlock(&export_lock);
 
-
-            // --- THE NON-DESTRUCTIVE HOLE FILLER ---
-            // We walk the requested memory range. We preserve existing VMAs (like file-backed code),
-            // and we only carve new anonymous memory into the empty gaps!
+            // --- THE EXECUTABLE-AWARE BRAIN CARVER ---
             if (deputy->mm) {
                 for (int i = 0; i < req->vma_count; i++) {
                     unsigned long start = req->vmas[i].vm_start;
                     unsigned long size = req->vmas[i].vm_end - start;
                     unsigned long flags = req->vmas[i].vm_flags;
-                    unsigned long curr = start;
-                    unsigned long end = start + size;
-
-                    while (curr < end) {
-                        mmap_read_lock(deputy->mm);
-                        struct vm_area_struct *vma = find_vma(deputy->mm, curr);
+                    
+                    // RULE 1: PRESERVE EXECUTABLE CODE
+                    // If the memory is executable, it is likely file-backed (the binary itself).
+                    // We MUST NOT destroy it with MAP_FIXED, or the process will segfault on wake.
+                    if (flags & VM_EXEC) {
+                        mattx_dbg("[RECALL] Preserving Executable Memory: 0x%lx\n", start);
+                        continue; 
+                    }
+                    
+                    // RULE 2: DESTROY AND RECREATE DATA SEGMENTS
+                    // For data, heap, and MPI buffers, we want a clean, contiguous, writable VMA.
+                    // If the existing memory is fragmented, access_process_vm will choke and hang.
+                    // We use the Destructive Carver to wipe it and lay down fresh anonymous memory.
+                    mmap_read_lock(deputy->mm);
+                    struct vm_area_struct *vma = find_vma(deputy->mm, start);
+                    bool needs_mapping = true;
+                    
+                    // Only skip carving if a single VMA perfectly covers the entire requested size
+                    if (vma && vma->vm_start <= start && vma->vm_end >= start + size) {
+                        needs_mapping = false; 
+                    }
+                    mmap_read_unlock(deputy->mm);
+                    
+                    if (needs_mapping) {
+                        mattx_dbg("[RECALL] Carving CLEAN memory for Deputy: 0x%lx (Size: %lu)\n", start, size);
                         
-                        if (!vma || vma->vm_start > curr) {
-                            // We found a hole! Calculate exactly how big the gap is.
-                            unsigned long hole_end = vma ? vma->vm_start : end;
-                            if (hole_end > end) hole_end = end;
-                            unsigned long hole_size = hole_end - curr;
-                            mmap_read_unlock(deputy->mm); // Drop lock before carving!
-
-                            mattx_dbg("[RECALL] Carving HOLE for Deputy: 0x%lx (Size: %lu)\n", curr, hole_size);
-
-                            kthread_use_mm(deputy->mm);
-                            unsigned long prot = PROT_READ | PROT_WRITE | PROT_EXEC;
-                            
-                            // --- NEW: THE BLUEPRINT MIRROR ---
-                            // Translate internal vm_flags back to mmap flags!
-                            unsigned long map_flags = MAP_FIXED;
-                            
-                            // Is it Shared or Private? (VM_SHARED = 0x08)
-                            if (flags & 0x08) {
-                                map_flags |= MAP_SHARED;
-                            } else {
-                                map_flags |= MAP_PRIVATE;
-                            }
-                            
-                            // Is it Anonymous? (VM_ANON doesn't exist as a simple flag, 
-                            // but if it's a hole we are filling, it's almost certainly anonymous data)
-                            map_flags |= MAP_ANONYMOUS;
-                            
-                            // Is it a Huge Page? (VM_HUGETLB = 0x400000)
-                            if (flags & 0x400000) {
-                                map_flags |= MAP_HUGETLB;
-                            }
-                            
-                            // Is it the Stack? (VM_GROWSDOWN = 0x0100)
-                            if (flags & 0x0100) {
-                                map_flags |= MAP_GROWSDOWN; 
-                            }
-                            
-                            unsigned long ret = vm_mmap(NULL, curr, hole_size, prot, map_flags, 0);
-                            if (IS_ERR_VALUE(ret)) {
-                                printk(KERN_ERR "MattX:[RECALL] FATAL: Failed to carve hole at 0x%lx (err: %ld)\n", curr, ret);
-                            }
-                            kthread_unuse_mm(deputy->mm);
-                            
-                            curr = hole_end;
-                        } else {
-                            // Memory already exists here! Skip over it to preserve file-backed mappings!
-                            unsigned long skip_to = vma->vm_end;
-                            mmap_read_unlock(deputy->mm);
-                            curr = skip_to;
+                        kthread_use_mm(deputy->mm);
+                        unsigned long prot = PROT_READ | PROT_WRITE | PROT_EXEC;
+                        unsigned long map_flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED;
+                        if (flags & 0x0100) map_flags |= MAP_GROWSDOWN; // Stack protector
+                        
+                        unsigned long ret = vm_mmap(NULL, start, size, prot, map_flags, 0);
+                        if (IS_ERR_VALUE(ret)) {
+                            printk(KERN_ERR "MattX:[RECALL] FATAL: Failed to carve memory at 0x%lx (err: %ld)\n", start, ret);
                         }
+                        kthread_unuse_mm(deputy->mm);
                     }
                 }
             }
+
 
             if (hijacked_stub_task) put_task_struct(hijacked_stub_task);
             hijacked_stub_task = deputy;
