@@ -59,6 +59,7 @@ static int nodes_show(struct seq_file *m, void *v) {
     
     seq_printf(m, "\nBalancer Enabled: %s\n", balancer_enabled ? "YES" : "NO");
     seq_printf(m, "MattXFS Enabled: %s\n", config_mattxfs_enabled ? "YES" : "NO");
+    seq_printf(m, "MPI Support: %s\n", config_mpi_support ? "YES" : "NO");
     seq_printf(m, "Debug Mode: %s\n", config_debug_mode ? "ON" : "OFF");
     seq_printf(m, "Node Affinity: %u (0 = Auto)\n", config_node_affinity);
     seq_printf(m, "Migration Excludes: %s\n", config_migration_excludes);
@@ -189,6 +190,10 @@ static ssize_t admin_write(struct file *file, const char __user *ubuf, size_t co
             config_mattxfs_enabled = (arg1 != 0);
             mattx_dbg(" [ADMIN] MattXFS Mode set to: %s\n", config_mattxfs_enabled ? "ON" : "OFF");
         }        
+        else if (strcmp(cmd, "mpi") == 0 && arg1 != -1) {
+            config_mpi_support = (arg1 != 0);
+            mattx_dbg(" [ADMIN] MPI Support set to: %s\n", config_mpi_support ? "ON" : "OFF");
+        }
         else if (strcmp(cmd, "migrate") == 0 && arg1 != -1 && arg2_str[0] != '\0') {
             
             if (strcmp(arg2_str, "home") == 0) {

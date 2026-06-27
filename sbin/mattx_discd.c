@@ -40,7 +40,7 @@
 #define DEFAULT_PORT 7225
 #define DEFAULT_IFACE "eth0"
 
-enum { MATTX_ATTR_UNSPEC, MATTX_ATTR_NODE_ID, MATTX_ATTR_IPV4_ADDR, MATTX_ATTR_STUB_PID, MATTX_ATTR_BLUEPRINT, MATTX_ATTR_MY_NODE_ID, MATTX_ATTR_LOCAL_IP, MATTX_ATTR_CONFIG_FILE_IO, MATTX_ATTR_CONFIG_NET_IO, MATTX_ATTR_MATTXFS_ENABLED, MATTX_ATTR_DFSA_DIR, __MATTX_ATTR_MAX };
+enum { MATTX_ATTR_UNSPEC, MATTX_ATTR_NODE_ID, MATTX_ATTR_IPV4_ADDR, MATTX_ATTR_STUB_PID, MATTX_ATTR_BLUEPRINT, MATTX_ATTR_MY_NODE_ID, MATTX_ATTR_LOCAL_IP, MATTX_ATTR_CONFIG_FILE_IO, MATTX_ATTR_CONFIG_NET_IO, MATTX_ATTR_MATTXFS_ENABLED, MATTX_ATTR_DFSA_DIR, MATTX_ATTR_MPI_SUPPORT, __MATTX_ATTR_MAX };
 #define MATTX_ATTR_MAX (__MATTX_ATTR_MAX - 1)
 
 enum { MATTX_CMD_UNSPEC, MATTX_CMD_NODE_JOIN, MATTX_CMD_NODE_LEAVE, MATTX_CMD_HIJACK_ME, MATTX_CMD_GET_BLUEPRINT, MATTX_CMD_SET_LOCAL_IP, MATTX_CMD_SET_CONFIG, __MATTX_CMD_MAX };
@@ -55,6 +55,7 @@ struct mattx_config {
     uint8_t migrate_net_io;
     uint8_t mattxfs_enabled;
     char dfsa_dir[256];
+    uint8_t mpi_support;
     char autodiscovery[32]; // Discovery Mode ---
 
 };
@@ -125,7 +126,8 @@ void register_config_to_kernel() {
     if (strlen(config.dfsa_dir) > 0) {
         nla_put_string(msg, MATTX_ATTR_DFSA_DIR, config.dfsa_dir);
     }
-    
+    nla_put_u8(msg, MATTX_ATTR_MPI_SUPPORT, config.mpi_support);
+
     if (nl_send_auto(nl_sock, msg) < 0) {
         printf("ERROR: Failed to push configuration to kernel.\n");
     } else {
@@ -210,6 +212,7 @@ void load_config() {
     config.migrate_file_io = 1;
     config.migrate_net_io = 1;
     config.mattxfs_enabled = 1; // Default to true
+    config.mpi_support = 0; // Default to false
 
     FILE *fp = fopen(CONFIG_FILE, "r");
     if (!fp) {
@@ -238,6 +241,11 @@ void load_config() {
             continue;
         }
         if (sscanf(line, "DFSA_DIR=%255s", config.dfsa_dir)) continue;        
+
+        if (sscanf(line, "MPI_SUPPORT=%s", temp_val)) {
+            if (strcmp(temp_val, "true") == 0 || strcmp(temp_val, "1") == 0) config.mpi_support = 1;
+            continue;
+        }
     }
     fclose(fp);
     if (config.node_id == 0) config.node_id = generate_node_id(config.interface);

@@ -259,30 +259,40 @@ static void handle_return_blueprint(struct mattx_link *link, struct mattx_header
                     unsigned long flags = req->vmas[i].vm_flags;
                     
 
-                    // migtest working / mpitest hangs on returning home
-                    // 1. Take the READ lock to check if the VMA exists
-                    mmap_read_lock(deputy->mm);
-                    struct vm_area_struct *vma = find_vma(deputy->mm, start);
-                    
-                    // ONLY carve if there is literally no memory mapped at this starting address!
-                    // If vma->vm_start > start, it means there is a hole in the memory map.
-                    bool needs_mapping = (!vma || vma->vm_start > start);
-                    mmap_read_unlock(deputy->mm); // DROP THE LOCK!
 
+                    // here we check for MPI_SUPPORT and if it's enabled it needs to check if the entire VMA exists, 
+                    // not just the start address. This is because MPI applications may have large contiguous memory
+                    // regions that need to be preserved during migration. If the entire VMA does not exist, we will
+                    // carve it out to ensure the Deputy has the necessary memory mapped before we inject data.
+                    bool needs_mapping = true;
+                    if (config_mpi_support) {
+                        //  "mpitest working / migtest segfaults on returning home"
+                        // 1. Take the READ lock to check if the ENTIRE VMA exists
+                        mmap_read_lock(deputy->mm);
+                        struct vm_area_struct *vma = find_vma(deputy->mm, start);
+                        
+                        // It only exists if the start matches AND the end covers the whole size!
+                        if (vma && vma->vm_start <= start && vma->vm_end >= start + size) {
+                            needs_mapping = false; 
+                        }
+                        mmap_read_unlock(deputy->mm); // DROP THE LOCK!
 
+                    } else {
 
-                    //  "mpitest working / migtest segfaults on returning home"
-                    // 1. Take the READ lock to check if the ENTIRE VMA exists
-//                    mmap_read_lock(deputy->mm);
-//                    struct vm_area_struct *vma = find_vma(deputy->mm, start);
-//                    bool needs_mapping = true;
-                    
-                    // It only exists if the start matches AND the end covers the whole size!
-//                    if (vma && vma->vm_start <= start && vma->vm_end >= start + size) {
-//                        needs_mapping = false; 
-//                    }
-//                    mmap_read_unlock(deputy->mm); // DROP THE LOCK!
+                        // regular processes only need to check if the start address exists, 
+                        // as they typically don't have large contiguous memory regions like MPI applications.
 
+                        // migtest working / mpitest hangs on returning home
+                        // 1. Take the READ lock to check if the VMA exists
+                        mmap_read_lock(deputy->mm);
+                        struct vm_area_struct *vma = find_vma(deputy->mm, start);
+                        
+                        // ONLY carve if there is literally no memory mapped at this starting address!
+                        // If vma->vm_start > start, it means there is a hole in the memory map.
+                        needs_mapping = (!vma || vma->vm_start > start);
+                        mmap_read_unlock(deputy->mm); // DROP THE LOCK!
+
+                    }
 
 
                     

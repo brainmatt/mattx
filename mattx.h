@@ -929,6 +929,8 @@ extern mattx_sys_close_fn real_sys_close;
 // Configuration Toggles
 extern bool config_migrate_file_io;
 extern bool config_migrate_network_io;
+extern bool config_mpi_support;
+
 
 int mattx_comm_send(struct mattx_link *link, u32 type, void *data, u32 len);
 int mattx_comm_send_ctrl(struct mattx_link *link, u32 type, void *data, u32 len);
