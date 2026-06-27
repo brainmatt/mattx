@@ -1,0 +1,263 @@
+<!--
+#
+# MattX - The Modern Single System Image (SSI) Cluster
+# 
+# Copyright (c) 2026 by Matthias Rechenburg
+# All rights reserved.
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 2 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
+#
+# Commercial licensing options are available upon request.
+#
+-->
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>MattX // Cyberpunk MPIChess</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #050505; font-family: 'Courier New', Courier, monospace; }
+        #canvas-container { width: 100vw; height: 100vh; }
+        #hud {
+            position: absolute; top: 20px; left: 20px; color: #00ffcc;
+            text-shadow: 0 0 5px #00ffcc; pointer-events: none;
+        }
+        h1 { margin: 0; font-size: 24px; letter-spacing: 2px; }
+        p { margin: 5px 0; font-size: 16px; }
+        #last-move { font-size: 20px; color: #ff00ff; font-weight: bold; text-shadow: 0 0 8px #ff00ff; }
+    </style>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+</head>
+<body>
+
+<div id="hud">
+    <h1>MATTX // MPICHESS</h1>
+    <p>Distributed Minimax Evaluation Engine</p>
+    <p>Last Move: <span id="last-move">AWAITING DATA...</span></p>
+</div>
+
+<div id="canvas-container"></div>
+
+<script>
+    // --- 1. SCENE SETUP ---
+    const scene = new THREE.Scene();
+    scene.fog = new THREE.FogExp2(0x050505, 0.015);
+
+    const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 1000);
+    camera.position.set(0, 12, 14);
+    camera.lookAt(0, 0, 0);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    document.getElementById('canvas-container').appendChild(renderer.domElement);
+
+    const ambientLight = new THREE.AmbientLight(0x222222);
+    scene.add(ambientLight);
+    const pointLight = new THREE.PointLight(0xffffff, 1.2, 100);
+    pointLight.position.set(0, 15, 0);
+    scene.add(pointLight);
+
+    // --- 2. THE CHESSBOARD ---
+    const boardGroup = new THREE.Group();
+    scene.add(boardGroup);
+    
+    const squareGeo = new THREE.BoxGeometry(1, 0.2, 1);
+    const darkMat = new THREE.MeshStandardMaterial({ color: 0x111111, metalness: 0.8, roughness: 0.2 });
+    const lightMat = new THREE.MeshStandardMaterial({ color: 0x333333, metalness: 0.8, roughness: 0.2 });
+
+    // Map algebraic coordinates (e.g., 'e2') to 3D positions
+    function getSquarePos(file, rank) {
+        const x = (file.charCodeAt(0) - 97) - 3.5; // 'a' to 'h' -> -3.5 to 3.5
+        const z = 3.5 - (parseInt(rank) - 1);      // '1' to '8' -> 3.5 to -3.5
+        return new THREE.Vector3(x, 0.1, z);
+    }
+
+    for (let row = 0; row < 8; row++) {
+        for (let col = 0; col < 8; col++) {
+            const isLight = (row + col) % 2 !== 0;
+            const square = new THREE.Mesh(squareGeo, isLight ? lightMat : darkMat);
+            square.position.set(col - 3.5, 0, row - 3.5);
+            
+            // Add neon borders
+            const edges = new THREE.EdgesGeometry(squareGeo);
+            const line = new THREE.LineSegments(edges, new THREE.LineBasicMaterial({ color: 0x00ffcc, transparent: true, opacity: 0.2 }));
+            square.add(line);
+            
+            boardGroup.add(square);
+        }
+    }
+
+    // --- 3. HACKER GEOMETRY (THE PIECES) ---
+    const pieces = {}; // Dictionary mapping square (e.g., 'e2') to Mesh
+    
+    const whiteMat = new THREE.MeshStandardMaterial({ color: 0x00ffff, emissive: 0x004444, metalness: 0.9, roughness: 0.1 });
+    const blackMat = new THREE.MeshStandardMaterial({ color: 0xff00ff, emissive: 0x440044, metalness: 0.9, roughness: 0.1 });
+
+    function createPiece(type, color, file, rank) {
+        let geo, mesh;
+        const mat = color === 'w' ? whiteMat : blackMat;
+
+        // --- THE GRAVITY FIX ---
+        // Translate the geometries so their origin (0,0,0) is at their feet!
+        if (type === 'p') { geo = new THREE.TetrahedronGeometry(0.35); geo.translate(0, 0.35, 0); }
+        else if (type === 'r') { geo = new THREE.BoxGeometry(0.5, 0.8, 0.5); geo.translate(0, 0.4, 0); }
+        else if (type === 'n') { geo = new THREE.CylinderGeometry(0.2, 0.4, 0.8, 8); geo.translate(0, 0.4, 0); }
+        else if (type === 'b') { geo = new THREE.OctahedronGeometry(0.4); geo.translate(0, 0.4, 0); }
+        else if (type === 'q') { geo = new THREE.ConeGeometry(0.4, 1.2, 16); geo.translate(0, 0.6, 0); }
+        else if (type === 'k') { geo = new THREE.CylinderGeometry(0.3, 0.3, 1.4, 16); geo.translate(0, 0.7, 0); }
+
+        mesh = new THREE.Mesh(geo, mat);
+        
+        // Tilt the knight forward for momentum, tilt the pawn to look like a pyramid
+        if (type === 'n') { mesh.rotation.x = Math.PI / 6; }
+        if (type === 'p') { mesh.rotation.x = Math.PI / 4; mesh.rotation.y = Math.PI / 4; }
+
+        const pos = getSquarePos(file, rank);
+        mesh.position.set(pos.x, 0.1, pos.z); // 0.1 is exactly flush with the top of the board!
+        
+        // Save the base height so the animation knows where to land
+        mesh.userData.baseY = 0.1; 
+
+        scene.add(mesh);
+        pieces[file + rank] = mesh;
+    }
+    
+    // Initialize Standard Board
+    const setup = [
+        ['r','n','b','q','k','b','n','r'], // Rank 1 & 8
+        ['p','p','p','p','p','p','p','p']  // Rank 2 & 7
+    ];
+    
+    for (let i = 0; i < 8; i++) {
+        const file = String.fromCharCode(97 + i);
+        createPiece(setup[0][i], 'w', file, '1');
+        createPiece(setup[1][i], 'w', file, '2');
+        createPiece(setup[1][i], 'b', file, '7');
+        createPiece(setup[0][i], 'b', file, '8');
+    }
+
+    // --- 4. ANIMATION ENGINE ---
+    let activeMove = null;
+
+    function executeMove(moveStr) {
+        // Parse move (e.g., "e2e4" or "e2-e4")
+        const cleanMove = moveStr.replace('-', '').trim().toLowerCase();
+        if (cleanMove.length < 4) return;
+
+        const fromSq = cleanMove.substring(0, 2);
+        const toSq = cleanMove.substring(2, 4);
+
+        const piece = pieces[fromSq];
+        if (!piece) return; // No piece there!
+
+        const startPos = piece.position.clone();
+        const endPos = getSquarePos(toSq[0], toSq[1]);
+        endPos.y = piece.userData.baseY; // Land perfectly flush on the board!
+
+        // Check for capture
+        const targetPiece = pieces[toSq];
+        if (targetPiece) {
+            scene.remove(targetPiece);
+            targetPiece.geometry.dispose();
+        }
+
+        // Update internal state
+        delete pieces[fromSq];
+        pieces[toSq] = piece;
+
+        // --- THE ABANDONMENT FIX ---
+        // If another piece is currently flying, instantly snap it to its destination 
+        // before we overwrite the activeMove variable!
+        if (activeMove) {
+            activeMove.mesh.position.copy(activeMove.end);
+        }
+
+        // Trigger 3D Hop Animation
+        activeMove = {
+            mesh: piece,
+            start: startPos,
+            end: endPos,
+            progress: 0.0
+        };
+
+        document.getElementById('last-move').innerText = moveStr.toUpperCase();
+    }
+
+    function animate() {
+        requestAnimationFrame(animate);
+
+        // Handle Piece Movement
+        if (activeMove) {
+            activeMove.progress += 0.05; // Speed of the hop
+            if (activeMove.progress >= 1.0) {
+                activeMove.mesh.position.copy(activeMove.end);
+                activeMove = null;
+            } else {
+                // Linear interpolation for X and Z
+                const currentX = THREE.MathUtils.lerp(activeMove.start.x, activeMove.end.x, activeMove.progress);
+                const currentZ = THREE.MathUtils.lerp(activeMove.start.z, activeMove.end.z, activeMove.progress);
+                
+                // Sine wave for the Y-axis "Hop"
+                const hopHeight = 2.0;
+                const currentY = activeMove.start.y + Math.sin(activeMove.progress * Math.PI) * hopHeight;
+                
+                activeMove.mesh.position.set(currentX, currentY, currentZ);
+            }
+        }
+
+        // Slowly rotate the camera around the board
+        const time = Date.now() * 0.0002;
+        camera.position.x = Math.sin(time) * 12;
+        camera.position.z = Math.cos(time) * 12;
+        camera.lookAt(0, 0, 0);
+
+        renderer.render(scene, camera);
+    }
+
+    animate();
+
+    // --- 5. POLLING LOGIC ---
+    let lastMoveStr = "";
+
+    async function fetchMove() {
+        try {
+            const response = await fetch('/move');
+            if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
+            
+            const data = await response.json();
+            const newMove = data.move;
+            
+            if (newMove && newMove !== lastMoveStr) {
+                executeMove(newMove);
+                lastMoveStr = newMove;
+            }
+        } catch (error) {
+            console.error('Error fetching data:', error);
+        }
+    }
+
+    // Poll every 1 second
+    setInterval(fetchMove, 1000);
+
+    window.addEventListener('resize', () => {
+        camera.aspect = window.innerWidth / window.innerHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+</script>
+</body>
+</html>
+
