@@ -249,55 +249,65 @@ static void handle_return_blueprint(struct mattx_link *link, struct mattx_header
             }
             spin_unlock(&export_lock);
 
-
-            // --- MATT'S HEURISTIC BRAIN CARVER ---
-            // Detect complex apps (like MPI) vs simple apps (like migtest)
-            // MPI apps open dozens of FDs for communication rings. Simple apps open < 10.
-            bool is_complex_app = (req->fd_count > 10);
-            
+            // --- THE DYNAMIC BRAIN CARVER (Deadlock-Free Edition) ---
+            // The Surrogate may have allocated NEW memory while running on VM2!
+            // We must ensure the Deputy has these VMAs mapped before we inject data.
             if (deputy->mm) {
                 for (int i = 0; i < req->vma_count; i++) {
                     unsigned long start = req->vmas[i].vm_start;
                     unsigned long size = req->vmas[i].vm_end - start;
                     unsigned long flags = req->vmas[i].vm_flags;
                     
+
+                    // migtest working / mpitest hangs on returning home
+                    // 1. Take the READ lock to check if the VMA exists
+//                    mmap_read_lock(deputy->mm);
+//                    struct vm_area_struct *vma = find_vma(deputy->mm, start);
+                    
+                    // ONLY carve if there is literally no memory mapped at this starting address!
+                    // If vma->vm_start > start, it means there is a hole in the memory map.
+//                    bool needs_mapping = (!vma || vma->vm_start > start);
+//                    mmap_read_unlock(deputy->mm); // DROP THE LOCK!
+
+
+
+                    //  "mpitest working / migtest segfaults on returning home"
+                    // 1. Take the READ lock to check if the ENTIRE VMA exists
                     mmap_read_lock(deputy->mm);
                     struct vm_area_struct *vma = find_vma(deputy->mm, start);
-                    bool needs_mapping = false;
+                    bool needs_mapping = true;
                     
-                    if (is_complex_app) {
-                        // LOGIC 2: DESTRUCTIVE CARVER (For mpitest & heavy HPC)
-                        // Wipe and recreate if it doesn't perfectly cover the size
-                        needs_mapping = true;
-                        if (vma && vma->vm_start <= start && vma->vm_end >= start + size) {
-                            needs_mapping = false; 
-                        }
-                    } else {
-                        // LOGIC 1: SAFE CARVER (For migtest & simple apps)
-                        // Only carve if there is literally a hole at the starting address
-                        if (!vma || vma->vm_start > start) {
-                            needs_mapping = true;
-                        }
+                    // It only exists if the start matches AND the end covers the whole size!
+                    if (vma && vma->vm_start <= start && vma->vm_end >= start + size) {
+                        needs_mapping = false; 
                     }
-                    mmap_read_unlock(deputy->mm);
+                    mmap_read_unlock(deputy->mm); // DROP THE LOCK!
+
+
+
                     
+                    // 2. If it's missing, carve it out safely!
                     if (needs_mapping) {
-                        mattx_dbg("[RECALL] Carving memory for Deputy: 0x%lx (Size: %lu, Complex: %d)\n", start, size, is_complex_app);
+                        mattx_dbg("[RECALL] Carving NEW memory for Deputy: 0x%lx (Size: %lu)\n", start, size);
                         
+                        // We must temporarily adopt the Deputy's memory context to call vm_mmap
                         kthread_use_mm(deputy->mm);
+                        
                         unsigned long prot = PROT_READ | PROT_WRITE | PROT_EXEC;
                         unsigned long map_flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED;
+                        
                         if (flags & 0x0100) map_flags |= MAP_GROWSDOWN; // Stack protector
                         
+                        // vm_mmap handles its own locking internally!
                         unsigned long ret = vm_mmap(NULL, start, size, prot, map_flags, 0);
                         if (IS_ERR_VALUE(ret)) {
                             printk(KERN_ERR "MattX:[RECALL] FATAL: Failed to carve memory at 0x%lx (err: %ld)\n", start, ret);
                         }
+                        
                         kthread_unuse_mm(deputy->mm);
                     }
                 }
             }
-
 
             if (hijacked_stub_task) put_task_struct(hijacked_stub_task);
             hijacked_stub_task = deputy;

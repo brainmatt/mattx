@@ -505,9 +505,7 @@ void mattx_send_vma_data(void) {
                   i + 1, local_migration_req->vma_count, start, end, vma_size, vma_pages, vma_flags);
 
         // --- The Smart Return Optimization ---
-        // If returning, skip Read-Only memory (like the binary code).
-        // BUT NEVER SKIP THE STACK! (VM_GROWSDOWN = 0x0100). The stack must always return!
-        if (is_returning && !(vma_flags & VM_WRITE) && !(vma_flags & 0x0100)) {
+        if (is_returning && !(vma_flags & VM_WRITE)) {
             mattx_dbg("[MIGRATE] -> Skipping VMA %d (Read-Only during Return)\n", i);
             continue;
         }
