@@ -250,8 +250,11 @@ static void handle_return_blueprint(struct mattx_link *link, struct mattx_header
             spin_unlock(&export_lock);
 
 
-            // --- THE FILE-AWARE BRAIN CARVER ---
-            // Synthesizing Logic 1 (Safe) and Logic 2 (Destructive) based on memory type!
+            // --- MATT'S HEURISTIC BRAIN CARVER ---
+            // Detect complex apps (like MPI) vs simple apps (like migtest)
+            // MPI apps open dozens of FDs for communication rings. Simple apps open < 10.
+            bool is_complex_app = (req->fd_count > 10);
+            
             if (deputy->mm) {
                 for (int i = 0; i < req->vma_count; i++) {
                     unsigned long start = req->vmas[i].vm_start;
@@ -260,32 +263,26 @@ static void handle_return_blueprint(struct mattx_link *link, struct mattx_header
                     
                     mmap_read_lock(deputy->mm);
                     struct vm_area_struct *vma = find_vma(deputy->mm, start);
-                    
-                    // The Ultimate Check: Is this memory File-Backed or Anonymous RAM?
-                    bool is_file_backed = (vma && vma->vm_start <= start && vma->vm_file != NULL);
                     bool needs_mapping = false;
                     
-                    if (is_file_backed) {
-                        // LOGIC 1: THE SAFE CARVER (Preserves migtest's executable code)
-                        // Only carve if there is literally a hole at the starting address.
-                        if (!vma || vma->vm_start > start) {
-                            needs_mapping = true;
-                        } else {
-                            mattx_dbg("[RECALL] Preserving File-Backed Memory: 0x%lx\n", start);
-                        }
-                    } else {
-                        // LOGIC 2: THE DESTRUCTIVE CARVER (Fixes mpitest's fragmented buffers)
-                        // If it's anonymous RAM, we want a clean, contiguous block.
-                        // If the existing VMA doesn't perfectly cover the size, wipe and recreate it!
+                    if (is_complex_app) {
+                        // LOGIC 2: DESTRUCTIVE CARVER (For mpitest & heavy HPC)
+                        // Wipe and recreate if it doesn't perfectly cover the size
                         needs_mapping = true;
                         if (vma && vma->vm_start <= start && vma->vm_end >= start + size) {
                             needs_mapping = false; 
+                        }
+                    } else {
+                        // LOGIC 1: SAFE CARVER (For migtest & simple apps)
+                        // Only carve if there is literally a hole at the starting address
+                        if (!vma || vma->vm_start > start) {
+                            needs_mapping = true;
                         }
                     }
                     mmap_read_unlock(deputy->mm);
                     
                     if (needs_mapping) {
-                        mattx_dbg("[RECALL] Carving memory for Deputy: 0x%lx (Size: %lu, FileBacked: %d)\n", start, size, is_file_backed);
+                        mattx_dbg("[RECALL] Carving memory for Deputy: 0x%lx (Size: %lu, Complex: %d)\n", start, size, is_complex_app);
                         
                         kthread_use_mm(deputy->mm);
                         unsigned long prot = PROT_READ | PROT_WRITE | PROT_EXEC;
