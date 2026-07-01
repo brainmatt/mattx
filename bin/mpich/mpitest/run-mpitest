@@ -22,4 +22,6 @@
 # Commercial licensing options are available upon request.
 #
 
+export MPICH_NO_LOCAL=1
+
 mpirun -np 1 ./mpitest
