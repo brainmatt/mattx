@@ -59,6 +59,10 @@ void add_guest_process(pid_t local_pid, u32 orig_pid, int home_node) {
         guest_registry[guest_count].rpc_statx_buf = NULL;
         guest_registry[guest_count].rpc_fsync_res = 0;
 
+        // Init DSM Map ---
+        guest_registry[guest_count].dsm_count = 0;
+        memset(guest_registry[guest_count].dsm_map, 0, sizeof(guest_registry[guest_count].dsm_map));
+
         guest_count++;
     } else {
         printk(KERN_WARNING "MattX: [REGISTRY] Guest registry is full!\n");

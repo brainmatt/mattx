@@ -65,6 +65,8 @@ struct mattx_vma_info {
     uint64_t vm_start;
     uint64_t vm_end;
     uint64_t vm_flags;
+    uint32_t shmid;
+    uint8_t is_shm;    
 };
 
 struct mattx_cpu_regs {

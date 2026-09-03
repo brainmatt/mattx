@@ -359,6 +359,20 @@ static void handle_migrate_done(struct mattx_link *link, struct mattx_header *hd
                     }
                 }
                 rcu_read_unlock();
+
+                // Populate the DSM Translation Map ---
+                guest_registry[i].dsm_count = 0;
+                for (int v = 0; v < pending_migration->vma_count; v++) {
+                    if (pending_migration->vmas[v].is_shm && guest_registry[i].dsm_count < MAX_DSM_SEGMENTS) {
+                        int d_idx = guest_registry[i].dsm_count++;
+                        guest_registry[i].dsm_map[d_idx].base_addr = pending_migration->vmas[v].vm_start;
+                        guest_registry[i].dsm_map[d_idx].size = pending_migration->vmas[v].vm_end - pending_migration->vmas[v].vm_start;
+                        guest_registry[i].dsm_map[d_idx].shmid = pending_migration->vmas[v].shmid;
+                        mattx_dbg("[IMPORT] Registered DSM Segment: 0x%lx (ID: %u, Size: %lu)\n", 
+                                  guest_registry[i].dsm_map[d_idx].base_addr, guest_registry[i].dsm_map[d_idx].shmid, guest_registry[i].dsm_map[d_idx].size);
+                    }
+                }
+
                 break;
             }
         }

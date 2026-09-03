@@ -594,6 +594,18 @@ void mattx_capture_and_send_state(struct task_struct *task, int target_node) {
             req->vmas[vma_count].vm_start = vma->vm_start;
             req->vmas[vma_count].vm_end = vma->vm_end;
             req->vmas[vma_count].vm_flags = vma->vm_flags;
+
+            // The DSM Detector ---
+            req->vmas[vma_count].is_shm = 0;
+            req->vmas[vma_count].shmid = 0;
+            if (vma->vm_file && vma->vm_file->f_path.dentry->d_name.name) {
+                if (strncmp(vma->vm_file->f_path.dentry->d_name.name, "SYSV", 4) == 0) {
+                    req->vmas[vma_count].is_shm = 1;
+                    req->vmas[vma_count].shmid = (u32)vma->vm_file->f_inode->i_ino; // Use inode as unique ID!
+                    mattx_dbg("[EXTRACT] Found System V SHM Segment at 0x%lx (ID: %u)\n", vma->vm_start, req->vmas[vma_count].shmid);
+                }
+            }
+                        
             vma_count++;
         }
         mmap_read_unlock(mm);
@@ -751,6 +763,18 @@ void mattx_capture_and_return_state(struct task_struct *task, u32 orig_pid, int 
             req->vmas[vma_count].vm_start = vma->vm_start;
             req->vmas[vma_count].vm_end = vma->vm_end;
             req->vmas[vma_count].vm_flags = vma->vm_flags;
+
+            // The DSM Detector ---
+            req->vmas[vma_count].is_shm = 0;
+            req->vmas[vma_count].shmid = 0;
+            if (vma->vm_file && vma->vm_file->f_path.dentry->d_name.name) {
+                if (strncmp(vma->vm_file->f_path.dentry->d_name.name, "SYSV", 4) == 0) {
+                    req->vmas[vma_count].is_shm = 1;
+                    req->vmas[vma_count].shmid = (u32)vma->vm_file->f_inode->i_ino; // Use inode as unique ID!
+                    mattx_dbg("[EXTRACT] Found System V SHM Segment at 0x%lx (ID: %u)\n", vma->vm_start, req->vmas[vma_count].shmid);
+                }
+            }
+
             vma_count++;
         }
         mmap_read_unlock(mm);

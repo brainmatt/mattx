@@ -100,6 +100,9 @@
 
 #define MATTX_MAGIC 0x4D415454 
 #define MATTX_MAX_PAYLOAD (10 * 1024 * 1024) 
+// max dsm segments
+#define MAX_DSM_SEGMENTS 16
+
 
 enum mattx_msg_type {
     MATTX_MSG_HEARTBEAT = 1,
@@ -206,6 +209,16 @@ enum mattx_msg_type {
     MATTX_MSG_SYS_GETDENTS64_REPLY,
     MATTX_MSG_SYS_PIPE2_REQ, 
     MATTX_MSG_SYS_PIPE2_REPLY,
+    MATTX_MSG_SYS_SHMGET_REQ,
+    MATTX_MSG_SYS_SHMGET_REPLY,
+    MATTX_MSG_SYS_SHMAT_REQ,
+    MATTX_MSG_SYS_SHMAT_REPLY,
+    MATTX_MSG_SYS_SHMDT_REQ,
+    MATTX_MSG_SYS_SHMDT_REPLY,
+    MATTX_MSG_SYS_SHMCTL_REQ,
+    MATTX_MSG_SYS_SHMCTL_REPLY,
+    MATTX_MSG_DSM_PAGE_FAULT_REQ,
+    MATTX_MSG_DSM_PAGE_FAULT_REPLY,    
 };
 
 struct mattx_header {
@@ -226,6 +239,8 @@ struct mattx_vma_info {
     unsigned long vm_start;
     unsigned long vm_end;
     unsigned long vm_flags;
+    u32 shmid; // The unique DSM ID
+    u8 is_shm; // Flag indicating this is Shared Memory    
 };
 
 struct mattx_cpu_regs {
@@ -957,6 +972,13 @@ struct mattx_link {
 };
 
 
+struct mattx_dsm_mapping {
+    unsigned long base_addr;
+    u32 shmid;
+    unsigned long size;
+};
+
+
 struct mattx_guest_info {
     pid_t local_pid;
     u32 orig_pid;
@@ -976,6 +998,9 @@ struct mattx_guest_info {
     u32 orig_tids[MAX_GANG_THREADS];
     pid_t local_tids[MAX_GANG_THREADS];    
 
+    // The DSM Translation Map ---
+    int dsm_count;
+    struct mattx_dsm_mapping dsm_map[MAX_DSM_SEGMENTS];    
 };
 
 struct mattx_export_info {
@@ -1111,6 +1136,22 @@ struct mattx_sys_unlink_reply {
     u32 orig_pid;
     int error;
 };
+
+
+
+
+// --- DSM Payloads ---
+struct mattx_sys_shmget_req { u32 orig_pid; int key; size_t size; int shmflg; };
+struct mattx_sys_shmget_reply { u32 orig_pid; int shmid; int error; };
+
+struct mattx_sys_shmat_req { u32 orig_pid; int shmid; unsigned long shmaddr; int shmflg; };
+struct mattx_sys_shmat_reply { u32 orig_pid; unsigned long ret_addr; size_t size; int error; };
+
+struct mattx_sys_shmdt_req { u32 orig_pid; unsigned long shmaddr; };
+struct mattx_sys_shmdt_reply { u32 orig_pid; int error; };
+
+struct mattx_sys_shmctl_req { u32 orig_pid; int shmid; int cmd; };
+struct mattx_sys_shmctl_reply { u32 orig_pid; int error; };
 
 
 // This defines the standard signature for all message handlers
