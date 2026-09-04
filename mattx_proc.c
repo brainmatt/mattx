@@ -128,7 +128,7 @@ static const struct proc_ops guests_proc_ops = {
 };
 
 static int version_show(struct seq_file *m, void *v) {
-    seq_printf(m, "MattX Version: 1.8\n");
+    seq_printf(m, "MattX Version: 1.9\n");
     seq_printf(m, "MattX License: GPLv2\n");
     seq_printf(m, "Copyright (c) 2026 by Matthias Rechenburg\n");
     return 0;
