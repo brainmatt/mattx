@@ -73,6 +73,7 @@ mattx_sys_shmget_fn real_sys_shmget = NULL;
 mattx_sys_shmctl_fn real_sys_shmctl = NULL;
 mattx_sys_shmdt_fn real_sys_shmdt = NULL;
 mattx_sys_shmat_fn real_sys_shmat = NULL;
+mattx_x86_task_fpu_fn real_x86_task_fpu = NULL;
 
 
 static void mattx_resolve_hidden_symbols(void) {
@@ -84,7 +85,7 @@ static void mattx_resolve_hidden_symbols(void) {
     if (register_kprobe(&kp) == 0) {
         real_task_work_add = (mattx_task_work_add_fn)kp.addr;
         unregister_kprobe(&kp);
-        mattx_dbg("[MIGR] Hacker Magic: Resolved task_work_add at %p\n", real_task_work_add);
+        // mattx_dbg("[MIGR] Hacker Magic: Resolved task_work_add at %p\n", real_task_work_add);
     }
 
     // 2. epoll_create1
@@ -377,7 +378,18 @@ static void mattx_resolve_hidden_symbols(void) {
     if (register_kprobe(&kp) == 0) { 
         real_sys_shmat = (mattx_sys_shmat_fn)kp.addr; 
         unregister_kprobe(&kp); 
-    }    
+    }
+    
+    // --- THE FPU GHOST RESOLVER ---
+    memset(&kp, 0, sizeof(kp)); 
+    kp.symbol_name = "x86_task_fpu";
+    if (register_kprobe(&kp) == 0) { 
+        real_x86_task_fpu = (mattx_x86_task_fpu_fn)kp.addr; 
+        unregister_kprobe(&kp); 
+        // mattx_dbg("[MIGR] Hacker Magic: Resolved x86_task_fpu at %p\n", real_x86_task_fpu);
+    } else {
+        printk(KERN_ERR "MattX: FATAL - Could not resolve x86_task_fpu!\n");
+    }
 }
 
 

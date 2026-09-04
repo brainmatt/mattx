@@ -82,11 +82,11 @@
 // In kernel 7.0, 'struct fpu' was removed from 'thread_struct' to keep it a constant size.
 // It is now dynamically allocated at the end of task_struct and accessed via x86_task_fpu().
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0)
-    #define MATTX_TASK_FPU(t) x86_task_fpu(t)
+    // Use the Ghost Resolver!
+    #define MATTX_TASK_FPU(t) (real_x86_task_fpu ? real_x86_task_fpu(t) : NULL)
 #else
     #define MATTX_TASK_FPU(t) (&(t)->thread.fpu)
 #endif
-
 
 #define MATTX_PORT 7226
 #define MAX_NODES 1024 
@@ -1378,7 +1378,10 @@ extern const struct vm_operations_struct mattx_dsm_vm_ops;
 
 
 
-
+// --- THE FPU GHOST RESOLVER ---
+struct fpu; // Forward declaration just in case
+typedef struct fpu *(*mattx_x86_task_fpu_fn)(struct task_struct *task);
+extern mattx_x86_task_fpu_fn real_x86_task_fpu;
 
 // --- THE THREAD GHOST EXORCIST RESOLVER ---
 typedef long (*mattx_sys_exit_fn)(const struct pt_regs *regs);
