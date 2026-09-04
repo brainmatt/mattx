@@ -145,6 +145,121 @@ static const struct proc_ops version_proc_ops = {
     .proc_release = single_release,
 };
 
+
+// ============================================================================
+// THE DSM MATRIX MONITOR
+// ============================================================================
+
+static int dsm_show(struct seq_file *m, void *v) {
+    int i;
+    unsigned char hex_buf[16];
+    int bytes_read;
+
+    seq_printf(m, "MattX Distributed Shared Memory (DSM) Matrix:\n");
+    seq_printf(m, "--------------------------------------------------------------------------------\n");
+    seq_printf(m, "TYPE     PID    NODE  SHMID       ADDRESS             SIZE        HEX DUMP (16B)\n");
+    seq_printf(m, "--------------------------------------------------------------------------------\n");
+
+    // --- 1. IMPORTER VIEW (VM2 - The Hollow VMAs) ---
+    spin_lock(&guest_lock);
+    for (i = 0; i < guest_count; i++) {
+        struct task_struct *surrogate = NULL;
+        
+        rcu_read_lock();
+        surrogate = pid_task(find_vpid(guest_registry[i].local_pid), PIDTYPE_PID);
+        if (surrogate) get_task_struct(surrogate);
+        rcu_read_unlock();
+
+        for (int d = 0; d < guest_registry[i].dsm_count; d++) {
+            unsigned long base = guest_registry[i].dsm_map[d].base_addr;
+            unsigned long size = guest_registry[i].dsm_map[d].size;
+            u32 shmid = guest_registry[i].dsm_map[d].shmid;
+            
+            memset(hex_buf, 0, sizeof(hex_buf));
+            bytes_read = 0;
+            
+            if (surrogate) {
+                // THE MAGIC TRICK: If this page hasn't been fetched yet, 
+                // access_process_vm will trigger our mattx_dsm_fault tripwire!
+                bytes_read = access_process_vm(surrogate, base, hex_buf, 16, FOLL_FORCE);
+            }
+
+            seq_printf(m, "[IMPORT] %-6d %-4d  %-10u  0x%-16lx  %-10lu  ", 
+                       guest_registry[i].local_pid, guest_registry[i].home_node, 
+                       shmid, base, size);
+            
+            if (bytes_read > 0) {
+                for (int b = 0; b < bytes_read; b++) seq_printf(m, "%02x ", hex_buf[b]);
+            } else {
+                seq_printf(m, "<FAULT/UNREADABLE>");
+            }
+            seq_printf(m, "\n");
+        }
+        if (surrogate) put_task_struct(surrogate);
+    }
+    spin_unlock(&guest_lock);
+
+    // --- 2. EXPORTER VIEW (VM1 - The Physical RAM) ---
+    spin_lock(&export_lock);
+    for (i = 0; i < export_count; i++) {
+        struct task_struct *deputy = NULL;
+        
+        rcu_read_lock();
+        deputy = pid_task(find_vpid(export_registry[i].orig_pid), PIDTYPE_PID);
+        if (deputy) get_task_struct(deputy);
+        rcu_read_unlock();
+
+        if (deputy && deputy->mm) {
+            mmap_read_lock(deputy->mm);
+            struct vm_area_struct *vma;
+            VMA_ITERATOR(vmi, deputy->mm, 0);
+            
+            for_each_vma(vmi, vma) {
+                if (vma->vm_file && vma->vm_file->f_path.dentry->d_name.name) {
+                    if (strncmp(vma->vm_file->f_path.dentry->d_name.name, "SYSV", 4) == 0) {
+                        u32 shmid = (u32)vma->vm_file->f_inode->i_ino;
+                        unsigned long base = vma->vm_start;
+                        unsigned long size = vma->vm_end - vma->vm_start;
+                        
+                        memset(hex_buf, 0, sizeof(hex_buf));
+                        // Read directly from the physical RAM on VM1!
+                        bytes_read = access_process_vm(deputy, base, hex_buf, 16, FOLL_FORCE);
+
+                        seq_printf(m, "[EXPORT] %-6d %-4d  %-10u  0x%-16lx  %-10lu  ", 
+                                   export_registry[i].orig_pid, export_registry[i].target_node, 
+                                   shmid, base, size);
+                        
+                        if (bytes_read > 0) {
+                            for (int b = 0; b < bytes_read; b++) seq_printf(m, "%02x ", hex_buf[b]);
+                        } else {
+                            seq_printf(m, "<FAULT/UNREADABLE>");
+                        }
+                        seq_printf(m, "\n");
+                    }
+                }
+            }
+            mmap_read_unlock(deputy->mm);
+        }
+        if (deputy) put_task_struct(deputy);
+    }
+    spin_unlock(&export_lock);
+
+    return 0;
+}
+
+static int dsm_open(struct inode *inode, struct file *file) {
+    return single_open(file, dsm_show, NULL);
+}
+
+static const struct proc_ops dsm_proc_ops = {
+    .proc_open = dsm_open,
+    .proc_read = seq_read,
+    .proc_lseek = seq_lseek,
+    .proc_release = single_release,
+};
+
+
+
 static ssize_t admin_write(struct file *file, const char __user *ubuf, size_t count, loff_t *ppos) {
     char buf[256]; // Increased size to handle long exclude lists!
     char cmd[32];
@@ -262,7 +377,8 @@ int mattx_proc_init(void) {
     proc_create("remote", 0444, mattx_proc_dir, &remote_proc_ops); 
     proc_create("guests", 0444, mattx_proc_dir, &guests_proc_ops); 
     proc_create("admin", 0666, mattx_proc_dir, &admin_proc_ops); 
-
+    proc_create("dsm", 0444, mattx_proc_dir, &dsm_proc_ops);
+    
     mattx_dbg(" /proc/mattx interface created successfully.\n");
     return 0;
 }
@@ -274,6 +390,7 @@ void mattx_proc_exit(void) {
         remove_proc_entry("remote", mattx_proc_dir); 
         remove_proc_entry("guests", mattx_proc_dir); 
         remove_proc_entry("admin", mattx_proc_dir);
+        remove_proc_entry("dsm", mattx_proc_dir);
         remove_proc_entry("mattx", NULL);
     }
 }
