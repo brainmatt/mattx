@@ -3564,6 +3564,13 @@ static void handle_sys_pipe2_reply(struct mattx_link *link, struct mattx_header 
 // DSM CONTROL PLANE (VM1 NATIVE EXECUTION)
 // ============================================================================
 
+// --- THE DSM TRIPWIRE ---
+const struct vm_operations_struct mattx_dsm_vm_ops = {
+    // The Page Fault trapdoor will go here!
+};
+EXPORT_SYMBOL(mattx_dsm_vm_ops);
+
+
 // --- SHMGET KWORKER ---
 struct mattx_shmget_kworker_ctx { struct work_struct work; struct mattx_sys_shmget_req req; int target_node; };
 static void mattx_shmget_kworker(struct work_struct *work) {
@@ -3713,7 +3720,69 @@ static void handle_sys_shmdt_reply(struct mattx_link *link, struct mattx_header 
 }
 
 
+// --- SHMAT KWORKER (VM1) ---
+struct mattx_shmat_kworker_ctx { struct work_struct work; struct mattx_sys_shmat_req req; int target_node; };
+static void mattx_shmat_kworker(struct work_struct *work) {
+    struct mattx_shmat_kworker_ctx *ctx = container_of(work, struct mattx_shmat_kworker_ctx, work);
+    struct pt_regs regs; memset(&regs, 0, sizeof(regs));
+    long ret = -ENOSYS; size_t shm_size = 0; struct task_struct *deputy = NULL;
 
+    rcu_read_lock(); deputy = pid_task(find_vpid(ctx->req.orig_pid), PIDTYPE_PID); if (deputy) get_task_struct(deputy); rcu_read_unlock();
+    if (deputy && real_sys_shmat) {
+        struct nsproxy *old_ns = current->nsproxy;
+        current->nsproxy = deputy->nsproxy;
+        const struct cred *old_cred = override_creds(deputy->cred);
+        kthread_use_mm(deputy->mm);
+
+        regs.di = ctx->req.shmid; regs.si = ctx->req.shmaddr; regs.dx = ctx->req.shmflg;
+        ret = real_sys_shmat(&regs);
+
+        // Intelligence Gathering: Find the size of the newly attached segment!
+        if (ret >= 0 && deputy->mm) {
+            mmap_read_lock(deputy->mm);
+            struct vm_area_struct *vma = find_vma(deputy->mm, ret);
+            if (vma && vma->vm_start == ret) {
+                shm_size = vma->vm_end - vma->vm_start;
+                mattx_dbg("[KWORKER] Native shmat successful on VM1. Addr: 0x%lx, Size: %zu\n", ret, shm_size);
+            }
+            mmap_read_unlock(deputy->mm);
+        }
+
+        kthread_unuse_mm(deputy->mm);
+        revert_creds(old_cred);
+        current->nsproxy = old_ns;
+        put_task_struct(deputy);
+    }
+
+    struct mattx_sys_shmat_reply reply = { .orig_pid = ctx->req.orig_pid, .ret_addr = (ret >= 0) ? ret : 0, .size = shm_size, .error = (ret < 0) ? ret : 0 };
+    if (cluster_map[ctx->target_node]) mattx_comm_send(cluster_map[ctx->target_node], MATTX_MSG_SYS_SHMAT_REPLY, &reply, sizeof(reply));
+    kfree(ctx);
+}
+static void handle_sys_shmat_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    struct mattx_sys_shmat_req *req = payload; struct mattx_shmat_kworker_ctx *ctx = kmalloc(sizeof(*ctx), GFP_ATOMIC);
+    if (ctx) { INIT_WORK(&ctx->work, mattx_shmat_kworker); memcpy(&ctx->req, req, sizeof(*req)); ctx->target_node = hdr->sender_id; schedule_work(&ctx->work); }
+}
+
+// --- VM2 REPLY HANDLER ---
+static void handle_sys_shmat_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    struct mattx_sys_shmat_reply *reply = payload;
+    spin_lock(&guest_lock);
+    for (int i = 0; i < guest_count; i++) {
+        if (guest_registry[i].orig_pid == reply->orig_pid && guest_registry[i].home_node == hdr->sender_id) {
+            guest_registry[i].rpc_fsync_res = reply->error;
+            guest_registry[i].rpc_lseek_res = reply->size; // Store the size here!
+            
+            // We need to pass the ret_addr back. Let's allocate a small buffer.
+            guest_registry[i].rpc_read_buf = kmalloc(sizeof(unsigned long), GFP_ATOMIC);
+            if (guest_registry[i].rpc_read_buf) {
+                memcpy(guest_registry[i].rpc_read_buf, &reply->ret_addr, sizeof(unsigned long));
+            }
+            
+            guest_registry[i].rpc_done = true; if (guest_registry[i].rpc_wq) wake_up_interruptible(guest_registry[i].rpc_wq); break;
+        }
+    }
+    spin_unlock(&guest_lock);
+}
 
 
 
@@ -4994,7 +5063,8 @@ void mattx_fileio_init_handlers(void) {
     mattx_register_handler(MATTX_MSG_SYS_SHMCTL_REPLY, handle_sys_shmctl_reply);
     mattx_register_handler(MATTX_MSG_SYS_SHMDT_REQ, handle_sys_shmdt_req);
     mattx_register_handler(MATTX_MSG_SYS_SHMDT_REPLY, handle_sys_shmdt_reply);
-
+    mattx_register_handler(MATTX_MSG_SYS_SHMAT_REQ, handle_sys_shmat_req);
+    mattx_register_handler(MATTX_MSG_SYS_SHMAT_REPLY, handle_sys_shmat_reply);
 
     mattx_dbg(" [FILEIO] Network handlers registered.\n");
 }

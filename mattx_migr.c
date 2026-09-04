@@ -72,6 +72,7 @@ mattx_x86_gsbase_write_task_fn real_x86_gsbase_write_task = NULL;
 mattx_sys_shmget_fn real_sys_shmget = NULL;
 mattx_sys_shmctl_fn real_sys_shmctl = NULL;
 mattx_sys_shmdt_fn real_sys_shmdt = NULL;
+mattx_sys_shmat_fn real_sys_shmat = NULL;
 
 
 static void mattx_resolve_hidden_symbols(void) {
@@ -370,6 +371,13 @@ static void mattx_resolve_hidden_symbols(void) {
         real_sys_shmdt = (mattx_sys_shmdt_fn)kp.addr; 
         unregister_kprobe(&kp); 
     }
+
+    memset(&kp, 0, sizeof(kp)); 
+    kp.symbol_name = "__x64_sys_shmat";
+    if (register_kprobe(&kp) == 0) { 
+        real_sys_shmat = (mattx_sys_shmat_fn)kp.addr; 
+        unregister_kprobe(&kp); 
+    }    
 }
 
 

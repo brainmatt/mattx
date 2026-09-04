@@ -581,6 +581,9 @@ static void mattx_rpc_worker(struct work_struct *work) {
         struct mattx_sys_shmdt_req req = { .orig_pid = rpc->orig_pid, .shmaddr = rpc->shm_addr };
         if (cluster_map[rpc->home_node]) mattx_comm_send(cluster_map[rpc->home_node], MATTX_MSG_SYS_SHMDT_REQ, &req, sizeof(req));
 
+    } else if (rpc->is_shmat) {
+        struct mattx_sys_shmat_req req = { .orig_pid = rpc->orig_pid, .shmid = rpc->shm_id, .shmaddr = rpc->shm_addr, .shmflg = rpc->shm_flg };
+        if (cluster_map[rpc->home_node]) mattx_comm_send(cluster_map[rpc->home_node], MATTX_MSG_SYS_SHMAT_REQ, &req, sizeof(req));
 
 
 
@@ -1500,6 +1503,81 @@ static void mattx_rpc_worker(struct work_struct *work) {
                 }
 
                 if (regs) regs->ax = error;
+
+            // --- SHMAT AWAKENING (THE HOLLOW CARVING) ---
+            } else if (rpc->is_shmat) {
+                struct pt_regs *regs = task_pt_regs(surrogate);
+                int error = -EINTR;
+                size_t shm_size = 0;
+                unsigned long ret_addr = 0;
+                void *read_buf = NULL;
+
+                spin_lock(&guest_lock);
+                for (i = 0; i < guest_count; i++) {
+                    if (mattx_pid_shares_tgid_with_guest(rpc->local_pid, guest_registry[i].local_pid)) {
+                        if (guest_registry[i].rpc_done) {
+                            error = guest_registry[i].rpc_fsync_res;
+                            shm_size = guest_registry[i].rpc_lseek_res; // We stored the size here!
+                            read_buf = guest_registry[i].rpc_read_buf;
+                        }
+                        guest_registry[i].rpc_read_buf = NULL;
+                        break;
+                    }
+                }
+                spin_unlock(&guest_lock);
+
+                if (error == 0 && read_buf && shm_size > 0) {
+                    memcpy(&ret_addr, read_buf, sizeof(unsigned long));
+                    
+                    // --- THE HOLLOW CARVING ---
+                    kthread_use_mm(surrogate->mm);
+                    
+                    unsigned long prot = PROT_READ | PROT_WRITE;
+                    if (rpc->shm_flg & SHM_RDONLY) prot = PROT_READ;
+                    
+                    unsigned long map_flags = MAP_PRIVATE | MAP_ANONYMOUS;
+                    if (rpc->shm_addr) map_flags |= MAP_FIXED; // If user requested specific address
+
+                    // 1. Carve the blank VMA
+                    unsigned long hollow_addr = vm_mmap(NULL, ret_addr, shm_size, prot, map_flags, 0);
+                    
+                    if (!IS_ERR_VALUE(hollow_addr)) {
+                        // 2. The Tripwire Injection!
+                        mmap_write_lock(surrogate->mm);
+                        struct vm_area_struct *vma = find_vma(surrogate->mm, hollow_addr);
+                        if (vma && vma->vm_start == hollow_addr) {
+                            
+                            vma->vm_ops = &mattx_dsm_vm_ops; // LAY THE TRAP!
+                            
+                            // 3. Register it in the DSM Map
+                            spin_lock(&guest_lock);
+                            for (i = 0; i < guest_count; i++) {
+                                if (guest_registry[i].local_pid == surrogate->tgid) {
+                                    if (guest_registry[i].dsm_count < MAX_DSM_SEGMENTS) {
+                                        int d_idx = guest_registry[i].dsm_count++;
+                                        guest_registry[i].dsm_map[d_idx].base_addr = hollow_addr;
+                                        guest_registry[i].dsm_map[d_idx].size = shm_size;
+                                        guest_registry[i].dsm_map[d_idx].shmid = rpc->shm_id;
+                                        mattx_dbg("[DSM] Hollow VMA carved at 0x%lx (Size: %zu, SHMID: %d). Tripwire armed!\n", hollow_addr, shm_size, rpc->shm_id);
+                                    }
+                                    break;
+                                }
+                            }
+                            spin_unlock(&guest_lock);
+                        }
+                        mmap_write_unlock(surrogate->mm);
+                        error = hollow_addr; // Return the mapped address in RAX!
+                    } else {
+                        error = hollow_addr; // Return the mmap error
+                    }
+                    
+                    kthread_unuse_mm(surrogate->mm);
+                }
+                
+                if (read_buf) kfree(read_buf);
+                if (regs) regs->ax = error;
+
+
 
 
                 
@@ -4537,6 +4615,52 @@ static int ret_handler_shmdt(struct kretprobe_instance *ri, struct pt_regs *regs
 }
 
 
+// --- SHMAT ---
+struct shmat_kretprobe_data { int shmid; unsigned long shmaddr; int shmflg; };
+static struct kretprobe shmat_kprobe;
+
+static int entry_handler_shmat(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    if (is_guest_process(current->tgid)) {
+        struct shmat_kretprobe_data *data = (struct shmat_kretprobe_data *)ri->data;
+        struct pt_regs *sys_regs = SYSCALL_REGS(regs);
+        data->shmid = (int)sys_regs->di;
+        data->shmaddr = (unsigned long)sys_regs->si;
+        data->shmflg = (int)sys_regs->dx;
+        sys_regs->di = -1; // Sabotage!
+    }
+    return 0;
+}
+
+static int ret_handler_shmat(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    if (!is_guest_process(current->tgid)) return 0;
+    if (fatal_signal_pending(current) || (current->flags & PF_EXITING)) return 0;
+
+    struct shmat_kretprobe_data *data = (struct shmat_kretprobe_data *)ri->data;
+    int home_node = -1; u32 orig_pid = 0;
+
+    spin_lock(&guest_lock);
+    for (int i = 0; i < guest_count; i++) {
+        if (guest_registry[i].local_pid == current->tgid) {
+            home_node = guest_registry[i].home_node; orig_pid = guest_registry[i].orig_pid;
+            guest_registry[i].rpc_done = false; break;
+        }
+    }
+    spin_unlock(&guest_lock);
+
+    if (home_node != -1) {
+        struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
+        if (rpc) {
+            INIT_WORK(&rpc->work, mattx_rpc_worker);
+            rpc->local_pid = current->pid; rpc->orig_pid = orig_pid; rpc->home_node = home_node;
+            rpc->is_shmat = true; rpc->shm_id = data->shmid; rpc->shm_addr = data->shmaddr; rpc->shm_flg = data->shmflg;
+            send_sig(SIGSTOP, current, 0); schedule_work(&rpc->work);
+        }
+    }
+    return 0;
+}
+
+
+
 
 
 
@@ -5095,8 +5219,13 @@ int mattx_hooks_init(void) {
     ret = register_kretprobe(&shmdt_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for shmdt, returned %d\n", ret);
 
+    memset(&shmat_kprobe, 0, sizeof(shmat_kprobe)); shmat_kprobe.kp.symbol_name = "__x64_sys_shmat";
+    shmat_kprobe.entry_handler = entry_handler_shmat; shmat_kprobe.handler = ret_handler_shmat;
+    shmat_kprobe.data_size = sizeof(struct shmat_kretprobe_data); shmat_kprobe.maxactive = 64;
+    ret = register_kretprobe(&shmat_kprobe);
+    if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for shmat, returned %d\n", ret);
 
-
+    
     mattx_dbg(" Syscall Hooks (Kprobes) registered successfully.\n");
     return 0;
 }

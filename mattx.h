@@ -50,7 +50,8 @@
 #include <linux/fdtable.h>       
 #include <linux/anon_inodes.h>   
 #include <linux/uaccess.h>       
-#include <linux/mman.h>          
+#include <linux/mman.h>
+#include <linux/shm.h>
 #include <linux/mmu_context.h>   
 #include <linux/kprobes.h>       
 #include <linux/workqueue.h>     
@@ -62,6 +63,11 @@
 #include <linux/task_work.h>
 #include <linux/utsname.h>
 #include <linux/resource.h>
+
+// --- SYSTEM V IPC FLAGS (Hidden by the kernel) ---
+#ifndef SHM_RDONLY
+#define SHM_RDONLY 010000
+#endif
 
 // --- KERNEL COMPATIBILITY: The Sockaddr Evolution ---
 // In late 2025 (Linux 6.18/6.19+), the kernel replaced 'struct sockaddr *' 
@@ -965,6 +971,7 @@ struct mattx_rpc_work {
     bool is_shmget;
     bool is_shmctl;
     bool is_shmdt;
+    bool is_shmat; // <-- NEW
     int shm_key;
     size_t shm_size;
     int shm_flg;
@@ -1337,6 +1344,15 @@ extern mattx_sys_shmctl_fn real_sys_shmctl;
 
 typedef long (*mattx_sys_shmdt_fn)(const struct pt_regs *regs);
 extern mattx_sys_shmdt_fn real_sys_shmdt;
+
+typedef long (*mattx_sys_shmat_fn)(const struct pt_regs *regs);
+extern mattx_sys_shmat_fn real_sys_shmat;
+
+// The DSM Tripwire Struct ---
+extern const struct vm_operations_struct mattx_dsm_vm_ops;
+
+
+
 
 
 // --- THE THREAD GHOST EXORCIST RESOLVER ---
