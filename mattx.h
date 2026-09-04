@@ -78,6 +78,15 @@
     #define MATTX_SA_CAST(addr) ((struct sockaddr *)(addr))
 #endif
 
+// --- KERNEL 7.0 COMPATIBILITY: The FPU Evolution ---
+// In kernel 7.0, 'struct fpu' was removed from 'thread_struct' to keep it a constant size.
+// It is now dynamically allocated at the end of task_struct and accessed via x86_task_fpu().
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0)
+    #define MATTX_TASK_FPU(t) x86_task_fpu(t)
+#else
+    #define MATTX_TASK_FPU(t) (&(t)->thread.fpu)
+#endif
+
 
 #define MATTX_PORT 7226
 #define MAX_NODES 1024 

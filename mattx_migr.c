@@ -590,11 +590,12 @@ void mattx_capture_and_send_state(struct task_struct *task, int target_node) {
             // freeze earlier in this function), so its FPU context is
             // safely resident in memory, not live in hardware registers.
             req->threads[i].fpu_size = 0;
-            if (threads[i]->thread.fpu.fpstate) {
-                u32 fsize = threads[i]->thread.fpu.fpstate->size;
+            struct fpu *fpu = MATTX_TASK_FPU(threads[i]);
+            if (fpu && fpu->fpstate) {
+                u32 fsize = fpu->fpstate->size;
                 if (fsize > sizeof(req->threads[i].fpu_state))
                     fsize = sizeof(req->threads[i].fpu_state);
-                memcpy(req->threads[i].fpu_state, &threads[i]->thread.fpu.fpstate->regs, fsize);
+                memcpy(req->threads[i].fpu_state, &fpu->fpstate->regs, fsize);
                 req->threads[i].fpu_size = fsize;
             }
 
@@ -762,11 +763,12 @@ void mattx_capture_and_return_state(struct task_struct *task, u32 orig_pid, int 
             // Capture FPU/SSE/AVX state on return! See the forward-path
             // capture above for why this is needed.
             req->threads[i].fpu_size = 0;
-            if (threads[i]->thread.fpu.fpstate) {
-                u32 fsize = threads[i]->thread.fpu.fpstate->size;
+            struct fpu *fpu = MATTX_TASK_FPU(threads[i]);
+            if (fpu && fpu->fpstate) {
+                u32 fsize = fpu->fpstate->size;
                 if (fsize > sizeof(req->threads[i].fpu_state))
                     fsize = sizeof(req->threads[i].fpu_state);
-                memcpy(req->threads[i].fpu_state, &threads[i]->thread.fpu.fpstate->regs, fsize);
+                memcpy(req->threads[i].fpu_state, &fpu->fpstate->regs, fsize);
                 req->threads[i].fpu_size = fsize;
             }
         }

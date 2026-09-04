@@ -245,13 +245,14 @@ static void handle_migrate_done(struct mattx_link *link, struct mattx_header *hd
                     // guaranteed frozen here (stopped, about to be
                     // SIGCONT'd below), so its FPU context is safely
                     // resident in memory, not live in hardware registers.
-                    if (t->thread.fpu.fpstate && pending_migration->threads[t_idx].fpu_size > 0) {
+                    struct fpu *fpu = MATTX_TASK_FPU(t);
+                    if (fpu && fpu->fpstate && pending_migration->threads[t_idx].fpu_size > 0) {
                         u32 fsize = pending_migration->threads[t_idx].fpu_size;
-                        if (fsize > t->thread.fpu.fpstate->size)
-                            fsize = t->thread.fpu.fpstate->size;
+                        if (fsize > fpu->fpstate->size)
+                            fsize = fpu->fpstate->size;
                         if (fsize > sizeof(pending_migration->threads[t_idx].fpu_state))
                             fsize = sizeof(pending_migration->threads[t_idx].fpu_state);
-                        memcpy(&t->thread.fpu.fpstate->regs, pending_migration->threads[t_idx].fpu_state, fsize);
+                        memcpy(&fpu->fpstate->regs, pending_migration->threads[t_idx].fpu_state, fsize);
                     }
                 }
 
@@ -728,13 +729,14 @@ static void handle_return_done(struct mattx_link *link, struct mattx_header *hdr
 
                     // Restore FPU/SSE/AVX state on return! See the matching
                     // capture side in mattx_migr.c for why this is needed.
-                    if (t->thread.fpu.fpstate && pending_migration->threads[t_idx].fpu_size > 0) {
+                    struct fpu *fpu = MATTX_TASK_FPU(t);
+                    if (fpu && fpu->fpstate && pending_migration->threads[t_idx].fpu_size > 0) {
                         u32 fsize = pending_migration->threads[t_idx].fpu_size;
-                        if (fsize > t->thread.fpu.fpstate->size)
-                            fsize = t->thread.fpu.fpstate->size;
+                        if (fsize > fpu->fpstate->size)
+                            fsize = fpu->fpstate->size;
                         if (fsize > sizeof(pending_migration->threads[t_idx].fpu_state))
                             fsize = sizeof(pending_migration->threads[t_idx].fpu_state);
-                        memcpy(&t->thread.fpu.fpstate->regs, pending_migration->threads[t_idx].fpu_state, fsize);
+                        memcpy(&fpu->fpstate->regs, pending_migration->threads[t_idx].fpu_state, fsize);
                     }
                 }
 
