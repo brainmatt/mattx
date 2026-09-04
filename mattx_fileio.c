@@ -26,6 +26,35 @@
 #include <linux/poll.h>
 #include <linux/namei.h> // For kern_path
 #include <linux/nsproxy.h>
+#include <linux/highmem.h> // Required for kmap_local_page
+
+#define MAX_VFS_RPC 64
+
+
+// --- VFS RPC Registry ---
+// This allows mattxfs.ko to sleep while waiting for network replies
+struct vfs_rpc_ctx {
+    u64 req_id;
+    wait_queue_head_t wq;
+    bool done;
+    int error;
+    struct kstat stat;
+    struct mattx_dirent *dirents;
+    u32 dirent_count;
+    u64 new_offset;
+
+    int remote_fd;
+    ssize_t bytes_rw;
+    void *data_buf;
+    loff_t ret_offset;
+
+    bool in_use;    
+};
+
+
+static struct vfs_rpc_ctx vfs_rpc_registry[MAX_VFS_RPC];
+static DEFINE_SPINLOCK(vfs_rpc_lock);
+static u64 next_req_id = 1;
 
 
 // --- THE HPC FAST-PATH HELPER ---
@@ -3559,17 +3588,137 @@ static void handle_sys_pipe2_reply(struct mattx_link *link, struct mattx_header 
 }
 
 
+// ============================================================================
+// THE DSM TRIPWIRE (VM2 PAGE FAULT HANDLER)
+// ============================================================================
+
+static vm_fault_t mattx_dsm_fault(struct vm_fault *vmf) {
+    struct vm_area_struct *vma = vmf->vma;
+    unsigned long fault_addr = vmf->address & PAGE_MASK; // Align to 4KB boundary
+    int shmid = -1;
+    unsigned long offset = 0;
+    int home_node = -1;
+    u32 orig_pid = 0;
+    bool found = false;
+
+    // 1. TRANSLATION: Find the mapping in the registry
+    spin_lock(&guest_lock);
+    for (int i = 0; i < guest_count; i++) {
+        if (guest_registry[i].local_pid == current->tgid) {
+            for (int d = 0; d < guest_registry[i].dsm_count; d++) {
+                unsigned long base = guest_registry[i].dsm_map[d].base_addr;
+                unsigned long size = guest_registry[i].dsm_map[d].size;
+                
+                if (fault_addr >= base && fault_addr < base + size) {
+                    shmid = guest_registry[i].dsm_map[d].shmid;
+                    offset = fault_addr - base;
+                    home_node = guest_registry[i].home_node;
+                    orig_pid = guest_registry[i].orig_pid;
+                    found = true;
+                    break;
+                }
+            }
+            break;
+        }
+    }
+    spin_unlock(&guest_lock);
+
+    if (!found || home_node == -1 || !cluster_map[home_node]) {
+        mattx_dbg("[DSM] SIGSEGV: Unmapped or disconnected DSM access at 0x%lx\n", fault_addr);
+        return VM_FAULT_SIGSEGV;
+    }
+
+    // 2. CONCURRENCY: Allocate a sterile RPC slot
+    int slot = -1;
+    u64 req_id = 0;
+    void *page_buf = kmalloc(4096, GFP_KERNEL);
+    if (!page_buf) return VM_FAULT_OOM;
+
+    spin_lock(&vfs_rpc_lock);
+    for (int i = 0; i < MAX_VFS_RPC; i++) {
+        if (!vfs_rpc_registry[i].in_use) {
+            slot = i;
+            vfs_rpc_registry[i].in_use = true;
+            req_id = next_req_id++;
+            vfs_rpc_registry[i].req_id = req_id;
+            vfs_rpc_registry[i].done = false;
+            vfs_rpc_registry[i].data_buf = page_buf;
+            init_waitqueue_head(&vfs_rpc_registry[i].wq);
+            break;
+        }
+    }
+    spin_unlock(&vfs_rpc_lock);
+
+    if (slot == -1) {
+        kfree(page_buf);
+        return VM_FAULT_SIGSEGV; 
+    }
+
+    // 3. THE REQUEST: Ask VM1 for the page
+    struct mattx_dsm_page_fault_req req = {
+        .req_id = req_id,
+        .orig_pid = orig_pid,
+        .shmid = shmid,
+        .offset = offset
+    };
+    
+    mattx_dbg("[DSM] Page Fault at 0x%lx (SHMID: %d, Offset: %lu). Fetching from Node %d...\n", fault_addr, shmid, offset, home_node);
+    mattx_comm_send(cluster_map[home_node], MATTX_MSG_DSM_PAGE_FAULT_REQ, &req, sizeof(req));
+
+    // 4. THE FREEZE: Sleep until the page arrives!
+    wait_event_interruptible(vfs_rpc_registry[slot].wq, vfs_rpc_registry[slot].done);
+
+    int err = vfs_rpc_registry[slot].error;
+
+    spin_lock(&vfs_rpc_lock);
+    vfs_rpc_registry[slot].in_use = false;
+    spin_unlock(&vfs_rpc_lock);
+
+    if (err != 0) {
+        kfree(page_buf);
+        return VM_FAULT_SIGSEGV;
+    }
+
+    // 5. THE INJECTION: Wire the page into the Surrogate's brain!
+    struct page *page = alloc_page(GFP_HIGHUSER_MOVABLE | __GFP_ZERO);
+    if (!page) {
+        kfree(page_buf);
+        return VM_FAULT_OOM;
+    }
+
+    // Map the physical page temporarily, copy the payload, and unmap it
+    void *kaddr = kmap_local_page(page);
+    memcpy(kaddr, page_buf, 4096);
+    kunmap_local(kaddr);
+
+    // Hacker Trick: We must ensure the VMA allows custom page insertion!
+    vm_flags_set(vma, vma->vm_flags | VM_MIXEDMAP);
+
+    // Surgically insert the physical page into the application's page tables!
+    vm_fault_t ret = vmf_insert_page(vma, fault_addr, page);
+    
+    kfree(page_buf);
+
+    if (ret != VM_FAULT_NOPAGE) {
+        __free_page(page);
+        return ret;
+    }
+
+    mattx_dbg("[DSM] Illusion Complete! Page successfully injected at 0x%lx!\n", fault_addr);
+    return VM_FAULT_NOPAGE;
+}
+
+const struct vm_operations_struct mattx_dsm_vm_ops = {
+    .fault = mattx_dsm_fault,
+};
+EXPORT_SYMBOL(mattx_dsm_vm_ops);
+
+
+
 
 // ============================================================================
 // DSM CONTROL PLANE (VM1 NATIVE EXECUTION)
 // ============================================================================
-
-// --- THE DSM TRIPWIRE ---
-const struct vm_operations_struct mattx_dsm_vm_ops = {
-    // The Page Fault trapdoor will go here!
-};
-EXPORT_SYMBOL(mattx_dsm_vm_ops);
-
 
 // --- SHMGET KWORKER ---
 struct mattx_shmget_kworker_ctx { struct work_struct work; struct mattx_sys_shmget_req req; int target_node; };
@@ -3787,33 +3936,98 @@ static void handle_sys_shmat_reply(struct mattx_link *link, struct mattx_header 
 
 
 
+// --- DSM PAGE FAULT KWORKER (VM1) ---
+struct mattx_dsm_fault_kworker_ctx { struct work_struct work; struct mattx_dsm_page_fault_req req; int target_node; };
+
+static void mattx_dsm_fault_kworker(struct work_struct *work) {
+    struct mattx_dsm_fault_kworker_ctx *ctx = container_of(work, struct mattx_dsm_fault_kworker_ctx, work);
+    struct mattx_dsm_page_fault_reply *reply;
+    struct task_struct *deputy = NULL;
+    int ret = -EFAULT;
+
+    reply = kzalloc(sizeof(*reply), GFP_KERNEL);
+    if (!reply) { kfree(ctx); return; }
+
+    reply->req_id = ctx->req.req_id;
+
+    rcu_read_lock();
+    deputy = pid_task(find_vpid(ctx->req.orig_pid), PIDTYPE_PID);
+    if (deputy) get_task_struct(deputy);
+    rcu_read_unlock();
+
+    if (deputy && deputy->mm) {
+        // THE HUNT: Scan the Deputy's VMAs for the matching SYSV inode!
+        mmap_read_lock(deputy->mm);
+        struct vm_area_struct *vma;
+        VMA_ITERATOR(vmi, deputy->mm, 0);
+        for_each_vma(vmi, vma) {
+            if (vma->vm_file && vma->vm_file->f_path.dentry->d_name.name) {
+                if (strncmp(vma->vm_file->f_path.dentry->d_name.name, "SYSV", 4) == 0) {
+                    if (vma->vm_file->f_inode->i_ino == ctx->req.shmid) {
+                        
+                        // FOUND IT! Calculate the absolute physical address on VM1
+                        unsigned long target_addr = vma->vm_start + ctx->req.offset;
+                        
+                        if (target_addr < vma->vm_end) {
+                            // THE PUMP: Suck exactly 4096 bytes out of the Deputy's brain!
+                            int bytes = access_process_vm(deputy, target_addr, reply->data, 4096, FOLL_FORCE);
+                            if (bytes == 4096) ret = 0;
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+        mmap_read_unlock(deputy->mm);
+        put_task_struct(deputy);
+    }
+
+    reply->error = ret;
+    if (cluster_map[ctx->target_node]) {
+        mattx_comm_send(cluster_map[ctx->target_node], MATTX_MSG_DSM_PAGE_FAULT_REPLY, reply, sizeof(*reply));
+    }
+    kfree(reply);
+    kfree(ctx);
+}
+
+static void handle_dsm_page_fault_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    struct mattx_dsm_page_fault_req *req = payload;
+    struct mattx_dsm_fault_kworker_ctx *ctx = kmalloc(sizeof(*ctx), GFP_ATOMIC);
+    if (ctx) {
+        INIT_WORK(&ctx->work, mattx_dsm_fault_kworker);
+        memcpy(&ctx->req, req, sizeof(*req));
+        ctx->target_node = hdr->sender_id;
+        schedule_work(&ctx->work);
+    }
+}
+
+
+// --- DSM PAGE FAULT REPLY HANDLER (VM2) ---
+static void handle_dsm_page_fault_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    struct mattx_dsm_page_fault_reply *reply = payload;
+    
+    spin_lock(&vfs_rpc_lock);
+    for (int i = 0; i < MAX_VFS_RPC; i++) {
+        if (vfs_rpc_registry[i].in_use && vfs_rpc_registry[i].req_id == reply->req_id) {
+            vfs_rpc_registry[i].error = reply->error;
+            
+            // Copy the 4KB payload into the waiting buffer!
+            if (reply->error == 0 && vfs_rpc_registry[i].data_buf) {
+                memcpy(vfs_rpc_registry[i].data_buf, reply->data, 4096);
+            }
+            
+            vfs_rpc_registry[i].done = true;
+            wake_up_interruptible(&vfs_rpc_registry[i].wq);
+            break;
+        }
+    }
+    spin_unlock(&vfs_rpc_lock);
+}
 
 
 
-// --- VFS RPC Registry ---
-// This allows mattxfs.ko to sleep while waiting for network replies
-#define MAX_VFS_RPC 64
-struct vfs_rpc_ctx {
-    u64 req_id;
-    wait_queue_head_t wq;
-    bool done;
-    int error;
-    struct kstat stat;
-    struct mattx_dirent *dirents;
-    u32 dirent_count;
-    u64 new_offset;
 
-    int remote_fd;
-    ssize_t bytes_rw;
-    void *data_buf;
-    loff_t ret_offset;
 
-    bool in_use;    
-};
-
-static struct vfs_rpc_ctx vfs_rpc_registry[MAX_VFS_RPC];
-static DEFINE_SPINLOCK(vfs_rpc_lock);
-static u64 next_req_id = 1;
 
 // This context helps us catch the filenames as the kernel reads the local disk
 struct mattx_readdir_ctx {
@@ -5065,7 +5279,10 @@ void mattx_fileio_init_handlers(void) {
     mattx_register_handler(MATTX_MSG_SYS_SHMDT_REPLY, handle_sys_shmdt_reply);
     mattx_register_handler(MATTX_MSG_SYS_SHMAT_REQ, handle_sys_shmat_req);
     mattx_register_handler(MATTX_MSG_SYS_SHMAT_REPLY, handle_sys_shmat_reply);
+    mattx_register_handler(MATTX_MSG_DSM_PAGE_FAULT_REQ, handle_dsm_page_fault_req);
+    mattx_register_handler(MATTX_MSG_DSM_PAGE_FAULT_REPLY, handle_dsm_page_fault_reply);
 
+    
     mattx_dbg(" [FILEIO] Network handlers registered.\n");
 }
 

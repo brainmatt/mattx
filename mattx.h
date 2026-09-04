@@ -90,6 +90,7 @@
 #define MAX_GANG_THREADS 16
 #define MAX_FDS 256
 
+
 // Max size of a captured thread's raw FPU/SSE/AVX register image
 // (XSAVE/FXSAVE area). Covers up through AVX2 (~832-960 bytes on typical
 // hardware) with headroom. NOTE: this whole struct gets shipped to
@@ -1173,6 +1174,21 @@ struct mattx_sys_shmctl_reply {
     int error; 
     char data[128]; // Large enough to hold struct shmid_ds
 };
+
+// --- DSM Page Fault Payloads ---
+struct mattx_dsm_page_fault_req {
+    u64 req_id;
+    u32 orig_pid;
+    u32 shmid;
+    unsigned long offset;
+};
+
+struct mattx_dsm_page_fault_reply {
+    u64 req_id;
+    int error;
+    char data[4096]; // Exactly one PAGE_SIZE!
+};
+
 
 
 // This defines the standard signature for all message handlers
