@@ -568,6 +568,20 @@ static void mattx_rpc_worker(struct work_struct *work) {
         struct mattx_sys_pipe2_req req = { .orig_pid = rpc->orig_pid, .flags = rpc->pipe2_flags };
         if (cluster_map[rpc->home_node]) mattx_comm_send(cluster_map[rpc->home_node], MATTX_MSG_SYS_PIPE2_REQ, &req, sizeof(req));
 
+    // --- DSM WORKERS ---
+    } else if (rpc->is_shmget) {
+        struct mattx_sys_shmget_req req = { .orig_pid = rpc->orig_pid, .key = rpc->shm_key, .size = rpc->shm_size, .shmflg = rpc->shm_flg };
+        if (cluster_map[rpc->home_node]) mattx_comm_send(cluster_map[rpc->home_node], MATTX_MSG_SYS_SHMGET_REQ, &req, sizeof(req));
+
+    } else if (rpc->is_shmctl) {
+        struct mattx_sys_shmctl_req req = { .orig_pid = rpc->orig_pid, .shmid = rpc->shm_id, .cmd = rpc->shm_cmd };
+        if (cluster_map[rpc->home_node]) mattx_comm_send(cluster_map[rpc->home_node], MATTX_MSG_SYS_SHMCTL_REQ, &req, sizeof(req));
+
+    } else if (rpc->is_shmdt) {
+        struct mattx_sys_shmdt_req req = { .orig_pid = rpc->orig_pid, .shmaddr = rpc->shm_addr };
+        if (cluster_map[rpc->home_node]) mattx_comm_send(cluster_map[rpc->home_node], MATTX_MSG_SYS_SHMDT_REQ, &req, sizeof(req));
+
+
 
 
     // OPEN WORKER (DEFAULT FALLBACK)
@@ -1423,7 +1437,69 @@ static void mattx_rpc_worker(struct work_struct *work) {
                     regs->ax = error;
                 }
 
+            // --- DSM AWAKENING ---
+            } else if (rpc->is_shmget) {
+                struct pt_regs *regs = task_pt_regs(surrogate);
+                int error = -EINTR;
+                spin_lock(&guest_lock);
+                for (i = 0; i < guest_count; i++) {
+                    if (mattx_pid_shares_tgid_with_guest(rpc->local_pid, guest_registry[i].local_pid)) {
+                        if (guest_registry[i].rpc_done) error = guest_registry[i].rpc_fsync_res; 
+                        break;
+                    }
+                }
+                spin_unlock(&guest_lock);
+                if (regs) regs->ax = error;
 
+            } else if (rpc->is_shmctl) {
+                struct pt_regs *regs = task_pt_regs(surrogate);
+                int error = -EINTR; void *read_buf = NULL;
+                spin_lock(&guest_lock);
+                for (i = 0; i < guest_count; i++) {
+                    if (mattx_pid_shares_tgid_with_guest(rpc->local_pid, guest_registry[i].local_pid)) {
+                        if (guest_registry[i].rpc_done) { error = guest_registry[i].rpc_fsync_res; read_buf = guest_registry[i].rpc_read_buf; }
+                        guest_registry[i].rpc_read_buf = NULL; break;
+                    }
+                }
+                spin_unlock(&guest_lock);
+                
+                if (error == 0 && read_buf && rpc->buff) {
+                    access_process_vm(surrogate, (unsigned long)rpc->buff, read_buf, 128, FOLL_WRITE | FOLL_FORCE);
+                }
+                if (read_buf) kfree(read_buf);
+                if (regs) regs->ax = error;
+
+            } else if (rpc->is_shmdt) {
+                struct pt_regs *regs = task_pt_regs(surrogate);
+                int error = -EINTR;
+                unsigned long size_to_unmap = 0;
+
+                spin_lock(&guest_lock);
+                for (i = 0; i < guest_count; i++) {
+                    if (mattx_pid_shares_tgid_with_guest(rpc->local_pid, guest_registry[i].local_pid)) {
+                        if (guest_registry[i].rpc_done) {
+                            error = guest_registry[i].rpc_fsync_res; 
+                            // Find the Hollow VMA size and remove it from the map!
+                            for (int d = 0; d < guest_registry[i].dsm_count; d++) {
+                                if (guest_registry[i].dsm_map[d].base_addr == rpc->shm_addr) {
+                                    size_to_unmap = guest_registry[i].dsm_map[d].size;
+                                    guest_registry[i].dsm_map[d] = guest_registry[i].dsm_map[--guest_registry[i].dsm_count];
+                                    break;
+                                }
+                            }
+                        }
+                        break;
+                    }
+                }
+                spin_unlock(&guest_lock);
+
+                // The Magic Trick: Destroy the Hollow VMA on VM2!
+                if (error == 0 && size_to_unmap > 0) {
+                    vm_munmap(rpc->shm_addr, size_to_unmap);
+                    mattx_dbg("[DSM] Hollow VMA at 0x%lx (Size: %lu) destroyed on VM2.\n", rpc->shm_addr, size_to_unmap);
+                }
+
+                if (regs) regs->ax = error;
 
 
                 
@@ -4326,6 +4402,142 @@ static int ret_handler_tgkill(struct kretprobe_instance *ri, struct pt_regs *reg
 
 
 
+// ============================================================================
+// DSM CONTROL PLANE KPROBES
+// ============================================================================
+
+// --- SHMGET ---
+struct shmget_kretprobe_data { int key; size_t size; int shmflg; };
+static struct kretprobe shmget_kprobe;
+
+static int entry_handler_shmget(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    if (is_guest_process(current->tgid)) {
+        struct shmget_kretprobe_data *data = (struct shmget_kretprobe_data *)ri->data;
+        struct pt_regs *sys_regs = SYSCALL_REGS(regs);
+        data->key = (int)sys_regs->di;
+        data->size = (size_t)sys_regs->si;
+        data->shmflg = (int)sys_regs->dx;
+        sys_regs->di = -1; // Sabotage!
+    }
+    return 0;
+}
+
+static int ret_handler_shmget(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    if (!is_guest_process(current->tgid)) return 0;
+    if (fatal_signal_pending(current) || (current->flags & PF_EXITING)) return 0;
+
+    struct shmget_kretprobe_data *data = (struct shmget_kretprobe_data *)ri->data;
+    int home_node = -1; u32 orig_pid = 0;
+
+    spin_lock(&guest_lock);
+    for (int i = 0; i < guest_count; i++) {
+        if (guest_registry[i].local_pid == current->tgid) {
+            home_node = guest_registry[i].home_node; orig_pid = guest_registry[i].orig_pid;
+            guest_registry[i].rpc_done = false; break;
+        }
+    }
+    spin_unlock(&guest_lock);
+
+    if (home_node != -1) {
+        struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
+        if (rpc) {
+            INIT_WORK(&rpc->work, mattx_rpc_worker);
+            rpc->local_pid = current->pid; rpc->orig_pid = orig_pid; rpc->home_node = home_node;
+            rpc->is_shmget = true; rpc->shm_key = data->key; rpc->shm_size = data->size; rpc->shm_flg = data->shmflg;
+            send_sig(SIGSTOP, current, 0); schedule_work(&rpc->work);
+        }
+    }
+    return 0;
+}
+
+// --- SHMCTL ---
+struct shmctl_kretprobe_data { int shmid; int cmd; void __user *buf; };
+static struct kretprobe shmctl_kprobe;
+
+static int entry_handler_shmctl(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    if (is_guest_process(current->tgid)) {
+        struct shmctl_kretprobe_data *data = (struct shmctl_kretprobe_data *)ri->data;
+        struct pt_regs *sys_regs = SYSCALL_REGS(regs);
+        data->shmid = (int)sys_regs->di;
+        data->cmd = (int)sys_regs->si;
+        data->buf = (void __user *)sys_regs->dx;
+        sys_regs->di = -1; // Sabotage!
+    }
+    return 0;
+}
+
+static int ret_handler_shmctl(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    if (!is_guest_process(current->tgid)) return 0;
+    if (fatal_signal_pending(current) || (current->flags & PF_EXITING)) return 0;
+
+    struct shmctl_kretprobe_data *data = (struct shmctl_kretprobe_data *)ri->data;
+    int home_node = -1; u32 orig_pid = 0;
+
+    spin_lock(&guest_lock);
+    for (int i = 0; i < guest_count; i++) {
+        if (guest_registry[i].local_pid == current->tgid) {
+            home_node = guest_registry[i].home_node; orig_pid = guest_registry[i].orig_pid;
+            guest_registry[i].rpc_done = false; break;
+        }
+    }
+    spin_unlock(&guest_lock);
+
+    if (home_node != -1) {
+        struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
+        if (rpc) {
+            INIT_WORK(&rpc->work, mattx_rpc_worker);
+            rpc->local_pid = current->pid; rpc->orig_pid = orig_pid; rpc->home_node = home_node;
+            rpc->is_shmctl = true; rpc->shm_id = data->shmid; rpc->shm_cmd = data->cmd; rpc->buff = data->buf;
+            send_sig(SIGSTOP, current, 0); schedule_work(&rpc->work);
+        }
+    }
+    return 0;
+}
+
+// --- SHMDT ---
+struct shmdt_kretprobe_data { unsigned long shmaddr; };
+static struct kretprobe shmdt_kprobe;
+
+static int entry_handler_shmdt(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    if (is_guest_process(current->tgid)) {
+        struct shmdt_kretprobe_data *data = (struct shmdt_kretprobe_data *)ri->data;
+        struct pt_regs *sys_regs = SYSCALL_REGS(regs);
+        data->shmaddr = (unsigned long)sys_regs->di;
+        sys_regs->di = -1; // Sabotage!
+    }
+    return 0;
+}
+
+static int ret_handler_shmdt(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    if (!is_guest_process(current->tgid)) return 0;
+    if (fatal_signal_pending(current) || (current->flags & PF_EXITING)) return 0;
+
+    struct shmdt_kretprobe_data *data = (struct shmdt_kretprobe_data *)ri->data;
+    int home_node = -1; u32 orig_pid = 0;
+
+    spin_lock(&guest_lock);
+    for (int i = 0; i < guest_count; i++) {
+        if (guest_registry[i].local_pid == current->tgid) {
+            home_node = guest_registry[i].home_node; orig_pid = guest_registry[i].orig_pid;
+            guest_registry[i].rpc_done = false; break;
+        }
+    }
+    spin_unlock(&guest_lock);
+
+    if (home_node != -1) {
+        struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
+        if (rpc) {
+            INIT_WORK(&rpc->work, mattx_rpc_worker);
+            rpc->local_pid = current->pid; rpc->orig_pid = orig_pid; rpc->home_node = home_node;
+            rpc->is_shmdt = true; rpc->shm_addr = data->shmaddr;
+            send_sig(SIGSTOP, current, 0); schedule_work(&rpc->work);
+        }
+    }
+    return 0;
+}
+
+
+
 
 
 // --- KPROBE REGISTRATION ---
@@ -4864,12 +5076,35 @@ int mattx_hooks_init(void) {
     ret = register_kretprobe(&tgkill_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for tgkill, returned %d\n", ret);
 
+    // DSM - shared memory syscalls
+    memset(&shmget_kprobe, 0, sizeof(shmget_kprobe)); shmget_kprobe.kp.symbol_name = "__x64_sys_shmget";
+    shmget_kprobe.entry_handler = entry_handler_shmget; shmget_kprobe.handler = ret_handler_shmget;
+    shmget_kprobe.data_size = sizeof(struct shmget_kretprobe_data); shmget_kprobe.maxactive = 64;
+    ret = register_kretprobe(&shmget_kprobe);
+    if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for shmget, returned %d\n", ret);
+
+    memset(&shmctl_kprobe, 0, sizeof(shmctl_kprobe)); shmctl_kprobe.kp.symbol_name = "__x64_sys_shmctl";
+    shmctl_kprobe.entry_handler = entry_handler_shmctl; shmctl_kprobe.handler = ret_handler_shmctl;
+    shmctl_kprobe.data_size = sizeof(struct shmctl_kretprobe_data); shmctl_kprobe.maxactive = 64;
+    ret = register_kretprobe(&shmctl_kprobe);
+    if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for shmctl, returned %d\n", ret);
+
+    memset(&shmdt_kprobe, 0, sizeof(shmdt_kprobe)); shmdt_kprobe.kp.symbol_name = "__x64_sys_shmdt";
+    shmdt_kprobe.entry_handler = entry_handler_shmdt; shmdt_kprobe.handler = ret_handler_shmdt;
+    shmdt_kprobe.data_size = sizeof(struct shmdt_kretprobe_data); shmdt_kprobe.maxactive = 64;
+    ret = register_kretprobe(&shmdt_kprobe);
+    if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for shmdt, returned %d\n", ret);
+
+
 
     mattx_dbg(" Syscall Hooks (Kprobes) registered successfully.\n");
     return 0;
 }
 
 void mattx_hooks_exit(void) {
+    unregister_kretprobe(&shmdt_kprobe);
+    unregister_kretprobe(&shmctl_kprobe);
+    unregister_kretprobe(&shmget_kprobe);
     unregister_kretprobe(&tgkill_kprobe);
     unregister_kprobe(&wake_up_new_task_kprobe);
     unregister_kretprobe(&sched_getaffinity_kprobe);

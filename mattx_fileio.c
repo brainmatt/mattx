@@ -25,6 +25,8 @@
 #include <linux/wait.h>
 #include <linux/poll.h>
 #include <linux/namei.h> // For kern_path
+#include <linux/nsproxy.h>
+
 
 // --- THE HPC FAST-PATH HELPER ---
 bool is_hpc_local_lib(const char *path) {
@@ -3558,6 +3560,163 @@ static void handle_sys_pipe2_reply(struct mattx_link *link, struct mattx_header 
 
 
 
+// ============================================================================
+// DSM CONTROL PLANE (VM1 NATIVE EXECUTION)
+// ============================================================================
+
+// --- SHMGET KWORKER ---
+struct mattx_shmget_kworker_ctx { struct work_struct work; struct mattx_sys_shmget_req req; int target_node; };
+static void mattx_shmget_kworker(struct work_struct *work) {
+    struct mattx_shmget_kworker_ctx *ctx = container_of(work, struct mattx_shmget_kworker_ctx, work);
+    struct pt_regs regs; memset(&regs, 0, sizeof(regs));
+    int ret = -ENOSYS; struct task_struct *deputy = NULL;
+
+    rcu_read_lock(); deputy = pid_task(find_vpid(ctx->req.orig_pid), PIDTYPE_PID); if (deputy) get_task_struct(deputy); rcu_read_unlock();
+    if (deputy && real_sys_shmget) {
+        // THE SILENT NINJA: Steal the IPC Namespace!
+        struct nsproxy *old_ns = current->nsproxy;
+        current->nsproxy = deputy->nsproxy;
+        const struct cred *old_cred = override_creds(deputy->cred);
+
+        regs.di = ctx->req.key; regs.si = ctx->req.size; regs.dx = ctx->req.shmflg;
+        ret = real_sys_shmget(&regs);
+
+        revert_creds(old_cred);
+        current->nsproxy = old_ns;
+        put_task_struct(deputy);
+    }
+
+    struct mattx_sys_shmget_reply reply = { .orig_pid = ctx->req.orig_pid, .shmid = ret, .error = (ret < 0) ? ret : 0 };
+    if (cluster_map[ctx->target_node]) mattx_comm_send(cluster_map[ctx->target_node], MATTX_MSG_SYS_SHMGET_REPLY, &reply, sizeof(reply));
+    kfree(ctx);
+}
+static void handle_sys_shmget_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    struct mattx_sys_shmget_req *req = payload; struct mattx_shmget_kworker_ctx *ctx = kmalloc(sizeof(*ctx), GFP_ATOMIC);
+    if (ctx) { INIT_WORK(&ctx->work, mattx_shmget_kworker); memcpy(&ctx->req, req, sizeof(*req)); ctx->target_node = hdr->sender_id; schedule_work(&ctx->work); }
+}
+
+// --- SHMCTL KWORKER ---
+struct mattx_shmctl_kworker_ctx { struct work_struct work; struct mattx_sys_shmctl_req req; int target_node; };
+static void mattx_shmctl_kworker(struct work_struct *work) {
+    struct mattx_shmctl_kworker_ctx *ctx = container_of(work, struct mattx_shmctl_kworker_ctx, work);
+    struct pt_regs regs; memset(&regs, 0, sizeof(regs));
+    int ret = -ENOSYS; struct task_struct *deputy = NULL;
+    void *out_buf = kmalloc(128, GFP_KERNEL);
+
+    rcu_read_lock(); deputy = pid_task(find_vpid(ctx->req.orig_pid), PIDTYPE_PID); if (deputy) get_task_struct(deputy); rcu_read_unlock();
+    if (deputy && real_sys_shmctl) {
+        struct nsproxy *old_ns = current->nsproxy;
+        current->nsproxy = deputy->nsproxy;
+        const struct cred *old_cred = override_creds(deputy->cred);
+        kthread_use_mm(deputy->mm);
+
+        unsigned long scratchpad = task_pt_regs(deputy)->sp - 8192;
+        regs.di = ctx->req.shmid; regs.si = ctx->req.cmd; regs.dx = scratchpad;
+        
+        ret = real_sys_shmctl(&regs);
+
+        if (ret == 0 && out_buf) {
+            if (copy_from_user(out_buf, (void __user *)scratchpad, 128)) {
+                mattx_dbg("[KWORKER] Warning: Failed to read shmid_ds from scratchpad!\n");
+                ret = -EFAULT; // Sabotage the return code so VM2 knows it failed!
+            }
+        }
+
+        kthread_unuse_mm(deputy->mm);
+        revert_creds(old_cred);
+        current->nsproxy = old_ns;
+        put_task_struct(deputy);
+    }
+
+    struct mattx_sys_shmctl_reply reply = { .orig_pid = ctx->req.orig_pid, .error = ret };
+    if (ret == 0 && out_buf) memcpy(reply.data, out_buf, 128);
+    if (cluster_map[ctx->target_node]) mattx_comm_send(cluster_map[ctx->target_node], MATTX_MSG_SYS_SHMCTL_REPLY, &reply, sizeof(reply));
+    if (out_buf) kfree(out_buf);
+    kfree(ctx);
+}
+static void handle_sys_shmctl_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    struct mattx_sys_shmctl_req *req = payload; struct mattx_shmctl_kworker_ctx *ctx = kmalloc(sizeof(*ctx), GFP_ATOMIC);
+    if (ctx) { INIT_WORK(&ctx->work, mattx_shmctl_kworker); memcpy(&ctx->req, req, sizeof(*req)); ctx->target_node = hdr->sender_id; schedule_work(&ctx->work); }
+}
+
+// --- SHMDT KWORKER ---
+struct mattx_shmdt_kworker_ctx { struct work_struct work; struct mattx_sys_shmdt_req req; int target_node; };
+static void mattx_shmdt_kworker(struct work_struct *work) {
+    struct mattx_shmdt_kworker_ctx *ctx = container_of(work, struct mattx_shmdt_kworker_ctx, work);
+    struct pt_regs regs; memset(&regs, 0, sizeof(regs));
+    int ret = -ENOSYS; struct task_struct *deputy = NULL;
+
+    rcu_read_lock(); deputy = pid_task(find_vpid(ctx->req.orig_pid), PIDTYPE_PID); if (deputy) get_task_struct(deputy); rcu_read_unlock();
+    if (deputy && real_sys_shmdt) {
+        struct nsproxy *old_ns = current->nsproxy;
+        current->nsproxy = deputy->nsproxy;
+        const struct cred *old_cred = override_creds(deputy->cred);
+        kthread_use_mm(deputy->mm);
+
+        regs.di = ctx->req.shmaddr;
+        ret = real_sys_shmdt(&regs);
+
+        kthread_unuse_mm(deputy->mm);
+        revert_creds(old_cred);
+        current->nsproxy = old_ns;
+        put_task_struct(deputy);
+    }
+
+    struct mattx_sys_shmdt_reply reply = { .orig_pid = ctx->req.orig_pid, .error = ret };
+    if (cluster_map[ctx->target_node]) mattx_comm_send(cluster_map[ctx->target_node], MATTX_MSG_SYS_SHMDT_REPLY, &reply, sizeof(reply));
+    kfree(ctx);
+}
+static void handle_sys_shmdt_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    struct mattx_sys_shmdt_req *req = payload; struct mattx_shmdt_kworker_ctx *ctx = kmalloc(sizeof(*ctx), GFP_ATOMIC);
+    if (ctx) { INIT_WORK(&ctx->work, mattx_shmdt_kworker); memcpy(&ctx->req, req, sizeof(*req)); ctx->target_node = hdr->sender_id; schedule_work(&ctx->work); }
+}
+
+// --- VM2 REPLY HANDLERS ---
+static void handle_sys_shmget_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    struct mattx_sys_shmget_reply *reply = payload;
+    spin_lock(&guest_lock);
+    for (int i = 0; i < guest_count; i++) {
+        if (guest_registry[i].orig_pid == reply->orig_pid && guest_registry[i].home_node == hdr->sender_id) {
+            guest_registry[i].rpc_fsync_res = (reply->error < 0) ? reply->error : reply->shmid;
+            guest_registry[i].rpc_done = true; if (guest_registry[i].rpc_wq) wake_up_interruptible(guest_registry[i].rpc_wq); break;
+        }
+    }
+    spin_unlock(&guest_lock);
+}
+
+static void handle_sys_shmctl_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    struct mattx_sys_shmctl_reply *reply = payload;
+    spin_lock(&guest_lock);
+    for (int i = 0; i < guest_count; i++) {
+        if (guest_registry[i].orig_pid == reply->orig_pid && guest_registry[i].home_node == hdr->sender_id) {
+            guest_registry[i].rpc_fsync_res = reply->error;
+            if (reply->error == 0) {
+                guest_registry[i].rpc_read_buf = kmalloc(128, GFP_ATOMIC);
+                if (guest_registry[i].rpc_read_buf) memcpy(guest_registry[i].rpc_read_buf, reply->data, 128);
+            }
+            guest_registry[i].rpc_done = true; if (guest_registry[i].rpc_wq) wake_up_interruptible(guest_registry[i].rpc_wq); break;
+        }
+    }
+    spin_unlock(&guest_lock);
+}
+
+static void handle_sys_shmdt_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    struct mattx_sys_shmdt_reply *reply = payload;
+    spin_lock(&guest_lock);
+    for (int i = 0; i < guest_count; i++) {
+        if (guest_registry[i].orig_pid == reply->orig_pid && guest_registry[i].home_node == hdr->sender_id) {
+            guest_registry[i].rpc_fsync_res = reply->error;
+            guest_registry[i].rpc_done = true; if (guest_registry[i].rpc_wq) wake_up_interruptible(guest_registry[i].rpc_wq); break;
+        }
+    }
+    spin_unlock(&guest_lock);
+}
+
+
+
+
+
+
 
 
 
@@ -4829,7 +4988,12 @@ void mattx_fileio_init_handlers(void) {
     mattx_register_handler(MATTX_MSG_SYS_GETDENTS64_REPLY, handle_sys_getdents64_reply);
     mattx_register_handler(MATTX_MSG_SYS_PIPE2_REQ, handle_sys_pipe2_req);
     mattx_register_handler(MATTX_MSG_SYS_PIPE2_REPLY, handle_sys_pipe2_reply);
-
+    mattx_register_handler(MATTX_MSG_SYS_SHMGET_REQ, handle_sys_shmget_req);
+    mattx_register_handler(MATTX_MSG_SYS_SHMGET_REPLY, handle_sys_shmget_reply);
+    mattx_register_handler(MATTX_MSG_SYS_SHMCTL_REQ, handle_sys_shmctl_req);
+    mattx_register_handler(MATTX_MSG_SYS_SHMCTL_REPLY, handle_sys_shmctl_reply);
+    mattx_register_handler(MATTX_MSG_SYS_SHMDT_REQ, handle_sys_shmdt_req);
+    mattx_register_handler(MATTX_MSG_SYS_SHMDT_REPLY, handle_sys_shmdt_reply);
 
 
     mattx_dbg(" [FILEIO] Network handlers registered.\n");

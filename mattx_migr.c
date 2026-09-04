@@ -69,7 +69,9 @@ mattx_sys_clone_fn real_sys_clone = NULL;
 mattx_sys_mremap_fn real_sys_mremap = NULL;
 mattx_x86_fsbase_write_task_fn real_x86_fsbase_write_task = NULL;
 mattx_x86_gsbase_write_task_fn real_x86_gsbase_write_task = NULL;
-
+mattx_sys_shmget_fn real_sys_shmget = NULL;
+mattx_sys_shmctl_fn real_sys_shmctl = NULL;
+mattx_sys_shmdt_fn real_sys_shmdt = NULL;
 
 
 static void mattx_resolve_hidden_symbols(void) {
@@ -347,7 +349,27 @@ static void mattx_resolve_hidden_symbols(void) {
         unregister_kprobe(&kp); 
     }
     
+    // --- DSM RESOLVERS ---
+    memset(&kp, 0, sizeof(kp)); 
+    kp.symbol_name = "__x64_sys_shmget";
+    if (register_kprobe(&kp) == 0) { 
+        real_sys_shmget = (mattx_sys_shmget_fn)kp.addr; 
+        unregister_kprobe(&kp); 
+    }
 
+    memset(&kp, 0, sizeof(kp)); 
+    kp.symbol_name = "__x64_sys_shmctl";
+    if (register_kprobe(&kp) == 0) { 
+        real_sys_shmctl = (mattx_sys_shmctl_fn)kp.addr; 
+        unregister_kprobe(&kp); 
+    }
+
+    memset(&kp, 0, sizeof(kp)); 
+    kp.symbol_name = "__x64_sys_shmdt";
+    if (register_kprobe(&kp) == 0) { 
+        real_sys_shmdt = (mattx_sys_shmdt_fn)kp.addr; 
+        unregister_kprobe(&kp); 
+    }
 }
 
 

@@ -961,6 +961,16 @@ struct mattx_rpc_work {
     int pipe2_flags;
     void __user *pipe2_pipefd;
 
+    // For DSM Control Plane ---
+    bool is_shmget;
+    bool is_shmctl;
+    bool is_shmdt;
+    int shm_key;
+    size_t shm_size;
+    int shm_flg;
+    int shm_id;
+    int shm_cmd;
+    unsigned long shm_addr;    
 };
 
 struct mattx_link {
@@ -1151,7 +1161,11 @@ struct mattx_sys_shmdt_req { u32 orig_pid; unsigned long shmaddr; };
 struct mattx_sys_shmdt_reply { u32 orig_pid; int error; };
 
 struct mattx_sys_shmctl_req { u32 orig_pid; int shmid; int cmd; };
-struct mattx_sys_shmctl_reply { u32 orig_pid; int error; };
+struct mattx_sys_shmctl_reply { 
+    u32 orig_pid; 
+    int error; 
+    char data[128]; // Large enough to hold struct shmid_ds
+};
 
 
 // This defines the standard signature for all message handlers
@@ -1313,6 +1327,17 @@ extern mattx_sys_getdents64_fn real_sys_getdents64;
 
 typedef long (*mattx_sys_pipe2_fn)(const struct pt_regs *regs);
 extern mattx_sys_pipe2_fn real_sys_pipe2;
+
+// --- THE DSM GHOST RESOLVERS ---
+typedef long (*mattx_sys_shmget_fn)(const struct pt_regs *regs);
+extern mattx_sys_shmget_fn real_sys_shmget;
+
+typedef long (*mattx_sys_shmctl_fn)(const struct pt_regs *regs);
+extern mattx_sys_shmctl_fn real_sys_shmctl;
+
+typedef long (*mattx_sys_shmdt_fn)(const struct pt_regs *regs);
+extern mattx_sys_shmdt_fn real_sys_shmdt;
+
 
 // --- THE THREAD GHOST EXORCIST RESOLVER ---
 typedef long (*mattx_sys_exit_fn)(const struct pt_regs *regs);
