@@ -891,6 +891,14 @@ void mattx_send_vma_data(void) {
             mattx_dbg("[MIGRATE] -> Skipping VMA %d (Read-Only, non-exec during Return)\n", i);
             continue;
         }
+        
+        // --- THE DSM HOLLOW FILTER ---
+        // If this is a forward migration and the VMA is Shared Memory, DO NOT send the pages!
+        // We want it to arrive on VM2 completely hollow so the Page Fault Tripwire catches it.
+        if (!is_returning && local_migration_req->vmas[i].is_shm) {
+            mattx_dbg("[MIGRATE] -> Skipping VMA %d (DSM Segment - Leaving Hollow for Tripwire)\n", i);
+            continue;
+        }
 
         mattx_dbg("[MIGRATE] -> VMA %d: Entering page extraction loop...\n", i);
 

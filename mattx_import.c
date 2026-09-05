@@ -361,19 +361,35 @@ static void handle_migrate_done(struct mattx_link *link, struct mattx_header *hd
                 }
                 rcu_read_unlock();
 
-                // Populate the DSM Translation Map ---
+                // --- Populate the DSM Translation Map & Arm Tripwires ---
                 guest_registry[i].dsm_count = 0;
-                for (int v = 0; v < pending_migration->vma_count; v++) {
-                    if (pending_migration->vmas[v].is_shm && guest_registry[i].dsm_count < MAX_DSM_SEGMENTS) {
-                        int d_idx = guest_registry[i].dsm_count++;
-                        guest_registry[i].dsm_map[d_idx].base_addr = pending_migration->vmas[v].vm_start;
-                        guest_registry[i].dsm_map[d_idx].size = pending_migration->vmas[v].vm_end - pending_migration->vmas[v].vm_start;
-                        guest_registry[i].dsm_map[d_idx].shmid = pending_migration->vmas[v].shmid;
-                        mattx_dbg("[IMPORT] Registered DSM Segment: 0x%lx (ID: %u, Size: %lu)\n", 
-                                  guest_registry[i].dsm_map[d_idx].base_addr, guest_registry[i].dsm_map[d_idx].shmid, guest_registry[i].dsm_map[d_idx].size);
+                
+                if (hijacked_stub_task->mm) {
+                    // We need the write lock to modify the VMA flags and ops!
+                    mmap_write_lock(hijacked_stub_task->mm);
+                    
+                    for (int v = 0; v < pending_migration->vma_count; v++) {
+                        if (pending_migration->vmas[v].is_shm && guest_registry[i].dsm_count < MAX_DSM_SEGMENTS) {
+                            int d_idx = guest_registry[i].dsm_count++;
+                            unsigned long base = pending_migration->vmas[v].vm_start;
+                            
+                            guest_registry[i].dsm_map[d_idx].base_addr = base;
+                            guest_registry[i].dsm_map[d_idx].size = pending_migration->vmas[v].vm_end - base;
+                            guest_registry[i].dsm_map[d_idx].shmid = pending_migration->vmas[v].shmid;
+                            
+                            // --- ARM THE TRIPWIRE ---
+                            struct vm_area_struct *vma = find_vma(hijacked_stub_task->mm, base);
+                            if (vma && vma->vm_start == base) {
+                                vma->vm_ops = &mattx_dsm_vm_ops; // Lay the trap!
+                                vm_flags_set(vma, vma->vm_flags | VM_MIXEDMAP); // Allow page injection!
+                                
+                                mattx_dbg("[IMPORT] Armed DSM Tripwire at 0x%lx (ID: %u, Size: %lu)\n", 
+                                          base, pending_migration->vmas[v].shmid, guest_registry[i].dsm_map[d_idx].size);
+                            }
+                        }
                     }
+                    mmap_write_unlock(hijacked_stub_task->mm);
                 }
-
                 break;
             }
         }
