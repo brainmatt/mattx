@@ -3691,9 +3691,6 @@ static vm_fault_t mattx_dsm_fault(struct vm_fault *vmf) {
     memcpy(kaddr, page_buf, 4096);
     kunmap_local(kaddr);
 
-    // Hacker Trick: We must ensure the VMA allows custom page insertion!
-    vm_flags_set(vma, vma->vm_flags | VM_MIXEDMAP);
-
     // Surgically insert the physical page into the application's page tables!
     vm_fault_t ret = vmf_insert_page(vma, fault_addr, page);
     
@@ -3968,10 +3965,18 @@ static void mattx_dsm_fault_kworker(struct work_struct *work) {
                         // FOUND IT! Calculate the absolute physical address on VM1
                         unsigned long target_addr = vma->vm_start + ctx->req.offset;
                         
+
                         if (target_addr < vma->vm_end) {
+                            mattx_dbg("[DSM_PUMP] Found SYSV segment! Sucking 4096 bytes from physical addr 0x%lx...\n", target_addr); // <-- NEW LOG!
+                            
                             // THE PUMP: Suck exactly 4096 bytes out of the Deputy's brain!
                             int bytes = access_process_vm(deputy, target_addr, reply->data, 4096, FOLL_FORCE);
-                            if (bytes == 4096) ret = 0;
+                            if (bytes == 4096) {
+                                ret = 0;
+                                mattx_dbg("[DSM_PUMP] Successfully extracted 4KB page. Sending to Node %d...\n", ctx->target_node); // <-- NEW LOG!
+                            } else {
+                                mattx_dbg("[DSM_PUMP] ERROR: Failed to extract page! (Read %d bytes)\n", bytes); // <-- NEW LOG!
+                            }
                         }
                         break;
                     }
@@ -3992,6 +3997,10 @@ static void mattx_dsm_fault_kworker(struct work_struct *work) {
 
 static void handle_dsm_page_fault_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
     struct mattx_dsm_page_fault_req *req = payload;
+
+    mattx_dbg("[DSM_PUMP] Received PAGE_FAULT_REQ from Node %u for SHMID %u at Offset %lu\n", 
+              hdr->sender_id, req->shmid, req->offset);
+
     struct mattx_dsm_fault_kworker_ctx *ctx = kmalloc(sizeof(*ctx), GFP_ATOMIC);
     if (ctx) {
         INIT_WORK(&ctx->work, mattx_dsm_fault_kworker);
