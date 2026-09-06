@@ -98,7 +98,7 @@
 #define MAX_GUESTS 1024 
 #define MAX_GANG_THREADS 16
 #define MAX_FDS 256
-#define MAX_DSM_PAGES 512 // 4MB max per segment for this prototype
+#define MAX_DSM_PAGES 256 // 4MB max per segment for this prototype
 
 // Max size of a captured thread's raw FPU/SSE/AVX register image
 // (XSAVE/FXSAVE area). Covers up through AVX2 (~832-960 bytes on typical
