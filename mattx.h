@@ -98,7 +98,7 @@
 #define MAX_GUESTS 1024 
 #define MAX_GANG_THREADS 16
 #define MAX_FDS 256
-
+#define MAX_DSM_PAGES 512 // 4MB max per segment for this prototype
 
 // Max size of a captured thread's raw FPU/SSE/AVX register image
 // (XSAVE/FXSAVE area). Covers up through AVX2 (~832-960 bytes on typical
@@ -234,7 +234,8 @@ enum mattx_msg_type {
     MATTX_MSG_SYS_SHMCTL_REQ,
     MATTX_MSG_SYS_SHMCTL_REPLY,
     MATTX_MSG_DSM_PAGE_FAULT_REQ,
-    MATTX_MSG_DSM_PAGE_FAULT_REPLY,    
+    MATTX_MSG_DSM_PAGE_FAULT_REPLY,
+    MATTX_MSG_DSM_PAGE_UPDATE,    
 };
 
 struct mattx_header {
@@ -1003,6 +1004,7 @@ struct mattx_dsm_mapping {
     unsigned long base_addr;
     u32 shmid;
     unsigned long size;
+    unsigned long present_pages[MAX_DSM_PAGES / BITS_PER_LONG]; // Tracks mapped pages!
 };
 
 
@@ -1198,6 +1200,12 @@ struct mattx_dsm_page_fault_reply {
     char data[4096]; // Exactly one PAGE_SIZE!
 };
 
+struct mattx_dsm_page_update_req {
+    u32 orig_pid;
+    u32 shmid;
+    unsigned long offset;
+    char data[4096]; // The updated page content!
+};
 
 
 // This defines the standard signature for all message handlers
@@ -1375,6 +1383,12 @@ extern mattx_sys_shmat_fn real_sys_shmat;
 
 // The DSM Tripwire Struct ---
 extern const struct vm_operations_struct mattx_dsm_vm_ops;
+
+typedef void (*mattx_zap_vma_ptes_fn)(struct vm_area_struct *vma, unsigned long address, unsigned long size);
+extern mattx_zap_vma_ptes_fn real_zap_vma_ptes;
+
+extern int config_dsm_mode; // Expose the config toggle!
+int mattx_dsm_sweeper_loop(void *data); // Expose the Sweeper thread!
 
 
 

@@ -74,6 +74,7 @@ mattx_sys_shmctl_fn real_sys_shmctl = NULL;
 mattx_sys_shmdt_fn real_sys_shmdt = NULL;
 mattx_sys_shmat_fn real_sys_shmat = NULL;
 mattx_x86_task_fpu_fn real_x86_task_fpu = NULL;
+mattx_zap_vma_ptes_fn real_zap_vma_ptes = NULL;
 
 
 static void mattx_resolve_hidden_symbols(void) {
@@ -390,6 +391,17 @@ static void mattx_resolve_hidden_symbols(void) {
     } else {
         printk(KERN_ERR "MattX: FATAL - Could not resolve x86_task_fpu!\n");
     }
+
+    // --- THE vMA PTE ZAPPER ---
+    memset(&kp, 0, sizeof(kp)); 
+    kp.symbol_name = "zap_vma_ptes";
+    if (register_kprobe(&kp) == 0) { 
+        real_zap_vma_ptes = (mattx_zap_vma_ptes_fn)kp.addr; 
+        unregister_kprobe(&kp); 
+    }
+
+
+
 }
 
 

@@ -322,10 +322,17 @@ static ssize_t admin_write(struct file *file, const char __user *ubuf, size_t co
             config_accept_guests = (arg1 != 0);
             mattx_dbg(" [ADMIN] Accept Guests set to: %s\n", config_accept_guests ? "YES" : "NO");
         }
-        else if (strcmp(cmd, "locallibs") == 0 && arg1 != -1) { // <-- NEW
+        else if (strcmp(cmd, "locallibs") == 0 && arg1 != -1) {
             config_hpc_local_libs = (arg1 != 0);
             mattx_dbg(" [ADMIN] HPC Local Libs Fast-Path set to: %s\n", config_hpc_local_libs ? "ON" : "OFF");
         }
+        else if (strcmp(cmd, "dsm") == 0 && arg1 != -1) {
+            config_dsm_mode = (arg1 != 0);
+            mattx_dbg(" [ADMIN] DSM Mode set to: %s\n", config_dsm_mode ? "ON" : "OFF");
+        }
+        
+
+
         else if (strcmp(cmd, "migrate") == 0 && arg1 != -1 && arg2_str[0] != '\0') {
             
             if (strcmp(arg2_str, "home") == 0) {

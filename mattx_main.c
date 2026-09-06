@@ -57,6 +57,13 @@ EXPORT_SYMBOL(config_mpi_support);
 bool config_hpc_local_libs = true; // Default to ON for maximum performance!
 EXPORT_SYMBOL(config_hpc_local_libs);
 
+// DSM Sweeper
+int config_dsm_mode = 1; // 0 = Lazy, 1 = Dirty Sweeper
+EXPORT_SYMBOL(config_dsm_mode);
+static struct task_struct *dsm_sweeper_thread;
+
+
+
 
 enum { MATTX_ATTR_UNSPEC, MATTX_ATTR_NODE_ID, MATTX_ATTR_IPV4_ADDR, MATTX_ATTR_STUB_PID, MATTX_ATTR_BLUEPRINT, MATTX_ATTR_MY_NODE_ID, MATTX_ATTR_LOCAL_IP, MATTX_ATTR_CONFIG_FILE_IO, MATTX_ATTR_CONFIG_NET_IO, MATTX_ATTR_MATTXFS_ENABLED, MATTX_ATTR_DFSA_DIR, MATTX_ATTR_MPI_SUPPORT, MATTX_ATTR_ACCEPT_GUESTS, MATTX_ATTR_CONFIG_LOCAL_LIBS, __MATTX_ATTR_MAX };
 #define MATTX_ATTR_MAX (__MATTX_ATTR_MAX - 1)
@@ -297,7 +304,8 @@ static int __init mattx_init(void) {
 
     balancer_thread = kthread_run(mattx_balancer_loop, NULL, "mattx_balancer");
     listener_thread = kthread_run(mattx_listener_loop, NULL, "mattx_listener");
-    if (IS_ERR(balancer_thread) || IS_ERR(listener_thread)) {
+    dsm_sweeper_thread = kthread_run(mattx_dsm_sweeper_loop, NULL, "mattx_sweeper");
+    if (IS_ERR(balancer_thread) || IS_ERR(listener_thread) || IS_ERR(dsm_sweeper_thread)) {
         mattx_hooks_exit(); 
         genl_unregister_family(&mattx_genl_family);
         return -ENOMEM;
@@ -309,6 +317,7 @@ static void __exit mattx_exit(void) {
     int i;
     if (balancer_thread) kthread_stop(balancer_thread);
     if (listener_thread) kthread_stop(listener_thread);
+    if (dsm_sweeper_thread) kthread_stop(dsm_sweeper_thread);
     
     mattx_proc_exit();
     mattx_hooks_exit();
