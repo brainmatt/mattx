@@ -4102,6 +4102,7 @@ static void handle_dsm_page_update(struct mattx_link *link, struct mattx_header 
     }
 }
 
+
 // ============================================================================
 // THE DIRTY SWEEPER THREAD (VM2)
 // ============================================================================
@@ -4110,12 +4111,18 @@ int mattx_dsm_sweeper_loop(void *data) {
 
     while (!kthread_should_stop()) {
         if (config_dsm_mode == 1) {
-            // We iterate safely without sleeping inside the spinlock!
+            
+            // FIX: Allocate the map on the heap to prevent Kernel Stack Overflow!
+            struct mattx_dsm_mapping *local_dsm = kmalloc_array(16, sizeof(struct mattx_dsm_mapping), GFP_KERNEL);
+            if (!local_dsm) {
+                msleep(50);
+                continue;
+            }
+
             for (int i = 0; i < MAX_GUESTS; i++) {
                 pid_t local_pid = -1;
                 u32 orig_pid = 0;
                 int home_node = -1;
-                struct mattx_dsm_mapping local_dsm[16];
                 int dsm_count = 0;
 
                 spin_lock(&guest_lock);
@@ -4124,7 +4131,7 @@ int mattx_dsm_sweeper_loop(void *data) {
                     orig_pid = guest_registry[i].orig_pid;
                     home_node = guest_registry[i].home_node;
                     dsm_count = guest_registry[i].dsm_count;
-                    memcpy(local_dsm, guest_registry[i].dsm_map, sizeof(local_dsm));
+                    memcpy(local_dsm, guest_registry[i].dsm_map, dsm_count * sizeof(struct mattx_dsm_mapping));
                     
                     // Clear the present bits in the registry immediately so we don't double-sync
                     for (int d = 0; d < dsm_count; d++) {
@@ -4175,30 +4182,32 @@ int mattx_dsm_sweeper_loop(void *data) {
                                 }
                             }
 
-                            // 2. The Zap! (Burn it all down)
-                            if (real_zap_vma_ptes) {
-                                mmap_read_lock(surrogate->mm);
-                                struct vm_area_struct *vma = find_vma(surrogate->mm, base);
-                                if (vma && vma->vm_start == base) {
-                                    real_zap_vma_ptes(vma, base, size);
-                                    mattx_dbg("[DSM_SWEEPER] Zapped Hollow VMA at 0x%lx. Ready for next fault!\n", base);
-                                }
-                                mmap_read_unlock(surrogate->mm);
+                            // 2. The Zap! (Burn it all down SAFELY)
+                            if (real_sys_madvise) {
+                                // Steal the Surrogate's mm to execute the syscall!
+                                kthread_use_mm(surrogate->mm);
+                                struct pt_regs regs;
+                                memset(&regs, 0, sizeof(regs));
+                                regs.di = base;
+                                regs.si = size;
+                                regs.dx = MADV_DONTNEED; // Safely unmap and free the pages!
+                                
+                                real_sys_madvise(&regs);
+                                
+                                kthread_unuse_mm(surrogate->mm);
+                                mattx_dbg("[DSM_SWEEPER] Zapped Hollow VMA at 0x%lx using madvise. Ready for next fault!\n", base);
                             }
                         }
                         put_task_struct(surrogate);
                     }
                 }
             }
+            kfree(local_dsm); // Free the heap array!
         }
         msleep(50); // Run every 50ms (Eventual Consistency Window)
     }
     return 0;
 }
-
-
-
-
 
 
 

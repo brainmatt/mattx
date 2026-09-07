@@ -74,7 +74,7 @@ mattx_sys_shmctl_fn real_sys_shmctl = NULL;
 mattx_sys_shmdt_fn real_sys_shmdt = NULL;
 mattx_sys_shmat_fn real_sys_shmat = NULL;
 mattx_x86_task_fpu_fn real_x86_task_fpu = NULL;
-mattx_zap_vma_ptes_fn real_zap_vma_ptes = NULL;
+mattx_sys_madvise_fn real_sys_madvise = NULL;
 
 
 static void mattx_resolve_hidden_symbols(void) {
@@ -394,13 +394,11 @@ static void mattx_resolve_hidden_symbols(void) {
 
     // --- THE vMA PTE ZAPPER ---
     memset(&kp, 0, sizeof(kp)); 
-    kp.symbol_name = "zap_vma_ptes";
+    kp.symbol_name = "__x64_sys_madvise";
     if (register_kprobe(&kp) == 0) { 
-        real_zap_vma_ptes = (mattx_zap_vma_ptes_fn)kp.addr; 
+        real_sys_madvise = (mattx_sys_madvise_fn)kp.addr; 
         unregister_kprobe(&kp); 
     }
-
-
 
 }
 
