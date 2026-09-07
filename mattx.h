@@ -98,7 +98,7 @@
 #define MAX_GUESTS 1024 
 #define MAX_GANG_THREADS 16
 #define MAX_FDS 256
-#define MAX_DSM_PAGES 1024 // 4MB max per segment for this prototype
+#define MAX_DSM_PAGES 256 // 1MB max per segment for this prototype
 
 // Max size of a captured thread's raw FPU/SSE/AVX register image
 // (XSAVE/FXSAVE area). Covers up through AVX2 (~832-960 bytes on typical
@@ -1005,6 +1005,7 @@ struct mattx_dsm_mapping {
     u32 shmid;
     unsigned long size;
     unsigned long present_pages[MAX_DSM_PAGES / BITS_PER_LONG]; // Tracks mapped pages!
+    void *pages[MAX_DSM_PAGES]; // The Physical Page Pool!    
 };
 
 
@@ -1385,8 +1386,8 @@ extern mattx_sys_shmat_fn real_sys_shmat;
 extern const struct vm_operations_struct mattx_dsm_vm_ops;
 
 // --- THE DSM SWEEPER ---
-typedef long (*mattx_sys_madvise_fn)(const struct pt_regs *regs);
-extern mattx_sys_madvise_fn real_sys_madvise;
+typedef void (*mattx_zap_vma_ptes_fn)(struct vm_area_struct *vma, unsigned long address, unsigned long size);
+extern mattx_zap_vma_ptes_fn real_zap_vma_ptes;
 
 extern int config_dsm_mode; // Expose the config toggle!
 int mattx_dsm_sweeper_loop(void *data); // Expose the Sweeper thread!

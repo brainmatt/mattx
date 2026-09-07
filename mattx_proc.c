@@ -174,14 +174,14 @@ static int dsm_show(struct seq_file *m, void *v) {
             unsigned long base = guest_registry[i].dsm_map[d].base_addr;
             unsigned long size = guest_registry[i].dsm_map[d].size;
             u32 shmid = guest_registry[i].dsm_map[d].shmid;
-            
+
             memset(hex_buf, 0, sizeof(hex_buf));
             bytes_read = 0;
             
-            if (surrogate) {
-                // THE MAGIC TRICK: If this page hasn't been fetched yet, 
-                // access_process_vm will trigger our mattx_dsm_fault tripwire!
-                bytes_read = access_process_vm(surrogate, base, hex_buf, 16, FOLL_FORCE);
+            // Read directly from our physical page pool!
+            if (guest_registry[i].dsm_map[d].pages[0]) {
+                memcpy(hex_buf, guest_registry[i].dsm_map[d].pages[0], 16);
+                bytes_read = 16;
             }
 
             seq_printf(m, "[IMPORT] %-6d %-4d  %-10u  0x%-16lx  %-10lu  ", 
@@ -191,9 +191,10 @@ static int dsm_show(struct seq_file *m, void *v) {
             if (bytes_read > 0) {
                 for (int b = 0; b < bytes_read; b++) seq_printf(m, "%02x ", hex_buf[b]);
             } else {
-                seq_printf(m, "<FAULT/UNREADABLE>");
+                seq_printf(m, "<NOT LOADED YET>");
             }
             seq_printf(m, "\n");
+
         }
         if (surrogate) put_task_struct(surrogate);
     }

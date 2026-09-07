@@ -72,6 +72,17 @@ void add_guest_process(pid_t local_pid, u32 orig_pid, int home_node) {
 
 void remove_guest_process(int index) {
     if (index < 0 || index >= guest_count) return;
+
+    // Free DSM Physical Pages! ---
+    for (int d = 0; d < guest_registry[index].dsm_count; d++) {
+        for (int p = 0; p < MAX_DSM_PAGES; p++) {
+            if (guest_registry[index].dsm_map[d].pages[p]) {
+                free_page((unsigned long)guest_registry[index].dsm_map[d].pages[p]);
+                guest_registry[index].dsm_map[d].pages[p] = NULL;
+            }
+        }
+    }
+
     guest_registry[index] = guest_registry[guest_count - 1];
     guest_count--;
 }

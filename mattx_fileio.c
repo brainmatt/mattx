@@ -3679,31 +3679,49 @@ static vm_fault_t mattx_dsm_fault(struct vm_fault *vmf) {
         return VM_FAULT_SIGSEGV;
     }
 
-    // 5. THE INJECTION: Wire the page into the Surrogate's brain!
-    struct page *page = alloc_page(GFP_HIGHUSER_MOVABLE | __GFP_ZERO);
-    if (!page) {
+
+    // 5. THE INJECTION: Wire the PFN into the Surrogate's brain!
+    unsigned long page_idx = offset / PAGE_SIZE;
+    void *kaddr = NULL;
+
+    spin_lock(&guest_lock);
+    for (int i = 0; i < guest_count; i++) {
+        if (guest_registry[i].local_pid == current->tgid) {
+            for (int d = 0; d < guest_registry[i].dsm_count; d++) {
+                if (guest_registry[i].dsm_map[d].base_addr == (fault_addr - offset)) {
+                    // Allocate the physical page if we haven't yet!
+                    if (!guest_registry[i].dsm_map[d].pages[page_idx]) {
+                        guest_registry[i].dsm_map[d].pages[page_idx] = (void *)__get_free_page(GFP_KERNEL | __GFP_ZERO);
+                    }
+                    kaddr = guest_registry[i].dsm_map[d].pages[page_idx];
+                    break;
+                }
+            }
+            break;
+        }
+    }
+    spin_unlock(&guest_lock);
+
+    if (!kaddr) {
         kfree(page_buf);
         return VM_FAULT_OOM;
     }
 
-    // Map the physical page temporarily, copy the payload, and unmap it
-    void *kaddr = kmap_local_page(page);
+    // Copy the payload into our persistent physical page
     memcpy(kaddr, page_buf, 4096);
-    kunmap_local(kaddr);
 
-    // Surgically insert the physical page into the application's page tables!
-    vm_fault_t ret = vmf_insert_page(vma, fault_addr, page);
+    // Surgically insert the Page Frame Number (PFN) into the application's page tables!
+    unsigned long pfn = __pa(kaddr) >> PAGE_SHIFT;
+    vm_fault_t ret = vmf_insert_pfn(vma, fault_addr, pfn);
     
     kfree(page_buf);
 
     if (ret != VM_FAULT_NOPAGE) {
-        __free_page(page);
         return ret;
     }
 
 
     // Mark the page as present so the Sweeper knows to clean it!
-    unsigned long page_idx = offset / PAGE_SIZE;
     if (page_idx < MAX_DSM_PAGES) {
         spin_lock(&guest_lock);
         for (int i = 0; i < guest_count; i++) {
@@ -4112,28 +4130,18 @@ int mattx_dsm_sweeper_loop(void *data) {
     while (!kthread_should_stop()) {
         if (config_dsm_mode == 1) {
             
-            // FIX: Allocate the map on the heap to prevent Kernel Stack Overflow!
             struct mattx_dsm_mapping *local_dsm = kmalloc_array(16, sizeof(struct mattx_dsm_mapping), GFP_KERNEL);
-            if (!local_dsm) {
-                msleep(50);
-                continue;
-            }
+            if (!local_dsm) { msleep(50); continue; }
 
             for (int i = 0; i < MAX_GUESTS; i++) {
-                pid_t local_pid = -1;
-                u32 orig_pid = 0;
-                int home_node = -1;
-                int dsm_count = 0;
+                pid_t local_pid = -1; u32 orig_pid = 0; int home_node = -1; int dsm_count = 0;
 
                 spin_lock(&guest_lock);
                 if (i < guest_count && guest_registry[i].dsm_count > 0) {
-                    local_pid = guest_registry[i].local_pid;
-                    orig_pid = guest_registry[i].orig_pid;
-                    home_node = guest_registry[i].home_node;
-                    dsm_count = guest_registry[i].dsm_count;
+                    local_pid = guest_registry[i].local_pid; orig_pid = guest_registry[i].orig_pid;
+                    home_node = guest_registry[i].home_node; dsm_count = guest_registry[i].dsm_count;
                     memcpy(local_dsm, guest_registry[i].dsm_map, dsm_count * sizeof(struct mattx_dsm_mapping));
                     
-                    // Clear the present bits in the registry immediately so we don't double-sync
                     for (int d = 0; d < dsm_count; d++) {
                         memset(guest_registry[i].dsm_map[d].present_pages, 0, sizeof(guest_registry[i].dsm_map[d].present_pages));
                     }
@@ -4142,10 +4150,7 @@ int mattx_dsm_sweeper_loop(void *data) {
 
                 if (local_pid != -1) {
                     struct task_struct *surrogate = NULL;
-                    rcu_read_lock();
-                    surrogate = pid_task(find_vpid(local_pid), PIDTYPE_PID);
-                    if (surrogate) get_task_struct(surrogate);
-                    rcu_read_unlock();
+                    rcu_read_lock(); surrogate = pid_task(find_vpid(local_pid), PIDTYPE_PID); if (surrogate) get_task_struct(surrogate); rcu_read_unlock();
 
                     if (surrogate && surrogate->mm) {
                         for (int d = 0; d < dsm_count; d++) {
@@ -4159,55 +4164,46 @@ int mattx_dsm_sweeper_loop(void *data) {
                                     unsigned long offset = bit * PAGE_SIZE;
                                     if (offset >= size) continue;
 
-                                    void *page_buf = kmalloc(PAGE_SIZE, GFP_KERNEL);
-                                    if (page_buf) {
-                                        // Read the latest data from the Surrogate's brain!
-                                        if (access_process_vm(surrogate, base + offset, page_buf, PAGE_SIZE, FOLL_FORCE) == PAGE_SIZE) {
-                                            size_t req_size = sizeof(struct mattx_dsm_page_update_req);
-                                            struct mattx_dsm_page_update_req *req = kmalloc(req_size, GFP_KERNEL);
-                                            if (req) {
-                                                req->orig_pid = orig_pid;
-                                                req->shmid = shmid;
-                                                req->offset = offset;
-                                                memcpy(req->data, page_buf, PAGE_SIZE);
-                                                
-                                                if (cluster_map[home_node]) {
-                                                    mattx_comm_send(cluster_map[home_node], MATTX_MSG_DSM_PAGE_UPDATE, req, req_size);
-                                                }
-                                                kfree(req);
-                                            }
+                                    void *kaddr = local_dsm[d].pages[bit];
+                                    if (kaddr) {
+                                        size_t req_size = sizeof(struct mattx_dsm_page_update_req);
+                                        struct mattx_dsm_page_update_req *req = kmalloc(req_size, GFP_KERNEL);
+                                        if (req) {
+                                            req->orig_pid = orig_pid; req->shmid = shmid; req->offset = offset;
+                                            // FAST PATH: Read directly from our physical page! No access_process_vm needed!
+                                            memcpy(req->data, kaddr, PAGE_SIZE); 
+                                            
+                                            if (cluster_map[home_node]) mattx_comm_send(cluster_map[home_node], MATTX_MSG_DSM_PAGE_UPDATE, req, req_size);
+                                            kfree(req);
                                         }
-                                        kfree(page_buf);
                                     }
                                 }
                             }
 
                             // 2. The Zap! (Burn it all down SAFELY)
-                            if (real_sys_madvise) {
-                                // Steal the Surrogate's mm to execute the syscall!
-                                kthread_use_mm(surrogate->mm);
-                                struct pt_regs regs;
-                                memset(&regs, 0, sizeof(regs));
-                                regs.di = base;
-                                regs.si = size;
-                                regs.dx = MADV_DONTNEED; // Safely unmap and free the pages!
-                                
-                                real_sys_madvise(&regs);
-                                
-                                kthread_unuse_mm(surrogate->mm);
-                                mattx_dbg("[DSM_SWEEPER] Zapped Hollow VMA at 0x%lx using madvise. Ready for next fault!\n", base);
+                            if (real_zap_vma_ptes) {
+                                mmap_read_lock(surrogate->mm);
+                                struct vm_area_struct *vma = find_vma(surrogate->mm, base);
+                                if (vma && vma->vm_start == base) {
+                                    real_zap_vma_ptes(vma, base, size);
+                                    mattx_dbg("[DSM_SWEEPER] Zapped Hollow VMA at 0x%lx. Ready for next fault!\n", base);
+                                }
+                                mmap_read_unlock(surrogate->mm);
                             }
                         }
                         put_task_struct(surrogate);
                     }
                 }
             }
-            kfree(local_dsm); // Free the heap array!
+            kfree(local_dsm); 
         }
-        msleep(50); // Run every 50ms (Eventual Consistency Window)
+        msleep(50); 
     }
     return 0;
 }
+
+
+
 
 
 
