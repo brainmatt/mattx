@@ -382,7 +382,7 @@ static void handle_migrate_done(struct mattx_link *link, struct mattx_header *hd
                             if (vma && vma->vm_start == base) {
                                 vma->vm_ops = &mattx_dsm_vm_ops; // Lay the trap!
                                 // Add VM_PFNMAP so the kernel doesn't touch our pages!
-                                vm_flags_set(vma, vma->vm_flags | VM_MIXEDMAP | VM_PFNMAP); 
+                                vm_flags_set(vma, vma->vm_flags | VM_PFNMAP); // Pure hardware PFN mapping!
                                 
                                 mattx_dbg("[IMPORT] Armed DSM Tripwire at 0x%lx (ID: %u, Size: %lu)\n", 
                                           base, pending_migration->vmas[v].shmid, guest_registry[i].dsm_map[d_idx].size);

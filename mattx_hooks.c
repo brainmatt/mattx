@@ -1548,7 +1548,8 @@ static void mattx_rpc_worker(struct work_struct *work) {
                         if (vma && vma->vm_start == hollow_addr) {
                             
                             vma->vm_ops = &mattx_dsm_vm_ops; // LAY THE TRAP!
-                            
+                            vm_flags_set(vma, vma->vm_flags | VM_PFNMAP); // Pure hardware PFN mapping!
+                                                        
                             // 3. Register it in the DSM Map
                             spin_lock(&guest_lock);
                             for (i = 0; i < guest_count; i++) {
