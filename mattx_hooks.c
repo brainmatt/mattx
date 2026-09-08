@@ -1535,7 +1535,7 @@ static void mattx_rpc_worker(struct work_struct *work) {
                     unsigned long prot = PROT_READ | PROT_WRITE;
                     if (rpc->shm_flg & SHM_RDONLY) prot = PROT_READ;
                     
-                    unsigned long map_flags = MAP_PRIVATE | MAP_ANONYMOUS;
+                    unsigned long map_flags = MAP_SHARED | MAP_ANONYMOUS;
                     if (rpc->shm_addr) map_flags |= MAP_FIXED; // If user requested specific address
 
                     // 1. Carve the blank VMA

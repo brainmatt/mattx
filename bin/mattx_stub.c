@@ -242,7 +242,14 @@ int main() {
         size_t size = v.vm_end - v.vm_start;
 
         int prot = PROT_READ | PROT_WRITE | PROT_EXEC;
-        int flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED;
+
+        // --- THE MAP_SHARED FIX ---
+        int flags = MAP_ANONYMOUS | MAP_FIXED;
+        if (v.is_shm) {
+            flags |= MAP_SHARED; // Shared Memory gets MAP_SHARED!
+        } else {
+            flags |= MAP_PRIVATE; // Normal memory stays MAP_PRIVATE!
+        }
 
         // The Stack Growth Protector ---
         if (v.vm_flags & 0x0100) {
