@@ -1498,8 +1498,15 @@ static void mattx_rpc_worker(struct work_struct *work) {
 
                 // The Magic Trick: Destroy the Hollow VMA on VM2!
                 if (error == 0 && size_to_unmap > 0) {
-                    vm_munmap(rpc->shm_addr, size_to_unmap);
-                    mattx_dbg("[DSM] Hollow VMA at 0x%lx (Size: %lu) destroyed on VM2.\n", rpc->shm_addr, size_to_unmap);
+                    if (surrogate->mm) {
+                        // THE IDENTITY THEFT: Steal the Surrogate's brain so vm_munmap finds the right lock!
+                        kthread_use_mm(surrogate->mm);
+                        vm_munmap(rpc->shm_addr, size_to_unmap);
+                        kthread_unuse_mm(surrogate->mm);
+                        mattx_dbg("[DSM] Hollow VMA at 0x%lx (Size: %lu) destroyed on VM2.\n", rpc->shm_addr, size_to_unmap);
+                    } else {
+                        mattx_dbg("[DSM] Warning: Surrogate has no mm, cannot unmap Hollow VMA.\n");
+                    }
                 }
 
                 if (regs) regs->ax = error;
