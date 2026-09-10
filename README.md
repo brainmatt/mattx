@@ -18,15 +18,17 @@ Inspired by the legendary openMosix project, MattX allows multiple physical or v
 
 ## Testing MattX with EESSI
 
+*September 2026*
+
 <div style="display: inline-flex; align-items: center;">
   <a href="https://www.eessi.io/docs/blog/2026/09/08/testing-mattx-with-eessi/" target="_blank" style="display: inline-block;">
+    <b>European Environment for Scientific Software Installations (EESSI)</b><br>
     <img src="./web/media/MattX-SSI-Live-Process-Migration2.jpeg" style="width: 100%; display: block;">
   </a>
 
 </div>
 
-*September 2026*
-
+<br>
 A huge shoutout to #openMosix legend <a href="https://mastodon.social/@krisbuytaert">Kris Buytaert</a> for his featured article on the "European Environment for Scientific Software Installations (EESSI)" blog about "Testing MattX with EESSI"
 
 Many Thanks Kris! Awesome 🔥
