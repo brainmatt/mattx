@@ -40,7 +40,7 @@
 #define DEFAULT_PORT 7225
 #define DEFAULT_IFACE "eth0"
 
-enum { MATTX_ATTR_UNSPEC, MATTX_ATTR_NODE_ID, MATTX_ATTR_IPV4_ADDR, MATTX_ATTR_STUB_PID, MATTX_ATTR_BLUEPRINT, MATTX_ATTR_MY_NODE_ID, MATTX_ATTR_LOCAL_IP, MATTX_ATTR_CONFIG_FILE_IO, MATTX_ATTR_CONFIG_NET_IO, MATTX_ATTR_MATTXFS_ENABLED, MATTX_ATTR_DFSA_DIR, MATTX_ATTR_MPI_SUPPORT, MATTX_ATTR_ACCEPT_GUESTS, __MATTX_ATTR_MAX };
+enum { MATTX_ATTR_UNSPEC, MATTX_ATTR_NODE_ID, MATTX_ATTR_IPV4_ADDR, MATTX_ATTR_STUB_PID, MATTX_ATTR_BLUEPRINT, MATTX_ATTR_MY_NODE_ID, MATTX_ATTR_LOCAL_IP, MATTX_ATTR_CONFIG_FILE_IO, MATTX_ATTR_CONFIG_NET_IO, MATTX_ATTR_MATTXFS_ENABLED, MATTX_ATTR_DFSA_DIR, MATTX_ATTR_MPI_SUPPORT, MATTX_ATTR_ACCEPT_GUESTS, MATTX_ATTR_CONFIG_LOCAL_LIBS, MATTX_ATTR_DSM_MODE, __MATTX_ATTR_MAX };
 #define MATTX_ATTR_MAX (__MATTX_ATTR_MAX - 1)
 
 enum { MATTX_CMD_UNSPEC, MATTX_CMD_NODE_JOIN, MATTX_CMD_NODE_LEAVE, MATTX_CMD_HIJACK_ME, MATTX_CMD_GET_BLUEPRINT, MATTX_CMD_SET_LOCAL_IP, MATTX_CMD_SET_CONFIG, __MATTX_CMD_MAX };
@@ -57,6 +57,8 @@ struct mattx_config {
     char dfsa_dir[256];
     uint8_t mpi_support;
     uint8_t accept_guests;
+    uint8_t local_libs; // local libs
+    uint8_t dsm_mode; // DSM config
     char autodiscovery[32]; // Discovery Mode ---
 };
 
@@ -128,7 +130,9 @@ void register_config_to_kernel() {
     }
     nla_put_u8(msg, MATTX_ATTR_MPI_SUPPORT, config.mpi_support);
     nla_put_u8(msg, MATTX_ATTR_ACCEPT_GUESTS, config.accept_guests);
-    
+    nla_put_u8(msg, MATTX_ATTR_CONFIG_LOCAL_LIBS, config.local_libs);
+    nla_put_u8(msg, MATTX_ATTR_DSM_MODE, config.dsm_mode);
+
     if (nl_send_auto(nl_sock, msg) < 0) {
         printf("ERROR: Failed to push configuration to kernel.\n");
     } else {
@@ -215,6 +219,9 @@ void load_config() {
     config.mattxfs_enabled = 1; // Default to true
     config.mpi_support = 0; // Default to false
     config.accept_guests = 1; // Default to true
+    config.local_libs = 1; // use local libs
+    config.dsm_mode = 1; // Default to Dirty Sweeper
+
     FILE *fp = fopen(CONFIG_FILE, "r");
     if (!fp) {
         return;
@@ -249,6 +256,16 @@ void load_config() {
         }
         if (sscanf(line, "ACCEPT_GUESTS=%s", temp_val)) {
             if (strcmp(temp_val, "false") == 0 || strcmp(temp_val, "0") == 0) config.accept_guests = 0;
+            continue;
+        }
+
+        if (sscanf(line, "LOCAL_LIBS=%s", temp_val)) {
+            if (strcmp(temp_val, "false") == 0 || strcmp(temp_val, "0") == 0) config.local_libs = 0;
+            continue;
+        }
+
+        if (sscanf(line, "DSM_MODE=%s", temp_val)) {
+            if (strcmp(temp_val, "false") == 0 || strcmp(temp_val, "0") == 0) config.dsm_mode = 0;
             continue;
         }
     }

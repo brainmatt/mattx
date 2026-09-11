@@ -65,7 +65,7 @@ static struct task_struct *dsm_sweeper_thread;
 
 
 
-enum { MATTX_ATTR_UNSPEC, MATTX_ATTR_NODE_ID, MATTX_ATTR_IPV4_ADDR, MATTX_ATTR_STUB_PID, MATTX_ATTR_BLUEPRINT, MATTX_ATTR_MY_NODE_ID, MATTX_ATTR_LOCAL_IP, MATTX_ATTR_CONFIG_FILE_IO, MATTX_ATTR_CONFIG_NET_IO, MATTX_ATTR_MATTXFS_ENABLED, MATTX_ATTR_DFSA_DIR, MATTX_ATTR_MPI_SUPPORT, MATTX_ATTR_ACCEPT_GUESTS, MATTX_ATTR_CONFIG_LOCAL_LIBS, __MATTX_ATTR_MAX };
+enum { MATTX_ATTR_UNSPEC, MATTX_ATTR_NODE_ID, MATTX_ATTR_IPV4_ADDR, MATTX_ATTR_STUB_PID, MATTX_ATTR_BLUEPRINT, MATTX_ATTR_MY_NODE_ID, MATTX_ATTR_LOCAL_IP, MATTX_ATTR_CONFIG_FILE_IO, MATTX_ATTR_CONFIG_NET_IO, MATTX_ATTR_MATTXFS_ENABLED, MATTX_ATTR_DFSA_DIR, MATTX_ATTR_MPI_SUPPORT, MATTX_ATTR_ACCEPT_GUESTS, MATTX_ATTR_CONFIG_LOCAL_LIBS, MATTX_ATTR_DSM_MODE, __MATTX_ATTR_MAX };
 #define MATTX_ATTR_MAX (__MATTX_ATTR_MAX - 1)
 
 enum { MATTX_CMD_UNSPEC, MATTX_CMD_NODE_JOIN, MATTX_CMD_NODE_LEAVE, MATTX_CMD_HIJACK_ME, MATTX_CMD_GET_BLUEPRINT, MATTX_CMD_SET_LOCAL_IP, MATTX_CMD_SET_CONFIG, __MATTX_CMD_MAX };
@@ -83,6 +83,7 @@ static const struct nla_policy mattx_genl_policy[MATTX_ATTR_MAX + 1] = {[MATTX_A
     [MATTX_ATTR_MPI_SUPPORT] = { .type = NLA_U8 },
     [MATTX_ATTR_ACCEPT_GUESTS] = { .type = NLA_U8 },
     [MATTX_ATTR_CONFIG_LOCAL_LIBS] = { .type = NLA_U8 },
+    [MATTX_ATTR_DSM_MODE] = { .type = NLA_U8 },        
 };
 
 static int mattx_nl_cmd_node_join(struct sk_buff *skb, struct genl_info *info) {
@@ -237,14 +238,19 @@ static int mattx_nl_cmd_set_config(struct sk_buff *skb, struct genl_info *info) 
         config_hpc_local_libs = nla_get_u8(info->attrs[MATTX_ATTR_CONFIG_LOCAL_LIBS]) ? true : false;
         mattx_dbg("[NL] HPC Local Libs Fast-Path: %s\n", config_hpc_local_libs ? "ON" : "OFF");
     }
+    if (info->attrs[MATTX_ATTR_DSM_MODE]) {
+        config_dsm_mode = nla_get_u8(info->attrs[MATTX_ATTR_DSM_MODE]);
+        mattx_dbg("[NL] DSM Mode set to: %d\n", config_dsm_mode);
+    }
 
-    mattx_dbg(" Configuration Updated - FileIO: %s, NetworkIO: %s, MattXFS: %s, MPI: %s, Accept: %s, HPC Local Libs: %s\n",    
+    mattx_dbg(" Configuration Updated - FileIO: %s, NetworkIO: %s, MattXFS: %s, MPI: %s, Accept: %s, HPC Local Libs: %s, DSM Mode: %d\n",    
            config_migrate_file_io ? "TRUE" : "FALSE",
            config_migrate_network_io ? "TRUE" : "FALSE",
            config_mattxfs_enabled ? "TRUE" : "FALSE",
            config_mpi_support ? "TRUE" : "FALSE",
            config_accept_guests ? "TRUE" : "FALSE",
-           config_hpc_local_libs ? "TRUE" : "FALSE");           
+           config_hpc_local_libs ? "TRUE" : "FALSE",
+           config_dsm_mode);
     return 0;
 }
 
