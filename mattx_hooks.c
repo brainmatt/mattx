@@ -1511,10 +1511,12 @@ static void mattx_rpc_worker(struct work_struct *work) {
 
                 if (regs) regs->ax = error;
 
+
             // --- SHMAT AWAKENING (THE HOLLOW CARVING) ---
             } else if (rpc->is_shmat) {
                 struct pt_regs *regs = task_pt_regs(surrogate);
-                int error = -EINTR;
+                int rpc_err = -EINTR;
+                long final_ret = -EINTR; // 64-bit return value!
                 size_t shm_size = 0;
                 unsigned long ret_addr = 0;
                 void *read_buf = NULL;
@@ -1523,7 +1525,7 @@ static void mattx_rpc_worker(struct work_struct *work) {
                 for (i = 0; i < guest_count; i++) {
                     if (mattx_pid_shares_tgid_with_guest(rpc->local_pid, guest_registry[i].local_pid)) {
                         if (guest_registry[i].rpc_done) {
-                            error = guest_registry[i].rpc_fsync_res;
+                            rpc_err = guest_registry[i].rpc_fsync_res;
                             shm_size = guest_registry[i].rpc_lseek_res; // We stored the size here!
                             read_buf = guest_registry[i].rpc_read_buf;
                         }
@@ -1533,7 +1535,9 @@ static void mattx_rpc_worker(struct work_struct *work) {
                 }
                 spin_unlock(&guest_lock);
 
-                if (error == 0 && read_buf && shm_size > 0) {
+                final_ret = rpc_err; // Default to the RPC error code
+
+                if (rpc_err == 0 && read_buf && shm_size > 0) {
                     memcpy(&ret_addr, read_buf, sizeof(unsigned long));
                     
                     // --- THE HOLLOW CARVING ---
@@ -1554,9 +1558,9 @@ static void mattx_rpc_worker(struct work_struct *work) {
                         struct vm_area_struct *vma = find_vma(surrogate->mm, hollow_addr);
                         if (vma && vma->vm_start == hollow_addr) {
                             
-                            vma->vm_ops = &mattx_dsm_vm_ops; // LAY THE TRAP!
+                            vma->vm_ops = &mattx_dsm_vm_ops; // Lay the trap!
                             vm_flags_set(vma, vma->vm_flags | VM_PFNMAP); // Pure hardware PFN mapping!
-                                                        
+                            
                             // 3. Register it in the DSM Map
                             spin_lock(&guest_lock);
                             for (i = 0; i < guest_count; i++) {
@@ -1574,18 +1578,16 @@ static void mattx_rpc_worker(struct work_struct *work) {
                             spin_unlock(&guest_lock);
                         }
                         mmap_write_unlock(surrogate->mm);
-                        error = hollow_addr; // Return the mapped address in RAX!
+                        final_ret = (long)hollow_addr; // Safe 64-bit assignment!
                     } else {
-                        error = hollow_addr; // Return the mmap error
+                        final_ret = (long)hollow_addr; // Return the mmap error
                     }
                     
                     kthread_unuse_mm(surrogate->mm);
                 }
                 
                 if (read_buf) kfree(read_buf);
-                if (regs) regs->ax = error;
-
-
+                if (regs) regs->ax = final_ret; // Inject the clean 64-bit pointer!
 
 
                 
