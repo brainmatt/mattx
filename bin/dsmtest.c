@@ -96,7 +96,7 @@ int main() {
         // 3. PAGE FAULTS (Microsteps 4 & 5)
         for (int i = 0; i < 100; i++) {
             // Write to DSM (Triggers Page Fault on first touch!)
-            snprintf(shm_data, SHM_SIZE, "MattX DSM Magic! Loop %d", i);
+            snprintf(shm_data, SHM_SIZE, "%d MattX DSM Magic! Loop %d", i, i);
             
             // Read from DSM
             printf("[PID %d] Loop %d - Read from SHM: '%s'\n", getpid(), i, shm_data);
