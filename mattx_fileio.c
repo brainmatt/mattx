@@ -3588,6 +3588,162 @@ static void handle_sys_pipe2_reply(struct mattx_link *link, struct mattx_header 
 }
 
 
+
+// ============================================================================
+// THE X86-64 DSM MICRO-DECODER (MODE 3)
+// ============================================================================
+
+// Maps the x86 ModR/M register index to the Linux pt_regs struct
+static unsigned long *mattx_get_reg_ptr(struct pt_regs *regs, int reg_idx) {
+    switch (reg_idx) {
+        case 0: return &regs->ax;
+        case 1: return &regs->cx;
+        case 2: return &regs->dx;
+        case 3: return &regs->bx;
+        case 4: return &regs->sp;
+        case 5: return &regs->bp;
+        case 6: return &regs->si;
+        case 7: return &regs->di;
+        case 8: return &regs->r8;
+        case 9: return &regs->r9;
+        case 10: return &regs->r10;
+        case 11: return &regs->r11;
+        case 12: return &regs->r12;
+        case 13: return &regs->r13;
+        case 14: return &regs->r14;
+        case 15: return &regs->r15;
+        default: return NULL;
+    }
+}
+
+
+
+static vm_fault_t mattx_dsm_emulate_fault(struct vm_fault *vmf, u32 shmid, unsigned long offset, int home_node, u32 orig_pid) {
+    struct pt_regs *regs = task_pt_regs(current);
+    unsigned char inst[15]; 
+    
+    u8 is_write = 0;
+    u8 op_size = 4; 
+    u64 write_val = 0;
+    int reg_idx = -1;
+    unsigned long *reg_ptr = NULL;
+
+    if (copy_from_user(inst, (void __user *)regs->ip, sizeof(inst)) != 0) {
+        mattx_dbg("[EMULATOR] Failed to read instruction at RIP 0x%lx\n", regs->ip);
+        return VM_FAULT_SIGSEGV;
+    }
+
+    int i = 0;
+    u8 rex_prefix = 0;
+
+    // 1. Parse Prefixes
+    if (inst[i] >= 0x40 && inst[i] <= 0x4F) {
+        rex_prefix = inst[i++];
+        if (rex_prefix & 0x08) op_size = 8; 
+    } else if (inst[i] == 0x66) {
+        op_size = 2; 
+        i++;
+    }
+
+    u8 opcode = inst[i++];
+    u8 modrm = inst[i++];
+    u8 mod = (modrm >> 6) & 0x03;
+    u8 rm = modrm & 0x07;
+
+    // 2. Calculate Displacement & SIB Length
+    if (rm == 4 && mod != 3) i++; // SIB byte present
+    if (mod == 1) i += 1; // 8-bit displacement
+    else if (mod == 2 || (mod == 0 && rm == 5)) i += 4; // 32-bit displacement
+
+    // 3. Decode Opcode
+    if (opcode == 0x88 || opcode == 0x89) {
+        is_write = 1;
+        if (opcode == 0x88) op_size = 1;
+        reg_idx = (modrm >> 3) & 0x07; 
+        if (rex_prefix & 0x04) reg_idx += 8; 
+        reg_ptr = mattx_get_reg_ptr(regs, reg_idx);
+        if (reg_ptr) write_val = *reg_ptr;
+        
+    } else if (opcode == 0x8A || opcode == 0x8B) {
+        is_write = 0;
+        if (opcode == 0x8A) op_size = 1;
+        reg_idx = (modrm >> 3) & 0x07; 
+        if (rex_prefix & 0x04) reg_idx += 8;
+        reg_ptr = mattx_get_reg_ptr(regs, reg_idx);
+        
+    } else if (opcode == 0xC6 || opcode == 0xC7) {
+        is_write = 1;
+        if (opcode == 0xC6) { op_size = 1; write_val = inst[i++]; }
+        else { 
+            op_size = (op_size == 2) ? 2 : 4; // Immediate is max 32-bit in x86-64
+            write_val = *(u32 *)(&inst[i]); 
+            i += op_size; 
+        }
+    } else {
+        mattx_dbg("[EMULATOR] Unsupported Opcode: 0x%02x at RIP 0x%lx\n", opcode, regs->ip);
+        return VM_FAULT_SIGSEGV; 
+    }
+
+    int inst_len = i; // We now know exactly how many bytes the instruction takes!
+
+    mattx_dbg("[EMULATOR] Decoded %s: Size=%d, RegIdx=%d, InstLen=%d, RIP=0x%lx\n", 
+              is_write ? "WRITE" : "READ", op_size, reg_idx, inst_len, regs->ip);
+
+    // 4. ALLOCATE RPC SLOT
+    int slot = -1;
+    u64 req_id = 0;
+    spin_lock(&vfs_rpc_lock);
+    for (int j = 0; j < MAX_VFS_RPC; j++) {
+        if (!vfs_rpc_registry[j].in_use) {
+            slot = j;
+            vfs_rpc_registry[j].in_use = true;
+            req_id = next_req_id++;
+            vfs_rpc_registry[j].req_id = req_id;
+            vfs_rpc_registry[j].done = false;
+            init_waitqueue_head(&vfs_rpc_registry[j].wq);
+            break;
+        }
+    }
+    spin_unlock(&vfs_rpc_lock);
+
+    if (slot == -1) return VM_FAULT_SIGSEGV;
+
+    // 5. SEND RPC TO VM1
+    struct mattx_dsm_emulate_req req = {
+        .req_id = req_id, .orig_pid = orig_pid, .shmid = shmid, 
+        .offset = offset, .is_write = is_write, .size = op_size, .write_value = write_val
+    };
+    mattx_comm_send(cluster_map[home_node], MATTX_MSG_DSM_EMULATE_REQ, &req, sizeof(req));
+
+    // 6. SLEEP AND WAIT FOR VM1
+    wait_event_interruptible(vfs_rpc_registry[slot].wq, vfs_rpc_registry[slot].done);
+
+    int err = vfs_rpc_registry[slot].error;
+    u64 read_val = vfs_rpc_registry[slot].new_offset; // Reusing new_offset to hold the 64-bit read value!
+
+    spin_lock(&vfs_rpc_lock);
+    vfs_rpc_registry[slot].in_use = false;
+    spin_unlock(&vfs_rpc_lock);
+
+    if (err != 0) return VM_FAULT_SIGSEGV;
+
+    // 7. THE GRAND ILLUSION: Update Registers and Advance RIP!
+    if (!is_write && reg_ptr) {
+        // Carefully overwrite only the requested bytes in the register!
+        if (op_size == 1) *reg_ptr = (*reg_ptr & ~0xFFUL) | (read_val & 0xFF);
+        else if (op_size == 2) *reg_ptr = (*reg_ptr & ~0xFFFFUL) | (read_val & 0xFFFF);
+        else if (op_size == 4) *reg_ptr = (*reg_ptr & ~0xFFFFFFFFUL) | (read_val & 0xFFFFFFFF);
+        else *reg_ptr = read_val;
+    }
+
+    regs->ip += inst_len; // Skip the instruction!
+    
+    mattx_dbg("[EMULATOR] Illusion Complete! Advanced RIP to 0x%lx\n", regs->ip);
+    return VM_FAULT_NOPAGE;
+}
+
+
+
 // ============================================================================
 // THE DSM TRIPWIRE (VM2 PAGE FAULT HANDLER)
 // ============================================================================
@@ -3627,6 +3783,14 @@ static vm_fault_t mattx_dsm_fault(struct vm_fault *vmf) {
         mattx_dbg("[DSM] SIGSEGV: Unmapped or disconnected DSM access at 0x%lx\n", fault_addr);
         return VM_FAULT_SIGSEGV;
     }
+
+
+    // --- THE EMULATION POLICY BRANCH (MODE 3) ---
+    if (config_dsm_mode == 3) {
+        return mattx_dsm_emulate_fault(vmf, shmid, offset, home_node, orig_pid);
+    }
+    // ---------------------------------------
+
 
     // 2. CONCURRENCY: Allocate a sterile RPC slot
     int slot = -1;
@@ -4206,6 +4370,101 @@ int mattx_dsm_sweeper_loop(void *data) {
 
 
 
+// ============================================================================
+// THE EMULATION KWORKER (VM1)
+// ============================================================================
+struct mattx_emulate_kworker_ctx { struct work_struct work; struct mattx_dsm_emulate_req req; int target_node; };
+
+static void mattx_emulate_kworker(struct work_struct *work) {
+    struct mattx_emulate_kworker_ctx *ctx = container_of(work, struct mattx_emulate_kworker_ctx, work);
+    struct mattx_dsm_emulate_reply reply = { .req_id = ctx->req.req_id, .error = -EFAULT, .read_value = 0 };
+    struct task_struct *deputy = NULL;
+
+    rcu_read_lock();
+    deputy = pid_task(find_vpid(ctx->req.orig_pid), PIDTYPE_PID);
+    if (deputy) get_task_struct(deputy);
+    rcu_read_unlock();
+
+    if (deputy && deputy->mm) {
+        mmap_read_lock(deputy->mm);
+        struct vm_area_struct *vma;
+        VMA_ITERATOR(vmi, deputy->mm, 0);
+        for_each_vma(vmi, vma) {
+            if (vma->vm_file && vma->vm_file->f_path.dentry->d_name.name) {
+                if (strncmp(vma->vm_file->f_path.dentry->d_name.name, "SYSV", 4) == 0) {
+                    if (vma->vm_file->f_inode->i_ino == ctx->req.shmid) {
+                        unsigned long target_addr = vma->vm_start + ctx->req.offset;
+                        
+                        if (target_addr + ctx->req.size <= vma->vm_end) {
+                            if (ctx->req.is_write) {
+                                // Execute the WRITE!
+                                if (access_process_vm(deputy, target_addr, &ctx->req.write_value, ctx->req.size, FOLL_WRITE | FOLL_FORCE) == ctx->req.size) {
+                                    reply.error = 0;
+                                }
+                            } else {
+                                // Execute the READ!
+                                u64 temp_val = 0;
+                                if (access_process_vm(deputy, target_addr, &temp_val, ctx->req.size, FOLL_FORCE) == ctx->req.size) {
+                                    reply.read_value = temp_val;
+                                    reply.error = 0;
+                                }
+                            }
+                            mattx_dbg("[EMULATOR_VM1] Executed %s at offset %lu (Size: %d, Val: 0x%llx)\n", 
+                                      ctx->req.is_write ? "WRITE" : "READ", ctx->req.offset, ctx->req.size, 
+                                      ctx->req.is_write ? ctx->req.write_value : reply.read_value);
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+        mmap_read_unlock(deputy->mm);
+        put_task_struct(deputy);
+    }
+
+    if (cluster_map[ctx->target_node]) {
+        mattx_comm_send(cluster_map[ctx->target_node], MATTX_MSG_DSM_EMULATE_REPLY, &reply, sizeof(reply));
+    }
+    kfree(ctx);
+}
+
+static void handle_dsm_emulate_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    struct mattx_dsm_emulate_req *req = payload;
+    struct mattx_emulate_kworker_ctx *ctx = kmalloc(sizeof(*ctx), GFP_ATOMIC);
+    if (ctx) {
+        INIT_WORK(&ctx->work, mattx_emulate_kworker);
+        memcpy(&ctx->req, req, sizeof(*req));
+        ctx->target_node = hdr->sender_id;
+        schedule_work(&ctx->work);
+    }
+}
+
+
+// --- EMULATION REPLY HANDLER (VM2) ---
+static void handle_dsm_emulate_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    struct mattx_dsm_emulate_reply *reply = payload;
+    
+    spin_lock(&vfs_rpc_lock);
+    for (int i = 0; i < MAX_VFS_RPC; i++) {
+        if (vfs_rpc_registry[i].in_use && vfs_rpc_registry[i].req_id == reply->req_id) {
+            vfs_rpc_registry[i].error = reply->error;
+            vfs_rpc_registry[i].new_offset = reply->read_value; // Reusing new_offset to hold the 64-bit value!
+            vfs_rpc_registry[i].done = true;
+            wake_up_interruptible(&vfs_rpc_registry[i].wq);
+            break;
+        }
+    }
+    spin_unlock(&vfs_rpc_lock);
+}
+
+
+
+
+
+
+// ###############################################################################
+// MattxFS VFS RPC (VM2)
+// ###############################################################################
 
 
 // This context helps us catch the filenames as the kernel reads the local disk
@@ -5461,7 +5720,10 @@ void mattx_fileio_init_handlers(void) {
     mattx_register_handler(MATTX_MSG_DSM_PAGE_FAULT_REQ, handle_dsm_page_fault_req);
     mattx_register_handler(MATTX_MSG_DSM_PAGE_FAULT_REPLY, handle_dsm_page_fault_reply);
     mattx_register_handler(MATTX_MSG_DSM_PAGE_UPDATE, handle_dsm_page_update);
-    
+    mattx_register_handler(MATTX_MSG_DSM_EMULATE_REQ, handle_dsm_emulate_req);
+    mattx_register_handler(MATTX_MSG_DSM_EMULATE_REPLY, handle_dsm_emulate_reply);
+
+
     mattx_dbg(" [FILEIO] Network handlers registered.\n");
 }
 

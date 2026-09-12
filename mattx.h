@@ -235,7 +235,9 @@ enum mattx_msg_type {
     MATTX_MSG_SYS_SHMCTL_REPLY,
     MATTX_MSG_DSM_PAGE_FAULT_REQ,
     MATTX_MSG_DSM_PAGE_FAULT_REPLY,
-    MATTX_MSG_DSM_PAGE_UPDATE,    
+    MATTX_MSG_DSM_PAGE_UPDATE,
+    MATTX_MSG_DSM_EMULATE_REQ,
+    MATTX_MSG_DSM_EMULATE_REPLY,    
 };
 
 struct mattx_header {
@@ -1207,6 +1209,24 @@ struct mattx_dsm_page_update_req {
     unsigned long offset;
     char data[4096]; // The updated page content!
 };
+
+// --- DSM Emulation Payloads (Mode 3) ---
+struct mattx_dsm_emulate_req {
+    u64 req_id;
+    u32 orig_pid;
+    u32 shmid;
+    unsigned long offset;
+    u8 is_write;
+    u8 size; // 1, 2, 4, or 8 bytes
+    u64 write_value; // The data to write (if is_write == 1)
+};
+
+struct mattx_dsm_emulate_reply {
+    u64 req_id;
+    int error;
+    u64 read_value; // The data read from VM1 (if is_write == 0)
+};
+
 
 
 // This defines the standard signature for all message handlers
