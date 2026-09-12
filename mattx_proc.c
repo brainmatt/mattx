@@ -328,12 +328,14 @@ static ssize_t admin_write(struct file *file, const char __user *ubuf, size_t co
             config_hpc_local_libs = (arg1 != 0);
             mattx_dbg(" [ADMIN] HPC Local Libs Fast-Path set to: %s\n", config_hpc_local_libs ? "ON" : "OFF");
         }
-        else if (strcmp(cmd, "dsm") == 0 && arg1 != -1) {
-            config_dsm_mode = (arg1 != 0);
-            mattx_dbg(" [ADMIN] DSM Mode set to: %s\n", config_dsm_mode ? "ON" : "OFF");
-        }
-        
 
+        else if (strncmp(buf, "dsm_mode ", 9) == 0) {
+            int val;
+            if (sscanf(buf + 9, "%d", &val) == 1) {
+                config_dsm_mode = val;
+                mattx_dbg(" [ADMIN] DSM Mode set to %d\n", val);
+            }
+        }
 
         else if (strcmp(cmd, "migrate") == 0 && arg1 != -1 && arg2_str[0] != '\0') {
             
