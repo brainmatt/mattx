@@ -4671,6 +4671,64 @@ static int ret_handler_shmat(struct kretprobe_instance *ri, struct pt_regs *regs
 
 
 
+// ============================================================================
+// MODE 3: THE TRAP CATCHER
+// ============================================================================
+static struct kretprobe force_sig_fault_kprobe;
+
+static int entry_handler_force_sig_fault(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    if (config_dsm_mode == 3 && is_guest_process(current->tgid)) {
+        struct pt_regs *sys_regs = SYSCALL_REGS(regs);
+        int sig = (int)sys_regs->di;
+        
+        if (sig == SIGTRAP) {
+            bool pending = false;
+            bool is_write = false;
+            unsigned long fault_addr = 0;
+            u32 shmid = 0;
+            int home_node = -1;
+            u32 orig_pid = 0;
+
+            spin_lock(&guest_lock);
+            for (int i = 0; i < guest_count; i++) {
+                if (guest_registry[i].local_pid == current->tgid) {
+                    if (guest_registry[i].dsm_step_pending) {
+                        pending = true;
+                        is_write = guest_registry[i].dsm_step_is_write;
+                        fault_addr = guest_registry[i].dsm_step_addr;
+                        shmid = guest_registry[i].dsm_step_shmid;
+                        home_node = guest_registry[i].home_node;
+                        orig_pid = guest_registry[i].orig_pid;
+                        guest_registry[i].dsm_step_pending = false; // Clear it!
+                    }
+                    break;
+                }
+            }
+            spin_unlock(&guest_lock);
+
+            if (pending) {
+                // 1. THE SABOTAGE: Set signal to 0 so the kernel drops it!
+                sys_regs->di = 0; 
+                
+                // 2. Clear the Trap Flag so the CPU resumes normal speed
+                struct pt_regs *task_regs = task_pt_regs(current);
+                if (task_regs) task_regs->flags &= ~X86_EFLAGS_TF;
+
+                mattx_dbg("[DSM_MODE3] Caught #DB Trap! Injecting Cleanup Callback...\n");
+
+                // 3. Inject the Cleanup Callback
+                mattx_inject_dsm_cleanup(orig_pid, home_node, shmid, fault_addr, is_write);
+            }
+        }
+    }
+    return 0;
+}
+
+
+
+
+
+
 
 
 
@@ -5235,12 +5293,20 @@ int mattx_hooks_init(void) {
     ret = register_kretprobe(&shmat_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for shmat, returned %d\n", ret);
 
-    
+    memset(&force_sig_fault_kprobe, 0, sizeof(force_sig_fault_kprobe));
+    force_sig_fault_kprobe.kp.symbol_name = "force_sig_fault";
+    force_sig_fault_kprobe.entry_handler = entry_handler_force_sig_fault;
+    force_sig_fault_kprobe.maxactive = 64;
+    ret = register_kretprobe(&force_sig_fault_kprobe);
+    if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for force_sig_fault, returned %d\n", ret);
+
+
     mattx_dbg(" Syscall Hooks (Kprobes) registered successfully.\n");
     return 0;
 }
 
 void mattx_hooks_exit(void) {
+    unregister_kretprobe(&force_sig_fault_kprobe);
     unregister_kretprobe(&shmdt_kprobe);
     unregister_kretprobe(&shmctl_kprobe);
     unregister_kretprobe(&shmget_kprobe);
