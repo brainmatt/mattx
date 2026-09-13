@@ -4678,8 +4678,8 @@ static struct kretprobe force_sig_fault_kprobe;
 
 static int entry_handler_force_sig_fault(struct kretprobe_instance *ri, struct pt_regs *regs) {
     if (config_dsm_mode == 3 && is_guest_process(current->tgid)) {
-        struct pt_regs *sys_regs = SYSCALL_REGS(regs);
-        int sig = (int)sys_regs->di;
+        // THE FIX: Read directly from regs! force_sig_fault is a standard C function, not a syscall!
+        int sig = (int)regs->di; 
         
         if (sig == SIGTRAP) {
             bool pending = false;
@@ -4708,7 +4708,7 @@ static int entry_handler_force_sig_fault(struct kretprobe_instance *ri, struct p
 
             if (pending) {
                 // 1. THE SABOTAGE: Set signal to 0 so the kernel drops it!
-                sys_regs->di = 0; 
+                regs->di = 0; // Modify the real regs directly!
                 
                 // 2. Clear the Trap Flag so the CPU resumes normal speed
                 struct pt_regs *task_regs = task_pt_regs(current);
