@@ -25,6 +25,7 @@
 #include <linux/wait.h> 
 #include <linux/poll.h>
 #include <linux/eventpoll.h>
+#include <linux/kdebug.h>
 
 // Helper for modern x86_64 syscall wrappers (__x64_sys_*)
 // The first argument (regs->di) is a pointer to the real pt_regs!
@@ -4670,59 +4671,63 @@ static int ret_handler_shmat(struct kretprobe_instance *ri, struct pt_regs *regs
 }
 
 
-
 // ============================================================================
-// MODE 3: THE TRAP CATCHER
+// MODE 3: THE HARDWARE EXCEPTION CATCHER (DIE NOTIFIER)
 // ============================================================================
-static struct kretprobe force_sig_fault_kprobe;
 
-static int entry_handler_force_sig_fault(struct kretprobe_instance *ri, struct pt_regs *regs) {
-    if (config_dsm_mode == 3 && is_guest_process(current->tgid)) {
-        // THE FIX: Read directly from regs! force_sig_fault is a standard C function, not a syscall!
-        int sig = (int)regs->di; 
-        
-        if (sig == SIGTRAP) {
-            bool pending = false;
-            bool is_write = false;
-            unsigned long fault_addr = 0;
-            u32 shmid = 0;
-            int home_node = -1;
-            u32 orig_pid = 0;
+static int mattx_die_cb(struct notifier_block *nb, unsigned long val, void *data) {
+    struct die_args *args = data;
+    struct pt_regs *regs = args->regs;
 
-            spin_lock(&guest_lock);
-            for (int i = 0; i < guest_count; i++) {
-                if (guest_registry[i].local_pid == current->tgid) {
-                    if (guest_registry[i].dsm_step_pending) {
-                        pending = true;
-                        is_write = guest_registry[i].dsm_step_is_write;
-                        fault_addr = guest_registry[i].dsm_step_addr;
-                        shmid = guest_registry[i].dsm_step_shmid;
-                        home_node = guest_registry[i].home_node;
-                        orig_pid = guest_registry[i].orig_pid;
-                        guest_registry[i].dsm_step_pending = false; // Clear it!
-                    }
-                    break;
+    // We only care about Debug Exceptions (#DB) caused by our Single-Step Trap Flag!
+    if (val == DIE_DEBUG && config_dsm_mode == 3 && current->mm && is_guest_process(current->tgid)) {
+        bool pending = false;
+        bool is_write = false;
+        unsigned long fault_addr = 0;
+        u32 shmid = 0;
+        int home_node = -1;
+        u32 orig_pid = 0;
+
+        spin_lock(&guest_lock);
+        for (int i = 0; i < guest_count; i++) {
+            if (guest_registry[i].local_pid == current->tgid) {
+                if (guest_registry[i].dsm_step_pending) {
+                    pending = true;
+                    is_write = guest_registry[i].dsm_step_is_write;
+                    fault_addr = guest_registry[i].dsm_step_addr;
+                    shmid = guest_registry[i].dsm_step_shmid;
+                    home_node = guest_registry[i].home_node;
+                    orig_pid = guest_registry[i].orig_pid;
+                    guest_registry[i].dsm_step_pending = false; // Clear it!
                 }
-            }
-            spin_unlock(&guest_lock);
-
-            if (pending) {
-                // 1. THE SABOTAGE: Set signal to 0 so the kernel drops it!
-                regs->di = 0; // Modify the real regs directly!
-                
-                // 2. Clear the Trap Flag so the CPU resumes normal speed
-                struct pt_regs *task_regs = task_pt_regs(current);
-                if (task_regs) task_regs->flags &= ~X86_EFLAGS_TF;
-
-                mattx_dbg("[DSM_MODE3] Caught #DB Trap! Injecting Cleanup Callback...\n");
-
-                // 3. Inject the Cleanup Callback
-                mattx_inject_dsm_cleanup(orig_pid, home_node, shmid, fault_addr, is_write);
+                break;
             }
         }
+        spin_unlock(&guest_lock);
+
+        if (pending) {
+            // 1. Clear the Trap Flag so the CPU resumes normal speed
+            if (regs) regs->flags &= ~X86_EFLAGS_TF;
+
+            mattx_dbg("[DSM_MODE3] Caught #DB Trap via Die Notifier! Injecting Cleanup Callback...\n");
+
+            // 2. Inject the Cleanup Callback
+            mattx_inject_dsm_cleanup(orig_pid, home_node, shmid, fault_addr, is_write);
+
+            // 3. THE SABOTAGE: Tell the kernel "I am a debugger, I handled this!"
+            // This instantly aborts the kernel's signal delivery pipeline!
+            return NOTIFY_STOP;
+        }
     }
-    return 0;
+    
+    // If it wasn't us, let the kernel handle it normally
+    return NOTIFY_DONE; 
 }
+
+static struct notifier_block mattx_die_notifier = {
+    .notifier_call = mattx_die_cb,
+    .priority = 0x7fffffff, // Highest priority! We catch it before anyone else!
+};
 
 
 
@@ -5293,20 +5298,19 @@ int mattx_hooks_init(void) {
     ret = register_kretprobe(&shmat_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for shmat, returned %d\n", ret);
 
-    memset(&force_sig_fault_kprobe, 0, sizeof(force_sig_fault_kprobe));
-    force_sig_fault_kprobe.kp.symbol_name = "force_sig_fault";
-    force_sig_fault_kprobe.entry_handler = entry_handler_force_sig_fault;
-    force_sig_fault_kprobe.maxactive = 64;
-    ret = register_kretprobe(&force_sig_fault_kprobe);
-    if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for force_sig_fault, returned %d\n", ret);
 
+
+
+    // --- THE HARDWARE EXCEPTION CATCHER ---
+    if (register_die_notifier(&mattx_die_notifier) < 0) {
+        printk(KERN_ERR "MattX: Failed to register Die Notifier!\n");
+    }
 
     mattx_dbg(" Syscall Hooks (Kprobes) registered successfully.\n");
     return 0;
 }
 
 void mattx_hooks_exit(void) {
-    unregister_kretprobe(&force_sig_fault_kprobe);
     unregister_kretprobe(&shmdt_kprobe);
     unregister_kretprobe(&shmctl_kprobe);
     unregister_kretprobe(&shmget_kprobe);
@@ -5367,6 +5371,9 @@ void mattx_hooks_exit(void) {
     unregister_kretprobe(&dup2_kprobe);
     unregister_kretprobe(&dup_kprobe);
     unregister_kretprobe(&openat_kprobe);
+
+    unregister_die_notifier(&mattx_die_notifier);
+
     mattx_dbg(" Syscall Hooks (Kprobes) unregistered.\n");
 }
 
