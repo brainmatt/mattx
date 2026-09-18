@@ -75,6 +75,7 @@ mattx_sys_shmdt_fn real_sys_shmdt = NULL;
 mattx_sys_shmat_fn real_sys_shmat = NULL;
 mattx_x86_task_fpu_fn real_x86_task_fpu = NULL;
 mattx_zap_vma_ptes_fn real_zap_vma_ptes = NULL;
+mattx_vmf_insert_pfn_prot_fn real_vmf_insert_pfn_prot = NULL;
 
 
 static void mattx_resolve_hidden_symbols(void) {
@@ -400,6 +401,13 @@ static void mattx_resolve_hidden_symbols(void) {
         unregister_kprobe(&kp); 
     }
 
+    // --- THE DSM MESI RESOLVER ---
+    memset(&kp, 0, sizeof(kp)); 
+    kp.symbol_name = "vmf_insert_pfn_prot";
+    if (register_kprobe(&kp) == 0) { 
+        real_vmf_insert_pfn_prot = (mattx_vmf_insert_pfn_prot_fn)kp.addr; 
+        unregister_kprobe(&kp); 
+    }
 }
 
 

@@ -3714,10 +3714,40 @@ static vm_fault_t mattx_dsm_fault(struct vm_fault *vmf) {
     // Copy the payload into our persistent physical page
     memcpy(kaddr, page_buf, 4096);
 
+
     // Surgically insert the Page Frame Number (PFN) into the application's page tables!
     unsigned long pfn = __pa(kaddr) >> PAGE_SHIFT;
-    vm_fault_t ret = vmf_insert_pfn(vma, fault_addr, pfn);
-    
+    vm_fault_t ret;
+
+    if (config_dsm_mode == 2 && real_vmf_insert_pfn_prot) {
+        // --- MODE 2: THE READ-ONLY TRAPDOOR ---
+        // We use vm_get_page_prot(VM_READ) to generate a strict Read-Only protection mask.
+        // Even if the VMA is RW, the CPU will throw a Write-Protect fault if the app tries to write!
+        pgprot_t ro_prot = vm_get_page_prot(VM_READ);
+        ret = real_vmf_insert_pfn_prot(vma, fault_addr, pfn, ro_prot);
+        
+        if (ret == VM_FAULT_NOPAGE) {
+            spin_lock(&guest_lock);
+            for (int i = 0; i < guest_count; i++) {
+                if (guest_registry[i].local_pid == current->tgid) {
+                    for (int d = 0; d < guest_registry[i].dsm_count; d++) {
+                        if (guest_registry[i].dsm_map[d].base_addr == (fault_addr - offset)) {
+                            guest_registry[i].dsm_map[d].page_states[page_idx] = MATTX_PAGE_SHARED;
+                            mattx_dbg("[MESI_VM2] Injected Read-Only Trapdoor at 0x%lx. Local State: SHARED\n", fault_addr);
+                            break;
+                        }
+                    }
+                    break;
+                }
+            }
+            spin_unlock(&guest_lock);
+        }
+    } else {
+        // Mode 1 or Mode 3: Standard RW injection
+        ret = vmf_insert_pfn(vma, fault_addr, pfn);
+    }
+
+
 
     // 6. THE LEASH: If we're in DSM_MODE3, set the Trap Flag so we can catch the next instruction!
     // ###################################################################################
@@ -4042,6 +4072,48 @@ static void mattx_dsm_fault_kworker(struct work_struct *work) {
                             if (bytes == 4096) {
                                 ret = 0;
                                 mattx_dbg("[DSM_PUMP] Successfully extracted 4KB page. Sending to Node %d...\n", ctx->target_node); // <-- NEW LOG!
+
+                                
+                                // --- NEW: MODE 2 MASTER DIRECTORY UPDATE ---
+                                if (config_dsm_mode == 2) {
+                                    spin_lock(&export_lock);
+                                    for (int e = 0; e < export_count; e++) {
+                                        if (export_registry[e].orig_pid == ctx->req.orig_pid) {
+                                            int dir_idx = -1;
+                                            
+                                            // Find or create the directory entry for this SHMID
+                                            for (int d = 0; d < export_registry[e].dsm_dir_count; d++) {
+                                                if (export_registry[e].dsm_dirs[d].shmid == ctx->req.shmid) {
+                                                    dir_idx = d; break;
+                                                }
+                                            }
+                                            if (dir_idx == -1 && export_registry[e].dsm_dir_count < MAX_DSM_SEGMENTS) {
+                                                dir_idx = export_registry[e].dsm_dir_count++;
+                                                export_registry[e].dsm_dirs[dir_idx].shmid = ctx->req.shmid;
+                                            }
+                                            
+                                            // Update the Page State and Shared Mask!
+                                            if (dir_idx != -1) {
+                                                unsigned long page_idx = ctx->req.offset / PAGE_SIZE;
+                                                if (page_idx < MAX_DSM_PAGES) {
+                                                    if (export_registry[e].dsm_dirs[dir_idx].page_state[page_idx] == MATTX_PAGE_INVALID) {
+                                                        export_registry[e].dsm_dirs[dir_idx].page_state[page_idx] = MATTX_PAGE_SHARED;
+                                                    }
+                                                    // Add the target node to the bitmask!
+                                                    export_registry[e].dsm_dirs[dir_idx].page_shared_mask[page_idx] |= (1ULL << ctx->target_node);
+                                                    
+                                                    mattx_dbg("[MESI_VM1] Page %lu of SHMID %u is now SHARED. Mask: 0x%llx\n", 
+                                                              page_idx, ctx->req.shmid, export_registry[e].dsm_dirs[dir_idx].page_shared_mask[page_idx]);
+                                                }
+                                            }
+                                            break;
+                                        }
+                                    }
+                                    spin_unlock(&export_lock);
+                                }
+                                // -------------------------------------------
+
+
                             } else {
                                 mattx_dbg("[DSM_PUMP] ERROR: Failed to extract page! (Read %d bytes)\n", bytes); // <-- NEW LOG!
                             }

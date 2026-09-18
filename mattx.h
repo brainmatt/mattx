@@ -1443,6 +1443,7 @@ extern mattx_sys_getdents64_fn real_sys_getdents64;
 typedef long (*mattx_sys_pipe2_fn)(const struct pt_regs *regs);
 extern mattx_sys_pipe2_fn real_sys_pipe2;
 
+
 // --- THE DSM GHOST RESOLVERS ---
 typedef long (*mattx_sys_shmget_fn)(const struct pt_regs *regs);
 extern mattx_sys_shmget_fn real_sys_shmget;
@@ -1465,6 +1466,10 @@ extern mattx_zap_vma_ptes_fn real_zap_vma_ptes;
 
 extern int config_dsm_mode; // Expose the config toggle!
 int mattx_dsm_sweeper_loop(void *data); // Expose the Sweeper thread!
+
+// DSM MESI: resolver for vmf_insert_pfn_prot
+typedef vm_fault_t (*mattx_vmf_insert_pfn_prot_fn)(struct vm_area_struct *vma, unsigned long addr, unsigned long pfn, pgprot_t pgprot);
+extern mattx_vmf_insert_pfn_prot_fn real_vmf_insert_pfn_prot;
 
 
 
