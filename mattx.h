@@ -1279,6 +1279,7 @@ struct mattx_dsm_flush_req {
 struct mattx_dsm_flush_reply {
     u64 req_id;
     int error;
+    char data[4096]; // The envelope for the dirty 4KB page!
 };
 
 
