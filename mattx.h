@@ -236,6 +236,12 @@ enum mattx_msg_type {
     MATTX_MSG_DSM_PAGE_FAULT_REQ,
     MATTX_MSG_DSM_PAGE_FAULT_REPLY,
     MATTX_MSG_DSM_PAGE_UPDATE,
+    MATTX_MSG_DSM_WRITE_ACQUIRE_REQ,
+    MATTX_MSG_DSM_WRITE_ACQUIRE_REPLY,
+    MATTX_MSG_DSM_INVALIDATE_REQ,
+    MATTX_MSG_DSM_INVALIDATE_REPLY,
+    MATTX_MSG_DSM_FLUSH_REQ,
+    MATTX_MSG_DSM_FLUSH_REPLY,
 };
 
 struct mattx_header {
@@ -266,6 +272,15 @@ struct mattx_cpu_regs {
     uint64_t rip, cs, eflags, rsp, ss;
 
 };
+
+
+// --- MESI Page States ---
+enum mattx_dsm_page_state {
+    MATTX_PAGE_INVALID = 0,
+    MATTX_PAGE_SHARED,    // Read-Only
+    MATTX_PAGE_EXCLUSIVE  // Read-Write (Dirty)
+};
+
 
 // NOTE: bin/mattx_stub.c hand-mirrors this struct (and mattx_migration_req
 // below) byte-for-byte, since it's a separate userspace program that can't
@@ -1005,7 +1020,8 @@ struct mattx_dsm_mapping {
     u32 shmid;
     unsigned long size;
     unsigned long present_pages[MAX_DSM_PAGES / BITS_PER_LONG]; // Tracks mapped pages!
-    void *pages[MAX_DSM_PAGES]; // The Physical Page Pool!    
+    void *pages[MAX_DSM_PAGES]; // The Physical Page Pool!
+    u8 page_states[MAX_DSM_PAGES]; // Local MESI State (VM2)
 };
 
 
@@ -1039,12 +1055,25 @@ struct mattx_guest_info {
     u32 dsm_step_shmid;
 };
 
+
+// DSM MESI: The Master Directory (VM1) ---
+struct mattx_dsm_master_dir {
+    u32 shmid;
+    u8 page_state[MAX_DSM_PAGES];       // Global state of the page
+    int page_owner[MAX_DSM_PAGES];      // Node ID of the EXCLUSIVE owner
+    u64 page_shared_mask[MAX_DSM_PAGES]; // Bitmap of Node IDs holding SHARED copies (Supports up to 64 nodes for this prototype)
+};
+
 struct mattx_export_info {
     pid_t orig_pid;
     int target_node;
     struct file *remote_files[MAX_FDS]; 
     bool abort_rpc; // The Kworker Kill-Switch! ---
     bool is_growing_gang; // The Gang Grower Flag!
+
+    // DSM MESI Directory ---
+    int dsm_dir_count;
+    struct mattx_dsm_master_dir dsm_dirs[MAX_DSM_SEGMENTS];    
 };
 
 struct mattx_vfs_getattr_req {
@@ -1215,7 +1244,42 @@ struct mattx_dsm_page_update_req {
 };
 
 
+// --- DSM MESI Payloads (Mode 2) ---
+struct mattx_dsm_write_acquire_req {
+    u64 req_id;
+    u32 orig_pid;
+    u32 shmid;
+    unsigned long offset;
+};
 
+struct mattx_dsm_write_acquire_reply {
+    u64 req_id;
+    int error;
+};
+
+struct mattx_dsm_invalidate_req {
+    u64 req_id;
+    u32 orig_pid;
+    u32 shmid;
+    unsigned long offset;
+};
+
+struct mattx_dsm_invalidate_reply {
+    u64 req_id;
+    int error;
+};
+
+struct mattx_dsm_flush_req {
+    u64 req_id;
+    u32 orig_pid;
+    u32 shmid;
+    unsigned long offset;
+};
+
+struct mattx_dsm_flush_reply {
+    u64 req_id;
+    int error;
+};
 
 
 
