@@ -3632,6 +3632,81 @@ static vm_fault_t mattx_dsm_fault(struct vm_fault *vmf) {
         return VM_FAULT_SIGSEGV;
     }
 
+
+    // MESI PROTOCOL (MODE 2) WRITE-ACQUIRE ---
+    unsigned long page_idx = offset / PAGE_SIZE;
+    u8 current_state = MATTX_PAGE_INVALID;
+    bool is_write = (vmf->flags & FAULT_FLAG_WRITE) ? true : false;
+
+    spin_lock(&guest_lock);
+    for (int i = 0; i < guest_count; i++) {
+        if (guest_registry[i].local_pid == current->tgid) {
+            for (int d = 0; d < guest_registry[i].dsm_count; d++) {
+                if (guest_registry[i].dsm_map[d].base_addr == (fault_addr - offset)) {
+                    current_state = guest_registry[i].dsm_map[d].page_states[page_idx];
+                    break;
+                }
+            }
+            break;
+        }
+    }
+    spin_unlock(&guest_lock);
+
+    if (config_dsm_mode == 2 && current_state == MATTX_PAGE_SHARED && is_write) {
+        mattx_dbg("[MESI_VM2] Write-Protect Fault at 0x%lx. Requesting EXCLUSIVE lock...\n", fault_addr);
+        
+        // 1. Allocate RPC slot
+        int slot = -1; u64 req_id = 0;
+        spin_lock(&vfs_rpc_lock);
+        for (int j = 0; j < MAX_VFS_RPC; j++) {
+            if (!vfs_rpc_registry[j].in_use) {
+                slot = j; vfs_rpc_registry[j].in_use = true;
+                req_id = next_req_id++; vfs_rpc_registry[j].req_id = req_id;
+                vfs_rpc_registry[j].done = false; init_waitqueue_head(&vfs_rpc_registry[j].wq);
+                break;
+            }
+        }
+        spin_unlock(&vfs_rpc_lock);
+        if (slot == -1) return VM_FAULT_SIGSEGV;
+
+        // 2. Send Request & Wait
+        struct mattx_dsm_write_acquire_req acq_req = { .req_id = req_id, .orig_pid = orig_pid, .shmid = shmid, .offset = offset };
+        mattx_comm_send(cluster_map[home_node], MATTX_MSG_DSM_WRITE_ACQUIRE_REQ, &acq_req, sizeof(acq_req));
+        wait_event_interruptible(vfs_rpc_registry[slot].wq, vfs_rpc_registry[slot].done);
+        
+        spin_lock(&vfs_rpc_lock); vfs_rpc_registry[slot].in_use = false; spin_unlock(&vfs_rpc_lock);
+
+        // 3. Upgrade local state to EXCLUSIVE
+        void *kaddr = NULL;
+        spin_lock(&guest_lock);
+        for (int i = 0; i < guest_count; i++) {
+            if (guest_registry[i].local_pid == current->tgid) {
+                for (int d = 0; d < guest_registry[i].dsm_count; d++) {
+                    if (guest_registry[i].dsm_map[d].base_addr == (fault_addr - offset)) {
+                        guest_registry[i].dsm_map[d].page_states[page_idx] = MATTX_PAGE_EXCLUSIVE;
+                        kaddr = guest_registry[i].dsm_map[d].pages[page_idx];
+                        break;
+                    }
+                }
+                break;
+            }
+        }
+        spin_unlock(&guest_lock);
+
+        // 4. Zap the old Read-Only PTE and re-insert as Read-Write!
+        if (real_zap_vma_ptes) real_zap_vma_ptes(vma, fault_addr, PAGE_SIZE);
+
+        if (kaddr) {
+            unsigned long pfn = __pa(kaddr) >> PAGE_SHIFT;
+            vmf_insert_pfn(vma, fault_addr, pfn); // vmf_insert_pfn defaults to RW!
+            mattx_dbg("[MESI_VM2] Lock acquired! Upgraded page at 0x%lx to EXCLUSIVE (RW).\n", fault_addr);
+        }
+        return VM_FAULT_NOPAGE;
+    }
+    // -------------------------------------------------------
+
+
+
     // 2. CONCURRENCY: Allocate a sterile RPC slot
     int slot = -1;
     u64 req_id = 0;
@@ -3685,7 +3760,7 @@ static vm_fault_t mattx_dsm_fault(struct vm_fault *vmf) {
 
 
     // 5. THE INJECTION: Wire the PFN into the Surrogate's brain!
-    unsigned long page_idx = offset / PAGE_SIZE;
+    // disabled since defined before: unsigned long page_idx = offset / PAGE_SIZE;
     void *kaddr = NULL;
 
     spin_lock(&guest_lock);
@@ -4397,6 +4472,146 @@ void mattx_inject_dsm_cleanup(u32 orig_pid, int home_node, u32 shmid, unsigned l
 }
 EXPORT_SYMBOL(mattx_inject_dsm_cleanup);
 
+
+
+
+// ============================================================================
+// MESI PROTOCOL: WRITE ACQUIRE & INVALIDATE (MODE 2)
+// ============================================================================
+
+// --- VM1: WRITE ACQUIRE KWORKER ---
+struct mattx_dsm_write_acquire_kworker_ctx { struct work_struct work; struct mattx_dsm_write_acquire_req req; int target_node; };
+
+static void mattx_dsm_write_acquire_kworker(struct work_struct *work) {
+    struct mattx_dsm_write_acquire_kworker_ctx *ctx = container_of(work, struct mattx_dsm_write_acquire_kworker_ctx, work);
+    struct mattx_dsm_write_acquire_reply reply = { .req_id = ctx->req.req_id, .error = 0 };
+    
+    spin_lock(&export_lock);
+    for (int e = 0; e < export_count; e++) {
+        if (export_registry[e].orig_pid == ctx->req.orig_pid) {
+            for (int d = 0; d < export_registry[e].dsm_dir_count; d++) {
+                if (export_registry[e].dsm_dirs[d].shmid == ctx->req.shmid) {
+                    unsigned long page_idx = ctx->req.offset / PAGE_SIZE;
+                    u64 mask = export_registry[e].dsm_dirs[d].page_shared_mask[page_idx];
+                    
+                    // 1. Send Invalidates to everyone in the mask EXCEPT the requester!
+                    for (int node = 0; node < MAX_NODES; node++) {
+                        if (node != ctx->target_node && (mask & (1ULL << node))) {
+                            if (cluster_map[node]) {
+                                struct mattx_dsm_invalidate_req inv_req = {
+                                    .req_id = 0, .orig_pid = ctx->req.orig_pid,
+                                    .shmid = ctx->req.shmid, .offset = ctx->req.offset
+                                };
+                                // Fire and forget! (For this prototype, we assume the network is reliable)
+                                mattx_comm_send(cluster_map[node], MATTX_MSG_DSM_INVALIDATE_REQ, &inv_req, sizeof(inv_req));
+                                mattx_dbg("[MESI_VM1] Sent INVALIDATE to Node %d for SHMID %u Offset %lu\n", node, ctx->req.shmid, ctx->req.offset);
+                            }
+                        }
+                    }
+                    
+                    // 2. Update Directory to EXCLUSIVE
+                    export_registry[e].dsm_dirs[d].page_state[page_idx] = MATTX_PAGE_EXCLUSIVE;
+                    export_registry[e].dsm_dirs[d].page_owner[page_idx] = ctx->target_node;
+                    export_registry[e].dsm_dirs[d].page_shared_mask[page_idx] = 0;
+                    
+                    mattx_dbg("[MESI_VM1] Node %d granted EXCLUSIVE lock for SHMID %u Offset %lu\n", ctx->target_node, ctx->req.shmid, ctx->req.offset);
+                    break;
+                }
+            }
+            break;
+        }
+    }
+    spin_unlock(&export_lock);
+    
+    if (cluster_map[ctx->target_node]) {
+        mattx_comm_send(cluster_map[ctx->target_node], MATTX_MSG_DSM_WRITE_ACQUIRE_REPLY, &reply, sizeof(reply));
+    }
+    kfree(ctx);
+}
+
+static void handle_dsm_write_acquire_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    struct mattx_dsm_write_acquire_req *req = payload;
+    struct mattx_dsm_write_acquire_kworker_ctx *ctx = kmalloc(sizeof(*ctx), GFP_ATOMIC);
+    if (ctx) {
+        INIT_WORK(&ctx->work, mattx_dsm_write_acquire_kworker);
+        memcpy(&ctx->req, req, sizeof(*req));
+        ctx->target_node = hdr->sender_id;
+        schedule_work(&ctx->work);
+    }
+}
+
+// --- VM3: INVALIDATE KWORKER ---
+struct mattx_dsm_invalidate_kworker_ctx { struct work_struct work; struct mattx_dsm_invalidate_req req; int target_node; };
+
+static void mattx_dsm_invalidate_kworker(struct work_struct *work) {
+    struct mattx_dsm_invalidate_kworker_ctx *ctx = container_of(work, struct mattx_dsm_invalidate_kworker_ctx, work);
+    
+    spin_lock(&guest_lock);
+    for (int i = 0; i < guest_count; i++) {
+        if (guest_registry[i].orig_pid == ctx->req.orig_pid) {
+            for (int d = 0; d < guest_registry[i].dsm_count; d++) {
+                if (guest_registry[i].dsm_map[d].shmid == ctx->req.shmid) {
+                    unsigned long base = guest_registry[i].dsm_map[d].base_addr;
+                    unsigned long fault_addr = base + ctx->req.offset;
+                    unsigned long page_idx = ctx->req.offset / PAGE_SIZE;
+                    
+                    // 1. Update local state to INVALID
+                    guest_registry[i].dsm_map[d].page_states[page_idx] = MATTX_PAGE_INVALID;
+                    
+                    // 2. Zap the PTE!
+                    struct task_struct *surrogate = NULL;
+                    rcu_read_lock();
+                    surrogate = pid_task(find_vpid(guest_registry[i].local_pid), PIDTYPE_PID);
+                    if (surrogate) get_task_struct(surrogate);
+                    rcu_read_unlock();
+                    
+                    if (surrogate && surrogate->mm && real_zap_vma_ptes) {
+                        mmap_read_lock(surrogate->mm);
+                        struct vm_area_struct *vma = find_vma(surrogate->mm, base);
+                        if (vma && vma->vm_start <= base) {
+                            real_zap_vma_ptes(vma, fault_addr, PAGE_SIZE);
+                            mattx_dbg("[MESI_VM3] Zapped invalidated page at 0x%lx\n", fault_addr);
+                        }
+                        mmap_read_unlock(surrogate->mm);
+                        put_task_struct(surrogate);
+                    }
+                    break;
+                }
+            }
+            break;
+        }
+    }
+    spin_unlock(&guest_lock);
+    kfree(ctx);
+}
+
+static void handle_dsm_invalidate_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    struct mattx_dsm_invalidate_req *req = payload;
+    struct mattx_dsm_invalidate_kworker_ctx *ctx = kmalloc(sizeof(*ctx), GFP_ATOMIC);
+    if (ctx) {
+        INIT_WORK(&ctx->work, mattx_dsm_invalidate_kworker);
+        memcpy(&ctx->req, req, sizeof(*req));
+        ctx->target_node = hdr->sender_id;
+        schedule_work(&ctx->work);
+    }
+}
+
+
+// --- VM2: WRITE ACQUIRE REPLY HANDLER ---
+static void handle_dsm_write_acquire_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    struct mattx_dsm_write_acquire_reply *reply = payload;
+    
+    spin_lock(&vfs_rpc_lock);
+    for (int i = 0; i < MAX_VFS_RPC; i++) {
+        if (vfs_rpc_registry[i].in_use && vfs_rpc_registry[i].req_id == reply->req_id) {
+            vfs_rpc_registry[i].error = reply->error;
+            vfs_rpc_registry[i].done = true;
+            wake_up_interruptible(&vfs_rpc_registry[i].wq);
+            break;
+        }
+    }
+    spin_unlock(&vfs_rpc_lock);
+}
 
 
 
@@ -5658,6 +5873,9 @@ void mattx_fileio_init_handlers(void) {
     mattx_register_handler(MATTX_MSG_DSM_PAGE_FAULT_REQ, handle_dsm_page_fault_req);
     mattx_register_handler(MATTX_MSG_DSM_PAGE_FAULT_REPLY, handle_dsm_page_fault_reply);
     mattx_register_handler(MATTX_MSG_DSM_PAGE_UPDATE, handle_dsm_page_update);
+    mattx_register_handler(MATTX_MSG_DSM_WRITE_ACQUIRE_REQ, handle_dsm_write_acquire_req);
+    mattx_register_handler(MATTX_MSG_DSM_WRITE_ACQUIRE_REPLY, handle_dsm_write_acquire_reply);
+    mattx_register_handler(MATTX_MSG_DSM_INVALIDATE_REQ, handle_dsm_invalidate_req);
 
 
     mattx_dbg(" [FILEIO] Network handlers registered.\n");
