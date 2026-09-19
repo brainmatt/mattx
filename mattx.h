@@ -1061,7 +1061,8 @@ struct mattx_dsm_master_dir {
     u32 shmid;
     u8 page_state[MAX_DSM_PAGES];       // Global state of the page
     int page_owner[MAX_DSM_PAGES];      // Node ID of the EXCLUSIVE owner
-    u64 page_shared_mask[MAX_DSM_PAGES]; // Bitmap of Node IDs holding SHARED copies (Supports up to 64 nodes for this prototype)
+    // Upgrade to a true kernel bitmap to support MAX_NODES (1024)!
+    DECLARE_BITMAP(page_shared_mask[MAX_DSM_PAGES], MAX_NODES); 
 };
 
 struct mattx_export_info {
