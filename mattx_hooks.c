@@ -20,7 +20,7 @@
  *
  * Commercial licensing options are available upon request.
  */
- 
+
 #include "mattx.h"
 #include <linux/wait.h> 
 #include <linux/poll.h>
@@ -1473,10 +1473,16 @@ static void mattx_rpc_worker(struct work_struct *work) {
                 if (read_buf) kfree(read_buf);
                 if (regs) regs->ax = error;
 
+
+            // --- SHMDT AWAKENING / DSM MESI PROTOCOL ---
             } else if (rpc->is_shmdt) {
                 struct pt_regs *regs = task_pt_regs(surrogate);
                 int error = -EINTR;
                 unsigned long size_to_unmap = 0;
+
+                // --- THE FUNERAL FLUSH (MODE 2) ---
+                struct mattx_dsm_page_update_req *flush_reqs = NULL;
+                int flush_count = 0;
 
                 spin_lock(&guest_lock);
                 for (i = 0; i < guest_count; i++) {
@@ -1487,6 +1493,37 @@ static void mattx_rpc_worker(struct work_struct *work) {
                             for (int d = 0; d < guest_registry[i].dsm_count; d++) {
                                 if (guest_registry[i].dsm_map[d].base_addr == rpc->shm_addr) {
                                     size_to_unmap = guest_registry[i].dsm_map[d].size;
+                                    
+                                    // 1. Pack the dirty pages!
+                                    if (config_dsm_mode == 2) {
+                                        for (int p = 0; p < MAX_DSM_PAGES; p++) {
+                                            if (guest_registry[i].dsm_map[d].page_states[p] == MATTX_PAGE_EXCLUSIVE) flush_count++;
+                                        }
+                                        if (flush_count > 0) {
+                                            flush_reqs = kmalloc_array(flush_count, sizeof(*flush_reqs), GFP_ATOMIC);
+                                            if (flush_reqs) {
+                                                int idx = 0;
+                                                for (int p = 0; p < MAX_DSM_PAGES; p++) {
+                                                    if (guest_registry[i].dsm_map[d].page_states[p] == MATTX_PAGE_EXCLUSIVE) {
+                                                        flush_reqs[idx].orig_pid = rpc->orig_pid;
+                                                        flush_reqs[idx].shmid = guest_registry[i].dsm_map[d].shmid;
+                                                        flush_reqs[idx].offset = p * PAGE_SIZE;
+                                                        memcpy(flush_reqs[idx].data, guest_registry[i].dsm_map[d].pages[p], PAGE_SIZE);
+                                                        idx++;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    // 2. Free the physical pages for this segment!
+                                    for (int p = 0; p < MAX_DSM_PAGES; p++) {
+                                        if (guest_registry[i].dsm_map[d].pages[p]) {
+                                            free_page((unsigned long)guest_registry[i].dsm_map[d].pages[p]);
+                                            guest_registry[i].dsm_map[d].pages[p] = NULL;
+                                        }
+                                    }
+
                                     guest_registry[i].dsm_map[d] = guest_registry[i].dsm_map[--guest_registry[i].dsm_count];
                                     break;
                                 }
@@ -1497,10 +1534,20 @@ static void mattx_rpc_worker(struct work_struct *work) {
                 }
                 spin_unlock(&guest_lock);
 
+                // 3. Fire the Data Bombs safely outside the spinlock!
+                if (flush_reqs) {
+                    for (int f = 0; f < flush_count; f++) {
+                        if (cluster_map[rpc->home_node]) {
+                            mattx_comm_send(cluster_map[rpc->home_node], MATTX_MSG_DSM_PAGE_UPDATE, &flush_reqs[f], sizeof(struct mattx_dsm_page_update_req));
+                            mattx_dbg("[MESI_VM2] Funeral Flush (shmdt): Sent dirty page (SHMID %u, Offset %lu) to VM1\n", flush_reqs[f].shmid, flush_reqs[f].offset);
+                        }
+                    }
+                    kfree(flush_reqs);
+                }
+
                 // The Magic Trick: Destroy the Hollow VMA on VM2!
                 if (error == 0 && size_to_unmap > 0) {
                     if (surrogate->mm) {
-                        // THE IDENTITY THEFT: Steal the Surrogate's brain so vm_munmap finds the right lock!
                         kthread_use_mm(surrogate->mm);
                         vm_munmap(rpc->shm_addr, size_to_unmap);
                         kthread_unuse_mm(surrogate->mm);

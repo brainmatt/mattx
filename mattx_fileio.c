@@ -20,7 +20,7 @@
  *
  * Commercial licensing options are available upon request.
  */
- 
+
 #include "mattx.h"
 #include <linux/wait.h>
 #include <linux/poll.h>
@@ -4205,20 +4205,24 @@ static void mattx_dsm_fault_kworker(struct work_struct *work) {
                                             // Re-acquire the lock!
                                             mmap_read_lock(deputy->mm);
 
+
                                             if (flush_err == 0) {
                                                 // Write the flushed data into the Deputy's physical RAM!
                                                 access_process_vm(deputy, target_addr, flush_buf, PAGE_SIZE, FOLL_WRITE | FOLL_FORCE);
                                                 mattx_dbg("[MESI_VM1] Successfully flushed dirty data from Node %d to physical RAM.\n", owner_node);
-                                                
-                                                // Update Directory: Downgrade to SHARED
-                                                spin_lock(&export_lock);
-                                                if (e_idx != -1 && dir_idx != -1) {
-                                                    export_registry[e_idx].dsm_dirs[dir_idx].page_state[page_idx] = MATTX_PAGE_SHARED;
-                                                    export_registry[e_idx].dsm_dirs[dir_idx].page_owner[page_idx] = -1;
-                                                    export_registry[e_idx].dsm_dirs[dir_idx].page_shared_mask[page_idx] = 0; // VM2 zapped it, so mask is 0
-                                                }
-                                                spin_unlock(&export_lock);
+                                            } else {
+                                                mattx_dbg("[MESI_VM1] Flush failed (Node %d detached). Assuming RAM was updated via Funeral Flush.\n", owner_node);
                                             }
+                                            
+                                            // Update Directory: Downgrade to SHARED regardless of flush success!
+                                            spin_lock(&export_lock);
+                                            if (e_idx != -1 && dir_idx != -1) {
+                                                export_registry[e_idx].dsm_dirs[dir_idx].page_state[page_idx] = MATTX_PAGE_SHARED;
+                                                export_registry[e_idx].dsm_dirs[dir_idx].page_owner[page_idx] = -1;
+                                                export_registry[e_idx].dsm_dirs[dir_idx].page_shared_mask[page_idx] = 0; // VM2 zapped it, so mask is 0
+                                            }
+                                            spin_unlock(&export_lock);
+
                                         }
                                         kfree(flush_buf);
                                     }
