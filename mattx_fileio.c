@@ -3633,81 +3633,8 @@ static vm_fault_t mattx_dsm_fault(struct vm_fault *vmf) {
     }
 
 
-    // MESI PROTOCOL (MODE 2) WRITE-ACQUIRE ---
-    unsigned long page_idx = offset / PAGE_SIZE;
-    u8 current_state = MATTX_PAGE_INVALID;
-    bool is_write = (vmf->flags & FAULT_FLAG_WRITE) ? true : false;
-
-    spin_lock(&guest_lock);
-    for (int i = 0; i < guest_count; i++) {
-        if (guest_registry[i].local_pid == current->tgid) {
-            for (int d = 0; d < guest_registry[i].dsm_count; d++) {
-                if (guest_registry[i].dsm_map[d].base_addr == (fault_addr - offset)) {
-                    current_state = guest_registry[i].dsm_map[d].page_states[page_idx];
-                    break;
-                }
-            }
-            break;
-        }
-    }
-    spin_unlock(&guest_lock);
-
-    if (config_dsm_mode == 2 && current_state == MATTX_PAGE_SHARED && is_write) {
-        mattx_dbg("[MESI_VM2] Write-Protect Fault at 0x%lx. Requesting EXCLUSIVE lock...\n", fault_addr);
-        
-        // 1. Allocate RPC slot
-        int slot = -1; u64 req_id = 0;
-        spin_lock(&vfs_rpc_lock);
-        for (int j = 0; j < MAX_VFS_RPC; j++) {
-            if (!vfs_rpc_registry[j].in_use) {
-                slot = j; vfs_rpc_registry[j].in_use = true;
-                req_id = next_req_id++; vfs_rpc_registry[j].req_id = req_id;
-                vfs_rpc_registry[j].done = false; init_waitqueue_head(&vfs_rpc_registry[j].wq);
-                break;
-            }
-        }
-        spin_unlock(&vfs_rpc_lock);
-        if (slot == -1) return VM_FAULT_SIGSEGV;
-
-        // 2. Send Request & Wait
-        struct mattx_dsm_write_acquire_req acq_req = { .req_id = req_id, .orig_pid = orig_pid, .shmid = shmid, .offset = offset };
-        mattx_comm_send(cluster_map[home_node], MATTX_MSG_DSM_WRITE_ACQUIRE_REQ, &acq_req, sizeof(acq_req));
-        wait_event_interruptible(vfs_rpc_registry[slot].wq, vfs_rpc_registry[slot].done);
-        
-        spin_lock(&vfs_rpc_lock); vfs_rpc_registry[slot].in_use = false; spin_unlock(&vfs_rpc_lock);
-
-        // 3. Upgrade local state to EXCLUSIVE
-        void *kaddr = NULL;
-        spin_lock(&guest_lock);
-        for (int i = 0; i < guest_count; i++) {
-            if (guest_registry[i].local_pid == current->tgid) {
-                for (int d = 0; d < guest_registry[i].dsm_count; d++) {
-                    if (guest_registry[i].dsm_map[d].base_addr == (fault_addr - offset)) {
-                        guest_registry[i].dsm_map[d].page_states[page_idx] = MATTX_PAGE_EXCLUSIVE;
-                        kaddr = guest_registry[i].dsm_map[d].pages[page_idx];
-                        break;
-                    }
-                }
-                break;
-            }
-        }
-        spin_unlock(&guest_lock);
-
-        // 4. Zap the old Read-Only PTE and re-insert as Read-Write!
-        if (real_zap_vma_ptes) real_zap_vma_ptes(vma, fault_addr, PAGE_SIZE);
-
-        if (kaddr) {
-            unsigned long pfn = __pa(kaddr) >> PAGE_SHIFT;
-            vmf_insert_pfn(vma, fault_addr, pfn); // vmf_insert_pfn defaults to RW!
-            mattx_dbg("[MESI_VM2] Lock acquired! Upgraded page at 0x%lx to EXCLUSIVE (RW).\n", fault_addr);
-        }
-        return VM_FAULT_NOPAGE;
-    }
-    // -------------------------------------------------------
-
-
-
     // 2. CONCURRENCY: Allocate a sterile RPC slot
+    unsigned long page_idx = offset / PAGE_SIZE;
     int slot = -1;
     u64 req_id = 0;
     void *page_buf = kmalloc(4096, GFP_KERNEL);
@@ -3878,10 +3805,108 @@ static vm_fault_t mattx_dsm_fault(struct vm_fault *vmf) {
     return VM_FAULT_NOPAGE;
 }
 
+
+
+// ============================================================================
+// THE MESI WRITE-PROTECT TRAPDOOR (VM2)
+// ============================================================================
+static vm_fault_t mattx_dsm_pfn_mkwrite(struct vm_fault *vmf) {
+    unsigned long fault_addr = vmf->address & PAGE_MASK;
+    int shmid = -1;
+    unsigned long offset = 0;
+    int home_node = -1;
+    u32 orig_pid = 0;
+    bool found = false;
+
+    // 1. TRANSLATION: Find the mapping in the registry
+    spin_lock(&guest_lock);
+    for (int i = 0; i < guest_count; i++) {
+        if (guest_registry[i].local_pid == current->tgid) {
+            for (int d = 0; d < guest_registry[i].dsm_count; d++) {
+                unsigned long base = guest_registry[i].dsm_map[d].base_addr;
+                unsigned long size = guest_registry[i].dsm_map[d].size;
+                
+                if (fault_addr >= base && fault_addr < base + size) {
+                    shmid = guest_registry[i].dsm_map[d].shmid;
+                    offset = fault_addr - base;
+                    home_node = guest_registry[i].home_node;
+                    orig_pid = guest_registry[i].orig_pid;
+                    found = true;
+                    break;
+                }
+            }
+            break;
+        }
+    }
+    spin_unlock(&guest_lock);
+
+    if (!found || home_node == -1 || !cluster_map[home_node]) {
+        return VM_FAULT_SIGBUS;
+    }
+
+    if (config_dsm_mode == 2) {
+        mattx_dbg("[MESI_VM2] Write-Protect Fault at 0x%lx. Requesting EXCLUSIVE lock...\n", fault_addr);
+        
+        // 2. CONCURRENCY: Allocate a sterile RPC slot
+        int slot = -1; u64 req_id = 0;
+        spin_lock(&vfs_rpc_lock);
+        for (int j = 0; j < MAX_VFS_RPC; j++) {
+            if (!vfs_rpc_registry[j].in_use) {
+                slot = j; vfs_rpc_registry[j].in_use = true;
+                req_id = next_req_id++; vfs_rpc_registry[j].req_id = req_id;
+                vfs_rpc_registry[j].done = false; init_waitqueue_head(&vfs_rpc_registry[j].wq);
+                break;
+            }
+        }
+        spin_unlock(&vfs_rpc_lock);
+        
+        if (slot == -1) return VM_FAULT_SIGBUS;
+
+        // 3. THE REQUEST: Ask VM1 for the EXCLUSIVE lock!
+        struct mattx_dsm_write_acquire_req acq_req = { 
+            .req_id = req_id, .orig_pid = orig_pid, .shmid = shmid, .offset = offset 
+        };
+        mattx_comm_send(cluster_map[home_node], MATTX_MSG_DSM_WRITE_ACQUIRE_REQ, &acq_req, sizeof(acq_req));
+        
+        // 4. THE FREEZE: Sleep until VM1 invalidates the other nodes!
+        wait_event_interruptible(vfs_rpc_registry[slot].wq, vfs_rpc_registry[slot].done);
+        
+        int err = vfs_rpc_registry[slot].error;
+        spin_lock(&vfs_rpc_lock); vfs_rpc_registry[slot].in_use = false; spin_unlock(&vfs_rpc_lock);
+
+        if (err != 0) return VM_FAULT_SIGBUS;
+
+        // 5. THE UPGRADE: Mark local state as EXCLUSIVE
+        unsigned long page_idx = offset / PAGE_SIZE;
+        spin_lock(&guest_lock);
+        for (int i = 0; i < guest_count; i++) {
+            if (guest_registry[i].local_pid == current->tgid) {
+                for (int d = 0; d < guest_registry[i].dsm_count; d++) {
+                    if (guest_registry[i].dsm_map[d].base_addr == (fault_addr - offset)) {
+                        guest_registry[i].dsm_map[d].page_states[page_idx] = MATTX_PAGE_EXCLUSIVE;
+                        break;
+                    }
+                }
+                break;
+            }
+        }
+        spin_unlock(&guest_lock);
+
+        mattx_dbg("[MESI_VM2] Lock acquired! Kernel will now upgrade page at 0x%lx to EXCLUSIVE (RW).\n", fault_addr);
+    }
+
+    // Return 0 (Success) to tell the Linux kernel: "I handled the lock, you may now make the PTE writable!"
+    return 0; 
+}
+
+
+
 const struct vm_operations_struct mattx_dsm_vm_ops = {
     .fault = mattx_dsm_fault,
+    .pfn_mkwrite = mattx_dsm_pfn_mkwrite, // <-- THE WRITE TRAPDOOR!
 };
 EXPORT_SYMBOL(mattx_dsm_vm_ops);
+
 
 
 
