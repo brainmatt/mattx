@@ -66,6 +66,8 @@ bool is_hpc_local_lib(const char *path) {
     if (strncmp(path, "/usr/lib64/", 11) == 0) return true;
     if (strncmp(path, "/etc/ld.so.cache", 16) == 0) return true;
     if (strncmp(path, "/usr/share/locale/", 18) == 0) return true;
+    if (strncmp(path, "/proc/", 6) == 0) return true; // Localize /proc!
+    if (strncmp(path, "/sys/", 5) == 0) return true;  // Localize /sys!    
     return false;
 }
 EXPORT_SYMBOL(is_hpc_local_lib);
