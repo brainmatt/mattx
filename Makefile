@@ -84,7 +84,7 @@ dsmtest: bin/dsmtest.c
 	gcc -o bin/dsmtest bin/dsmtest.c
 
 dsmstresstest: bin/dsmstresstest.c
-	gcc -o bin/dsmstresstest bin/dsmstresstest.c -lpthread -lgcc_s
+	gcc -o bin/dsmstresstest bin/dsmstresstest.c
 
 clean:
 	$(MAKE) -C $(KDIR) M=$(PWD) clean
