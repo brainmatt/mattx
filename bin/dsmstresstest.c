@@ -109,7 +109,7 @@ int main(int argc, char *argv[]) {
 
             printf("[Worker PID %d] Waking up! Starting 100 loops...\n", getpid());
             
-            for (int tick = 0; tick < 100; tick++) {
+            for (int tick = 0; tick < 1000; tick++) {
                 int is_write = rand() % 2; // 0 = Read, 1 = Write
                 int ops = (rand() % max_ops) + 1;
                 int current_node = get_local_node_id();
@@ -131,7 +131,7 @@ int main(int argc, char *argv[]) {
                 }
             }
 
-            printf("[Worker PID %d] Finished 100 loops. Exiting cleanly.\n", getpid());
+            printf("[Worker PID %d] Finished 1000 loops. Exiting cleanly.\n", getpid());
             exit(0);
         } else {
             // Parent records the PID and waits 2 seconds before spawning the next
