@@ -4170,8 +4170,10 @@ static void mattx_dsm_fault_kworker(struct work_struct *work) {
                             
                             unsigned long page_idx = ctx->req.offset / PAGE_SIZE;
 
+
                             // --- NEW: MESI FLUSH PIPELINE (MODE 2) ---
                             if (config_dsm_mode == 2) {
+                                u32 owner_pid = 0;
                                 int owner_node = -1;
                                 int dir_idx = -1;
                                 int e_idx = -1;
@@ -4184,7 +4186,7 @@ static void mattx_dsm_fault_kworker(struct work_struct *work) {
                                             if (export_registry[e].dsm_dirs[d].shmid == ctx->req.shmid) {
                                                 dir_idx = d;
                                                 if (export_registry[e].dsm_dirs[d].page_state[page_idx] == MATTX_PAGE_EXCLUSIVE) {
-                                                    owner_node = export_registry[e].dsm_dirs[d].page_owner[page_idx];
+                                                    owner_pid = export_registry[e].dsm_dirs[d].page_owner_pid[page_idx];
                                                 }
                                                 break;
                                             }
@@ -4192,11 +4194,21 @@ static void mattx_dsm_fault_kworker(struct work_struct *work) {
                                         break;
                                     }
                                 }
+                                
+                                // If we found an owner PID, we need to find which node it lives on!
+                                if (owner_pid != 0 && owner_pid != ctx->req.orig_pid) {
+                                    for (int e = 0; e < export_count; e++) {
+                                        if (export_registry[e].orig_pid == owner_pid) {
+                                            owner_node = export_registry[e].target_node;
+                                            break;
+                                        }
+                                    }
+                                }
                                 spin_unlock(&export_lock);
 
                                 // If someone else owns it exclusively, we must FLUSH them first!
-                                if (owner_node != -1 && owner_node != ctx->target_node && cluster_map[owner_node]) {
-                                    mattx_dbg("[MESI_VM1] Page %lu is EXCLUSIVE to Node %d. Pausing fault to request FLUSH...\n", page_idx, owner_node);
+                                if (owner_pid != 0 && owner_pid != ctx->req.orig_pid && owner_node != -1 && cluster_map[owner_node]) {
+                                    mattx_dbg("[MESI_VM1] Page %lu is EXCLUSIVE to PID %u (Node %d). Pausing fault to request FLUSH...\n", page_idx, owner_pid, owner_node);
                                     
                                     int slot = -1; u64 req_id = 0;
                                     void *flush_buf = kmalloc(PAGE_SIZE, GFP_KERNEL);
@@ -4216,7 +4228,7 @@ static void mattx_dsm_fault_kworker(struct work_struct *work) {
 
                                         if (slot != -1) {
                                             struct mattx_dsm_flush_req flush_req = {
-                                                .req_id = req_id, .orig_pid = ctx->req.orig_pid,
+                                                .req_id = req_id, .orig_pid = owner_pid, // <-- Target the OWNER PID!
                                                 .shmid = ctx->req.shmid, .offset = ctx->req.offset
                                             };
                                             
@@ -4232,21 +4244,19 @@ static void mattx_dsm_fault_kworker(struct work_struct *work) {
                                             // Re-acquire the lock!
                                             mmap_read_lock(deputy->mm);
 
-
                                             if (flush_err == 0) {
                                                 // Write the flushed data into the Deputy's physical RAM!
                                                 access_process_vm(deputy, target_addr, flush_buf, PAGE_SIZE, FOLL_WRITE | FOLL_FORCE);
-                                                mattx_dbg("[MESI_VM1] Successfully flushed dirty data from Node %d to physical RAM.\n", owner_node);
+                                                mattx_dbg("[MESI_VM1] Successfully flushed dirty data from PID %u to physical RAM.\n", owner_pid);
                                             } else {
-                                                mattx_dbg("[MESI_VM1] Flush failed (Node %d detached). Assuming RAM was updated via Funeral Flush.\n", owner_node);
+                                                mattx_dbg("[MESI_VM1] Flush failed (PID %u detached). Assuming RAM was updated via Funeral Flush.\n", owner_pid);
                                             }
                                             
                                             // Update Directory: Downgrade to SHARED regardless of flush success!
                                             spin_lock(&export_lock);
                                             if (e_idx != -1 && dir_idx != -1) {
                                                 export_registry[e_idx].dsm_dirs[dir_idx].page_state[page_idx] = MATTX_PAGE_SHARED;
-                                                export_registry[e_idx].dsm_dirs[dir_idx].page_owner[page_idx] = -1;
-                                                // VM2 zapped it, so clear the mask
+                                                export_registry[e_idx].dsm_dirs[dir_idx].page_owner_pid[page_idx] = 0; // Clear owner!
                                                 bitmap_zero(export_registry[e_idx].dsm_dirs[dir_idx].page_shared_mask[page_idx], MAX_NODES);
                                             }
                                             spin_unlock(&export_lock);
@@ -4256,7 +4266,6 @@ static void mattx_dsm_fault_kworker(struct work_struct *work) {
                                 }
                             }
                             // ---------------------------------------
-
 
 
                             mattx_dbg("[DSM_PUMP] Found SYSV segment! Sucking 4096 bytes from physical addr 0x%lx...\n", target_addr); // <-- NEW LOG!
@@ -4612,12 +4621,12 @@ static void mattx_dsm_write_acquire_kworker(struct work_struct *work) {
                 if (export_registry[e].dsm_dirs[d].shmid == ctx->req.shmid) {
                     unsigned long page_idx = ctx->req.offset / PAGE_SIZE;
                     
-                    // 1. Send Invalidates to everyone in the mask EXCEPT the requester!
+                    // 1. Send Invalidates to EVERYONE in the mask!
                     for (int node = 0; node < MAX_NODES; node++) {
-                        if (node != ctx->target_node && test_bit(node, export_registry[e].dsm_dirs[d].page_shared_mask[page_idx])) {
+                        if (test_bit(node, export_registry[e].dsm_dirs[d].page_shared_mask[page_idx])) {
                             if (cluster_map[node]) {
                                 struct mattx_dsm_invalidate_req inv_req = {
-                                    .req_id = 0, .orig_pid = ctx->req.orig_pid,
+                                    .req_id = 0, .orig_pid = ctx->req.orig_pid, // Pass the requester's PID!
                                     .shmid = ctx->req.shmid, .offset = ctx->req.offset
                                 };
                                 // Fire and forget!
@@ -4626,10 +4635,11 @@ static void mattx_dsm_write_acquire_kworker(struct work_struct *work) {
                             }
                         }
                     }
+
                     
                     // 2. Update Directory to EXCLUSIVE
                     export_registry[e].dsm_dirs[d].page_state[page_idx] = MATTX_PAGE_EXCLUSIVE;
-                    export_registry[e].dsm_dirs[d].page_owner[page_idx] = ctx->target_node;
+                    export_registry[e].dsm_dirs[d].page_owner_pid[page_idx] = ctx->req.orig_pid; // <-- PID TRACKING!
                     // Clear the entire bitmap for this page!
                     bitmap_zero(export_registry[e].dsm_dirs[d].page_shared_mask[page_idx], MAX_NODES);
 
@@ -4664,40 +4674,42 @@ struct mattx_dsm_invalidate_kworker_ctx { struct work_struct work; struct mattx_
 
 static void mattx_dsm_invalidate_kworker(struct work_struct *work) {
     struct mattx_dsm_invalidate_kworker_ctx *ctx = container_of(work, struct mattx_dsm_invalidate_kworker_ctx, work);
-    
+
     spin_lock(&guest_lock);
     for (int i = 0; i < guest_count; i++) {
+        // THE FIX: Skip the process that is currently acquiring the EXCLUSIVE lock!
         if (guest_registry[i].orig_pid == ctx->req.orig_pid) {
-            for (int d = 0; d < guest_registry[i].dsm_count; d++) {
-                if (guest_registry[i].dsm_map[d].shmid == ctx->req.shmid) {
-                    unsigned long base = guest_registry[i].dsm_map[d].base_addr;
-                    unsigned long fault_addr = base + ctx->req.offset;
-                    unsigned long page_idx = ctx->req.offset / PAGE_SIZE;
-                    
-                    // 1. Update local state to INVALID
-                    guest_registry[i].dsm_map[d].page_states[page_idx] = MATTX_PAGE_INVALID;
-                    
-                    // 2. Zap the PTE!
-                    struct task_struct *surrogate = NULL;
-                    rcu_read_lock();
-                    surrogate = pid_task(find_vpid(guest_registry[i].local_pid), PIDTYPE_PID);
-                    if (surrogate) get_task_struct(surrogate);
-                    rcu_read_unlock();
-                    
-                    if (surrogate && surrogate->mm && real_zap_vma_ptes) {
-                        mmap_read_lock(surrogate->mm);
-                        struct vm_area_struct *vma = find_vma(surrogate->mm, base);
-                        if (vma && vma->vm_start <= base) {
-                            real_zap_vma_ptes(vma, fault_addr, PAGE_SIZE);
-                            mattx_dbg("[MESI_VM3] Zapped invalidated page at 0x%lx\n", fault_addr);
-                        }
-                        mmap_read_unlock(surrogate->mm);
-                        put_task_struct(surrogate);
+            continue; 
+        }
+
+        // We must check ALL OTHER guests on this node for the SHMID!
+        for (int d = 0; d < guest_registry[i].dsm_count; d++) {
+            if (guest_registry[i].dsm_map[d].shmid == ctx->req.shmid) {
+                unsigned long base = guest_registry[i].dsm_map[d].base_addr;
+                unsigned long fault_addr = base + ctx->req.offset;
+                unsigned long page_idx = ctx->req.offset / PAGE_SIZE;
+                
+                // 1. Update local state to INVALID
+                guest_registry[i].dsm_map[d].page_states[page_idx] = MATTX_PAGE_INVALID;
+                
+                // 2. Zap the PTE!
+                struct task_struct *surrogate = NULL;
+                rcu_read_lock();
+                surrogate = pid_task(find_vpid(guest_registry[i].local_pid), PIDTYPE_PID);
+                if (surrogate) get_task_struct(surrogate);
+                rcu_read_unlock();
+                
+                if (surrogate && surrogate->mm && real_zap_vma_ptes) {
+                    mmap_read_lock(surrogate->mm);
+                    struct vm_area_struct *vma = find_vma(surrogate->mm, base);
+                    if (vma && vma->vm_start <= base) {
+                        real_zap_vma_ptes(vma, fault_addr, PAGE_SIZE);
+                        mattx_dbg("[MESI_VM2] Zapped invalidated page at 0x%lx for PID %d\n", fault_addr, surrogate->pid);
                     }
-                    break;
+                    mmap_read_unlock(surrogate->mm);
+                    put_task_struct(surrogate);
                 }
             }
-            break;
         }
     }
     spin_unlock(&guest_lock);

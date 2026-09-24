@@ -1060,7 +1060,7 @@ struct mattx_guest_info {
 struct mattx_dsm_master_dir {
     u32 shmid;
     u8 page_state[MAX_DSM_PAGES];       // Global state of the page
-    int page_owner[MAX_DSM_PAGES];      // Node ID of the EXCLUSIVE owner
+    u32 page_owner_pid[MAX_DSM_PAGES];  // <-- CHANGED: PID of the EXCLUSIVE owner
     // Upgrade to a true kernel bitmap to support MAX_NODES (1024)!
     DECLARE_BITMAP(page_shared_mask[MAX_DSM_PAGES], MAX_NODES); 
 };
