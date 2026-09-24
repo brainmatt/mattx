@@ -5358,6 +5358,7 @@ int mattx_hooks_init(void) {
 }
 
 void mattx_hooks_exit(void) {
+    unregister_kretprobe(&shmat_kprobe);
     unregister_kretprobe(&shmdt_kprobe);
     unregister_kretprobe(&shmctl_kprobe);
     unregister_kretprobe(&shmget_kprobe);
