@@ -236,6 +236,12 @@ enum mattx_msg_type {
     MATTX_MSG_DSM_PAGE_FAULT_REQ,
     MATTX_MSG_DSM_PAGE_FAULT_REPLY,
     MATTX_MSG_DSM_PAGE_UPDATE,
+    MATTX_MSG_DSM_WRITE_ACQUIRE_REQ,
+    MATTX_MSG_DSM_WRITE_ACQUIRE_REPLY,
+    MATTX_MSG_DSM_INVALIDATE_REQ,
+    MATTX_MSG_DSM_INVALIDATE_REPLY,
+    MATTX_MSG_DSM_FLUSH_REQ,
+    MATTX_MSG_DSM_FLUSH_REPLY,
 };
 
 struct mattx_header {
@@ -266,6 +272,15 @@ struct mattx_cpu_regs {
     uint64_t rip, cs, eflags, rsp, ss;
 
 };
+
+
+// --- MESI Page States ---
+enum mattx_dsm_page_state {
+    MATTX_PAGE_INVALID = 0,
+    MATTX_PAGE_SHARED,    // Read-Only
+    MATTX_PAGE_EXCLUSIVE  // Read-Write (Dirty)
+};
+
 
 // NOTE: bin/mattx_stub.c hand-mirrors this struct (and mattx_migration_req
 // below) byte-for-byte, since it's a separate userspace program that can't
@@ -1005,7 +1020,8 @@ struct mattx_dsm_mapping {
     u32 shmid;
     unsigned long size;
     unsigned long present_pages[MAX_DSM_PAGES / BITS_PER_LONG]; // Tracks mapped pages!
-    void *pages[MAX_DSM_PAGES]; // The Physical Page Pool!    
+    void *pages[MAX_DSM_PAGES]; // The Physical Page Pool!
+    u8 page_states[MAX_DSM_PAGES]; // Local MESI State (VM2)
 };
 
 
@@ -1039,12 +1055,26 @@ struct mattx_guest_info {
     u32 dsm_step_shmid;
 };
 
+
+// DSM MESI: The Master Directory (VM1) ---
+struct mattx_dsm_master_dir {
+    u32 shmid;
+    u8 page_state[MAX_DSM_PAGES];       // Global state of the page
+    u32 page_owner_pid[MAX_DSM_PAGES];  // <-- CHANGED: PID of the EXCLUSIVE owner
+    // Upgrade to a true kernel bitmap to support MAX_NODES (1024)!
+    DECLARE_BITMAP(page_shared_mask[MAX_DSM_PAGES], MAX_NODES); 
+};
+
 struct mattx_export_info {
     pid_t orig_pid;
     int target_node;
     struct file *remote_files[MAX_FDS]; 
     bool abort_rpc; // The Kworker Kill-Switch! ---
     bool is_growing_gang; // The Gang Grower Flag!
+
+    // DSM MESI Directory ---
+    int dsm_dir_count;
+    struct mattx_dsm_master_dir dsm_dirs[MAX_DSM_SEGMENTS];    
 };
 
 struct mattx_vfs_getattr_req {
@@ -1215,7 +1245,43 @@ struct mattx_dsm_page_update_req {
 };
 
 
+// --- DSM MESI Payloads (Mode 2) ---
+struct mattx_dsm_write_acquire_req {
+    u64 req_id;
+    u32 orig_pid;
+    u32 shmid;
+    unsigned long offset;
+};
 
+struct mattx_dsm_write_acquire_reply {
+    u64 req_id;
+    int error;
+};
+
+struct mattx_dsm_invalidate_req {
+    u64 req_id;
+    u32 orig_pid;
+    u32 shmid;
+    unsigned long offset;
+};
+
+struct mattx_dsm_invalidate_reply {
+    u64 req_id;
+    int error;
+};
+
+struct mattx_dsm_flush_req {
+    u64 req_id;
+    u32 orig_pid;
+    u32 shmid;
+    unsigned long offset;
+};
+
+struct mattx_dsm_flush_reply {
+    u64 req_id;
+    int error;
+    char data[4096]; // The envelope for the dirty 4KB page!
+};
 
 
 
@@ -1379,6 +1445,7 @@ extern mattx_sys_getdents64_fn real_sys_getdents64;
 typedef long (*mattx_sys_pipe2_fn)(const struct pt_regs *regs);
 extern mattx_sys_pipe2_fn real_sys_pipe2;
 
+
 // --- THE DSM GHOST RESOLVERS ---
 typedef long (*mattx_sys_shmget_fn)(const struct pt_regs *regs);
 extern mattx_sys_shmget_fn real_sys_shmget;
@@ -1401,6 +1468,10 @@ extern mattx_zap_vma_ptes_fn real_zap_vma_ptes;
 
 extern int config_dsm_mode; // Expose the config toggle!
 int mattx_dsm_sweeper_loop(void *data); // Expose the Sweeper thread!
+
+// DSM MESI: resolver for vmf_insert_pfn_prot
+typedef vm_fault_t (*mattx_vmf_insert_pfn_prot_fn)(struct vm_area_struct *vma, unsigned long addr, unsigned long pfn, pgprot_t pgprot);
+extern mattx_vmf_insert_pfn_prot_fn real_vmf_insert_pfn_prot;
 
 
 

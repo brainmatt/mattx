@@ -100,6 +100,12 @@ void add_export_process(pid_t orig_pid, int target_node) {
 
         // Reset the Kill-Switch for ping-pong migrations! ---
         export_registry[export_count].abort_rpc = false; 
+        // NOTICE: The following line was missing before - re-added
+        export_registry[export_count].is_growing_gang = false;
+
+        // DSM MESI Init Master Directory ---
+        export_registry[export_count].dsm_dir_count = 0;
+        memset(export_registry[export_count].dsm_dirs, 0, sizeof(export_registry[export_count].dsm_dirs));
 
         export_count++;
     } else {

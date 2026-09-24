@@ -1,0 +1,2 @@
+
+watch -n 0.5 cat /proc/mattx/dsm
