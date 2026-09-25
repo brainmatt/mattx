@@ -34,7 +34,7 @@ PWD := $(shell pwd)
 CFLAGS_USER := -fPIE -pie -Wall -O2 $(shell pkg-config --cflags libnl-3.0 libnl-genl-3.0)
 LDFLAGS_USER := $(shell pkg-config --libs libnl-3.0 libnl-genl-3.0)
 
-all: module daemon stub migtest migtest2 migtest3 migtest4 servertestpoll servertestselect dfsatest epolltest threadtest threadtest2 threadtest_nofork dsmtest dsmstresstest dsmstresstest-debug
+all: module daemon stub migtest migtest2 migtest3 migtest4 servertestpoll servertestselect dfsatest epolltest threadtest threadtest2 threadtest_nofork dsmtest dsmstresstest
 
 module:
 	$(MAKE) -C $(KDIR) M=$(PWD) modules
@@ -86,12 +86,9 @@ dsmtest: bin/dsmtest.c
 dsmstresstest: bin/dsmstresstest.c
 	gcc -o bin/dsmstresstest bin/dsmstresstest.c
 
-dsmstresstest-debug: bin/dsmstresstest-debug.c
-	gcc -g -o bin/dsmstresstest-debug bin/dsmstresstest-debug.c
-
 clean:
 	$(MAKE) -C $(KDIR) M=$(PWD) clean
-	rm -f bin/migtest bin/migtest2 bin/migtest3 bin/migtest4 bin/servertestpoll bin/servertestselect bin/mattx-stub sbin/mattx-discd bin/dfsatest bin/epolltest bin/threadtest bin/threadtest2 bin/threadtest_nofork bin/dsmtest bin/dsmstresstest bin/dsmstresstest-debug
+	rm -f bin/migtest bin/migtest2 bin/migtest3 bin/migtest4 bin/servertestpoll bin/servertestselect bin/mattx-stub sbin/mattx-discd bin/dfsatest bin/epolltest bin/threadtest bin/threadtest2 bin/threadtest_nofork bin/dsmtest bin/dsmstresstest
 	rm -f mattxfs/Module.symvers
 
 install:
@@ -110,7 +107,6 @@ install:
 	sudo rm -f /usr/local/bin/dfsatest
 	sudo rm -f /usr/local/bin/dsmtest
 	sudo rm -f /usr/local/bin/dsmstresstest
-	sudo rm -f /usr/local/bin/dsmstresstest-debug
 	sudo rm -f /etc/mattx.conf
 	sudo rm -f /etc/systemd/system/mattx.service
 	sudo cp -f bin/migtest /usr/local/bin/migtest
@@ -121,7 +117,6 @@ install:
 	sudo cp -f bin/dfsatest /usr/local/bin/dfsatest
 	sudo cp -f bin/dsmtest /usr/local/bin/dsmtest
 	sudo cp -f bin/dsmstresstest /usr/local/bin/dsmstresstest
-	sudo cp -f bin/dsmstresstest-debug /usr/local/bin/dsmstresstest-debug
 	sudo cp -f bin/epolltest /usr/local/bin/epolltest
 	sudo cp -f bin/threadtest /usr/local/bin/threadtest
 	sudo cp -f bin/threadtest2 /usr/local/bin/threadtest2
@@ -165,7 +160,6 @@ uninstall:
 	sudo rm -f /usr/local/bin/threadtest2
 	sudo rm -f /usr/local/bin/threadtest_nofork
 	sudo rm -f /usr/local/bin/dsmstresstest
-	sudo rm -f /usr/local/bin/dsmstresstest-debug
 	sudo rm -f /usr/local/bin/dsmtest
 	sudo rm -f /usr/local/bin/mattx-stub
 	sudo rm -f /usr/local/sbin/mattx-discd
