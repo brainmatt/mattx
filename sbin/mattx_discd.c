@@ -130,7 +130,7 @@ void register_config_to_kernel() {
     }
     nla_put_u8(msg, MATTX_ATTR_MPI_SUPPORT, config.mpi_support);
     nla_put_u8(msg, MATTX_ATTR_ACCEPT_GUESTS, config.accept_guests);
-    nla_put_u8(msg, MATTX_ATTR_LOCAL_LIBS, config.local_libs);
+    nla_put_u8(msg, MATTX_ATTR_CONFIG_LOCAL_LIBS, config.local_libs);
     nla_put_u8(msg, MATTX_ATTR_DSM_MODE, config.dsm_mode);
 
     if (nl_send_auto(nl_sock, msg) < 0) {
