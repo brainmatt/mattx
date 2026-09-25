@@ -264,7 +264,7 @@ void load_config() {
             continue;
         }
 
-        if (sscanf(line, "DSM_MODE=%u", &config.dsm_mode)) continue;
+        if (sscanf(line, "DSM_MODE=%hhu", &config.dsm_mode)) continue;
 
     }
     fclose(fp);
