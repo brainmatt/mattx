@@ -264,10 +264,8 @@ void load_config() {
             continue;
         }
 
-        if (sscanf(line, "DSM_MODE=%s", temp_val)) {
-            if (strcmp(temp_val, "false") == 0 || strcmp(temp_val, "0") == 0) config.dsm_mode = 0;
-            continue;
-        }
+        if (sscanf(line, "DSM_MODE=%u", &config.dsm_mode)) continue;
+
     }
     fclose(fp);
     if (config.node_id == 0) config.node_id = generate_node_id(config.interface);
