@@ -130,7 +130,7 @@ void register_config_to_kernel() {
     }
     nla_put_u8(msg, MATTX_ATTR_MPI_SUPPORT, config.mpi_support);
     nla_put_u8(msg, MATTX_ATTR_ACCEPT_GUESTS, config.accept_guests);
-    nla_put_u8(msg, MATTX_ATTR_CONFIG_LOCAL_LIBS, config.local_libs);
+    nla_put_u8(msg, MATTX_ATTR_LOCAL_LIBS, config.local_libs);
     nla_put_u8(msg, MATTX_ATTR_DSM_MODE, config.dsm_mode);
 
     if (nl_send_auto(nl_sock, msg) < 0) {
@@ -264,8 +264,10 @@ void load_config() {
             continue;
         }
 
-        if (sscanf(line, "DSM_MODE=%hhu", &config.dsm_mode)) continue;
-
+        if (sscanf(line, "DSM_MODE=%s", temp_val)) {
+            if (strcmp(temp_val, "false") == 0 || strcmp(temp_val, "0") == 0) config.dsm_mode = 0;
+            continue;
+        }
     }
     fclose(fp);
     if (config.node_id == 0) config.node_id = generate_node_id(config.interface);
