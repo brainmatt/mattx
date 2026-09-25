@@ -264,8 +264,9 @@ void load_config() {
             continue;
         }
 
-        if (sscanf(line, "DSM_MODE=%s", temp_val)) {
-            if (strcmp(temp_val, "false") == 0 || strcmp(temp_val, "0") == 0) config.dsm_mode = 0;
+        int temp_dsm;
+        if (sscanf(line, "DSM_MODE=%d", &temp_dsm) == 1) {
+            config.dsm_mode = (uint8_t)temp_dsm;
             continue;
         }
     }
