@@ -1848,7 +1848,7 @@ static int ret_handler_openat(struct kretprobe_instance *ri, struct pt_regs *reg
                 return 0;
             }
 
-            struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
+            struct mattx_rpc_work *rpc = kzalloc(sizeof(*rpc), GFP_ATOMIC); 
             if (rpc) {
                 INIT_WORK(&rpc->work, mattx_rpc_worker);
                 rpc->local_pid = my_pid;
@@ -1950,7 +1950,7 @@ static int ret_handler_dup(struct kretprobe_instance *ri, struct pt_regs *regs) 
             return 0;
         }
 
-        struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
+        struct mattx_rpc_work *rpc = kzalloc(sizeof(*rpc), GFP_ATOMIC); 
         if (rpc) {
             INIT_WORK(&rpc->work, mattx_rpc_worker);
             rpc->local_pid = my_pid;
@@ -2034,7 +2034,7 @@ static int ret_handler_unlinkat(struct kretprobe_instance *ri, struct pt_regs *r
                 return 0;
             }
 
-            struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
+            struct mattx_rpc_work *rpc = kzalloc(sizeof(*rpc), GFP_ATOMIC); 
             if (rpc) {
                 INIT_WORK(&rpc->work, mattx_rpc_worker);
                 rpc->local_pid = my_pid;
@@ -2106,7 +2106,7 @@ static int ret_handler_socket(struct kretprobe_instance *ri, struct pt_regs *reg
             return 0;
         }
 
-        struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
+        struct mattx_rpc_work *rpc = kzalloc(sizeof(*rpc), GFP_ATOMIC); 
         if (rpc) {
             INIT_WORK(&rpc->work, mattx_rpc_worker);
             rpc->local_pid = my_pid;
@@ -2193,7 +2193,7 @@ static int ret_handler_connect(struct kretprobe_instance *ri, struct pt_regs *re
             return 0;
         }
 
-        struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
+        struct mattx_rpc_work *rpc = kzalloc(sizeof(*rpc), GFP_ATOMIC); 
         if (rpc) {
             INIT_WORK(&rpc->work, mattx_rpc_worker);
             rpc->local_pid = my_pid;
@@ -2269,7 +2269,7 @@ static int ret_handler_bind(struct kretprobe_instance *ri, struct pt_regs *regs)
             return 0;
         }
 
-        struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
+        struct mattx_rpc_work *rpc = kzalloc(sizeof(*rpc), GFP_ATOMIC); 
         if (rpc) {
             INIT_WORK(&rpc->work, mattx_rpc_worker);
             rpc->local_pid = my_pid;
@@ -2345,7 +2345,7 @@ static int ret_handler_listen(struct kretprobe_instance *ri, struct pt_regs *reg
             return 0;
         }
 
-        struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
+        struct mattx_rpc_work *rpc = kzalloc(sizeof(*rpc), GFP_ATOMIC); 
         if (rpc) {
             INIT_WORK(&rpc->work, mattx_rpc_worker);
             rpc->local_pid = my_pid;
@@ -2424,7 +2424,7 @@ static int ret_handler_sendto(struct kretprobe_instance *ri, struct pt_regs *reg
             return 0;
         }
 
-        struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
+        struct mattx_rpc_work *rpc = kzalloc(sizeof(*rpc), GFP_ATOMIC); 
         if (rpc) {
             INIT_WORK(&rpc->work, mattx_rpc_worker);
             rpc->local_pid = my_pid;
@@ -2505,7 +2505,7 @@ static int ret_handler_recvfrom(struct kretprobe_instance *ri, struct pt_regs *r
             return 0;
         }
 
-        struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
+        struct mattx_rpc_work *rpc = kzalloc(sizeof(*rpc), GFP_ATOMIC); 
         if (rpc) {
             INIT_WORK(&rpc->work, mattx_rpc_worker);
             rpc->local_pid = my_pid;
@@ -2586,7 +2586,7 @@ static int ret_handler_accept(struct kretprobe_instance *ri, struct pt_regs *reg
             return 0;
         }
 
-        struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
+        struct mattx_rpc_work *rpc = kzalloc(sizeof(*rpc), GFP_ATOMIC); 
         if (rpc) {
             INIT_WORK(&rpc->work, mattx_rpc_worker);
             rpc->local_pid = my_pid;
@@ -2680,7 +2680,7 @@ static int ret_handler_poll(struct kretprobe_instance *ri, struct pt_regs *regs)
             return 0;
         }
 
-        struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
+        struct mattx_rpc_work *rpc = kzalloc(sizeof(*rpc), GFP_ATOMIC); 
         if (rpc) {
             INIT_WORK(&rpc->work, mattx_rpc_worker);
             rpc->local_pid = my_pid;
@@ -2761,7 +2761,7 @@ static int ret_handler_select(struct kretprobe_instance *ri, struct pt_regs *reg
             return 0;
         }
 
-        struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
+        struct mattx_rpc_work *rpc = kzalloc(sizeof(*rpc), GFP_ATOMIC); 
         if (rpc) {
             INIT_WORK(&rpc->work, mattx_rpc_worker);
             rpc->local_pid = my_pid;
@@ -2873,7 +2873,7 @@ static int ret_handler_pselect6(struct kretprobe_instance *ri, struct pt_regs *r
             return 0;
         }
 
-        struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
+        struct mattx_rpc_work *rpc = kzalloc(sizeof(*rpc), GFP_ATOMIC); 
         if (rpc) {
             INIT_WORK(&rpc->work, mattx_rpc_worker);
             rpc->local_pid = my_pid;
@@ -2987,7 +2987,7 @@ static int ret_handler_read(struct kretprobe_instance *ri, struct pt_regs *regs)
             return 0;
         }
 
-        struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
+        struct mattx_rpc_work *rpc = kzalloc(sizeof(*rpc), GFP_ATOMIC); 
         if (rpc) {
             INIT_WORK(&rpc->work, mattx_rpc_worker);
             rpc->local_pid = my_pid;
@@ -3070,7 +3070,7 @@ static int ret_handler_write(struct kretprobe_instance *ri, struct pt_regs *regs
             return 0;
         }
 
-        struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
+        struct mattx_rpc_work *rpc = kzalloc(sizeof(*rpc), GFP_ATOMIC); 
         if (rpc) {
             INIT_WORK(&rpc->work, mattx_rpc_worker);
             rpc->local_pid = my_pid;
@@ -3154,7 +3154,7 @@ static int ret_handler_fileio(struct kretprobe_instance *ri, struct pt_regs *reg
     spin_unlock(&guest_lock);
 
     if (home_node != -1) {
-        struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
+        struct mattx_rpc_work *rpc = kzalloc(sizeof(*rpc), GFP_ATOMIC); 
         if (rpc) {
             INIT_WORK(&rpc->work, mattx_rpc_worker);
             rpc->local_pid = current->pid; rpc->orig_pid = orig_pid; rpc->home_node = home_node; rpc->remote_fd = data->fd;
@@ -3230,7 +3230,7 @@ static int ret_handler_epoll_create(struct kretprobe_instance *ri, struct pt_reg
             return 0;
         }
 
-        struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
+        struct mattx_rpc_work *rpc = kzalloc(sizeof(*rpc), GFP_ATOMIC); 
         if (rpc) {
             INIT_WORK(&rpc->work, mattx_rpc_worker);
             rpc->local_pid = current->pid;
@@ -3306,7 +3306,7 @@ static int ret_handler_epoll_ctl(struct kretprobe_instance *ri, struct pt_regs *
     spin_unlock(&guest_lock);
 
     if (home_node != -1) {
-        struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
+        struct mattx_rpc_work *rpc = kzalloc(sizeof(*rpc), GFP_ATOMIC); 
         if (rpc) {
             INIT_WORK(&rpc->work, mattx_rpc_worker);
             rpc->local_pid = current->pid;
@@ -3386,7 +3386,7 @@ static int ret_handler_epoll_wait(struct kretprobe_instance *ri, struct pt_regs 
     spin_unlock(&guest_lock);
 
     if (home_node != -1) {
-        struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
+        struct mattx_rpc_work *rpc = kzalloc(sizeof(*rpc), GFP_ATOMIC); 
         if (rpc) {
             INIT_WORK(&rpc->work, mattx_rpc_worker);
             rpc->local_pid = current->pid;
@@ -3451,7 +3451,7 @@ static int ret_handler_sockname(struct kretprobe_instance *ri, struct pt_regs *r
     spin_unlock(&guest_lock);
 
     if (home_node != -1) {
-        struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
+        struct mattx_rpc_work *rpc = kzalloc(sizeof(*rpc), GFP_ATOMIC); 
         if (rpc) {
             INIT_WORK(&rpc->work, mattx_rpc_worker);
             rpc->local_pid = current->pid; rpc->orig_pid = orig_pid; rpc->home_node = home_node;
@@ -3506,7 +3506,7 @@ static int ret_handler_sockopt(struct kretprobe_instance *ri, struct pt_regs *re
     spin_unlock(&guest_lock);
 
     if (home_node != -1) {
-        struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
+        struct mattx_rpc_work *rpc = kzalloc(sizeof(*rpc), GFP_ATOMIC); 
         if (rpc) {
             INIT_WORK(&rpc->work, mattx_rpc_worker);
             rpc->local_pid = current->pid; rpc->orig_pid = orig_pid; rpc->home_node = home_node;
@@ -3571,7 +3571,7 @@ static int ret_handler_msg(struct kretprobe_instance *ri, struct pt_regs *regs) 
     spin_unlock(&guest_lock);
 
     if (home_node != -1) {
-        struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
+        struct mattx_rpc_work *rpc = kzalloc(sizeof(*rpc), GFP_ATOMIC); 
         if (rpc) {
             INIT_WORK(&rpc->work, mattx_rpc_worker);
             rpc->local_pid = current->pid; rpc->orig_pid = orig_pid; rpc->home_node = home_node;
@@ -3646,7 +3646,7 @@ static int ret_handler_uname(struct kretprobe_instance *ri, struct pt_regs *regs
     spin_unlock(&guest_lock);
 
     if (home_node != -1) {
-        struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
+        struct mattx_rpc_work *rpc = kzalloc(sizeof(*rpc), GFP_ATOMIC); 
         if (rpc) {
             INIT_WORK(&rpc->work, mattx_rpc_worker);
             rpc->local_pid = my_pid; rpc->orig_pid = orig_pid; rpc->home_node = home_node;
@@ -3692,7 +3692,7 @@ static int ret_handler_prlimit64(struct kretprobe_instance *ri, struct pt_regs *
     spin_unlock(&guest_lock);
 
     if (home_node != -1) {
-        struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
+        struct mattx_rpc_work *rpc = kzalloc(sizeof(*rpc), GFP_ATOMIC); 
         if (rpc) {
             INIT_WORK(&rpc->work, mattx_rpc_worker);
             rpc->local_pid = my_pid; rpc->orig_pid = orig_pid; rpc->home_node = home_node;
@@ -3739,7 +3739,7 @@ static int ret_handler_prctl(struct kretprobe_instance *ri, struct pt_regs *regs
     spin_unlock(&guest_lock);
 
     if (home_node != -1) {
-        struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
+        struct mattx_rpc_work *rpc = kzalloc(sizeof(*rpc), GFP_ATOMIC); 
         if (rpc) {
             INIT_WORK(&rpc->work, mattx_rpc_worker);
             rpc->local_pid = my_pid; rpc->orig_pid = orig_pid; rpc->home_node = home_node;
@@ -3785,7 +3785,7 @@ static int ret_handler_fcntl(struct kretprobe_instance *ri, struct pt_regs *regs
     spin_unlock(&guest_lock);
 
     if (home_node != -1) {
-        struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
+        struct mattx_rpc_work *rpc = kzalloc(sizeof(*rpc), GFP_ATOMIC); 
         if (rpc) {
             INIT_WORK(&rpc->work, mattx_rpc_worker);
             rpc->local_pid = current->pid; rpc->orig_pid = orig_pid; rpc->home_node = home_node; rpc->remote_fd = data->remote_fd;
@@ -3839,7 +3839,7 @@ static int ret_handler_pread64(struct kretprobe_instance *ri, struct pt_regs *re
     spin_unlock(&guest_lock);
 
     if (home_node != -1) {
-        struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
+        struct mattx_rpc_work *rpc = kzalloc(sizeof(*rpc), GFP_ATOMIC); 
         if (rpc) {
             INIT_WORK(&rpc->work, mattx_rpc_worker);
             rpc->local_pid = current->pid; rpc->orig_pid = orig_pid; rpc->home_node = home_node; rpc->remote_fd = data->remote_fd;
@@ -3889,7 +3889,7 @@ static int ret_handler_statfs(struct kretprobe_instance *ri, struct pt_regs *reg
     }
     spin_unlock(&guest_lock);
     if (home_node != -1) {
-        struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
+        struct mattx_rpc_work *rpc = kzalloc(sizeof(*rpc), GFP_ATOMIC); 
         if (rpc) {
             INIT_WORK(&rpc->work, mattx_rpc_worker);
             rpc->local_pid = current->pid; rpc->orig_pid = orig_pid; rpc->home_node = home_node;
@@ -3944,7 +3944,7 @@ static int ret_handler_fstatfs(struct kretprobe_instance *ri, struct pt_regs *re
     }
     spin_unlock(&guest_lock);
     if (home_node != -1) {
-        struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
+        struct mattx_rpc_work *rpc = kzalloc(sizeof(*rpc), GFP_ATOMIC); 
         if (rpc) {
             INIT_WORK(&rpc->work, mattx_rpc_worker);
             rpc->local_pid = current->pid; rpc->orig_pid = orig_pid; rpc->home_node = home_node;
@@ -4002,7 +4002,7 @@ static int ret_handler_newfstatat(struct kretprobe_instance *ri, struct pt_regs 
     }
     spin_unlock(&guest_lock);
     if (home_node != -1) {
-        struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
+        struct mattx_rpc_work *rpc = kzalloc(sizeof(*rpc), GFP_ATOMIC); 
         if (rpc) {
             INIT_WORK(&rpc->work, mattx_rpc_worker);
             rpc->local_pid = current->pid; rpc->orig_pid = orig_pid; rpc->home_node = home_node;
@@ -4069,7 +4069,7 @@ static int ret_handler_faccessat2(struct kretprobe_instance *ri, struct pt_regs 
     }
     spin_unlock(&guest_lock);
     if (home_node != -1) {
-        struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
+        struct mattx_rpc_work *rpc = kzalloc(sizeof(*rpc), GFP_ATOMIC); 
         if (rpc) {
             INIT_WORK(&rpc->work, mattx_rpc_worker);
             rpc->local_pid = current->pid; rpc->orig_pid = orig_pid; rpc->home_node = home_node;
@@ -4125,7 +4125,7 @@ static int ret_handler_readlink(struct kretprobe_instance *ri, struct pt_regs *r
     }
     spin_unlock(&guest_lock);
     if (home_node != -1) {
-        struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
+        struct mattx_rpc_work *rpc = kzalloc(sizeof(*rpc), GFP_ATOMIC); 
         if (rpc) {
             INIT_WORK(&rpc->work, mattx_rpc_worker);
             rpc->local_pid = current->pid; rpc->orig_pid = orig_pid; rpc->home_node = home_node;
@@ -4190,7 +4190,7 @@ static int ret_handler_readlinkat(struct kretprobe_instance *ri, struct pt_regs 
     }
     spin_unlock(&guest_lock);
     if (home_node != -1) {
-        struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
+        struct mattx_rpc_work *rpc = kzalloc(sizeof(*rpc), GFP_ATOMIC); 
         if (rpc) {
             INIT_WORK(&rpc->work, mattx_rpc_worker);
             rpc->local_pid = current->pid; rpc->orig_pid = orig_pid; rpc->home_node = home_node;
@@ -4240,7 +4240,7 @@ static int ret_handler_getdents64(struct kretprobe_instance *ri, struct pt_regs 
     spin_unlock(&guest_lock);
 
     if (home_node != -1) {
-        struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
+        struct mattx_rpc_work *rpc = kzalloc(sizeof(*rpc), GFP_ATOMIC); 
         if (rpc) {
             INIT_WORK(&rpc->work, mattx_rpc_worker);
             rpc->local_pid = current->pid; rpc->orig_pid = orig_pid; rpc->home_node = home_node;
@@ -4279,7 +4279,7 @@ static int ret_handler_pipe2(struct kretprobe_instance *ri, struct pt_regs *regs
     spin_unlock(&guest_lock);
 
     if (home_node != -1) {
-        struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
+        struct mattx_rpc_work *rpc = kzalloc(sizeof(*rpc), GFP_ATOMIC); 
         if (rpc) {
             INIT_WORK(&rpc->work, mattx_rpc_worker);
             rpc->local_pid = current->pid; rpc->orig_pid = orig_pid; rpc->home_node = home_node;
@@ -4575,7 +4575,7 @@ static int ret_handler_shmget(struct kretprobe_instance *ri, struct pt_regs *reg
     spin_unlock(&guest_lock);
 
     if (home_node != -1) {
-        struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
+        struct mattx_rpc_work *rpc = kzalloc(sizeof(*rpc), GFP_ATOMIC); 
         if (rpc) {
             INIT_WORK(&rpc->work, mattx_rpc_worker);
             rpc->local_pid = current->pid; rpc->orig_pid = orig_pid; rpc->home_node = home_node;
@@ -4619,7 +4619,7 @@ static int ret_handler_shmctl(struct kretprobe_instance *ri, struct pt_regs *reg
     spin_unlock(&guest_lock);
 
     if (home_node != -1) {
-        struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
+        struct mattx_rpc_work *rpc = kzalloc(sizeof(*rpc), GFP_ATOMIC); 
         if (rpc) {
             INIT_WORK(&rpc->work, mattx_rpc_worker);
             rpc->local_pid = current->pid; rpc->orig_pid = orig_pid; rpc->home_node = home_node;
@@ -4661,7 +4661,7 @@ static int ret_handler_shmdt(struct kretprobe_instance *ri, struct pt_regs *regs
     spin_unlock(&guest_lock);
 
     if (home_node != -1) {
-        struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
+        struct mattx_rpc_work *rpc = kzalloc(sizeof(*rpc), GFP_ATOMIC); 
         if (rpc) {
             INIT_WORK(&rpc->work, mattx_rpc_worker);
             rpc->local_pid = current->pid; rpc->orig_pid = orig_pid; rpc->home_node = home_node;
@@ -4706,7 +4706,7 @@ static int ret_handler_shmat(struct kretprobe_instance *ri, struct pt_regs *regs
     spin_unlock(&guest_lock);
 
     if (home_node != -1) {
-        struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC); 
+        struct mattx_rpc_work *rpc = kzalloc(sizeof(*rpc), GFP_ATOMIC); 
         if (rpc) {
             INIT_WORK(&rpc->work, mattx_rpc_worker);
             rpc->local_pid = current->pid; rpc->orig_pid = orig_pid; rpc->home_node = home_node;
