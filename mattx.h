@@ -322,6 +322,16 @@ struct mattx_migration_req {
     uint64_t brk;       // The current end of the Heap
     uint64_t vdso_addr; // The vDSO Transplant Address!
 
+    // The SOURCE node's CLOCK_MONOTONIC reading (ns since ITS OWN boot),
+    // taken at freeze time. CLOCK_MONOTONIC is boot-relative, not
+    // wall-clock, so this value is meaningless on any other node by
+    // itself -- it only exists so the target node can compute the delta
+    // needed to reinterpret a stale absolute clock_nanosleep() deadline
+    // still resident in the migrated process's memory/stack. See
+    // mattx_clock_fixup_register()/mattx_clock_fixup_consume() and the
+    // clock_nanosleep kretprobe in mattx_hooks.c.
+    uint64_t monotonic_at_freeze;
+
     char comm[16]; 
     char dfsa_dir[256]; 
     u32 fd_count;          
@@ -1534,6 +1544,17 @@ void mattx_freeze_task_safely(struct task_struct *task); // Expose the Freezer!
 bool is_guest_process(pid_t pid);
 bool is_rpc_pending(pid_t pid); // Check if a Wormhole is open!
 bool check_rpc_done(pid_t pid);
+
+// --- Clock-Offset Fixup Table (mattx_guest.c) ---------------------------
+// Registered once at Awakening (both forward Surrogate wake-up in
+// handle_migrate_done() and Deputy return wake-up in handle_return_done(),
+// both in mattx_import.c) and consumed at most once per thread by the
+// clock_nanosleep kretprobe in mattx_hooks.c. Deliberately independent of
+// guest_registry: a returned Deputy is no longer a guest (is_guest_process()
+// must say false for it so other Wormhole hooks stop routing its syscalls
+// home), yet it still needs this same one-shot deadline correction.
+void mattx_clock_fixup_register(pid_t local_pid, s64 offset_ns, int thread_count, const pid_t *tids);
+bool mattx_clock_fixup_consume(pid_t local_pid, pid_t tid, s64 *out_offset_ns);
 
 void add_guest_process(pid_t local_pid, u32 orig_pid, int home_node);
 void remove_guest_process(int index);

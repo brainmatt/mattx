@@ -4776,6 +4776,94 @@ static struct notifier_block mattx_die_notifier = {
     .priority = 0x7fffffff, // Highest priority! We catch it before anyone else!
 };
 
+// ============================================================================
+// BATCH 4: THE STALE-DEADLINE CLOCK FIX (mattx#20)
+// ============================================================================
+// clock_nanosleep(CLOCKID, TIMER_ABSTIME, ...) encodes its deadline as a raw
+// CLOCK_MONOTONIC/CLOCK_BOOTTIME value, and CLOCK_MONOTONIC is relative to
+// each kernel's own boot instant -- NOT wall-clock time. A process that was
+// frozen mid-sleep (or whose libc/runtime retry loop re-issues the syscall
+// against a stack-resident, pre-migration deadline -- confirmed via
+// /proc/<pid>/stack showing a migrated dd_migtest.py Surrogate genuinely
+// blocked in hrtimer_nanosleep()/clock_nanosleep() moments after arriving on
+// the target node) carries a deadline that's only meaningful in the SOURCE
+// node's own clock frame. Reused verbatim on the TARGET node it can be wildly
+// wrong -- e.g. forward migration FROM a node with a LARGER CLOCK_MONOTONIC
+// TO one with a SMALLER one leaves the process waiting for the target's own
+// clock to climb up to a huge stale number it hasn't caught up to yet,
+// stalling for a very long time (effectively forever for practical purposes).
+//
+// This does NOT fix the fully general case of arbitrary userspace code
+// computing elapsed time via two separate clock_gettime(CLOCK_MONOTONIC)
+// vDSO reads straddling a migration -- that needs real time namespaces
+// (CLONE_NEWTIME), which is out of scope here. It fixes exactly the
+// clock_nanosleep(CLOCK_MONOTONIC/BOOTTIME, TIMER_ABSTIME) case, which is
+// what's actually blocking, since that path is always a real syscall (never
+// vDSO-fast-pathed, since it can block).
+//
+// Plain nanosleep() is NOT hooked: it has no TIMER_ABSTIME concept at all
+// (it only ever takes a relative duration), so it cannot carry a stale
+// absolute deadline across a migration in the first place.
+//
+// We hook common_nsleep_timens() -- the internal helper CLOCK_MONOTONIC and
+// CLOCK_BOOTTIME route through via clock_nanosleep()'s k_clock ops table on
+// this kernel (confirmed by the actual crash's /proc/<pid>/stack showing
+// common_nsleep_timens as the direct caller of hrtimer_nanosleep), NOT the
+// raw __x64_sys_clock_nanosleep() syscall wrapper. By this point in the call
+// chain the timespec has already been copied in from userspace into a
+// kernel-local struct timespec64 on the caller's stack, so we can read/
+// correct it with a direct pointer dereference -- no access_process_vm()
+// round-trip needed, and no risk of racing the syscall's own copy_from_user.
+// We also register on common_nsleep() (the non-timens sibling used by other
+// clockids on some kernel configurations) as a defensive fallback in case a
+// different kernel routes CLOCK_MONOTONIC/BOOTTIME through it instead; it's
+// a harmless extra registration if unused.
+//
+// The offset itself is supplied by mattx_clock_fixup_register()/
+// mattx_clock_fixup_consume() (mattx_guest.c), populated once per thread at
+// Awakening (both the forward Surrogate wake-up and the Deputy return
+// wake-up in mattx_import.c) and consumed AT MOST ONCE per thread here. This
+// one-shot consumption is deliberate: only the deadline that was already
+// resident in memory at freeze time is stale. Any clock_nanosleep() call a
+// thread makes AFTER that first (corrected) one computes its own deadline
+// fresh, against the vDSO's live view of whichever node it's now actually
+// running on, so it's already correct -- adding the offset again would
+// corrupt it. Gating on is_guest_process() alone (which stays true for the
+// Surrogate's entire remaining lifetime) would NOT be safe here for exactly
+// that reason.
+static struct kretprobe clock_nanosleep_timens_kprobe;
+static struct kretprobe clock_nanosleep_kprobe;
+
+static int entry_handler_clock_nanosleep(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    clockid_t which_clock = (clockid_t)regs->di;
+    int flags = (int)regs->si;
+    struct timespec64 *rqtp = (struct timespec64 *)regs->dx;
+    pid_t my_tgid = current->tgid;
+    pid_t my_tid = current->pid;
+    s64 offset_ns;
+    s64 old_ns, new_ns;
+
+    if (!(flags & TIMER_ABSTIME)) return 0; // Relative sleep -- can't be stale, leave it alone.
+    if (which_clock != CLOCK_MONOTONIC && which_clock != CLOCK_BOOTTIME) return 0;
+    if (!rqtp) return 0;
+
+    if (!mattx_clock_fixup_consume(my_tgid, my_tid, &offset_ns)) return 0; // nothing pending for this thread
+    if (offset_ns == 0) return 0; // Same-clock migration (or no drift) -- nothing to correct.
+
+    old_ns = (s64)rqtp->tv_sec * NSEC_PER_SEC + (s64)rqtp->tv_nsec;
+    new_ns = old_ns + offset_ns;
+    if (new_ns < 0) new_ns = 0; // Never hand the kernel a negative/garbage deadline.
+
+    rqtp->tv_sec  = new_ns / NSEC_PER_SEC;
+    rqtp->tv_nsec = new_ns % NSEC_PER_SEC;
+
+    mattx_dbg("[HOOK] Corrected stale post-migration clock_nanosleep deadline for PID %d (tid %d): "
+              "%lld ns -> %lld ns (offset %lld ns)\n", my_tgid, my_tid, old_ns, new_ns, offset_ns);
+
+    return 0;
+}
+static int ret_handler_clock_nanosleep(struct kretprobe_instance *ri, struct pt_regs *regs) { return 0; }
+
 
 
 
@@ -5345,7 +5433,26 @@ int mattx_hooks_init(void) {
     ret = register_kretprobe(&shmat_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for shmat, returned %d\n", ret);
 
+    // --- Stale-deadline clock_nanosleep() fixup (mattx#20) ---
+    // Non-fatal if either fails to resolve: these are internal, unexported
+    // helper symbols that could legitimately move/vanish/get inlined on a
+    // different kernel version, and this fix is best-effort on top of the
+    // already-working migration path, not a prerequisite for it.
+    memset(&clock_nanosleep_timens_kprobe, 0, sizeof(clock_nanosleep_timens_kprobe));
+    clock_nanosleep_timens_kprobe.kp.symbol_name = "common_nsleep_timens";
+    clock_nanosleep_timens_kprobe.entry_handler = entry_handler_clock_nanosleep;
+    clock_nanosleep_timens_kprobe.handler = ret_handler_clock_nanosleep;
+    clock_nanosleep_timens_kprobe.maxactive = 64;
+    ret = register_kretprobe(&clock_nanosleep_timens_kprobe);
+    if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for common_nsleep_timens, returned %d (post-migration clock_nanosleep deadlines will NOT be corrected!)\n", ret);
 
+    memset(&clock_nanosleep_kprobe, 0, sizeof(clock_nanosleep_kprobe));
+    clock_nanosleep_kprobe.kp.symbol_name = "common_nsleep";
+    clock_nanosleep_kprobe.entry_handler = entry_handler_clock_nanosleep;
+    clock_nanosleep_kprobe.handler = ret_handler_clock_nanosleep;
+    clock_nanosleep_kprobe.maxactive = 64;
+    ret = register_kretprobe(&clock_nanosleep_kprobe);
+    if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for common_nsleep, returned %d (defensive fallback only, non-fatal)\n", ret);
 
 
     // --- THE HARDWARE EXCEPTION CATCHER ---
@@ -5358,6 +5465,8 @@ int mattx_hooks_init(void) {
 }
 
 void mattx_hooks_exit(void) {
+    unregister_kretprobe(&clock_nanosleep_kprobe);
+    unregister_kretprobe(&clock_nanosleep_timens_kprobe);
     unregister_kretprobe(&shmat_kprobe);
     unregister_kretprobe(&shmdt_kprobe);
     unregister_kretprobe(&shmctl_kprobe);

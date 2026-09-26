@@ -22,6 +22,7 @@
  */
 
 #include "mattx.h"
+#include <linux/timekeeping.h> // For ktime_get_ns()
 
 // Local state for the import pipeline
 static int injected_pages_count = 0;
@@ -224,9 +225,11 @@ static void handle_migrate_done(struct mattx_link *link, struct mattx_header *hd
 
         // --- GANG INJECTION ---
         int t_idx = 0;
+        pid_t fixup_tids[MAX_GANG_THREADS]; // local tids, for the clock-offset fixup registered below
         rcu_read_lock();
         for_each_thread(hijacked_stub_task, t) {
             if (t_idx < pending_migration->thread_count) {
+                if (t_idx < MAX_GANG_THREADS) fixup_tids[t_idx] = t->pid;
                 struct pt_regs *t_regs = task_pt_regs(t);
                 if (t_regs) {
                     memcpy(t_regs, &pending_migration->threads[t_idx].regs, sizeof(struct pt_regs));
@@ -333,6 +336,17 @@ static void handle_migrate_done(struct mattx_link *link, struct mattx_header *hd
             if (access_process_vm(hijacked_stub_task, mother_rip, rip_buf, 8, FOLL_FORCE) == 8) {
                 mattx_dbg("[DEBUG] Target RIP (0x%lx) contains: %8ph\n", mother_rip, rip_buf);
             }
+        }
+
+        // --- Register the clock-offset fixup BEFORE the SIGCONT below! ---
+        // A woken thread can re-enter its interrupted clock_nanosleep()
+        // essentially immediately, so this must be visible to the kretprobe
+        // before we let any thread run, not after.
+        {
+            s64 clock_offset_ns = (s64)ktime_get_ns() - (s64)pending_migration->monotonic_at_freeze;
+            mattx_clock_fixup_register(hijacked_stub_task->pid, clock_offset_ns, t_idx, fixup_tids);
+            mattx_dbg("[IMPORT] Registered clock-offset fixup for PID %d: %lld ns (%d threads)\n",
+                       hijacked_stub_task->pid, clock_offset_ns, t_idx);
         }
 
         mattx_dbg("[IMPORT] IT'S ALIVE! Waking %d threads in Gang PID %d\n", current_threads, hijacked_stub_task->pid);
@@ -681,6 +695,8 @@ static void handle_return_done(struct mattx_link *link, struct mattx_header *hdr
         struct task_struct *t;
         int t_idx = 0;
         int i;
+        pid_t fixup_tids[MAX_GANG_THREADS]; // local tids, for the clock-offset fixup registered below
+        int fixup_count = 0;
 
         // --- THE vDSO TRANSPLANT ---
         // disabled vDSO transplant for testing
@@ -731,10 +747,11 @@ static void handle_return_done(struct mattx_link *link, struct mattx_header *hdr
         rcu_read_lock();
         for_each_thread(hijacked_stub_task, t) {
             if (t_idx < pending_migration->thread_count) {
+                if (fixup_count < MAX_GANG_THREADS) fixup_tids[fixup_count++] = t->pid;
                 struct pt_regs *t_regs = task_pt_regs(t);
                 if (t_regs) {
                     memcpy(t_regs, &pending_migration->threads[t_idx].regs, sizeof(struct pt_regs));
-                    
+
                     // TLS Hardware Sync on Return! ---
                     t->thread.fsbase = pending_migration->threads[t_idx].fsbase;
                     t->thread.gsbase = pending_migration->threads[t_idx].gsbase;
@@ -793,6 +810,19 @@ static void handle_return_done(struct mattx_link *link, struct mattx_header *hdr
             }
         }
         spin_unlock(&export_lock);
+
+        // --- Register the clock-offset fixup BEFORE the SIGCONT below! ---
+        // The Deputy is no longer a "guest" at this point (it's home), but
+        // it can still be carrying a stale absolute clock_nanosleep()
+        // deadline computed on the Remote node's clock. See the comment on
+        // mattx_clock_fixup_register() in mattx.h for why this is tracked
+        // separately from guest_registry.
+        {
+            s64 clock_offset_ns = (s64)ktime_get_ns() - (s64)pending_migration->monotonic_at_freeze;
+            mattx_clock_fixup_register(hijacked_stub_task->pid, clock_offset_ns, fixup_count, fixup_tids);
+            mattx_dbg("[IMPORT] Registered RETURN clock-offset fixup for PID %d: %lld ns (%d threads)\n",
+                       hijacked_stub_task->pid, clock_offset_ns, fixup_count);
+        }
 
         mattx_dbg("[IMPORT] Welcome home! Waking Gang Deputy PID %d\n", hijacked_stub_task->pid);
         rcu_read_lock();

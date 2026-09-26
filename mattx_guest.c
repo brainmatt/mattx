@@ -28,6 +28,96 @@ struct mattx_guest_info guest_registry[MAX_GUESTS];
 int guest_count = 0;
 DEFINE_SPINLOCK(guest_lock);
 
+// --- Clock-Offset Fixup Table -------------------------------------------
+// CLOCK_MONOTONIC is relative to each kernel's own boot instant, not
+// wall-clock time -- two nodes with perfectly synced wall clocks can have
+// arbitrarily different CLOCK_MONOTONIC readings (e.g. one rebooted more
+// recently). A process that was frozen mid clock_nanosleep(TIMER_ABSTIME)
+// (or whose libc/runtime retry loop re-issues the syscall against a
+// stack-resident, pre-migration deadline -- see mattx_hooks.c's
+// clock_nanosleep kretprobe for the full story) carries an absolute
+// deadline that's only meaningful in the SOURCE node's clock frame. This
+// table records, per just-Awakened process, the one-time ns offset needed
+// to reinterpret that stale deadline correctly on the node it just landed
+// on, and lets the kretprobe consume it (at most once per thread).
+//
+// Deliberately NOT folded into guest_registry: a returned Deputy is no
+// longer a guest (is_guest_process() must say false for it so other
+// Wormhole hooks stop routing its syscalls home), yet it still needs this
+// exact same one-shot correction after RETURN_DONE. Keeping this table
+// separate means it doesn't care whether the pid it's tracking is
+// currently a guest, a Deputy, or anything else -- it only cares that an
+// Awakening just happened for it.
+#define MAX_CLOCK_FIXUPS 64
+
+struct mattx_clock_fixup {
+    bool in_use;
+    pid_t local_pid;                 // tgid this entry applies to
+    s64 offset_ns;                   // add to a stale deadline to fix it
+    int thread_count;
+    pid_t tids[MAX_GANG_THREADS];    // this gang's thread ids
+    bool pending[MAX_GANG_THREADS];  // not yet consumed for that tid
+};
+
+static struct mattx_clock_fixup clock_fixups[MAX_CLOCK_FIXUPS];
+static DEFINE_SPINLOCK(clock_fixup_lock);
+
+void mattx_clock_fixup_register(pid_t local_pid, s64 offset_ns, int thread_count, const pid_t *tids) {
+    int i, slot = -1;
+
+    if (thread_count > MAX_GANG_THREADS) thread_count = MAX_GANG_THREADS;
+    if (thread_count < 0) thread_count = 0;
+
+    spin_lock(&clock_fixup_lock);
+
+    // Reuse an existing entry for this pid (e.g. it got migrated again
+    // before the previous fixup was fully consumed), else take a free
+    // slot, else evict slot 0 as a last resort -- this table is best-effort
+    // bookkeeping, not a hard correctness requirement (worst case a very
+    // unlucky eviction just leaves one stale deadline uncorrected).
+    for (i = 0; i < MAX_CLOCK_FIXUPS; i++) {
+        if (clock_fixups[i].in_use && clock_fixups[i].local_pid == local_pid) { slot = i; break; }
+    }
+    if (slot < 0) {
+        for (i = 0; i < MAX_CLOCK_FIXUPS; i++) {
+            if (!clock_fixups[i].in_use) { slot = i; break; }
+        }
+    }
+    if (slot < 0) slot = 0;
+
+    clock_fixups[slot].in_use = true;
+    clock_fixups[slot].local_pid = local_pid;
+    clock_fixups[slot].offset_ns = offset_ns;
+    clock_fixups[slot].thread_count = thread_count;
+    for (i = 0; i < thread_count; i++) {
+        clock_fixups[slot].tids[i] = tids[i];
+        clock_fixups[slot].pending[i] = true;
+    }
+
+    spin_unlock(&clock_fixup_lock);
+}
+
+bool mattx_clock_fixup_consume(pid_t local_pid, pid_t tid, s64 *out_offset_ns) {
+    int i, j;
+    bool found = false;
+
+    spin_lock(&clock_fixup_lock);
+    for (i = 0; i < MAX_CLOCK_FIXUPS; i++) {
+        if (!clock_fixups[i].in_use || clock_fixups[i].local_pid != local_pid) continue;
+        for (j = 0; j < clock_fixups[i].thread_count; j++) {
+            if (clock_fixups[i].tids[j] == tid && clock_fixups[i].pending[j]) {
+                clock_fixups[i].pending[j] = false;
+                *out_offset_ns = clock_fixups[i].offset_ns;
+                found = true;
+                break;
+            }
+        }
+        break;
+    }
+    spin_unlock(&clock_fixup_lock);
+    return found;
+}
+
 bool is_guest_process(pid_t pid) {
     int i;
     bool found = false;
