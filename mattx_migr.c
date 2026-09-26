@@ -513,8 +513,14 @@ void mattx_capture_and_send_state(struct task_struct *task, int target_node) {
     // Use the Jedi Master Pivot!
     mattx_freeze_task_safely(task);
 
+    // Snapshot OUR (SOURCE) CLOCK_MONOTONIC right at freeze time. See the
+    // comment on monotonic_at_freeze in mattx.h -- this is what lets the
+    // target node correct a stale absolute clock_nanosleep() deadline
+    // after Awakening.
+    req->monotonic_at_freeze = ktime_get_ns();
+
     req->orig_pid = task->pid;
-    
+
     // Pass the Home Node and Feature Flag to the Stub! ---
     req->home_node = my_node_id;
     req->mattxfs_enabled = config_mattxfs_enabled ? 1 : 0;
@@ -722,6 +728,11 @@ void mattx_capture_and_return_state(struct task_struct *task, u32 orig_pid, int 
 
     // Use the Jedi Master Pivot!
     mattx_freeze_task_safely(task);
+
+    // Snapshot OUR (SOURCE, i.e. the Remote node the Surrogate is
+    // returning FROM) CLOCK_MONOTONIC right at freeze time -- same
+    // reasoning as the forward-migration capture above.
+    req->monotonic_at_freeze = ktime_get_ns();
 
     req->orig_pid = orig_pid;
 
