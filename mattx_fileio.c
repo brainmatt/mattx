@@ -4251,13 +4251,15 @@ static void mattx_dsm_fault_kworker(struct work_struct *work) {
                                             } else {
                                                 mattx_dbg("[MESI_VM1] Flush failed (PID %u detached). Assuming RAM was updated via Funeral Flush.\n", owner_pid);
                                             }
-                                            
+
                                             // Update Directory: Downgrade to SHARED regardless of flush success!
                                             spin_lock(&export_lock);
                                             if (e_idx != -1 && dir_idx != -1) {
                                                 export_registry[e_idx].dsm_dirs[dir_idx].page_state[page_idx] = MATTX_PAGE_SHARED;
                                                 export_registry[e_idx].dsm_dirs[dir_idx].page_owner_pid[page_idx] = 0; // Clear owner!
-                                                bitmap_zero(export_registry[e_idx].dsm_dirs[dir_idx].page_shared_mask[page_idx], MAX_NODES);
+                                                
+                                                // Clear the mask safely!
+                                                memset(export_registry[e_idx].dsm_dirs[dir_idx].page_shared_mask[page_idx], 0, sizeof(u64) * (MAX_NODES / 64));
                                             }
                                             spin_unlock(&export_lock);
                                         }
@@ -4302,8 +4304,11 @@ static void mattx_dsm_fault_kworker(struct work_struct *work) {
                                                     if (export_registry[e].dsm_dirs[dir_idx].page_state[page_idx] == MATTX_PAGE_INVALID) {
                                                         export_registry[e].dsm_dirs[dir_idx].page_state[page_idx] = MATTX_PAGE_SHARED;
                                                     }
-                                                    // Use the safe kernel bitmap API!
-                                                    set_bit(ctx->target_node, export_registry[e].dsm_dirs[dir_idx].page_shared_mask[page_idx]);
+
+                                                    // Explicit bitwise math!
+                                                    int n_idx = ctx->target_node / 64;
+                                                    int n_bit = ctx->target_node % 64;
+                                                    export_registry[e].dsm_dirs[dir_idx].page_shared_mask[page_idx][n_idx] |= (1ULL << n_bit);
                                                     
                                                     mattx_dbg("[MESI_VM1] Page %lu of SHMID %u is now SHARED with Node %d\n", 
                                                               page_idx, ctx->req.shmid, ctx->target_node);
@@ -4620,10 +4625,14 @@ static void mattx_dsm_write_acquire_kworker(struct work_struct *work) {
             for (int d = 0; d < export_registry[e].dsm_dir_count; d++) {
                 if (export_registry[e].dsm_dirs[d].shmid == ctx->req.shmid) {
                     unsigned long page_idx = ctx->req.offset / PAGE_SIZE;
-                    
+
                     // 1. Send Invalidates to EVERYONE in the mask!
                     for (int node = 0; node < MAX_NODES; node++) {
-                        if (test_bit(node, export_registry[e].dsm_dirs[d].page_shared_mask[page_idx])) {
+                        int n_idx = node / 64;
+                        int n_bit = node % 64;
+                        
+                        // Explicit bitwise test!
+                        if (export_registry[e].dsm_dirs[d].page_shared_mask[page_idx][n_idx] & (1ULL << n_bit)) {
                             if (cluster_map[node]) {
                                 struct mattx_dsm_invalidate_req inv_req = {
                                     .req_id = 0, .orig_pid = ctx->req.orig_pid, // Pass the requester's PID!
@@ -4635,15 +4644,15 @@ static void mattx_dsm_write_acquire_kworker(struct work_struct *work) {
                             }
                         }
                     }
-
                     
                     // 2. Update Directory to EXCLUSIVE
                     export_registry[e].dsm_dirs[d].page_state[page_idx] = MATTX_PAGE_EXCLUSIVE;
-                    export_registry[e].dsm_dirs[d].page_owner_pid[page_idx] = ctx->req.orig_pid; // <-- PID TRACKING!
-                    // Clear the entire bitmap for this page!
-                    bitmap_zero(export_registry[e].dsm_dirs[d].page_shared_mask[page_idx], MAX_NODES);
-
-                    mattx_dbg("[MESI_VM1] Node %d granted EXCLUSIVE lock for SHMID %u Offset %lu\n", ctx->target_node, ctx->req.shmid, ctx->req.offset);
+                    export_registry[e].dsm_dirs[d].page_owner_pid[page_idx] = ctx->req.orig_pid;
+                    
+                    // Clear the 16 u64s for this page!
+                    memset(export_registry[e].dsm_dirs[d].page_shared_mask[page_idx], 0, sizeof(u64) * (MAX_NODES / 64));
+                    
+                    mattx_dbg("[MESI_VM1] PID %u granted EXCLUSIVE lock for SHMID %u Offset %lu\n", ctx->req.orig_pid, ctx->req.shmid, ctx->req.offset);
                     break;
                 }
             }
