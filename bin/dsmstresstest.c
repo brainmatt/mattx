@@ -48,13 +48,14 @@ int get_local_node_id() {
 }
 
 int main(int argc, char *argv[]) {
-    if (argc != 3) {
-        printf("Usage: %s <num_workers> <max_rw_ops_per_loop>\n", argv[0]);
+    if (argc != 4) {
+        printf("Usage: %s <num_workers> <max_rw_ops_per_loop> <action_delay>\n", argv[0]);
         exit(1);
     }
 
     num_workers = atoi(argv[1]);
     int max_ops = atoi(argv[2]);
+    int action_delay = atoi(argv[3]);
 
     if (num_workers <= 0 || max_ops <= 0) {
         printf("Arguments must be > 0\n");
@@ -128,7 +129,7 @@ int main(int argc, char *argv[]) {
                         printf("  -> [PID %d] Read data: '%s'\n", getpid(), (char *)shm_data);
                     }
                     // usleep(500000); // Sleep 0.5s between ops to allow observation
-                    sleep(10);
+                    sleep(action_delay); // Sleep for the specified action delay
                 }
             }
 
