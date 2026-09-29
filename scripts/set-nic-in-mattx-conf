@@ -1,0 +1,5 @@
+#!/bin/bash
+
+MATTX_NIC=$(ip a s | grep enp.*: | awk '{print $2}' | cut -d: -f1 | head -n1)
+echo "MATTX_NIC: $MATTX_NIC - adjusting /etc/mattx.conf"
+sudo sed -i -e "s/INTERFACE=.*/INTERFACE=$MATTX_NIC/g" /etc/mattx.conf
