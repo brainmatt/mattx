@@ -151,15 +151,19 @@ static const struct proc_ops version_proc_ops = {
 // THE DSM MATRIX MONITOR
 // ============================================================================
 
+// ============================================================================
+// THE DSM MATRIX MONITOR
+// ============================================================================
+
 static int dsm_show(struct seq_file *m, void *v) {
     int i;
     unsigned char hex_buf[16];
     int bytes_read;
 
     seq_printf(m, "MattX Distributed Shared Memory (DSM) Matrix:\n");
-    seq_printf(m, "--------------------------------------------------------------------------------\n");
-    seq_printf(m, "TYPE     PID    NODE  SHMID       ADDRESS             SIZE        HEX DUMP (16B)\n");
-    seq_printf(m, "--------------------------------------------------------------------------------\n");
+    seq_printf(m, "---------------------------------------------------------------------------------------------------\n");
+    seq_printf(m, "TYPE     PID    NODE  SHMID       ADDRESS             SIZE        STATE (P0)  HEX DUMP (16B)\n");
+    seq_printf(m, "---------------------------------------------------------------------------------------------------\n");
 
     // --- 1. IMPORTER VIEW (VM2 - The Hollow VMAs) ---
     spin_lock(&guest_lock);
@@ -175,6 +179,11 @@ static int dsm_show(struct seq_file *m, void *v) {
             unsigned long base = guest_registry[i].dsm_map[d].base_addr;
             unsigned long size = guest_registry[i].dsm_map[d].size;
             u32 shmid = guest_registry[i].dsm_map[d].shmid;
+            
+            // Extract the local MESI state for Page 0!
+            u8 p_state = guest_registry[i].dsm_map[d].page_states[0];
+            char *state_str = (p_state == MATTX_PAGE_EXCLUSIVE) ? "EXCLUSIVE" : 
+                              (p_state == MATTX_PAGE_SHARED) ? "SHARED" : "INVALID";
 
             memset(hex_buf, 0, sizeof(hex_buf));
             bytes_read = 0;
@@ -185,9 +194,9 @@ static int dsm_show(struct seq_file *m, void *v) {
                 bytes_read = 16;
             }
 
-            seq_printf(m, "[IMPORT] %-6d %-4d  %-10u  0x%-16lx  %-10lu  ", 
+            seq_printf(m, "[IMPORT] %-6d %-4d  %-10u  0x%-16lx  %-10lu  %-10s  ", 
                        guest_registry[i].local_pid, guest_registry[i].home_node, 
-                       shmid, base, size);
+                       shmid, base, size, state_str);
             
             if (bytes_read > 0) {
                 for (int b = 0; b < bytes_read; b++) seq_printf(m, "%02x ", hex_buf[b]);
@@ -201,7 +210,7 @@ static int dsm_show(struct seq_file *m, void *v) {
     }
     spin_unlock(&guest_lock);
 
-    // --- 2. EXPORTER VIEW (VM1 - The Physical RAM) ---
+    // --- 2. EXPORTER VIEW (VM1 - The Physical RAM & Global Directory) ---
     spin_lock(&export_lock);
     for (i = 0; i < export_count; i++) {
         struct task_struct *deputy = NULL;
@@ -223,13 +232,31 @@ static int dsm_show(struct seq_file *m, void *v) {
                         unsigned long base = vma->vm_start;
                         unsigned long size = vma->vm_end - vma->vm_start;
                         
+                        // Look up the Global Directory State!
+                        char state_str[32] = "UNTRACKED";
+                        spin_lock(&mattx_dsm_lock);
+                        for (int gd = 0; gd < MAX_DSM_SEGMENTS; gd++) {
+                            if (mattx_global_dsm_dir[gd].in_use && mattx_global_dsm_dir[gd].shmid == shmid) {
+                                u8 p_state = mattx_global_dsm_dir[gd].page_state[0];
+                                if (p_state == MATTX_PAGE_EXCLUSIVE) {
+                                    snprintf(state_str, sizeof(state_str), "EXCL(P:%u)", mattx_global_dsm_dir[gd].page_owner_pid[0]);
+                                } else if (p_state == MATTX_PAGE_SHARED) {
+                                    snprintf(state_str, sizeof(state_str), "SHARED");
+                                } else {
+                                    snprintf(state_str, sizeof(state_str), "INVALID");
+                                }
+                                break;
+                            }
+                        }
+                        spin_unlock(&mattx_dsm_lock);
+
                         memset(hex_buf, 0, sizeof(hex_buf));
                         // Read directly from the physical RAM on VM1!
                         bytes_read = access_process_vm(deputy, base, hex_buf, 16, FOLL_FORCE);
 
-                        seq_printf(m, "[EXPORT] %-6d %-4d  %-10u  0x%-16lx  %-10lu  ", 
+                        seq_printf(m, "[EXPORT] %-6d %-4d  %-10u  0x%-16lx  %-10lu  %-10s  ", 
                                    export_registry[i].orig_pid, export_registry[i].target_node, 
-                                   shmid, base, size);
+                                   shmid, base, size, state_str);
                         
                         if (bytes_read > 0) {
                             for (int b = 0; b < bytes_read; b++) seq_printf(m, "%02x ", hex_buf[b]);
@@ -248,6 +275,7 @@ static int dsm_show(struct seq_file *m, void *v) {
 
     return 0;
 }
+
 
 static int dsm_open(struct inode *inode, struct file *file) {
     return single_open(file, dsm_show, NULL);

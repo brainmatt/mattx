@@ -57,6 +57,12 @@ static DEFINE_SPINLOCK(vfs_rpc_lock);
 static u64 next_req_id = 1;
 
 
+// ============================================================================
+// THE GLOBAL NODE-LOCAL MESI DIRECTORY (VM1)
+// ============================================================================
+struct mattx_dsm_master_dir mattx_global_dsm_dir[MAX_DSM_SEGMENTS];
+DEFINE_SPINLOCK(mattx_dsm_lock);
+
 // --- THE HPC FAST-PATH HELPER ---
 bool is_hpc_local_lib(const char *path) {
     if (!path) return false;
@@ -4165,46 +4171,60 @@ static void mattx_dsm_fault_kworker(struct work_struct *work) {
                         // FOUND IT! Calculate the absolute physical address on VM1
                         unsigned long target_addr = vma->vm_start + ctx->req.offset;
                         
-
                         if (target_addr < vma->vm_end) {
-                            
                             unsigned long page_idx = ctx->req.offset / PAGE_SIZE;
 
-
-                            // --- NEW: MESI FLUSH PIPELINE (MODE 2) ---
+                            // --- MESI FLUSH PIPELINE & DYNAMIC REGISTRATION (MODE 2) ---
                             if (config_dsm_mode == 2) {
                                 u32 owner_pid = 0;
                                 int owner_node = -1;
                                 int dir_idx = -1;
-                                int e_idx = -1;
 
-                                spin_lock(&export_lock);
-                                for (int e = 0; e < export_count; e++) {
-                                    if (export_registry[e].orig_pid == ctx->req.orig_pid) {
-                                        e_idx = e;
-                                        for (int d = 0; d < export_registry[e].dsm_dir_count; d++) {
-                                            if (export_registry[e].dsm_dirs[d].shmid == ctx->req.shmid) {
-                                                dir_idx = d;
-                                                if (export_registry[e].dsm_dirs[d].page_state[page_idx] == MATTX_PAGE_EXCLUSIVE) {
-                                                    owner_pid = export_registry[e].dsm_dirs[d].page_owner_pid[page_idx];
-                                                }
-                                                break;
-                                            }
-                                        }
+                                // 1. DYNAMIC REGISTRATION & LOOKUP (Microstep 2)
+                                spin_lock(&mattx_dsm_lock);
+                                for (int d = 0; d < MAX_DSM_SEGMENTS; d++) {
+                                    if (mattx_global_dsm_dir[d].in_use && mattx_global_dsm_dir[d].shmid == ctx->req.shmid) {
+                                        dir_idx = d;
                                         break;
                                     }
                                 }
                                 
+                                // If not found, claim an empty slot!
+                                if (dir_idx == -1) {
+                                    for (int d = 0; d < MAX_DSM_SEGMENTS; d++) {
+                                        if (!mattx_global_dsm_dir[d].in_use) {
+                                            dir_idx = d;
+                                            mattx_global_dsm_dir[d].in_use = true;
+                                            mattx_global_dsm_dir[d].shmid = ctx->req.shmid;
+                                            memset(mattx_global_dsm_dir[d].page_state, MATTX_PAGE_INVALID, sizeof(mattx_global_dsm_dir[d].page_state));
+                                            memset(mattx_global_dsm_dir[d].page_owner_pid, 0, sizeof(mattx_global_dsm_dir[d].page_owner_pid));
+                                            memset(mattx_global_dsm_dir[d].page_shared_mask, 0, sizeof(mattx_global_dsm_dir[d].page_shared_mask));
+                                            mattx_dbg("[MESI_VM1] Dynamically registered SHMID %u in Global Directory at slot %d\n", ctx->req.shmid, d);
+                                            break;
+                                        }
+                                    }
+                                }
+
+                                // 2. CHECK FOR EXCLUSIVE OWNER
+                                if (dir_idx != -1) {
+                                    if (mattx_global_dsm_dir[dir_idx].page_state[page_idx] == MATTX_PAGE_EXCLUSIVE) {
+                                        owner_pid = mattx_global_dsm_dir[dir_idx].page_owner_pid[page_idx];
+                                    }
+                                }
+                                spin_unlock(&mattx_dsm_lock);
+
                                 // If we found an owner PID, we need to find which node it lives on!
+                                // (We still use export_registry here just for routing the network packet!)
                                 if (owner_pid != 0 && owner_pid != ctx->req.orig_pid) {
+                                    spin_lock(&export_lock);
                                     for (int e = 0; e < export_count; e++) {
                                         if (export_registry[e].orig_pid == owner_pid) {
                                             owner_node = export_registry[e].target_node;
                                             break;
                                         }
                                     }
+                                    spin_unlock(&export_lock);
                                 }
-                                spin_unlock(&export_lock);
 
                                 // If someone else owns it exclusively, we must FLUSH them first!
                                 if (owner_pid != 0 && owner_pid != ctx->req.orig_pid && owner_node != -1 && cluster_map[owner_node]) {
@@ -4253,15 +4273,15 @@ static void mattx_dsm_fault_kworker(struct work_struct *work) {
                                             }
 
                                             // Update Directory: Downgrade to SHARED regardless of flush success!
-                                            spin_lock(&export_lock);
-                                            if (e_idx != -1 && dir_idx != -1) {
-                                                export_registry[e_idx].dsm_dirs[dir_idx].page_state[page_idx] = MATTX_PAGE_SHARED;
-                                                export_registry[e_idx].dsm_dirs[dir_idx].page_owner_pid[page_idx] = 0; // Clear owner!
+                                            spin_lock(&mattx_dsm_lock);
+                                            if (dir_idx != -1) {
+                                                mattx_global_dsm_dir[dir_idx].page_state[page_idx] = MATTX_PAGE_SHARED;
+                                                mattx_global_dsm_dir[dir_idx].page_owner_pid[page_idx] = 0; // Clear owner!
                                                 
                                                 // Clear the mask safely!
-                                                memset(export_registry[e_idx].dsm_dirs[dir_idx].page_shared_mask[page_idx], 0, sizeof(u64) * (MAX_NODES / 64));
+                                                memset(mattx_global_dsm_dir[dir_idx].page_shared_mask[page_idx], 0, sizeof(u64) * (MAX_NODES / 64));
                                             }
-                                            spin_unlock(&export_lock);
+                                            spin_unlock(&mattx_dsm_lock);
                                         }
                                         kfree(flush_buf);
                                     }
@@ -4270,60 +4290,46 @@ static void mattx_dsm_fault_kworker(struct work_struct *work) {
                             // ---------------------------------------
 
 
-                            mattx_dbg("[DSM_PUMP] Found SYSV segment! Sucking 4096 bytes from physical addr 0x%lx...\n", target_addr); // <-- NEW LOG!
+                            mattx_dbg("[DSM_PUMP] Found SYSV segment! Sucking 4096 bytes from physical addr 0x%lx...\n", target_addr); 
                             
                             // THE PUMP: Suck exactly 4096 bytes out of the Deputy's brain!
                             int bytes = access_process_vm(deputy, target_addr, reply->data, 4096, FOLL_FORCE);
                             if (bytes == 4096) {
                                 ret = 0;
-                                mattx_dbg("[DSM_PUMP] Successfully extracted 4KB page. Sending to Node %d...\n", ctx->target_node); // <-- NEW LOG!
+                                mattx_dbg("[DSM_PUMP] Successfully extracted 4KB page. Sending to Node %d...\n", ctx->target_node); 
 
                                 
-                                // --- NEW: MODE 2 MASTER DIRECTORY UPDATE ---
+                                // --- NEW: MODE 2 MASTER DIRECTORY UPDATE (Microstep 3: The Read Flow) ---
                                 if (config_dsm_mode == 2) {
-                                    spin_lock(&export_lock);
-                                    for (int e = 0; e < export_count; e++) {
-                                        if (export_registry[e].orig_pid == ctx->req.orig_pid) {
-                                            int dir_idx = -1;
-                                            
-                                            // Find or create the directory entry for this SHMID
-                                            for (int d = 0; d < export_registry[e].dsm_dir_count; d++) {
-                                                if (export_registry[e].dsm_dirs[d].shmid == ctx->req.shmid) {
-                                                    dir_idx = d; break;
-                                                }
-                                            }
-                                            if (dir_idx == -1 && export_registry[e].dsm_dir_count < MAX_DSM_SEGMENTS) {
-                                                dir_idx = export_registry[e].dsm_dir_count++;
-                                                export_registry[e].dsm_dirs[dir_idx].shmid = ctx->req.shmid;
-                                            }
-                                            
-                                            // Update the Page State and Shared Mask!
-                                            if (dir_idx != -1) {
-                                                unsigned long page_idx = ctx->req.offset / PAGE_SIZE;
-                                                if (page_idx < MAX_DSM_PAGES) {
-                                                    if (export_registry[e].dsm_dirs[dir_idx].page_state[page_idx] == MATTX_PAGE_INVALID) {
-                                                        export_registry[e].dsm_dirs[dir_idx].page_state[page_idx] = MATTX_PAGE_SHARED;
-                                                    }
-
-                                                    // Explicit bitwise math!
-                                                    int n_idx = ctx->target_node / 64;
-                                                    int n_bit = ctx->target_node % 64;
-                                                    export_registry[e].dsm_dirs[dir_idx].page_shared_mask[page_idx][n_idx] |= (1ULL << n_bit);
-                                                    
-                                                    mattx_dbg("[MESI_VM1] Page %lu of SHMID %u is now SHARED with Node %d\n", 
-                                                              page_idx, ctx->req.shmid, ctx->target_node);
-                                                }
-                                            }
-                                            break;
+                                    spin_lock(&mattx_dsm_lock);
+                                    int dir_idx = -1;
+                                    for (int d = 0; d < MAX_DSM_SEGMENTS; d++) {
+                                        if (mattx_global_dsm_dir[d].in_use && mattx_global_dsm_dir[d].shmid == ctx->req.shmid) {
+                                            dir_idx = d; break;
                                         }
                                     }
-                                    spin_unlock(&export_lock);
+                                    
+                                    // Update the Page State and Shared Mask!
+                                    if (dir_idx != -1) {
+                                        if (mattx_global_dsm_dir[dir_idx].page_state[page_idx] == MATTX_PAGE_INVALID) {
+                                            mattx_global_dsm_dir[dir_idx].page_state[page_idx] = MATTX_PAGE_SHARED;
+                                        }
+
+                                        // Explicit bitwise math!
+                                        int n_idx = ctx->target_node / 64;
+                                        int n_bit = ctx->target_node % 64;
+                                        mattx_global_dsm_dir[dir_idx].page_shared_mask[page_idx][n_idx] |= (1ULL << n_bit);
+                                        
+                                        mattx_dbg("[MESI_VM1] Page %lu of SHMID %u is now SHARED with Node %d\n", 
+                                                  page_idx, ctx->req.shmid, ctx->target_node);
+                                    }
+                                    spin_unlock(&mattx_dsm_lock);
                                 }
                                 // -------------------------------------------
 
 
                             } else {
-                                mattx_dbg("[DSM_PUMP] ERROR: Failed to extract page! (Read %d bytes)\n", bytes); // <-- NEW LOG!
+                                mattx_dbg("[DSM_PUMP] ERROR: Failed to extract page! (Read %d bytes)\n", bytes); 
                             }
                         }
                         break;
@@ -4619,53 +4625,50 @@ static void mattx_dsm_write_acquire_kworker(struct work_struct *work) {
     struct mattx_dsm_write_acquire_kworker_ctx *ctx = container_of(work, struct mattx_dsm_write_acquire_kworker_ctx, work);
     struct mattx_dsm_write_acquire_reply reply = { .req_id = ctx->req.req_id, .error = 0 };
     
-    spin_lock(&export_lock);
-    for (int e = 0; e < export_count; e++) {
-        if (export_registry[e].orig_pid == ctx->req.orig_pid) {
-            for (int d = 0; d < export_registry[e].dsm_dir_count; d++) {
-                if (export_registry[e].dsm_dirs[d].shmid == ctx->req.shmid) {
-                    unsigned long page_idx = ctx->req.offset / PAGE_SIZE;
+    // --- MODE 2 GLOBAL DIRECTORY LOOKUP ---
+    spin_lock(&mattx_dsm_lock);
+    for (int d = 0; d < MAX_DSM_SEGMENTS; d++) {
+        if (mattx_global_dsm_dir[d].in_use && mattx_global_dsm_dir[d].shmid == ctx->req.shmid) {
+            unsigned long page_idx = ctx->req.offset / PAGE_SIZE;
 
-                    // 1. Send Invalidates to EVERYONE in the mask!
-                    for (int node = 0; node < MAX_NODES; node++) {
-                        int n_idx = node / 64;
-                        int n_bit = node % 64;
-                        
-                        // Explicit bitwise test!
-                        if (export_registry[e].dsm_dirs[d].page_shared_mask[page_idx][n_idx] & (1ULL << n_bit)) {
-                            if (cluster_map[node]) {
-                                struct mattx_dsm_invalidate_req inv_req = {
-                                    .req_id = 0, .orig_pid = ctx->req.orig_pid, // Pass the requester's PID!
-                                    .shmid = ctx->req.shmid, .offset = ctx->req.offset
-                                };
-                                // Fire and forget!
-                                mattx_comm_send(cluster_map[node], MATTX_MSG_DSM_INVALIDATE_REQ, &inv_req, sizeof(inv_req));
-                                mattx_dbg("[MESI_VM1] Sent INVALIDATE to Node %d for SHMID %u Offset %lu\n", node, ctx->req.shmid, ctx->req.offset);
-                            }
-                        }
+            // 1. Send Invalidates to EVERYONE in the mask!
+            for (int node = 0; node < MAX_NODES; node++) {
+                int n_idx = node / 64;
+                int n_bit = node % 64;
+                
+                // Explicit bitwise test!
+                if (mattx_global_dsm_dir[d].page_shared_mask[page_idx][n_idx] & (1ULL << n_bit)) {
+                    if (cluster_map[node]) {
+                        struct mattx_dsm_invalidate_req inv_req = {
+                            .req_id = 0, .orig_pid = ctx->req.orig_pid, // Pass the requester's PID!
+                            .shmid = ctx->req.shmid, .offset = ctx->req.offset
+                        };
+                        // Fire and forget!
+                        mattx_comm_send(cluster_map[node], MATTX_MSG_DSM_INVALIDATE_REQ, &inv_req, sizeof(inv_req));
+                        mattx_dbg("[MESI_VM1] Sent INVALIDATE to Node %d for SHMID %u Offset %lu\n", node, ctx->req.shmid, ctx->req.offset);
                     }
-                    
-                    // 2. Update Directory to EXCLUSIVE
-                    export_registry[e].dsm_dirs[d].page_state[page_idx] = MATTX_PAGE_EXCLUSIVE;
-                    export_registry[e].dsm_dirs[d].page_owner_pid[page_idx] = ctx->req.orig_pid;
-                    
-                    // Clear the 16 u64s for this page!
-                    memset(export_registry[e].dsm_dirs[d].page_shared_mask[page_idx], 0, sizeof(u64) * (MAX_NODES / 64));
-                    
-                    mattx_dbg("[MESI_VM1] PID %u granted EXCLUSIVE lock for SHMID %u Offset %lu\n", ctx->req.orig_pid, ctx->req.shmid, ctx->req.offset);
-                    break;
                 }
             }
+            
+            // 2. Update Directory to EXCLUSIVE
+            mattx_global_dsm_dir[d].page_state[page_idx] = MATTX_PAGE_EXCLUSIVE;
+            mattx_global_dsm_dir[d].page_owner_pid[page_idx] = ctx->req.orig_pid; // <-- PID TRACKING!
+            
+            // Clear the 16 u64s for this page!
+            memset(mattx_global_dsm_dir[d].page_shared_mask[page_idx], 0, sizeof(u64) * (MAX_NODES / 64));
+            
+            mattx_dbg("[MESI_VM1] PID %u granted EXCLUSIVE lock for SHMID %u Offset %lu\n", ctx->req.orig_pid, ctx->req.shmid, ctx->req.offset);
             break;
         }
     }
-    spin_unlock(&export_lock);
+    spin_unlock(&mattx_dsm_lock);
     
     if (cluster_map[ctx->target_node]) {
         mattx_comm_send(cluster_map[ctx->target_node], MATTX_MSG_DSM_WRITE_ACQUIRE_REPLY, &reply, sizeof(reply));
     }
     kfree(ctx);
 }
+
 
 static void handle_dsm_write_acquire_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
     struct mattx_dsm_write_acquire_req *req = payload;

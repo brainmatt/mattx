@@ -1077,13 +1077,20 @@ struct mattx_guest_info {
 
 // DSM MESI: The Master Directory (VM1) ---
 struct mattx_dsm_master_dir {
+    bool in_use;                        // <-- NEW: Tracks if this slot is active
     u32 shmid;
     u8 page_state[MAX_DSM_PAGES];       // Global state of the page
-    u32 page_owner_pid[MAX_DSM_PAGES];  // <-- CHANGED: PID of the EXCLUSIVE owner
+    u32 page_owner_pid[MAX_DSM_PAGES];  // PID of the EXCLUSIVE owner
 
     // A foolproof 2D array. 1024 nodes / 64 bits = 16 u64s per page!
     u64 page_shared_mask[MAX_DSM_PAGES][MAX_NODES / 64]; 
 };
+
+
+// --- The Global Node-Local Directory & Lock ---
+extern struct mattx_dsm_master_dir mattx_global_dsm_dir[MAX_DSM_SEGMENTS];
+extern spinlock_t mattx_dsm_lock;
+
 
 struct mattx_export_info {
     pid_t orig_pid;
