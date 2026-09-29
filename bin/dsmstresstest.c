@@ -101,13 +101,13 @@ int main(int argc, char *argv[]) {
             // --- CHILD PROCESS (The Worker) ---
             srand(time(NULL) ^ getpid()); // Unique random seed per worker
             
-            printf("[Worker PID %d] Started. Waiting 10 seconds for migration...\n", getpid());
-            for (int t = 10; t > 0; t--) {
-                printf("[Worker PID %d] T-minus %d seconds...\n", getpid(), t);
+            printf("[Worker PID %d] Started. Waiting 30 seconds for migration...\n", getpid());
+            for (int t = 30; t > 0; t--) {
+                // printf("[Worker PID %d] T-minus %d seconds...\n", getpid(), t);
                 sleep(1);
             }
 
-            printf("[Worker PID %d] Waking up! Starting 100 loops...\n", getpid());
+            printf("[Worker PID %d] Waking up! Starting 1000 loops...\n", getpid());
             
             for (int tick = 0; tick < 1000; tick++) {
                 int is_write = rand() % 2; // 0 = Read, 1 = Write
@@ -127,7 +127,8 @@ int main(int argc, char *argv[]) {
                         // Read from DSM
                         printf("  -> [PID %d] Read data: '%s'\n", getpid(), (char *)shm_data);
                     }
-                    usleep(500000); // Sleep 0.5s between ops to allow observation
+                    // usleep(500000); // Sleep 0.5s between ops to allow observation
+                    sleep(10);
                 }
             }
 
