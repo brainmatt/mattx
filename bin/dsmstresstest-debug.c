@@ -45,6 +45,14 @@ int get_local_node_id() {
 }
 
 int main(int argc, char *argv[]) {
+    // Unbuffered stdout: when this runs backgrounded with its output
+    // redirected to a file (not a tty), glibc fully-buffers by default and
+    // nothing ever hits disk until the buffer fills or the process exits
+    // -- fatal for a long-running interactive debugger whose whole point
+    // is to be watched live. setvbuf() here, before fork(), applies to
+    // every forked worker too (fork() copies the parent's stdio state).
+    setvbuf(stdout, NULL, _IONBF, 0);
+
     if (argc != 2) {
         printf("Usage: %s <num_workers>\n", argv[0]);
         exit(1);
