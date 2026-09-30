@@ -703,8 +703,33 @@ void mattx_capture_and_send_state(struct task_struct *task, int target_node) {
     migrating_target_node = target_node;
 
     if (cluster_map[target_node]) {
+        int send_ret;
         mattx_dbg("[MIGRATE] Sending blueprint to Node %d. Waiting for READY signal...\n", target_node);
-        mattx_comm_send(cluster_map[target_node], MATTX_MSG_MIGRATE_REQ, req, actual_payload_size);
+        send_ret = mattx_comm_send(cluster_map[target_node], MATTX_MSG_MIGRATE_REQ, req, actual_payload_size);
+        if (send_ret < 0) {
+            // mattx#17: the Mother and Gang were already frozen (SIGSTOP'd
+            // at the user-space boundary) above, in anticipation of a
+            // successful hand-off. If the send itself fails -- e.g.
+            // against a stale/dead link right after the target node
+            // restarted its mattx service -- there was previously NO
+            // recovery path anywhere in mattx_migr.c/mattx_comm.c, so the
+            // process stayed frozen (STAT=T) forever. Confirmed via kdump
+            // on the lab cluster: "MattX:[COMM] Network send failed!
+            // (ret: -32)" (EPIPE) logged here, immediately followed by
+            // total silence and a permanently stuck migtest. Thaw
+            // everyone back to running instead of abandoning them frozen.
+            printk(KERN_ERR "MattX:[MIGRATE] Blueprint send to Node %d failed (%d)! Aborting migration, waking PID %d (and %d gang thread(s)) back up.\n",
+                   target_node, send_ret, task->pid, t_count);
+            for (int i = 0; i < t_count; i++) {
+                send_sig(SIGCONT, threads[i], 0);
+            }
+        }
+    } else {
+        printk(KERN_ERR "MattX:[MIGRATE] Node %d has no active link! Aborting migration, waking PID %d (and %d gang thread(s)) back up.\n",
+               target_node, task->pid, t_count);
+        for (int i = 0; i < t_count; i++) {
+            send_sig(SIGCONT, threads[i], 0);
+        }
     }
     kvfree(req); // FIX: Use kvfree!
 }
@@ -878,10 +903,49 @@ void mattx_capture_and_return_state(struct task_struct *task, u32 orig_pid, int 
     migrating_target_node = target_node;
 
     if (cluster_map[target_node]) {
-            mattx_dbg("[MIGRATE] RETURN Blueprint built! VMA Count: %d, Total Payload Size: %zu bytes.\n", 
+            int send_ret;
+            mattx_dbg("[MIGRATE] RETURN Blueprint built! VMA Count: %d, Total Payload Size: %zu bytes.\n",
                     vma_count, actual_payload_size);
             mattx_dbg("[MIGRATE] Sending RETURN blueprint to Node %d. Waiting for READY signal...\n", target_node);
-            mattx_comm_send(cluster_map[target_node], MATTX_MSG_RETURN_BLUEPRINT, req, actual_payload_size);
+            send_ret = mattx_comm_send(cluster_map[target_node], MATTX_MSG_RETURN_BLUEPRINT, req, actual_payload_size);
+            if (send_ret < 0) {
+                // mattx#17: same discarded-return-value hazard as the
+                // forward-migration path in mattx_capture_and_send_state()
+                // above -- the Surrogate and Gang were already frozen
+                // above in anticipation of a successful hand-off home. On
+                // failure, thaw them back to running AND release the
+                // per-guest is_migrating lock taken above, so the wormhole
+                // (mattx_hooks.c / mattx_fileio.c RPC paths, which check
+                // is_migrating) doesn't treat this guest as permanently
+                // mid-migration.
+                printk(KERN_ERR "MattX:[MIGRATE] RETURN Blueprint send to Node %d failed (%d)! Aborting return migration, waking PID %d (and %d gang thread(s)) back up.\n",
+                       target_node, send_ret, task->pid, t_count);
+                for (int i = 0; i < t_count; i++) {
+                    send_sig(SIGCONT, threads[i], 0);
+                }
+                spin_lock(&guest_lock);
+                for (int i = 0; i < guest_count; i++) {
+                    if (guest_registry[i].local_pid == task->pid) {
+                        guest_registry[i].is_migrating = false;
+                        break;
+                    }
+                }
+                spin_unlock(&guest_lock);
+            }
+        } else {
+            printk(KERN_ERR "MattX:[MIGRATE] Node %d has no active link! Aborting return migration, waking PID %d (and %d gang thread(s)) back up.\n",
+                   target_node, task->pid, t_count);
+            for (int i = 0; i < t_count; i++) {
+                send_sig(SIGCONT, threads[i], 0);
+            }
+            spin_lock(&guest_lock);
+            for (int i = 0; i < guest_count; i++) {
+                if (guest_registry[i].local_pid == task->pid) {
+                    guest_registry[i].is_migrating = false;
+                    break;
+                }
+            }
+            spin_unlock(&guest_lock);
         }
         kvfree(req); // FIX: Use kvfree!
 }
