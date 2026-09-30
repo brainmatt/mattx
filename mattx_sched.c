@@ -383,6 +383,22 @@ restart_export_loop:
 // --- Network Handlers for the Scheduler ---
 static void handle_heartbeat(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
     if (link->node_id == -1 && hdr->sender_id < MAX_NODES) {
+        // mattx#17: if a stale connection from a previous crash/reconnect
+        // cycle is still sitting in cluster_map for this node, tear it
+        // down first -- otherwise its socket and receiver kthread (parked
+        // forever in the "Zombie Halt" loop in mattx_receiver_loop(),
+        // mattx_comm.c) leak permanently every time a peer reconnects.
+        // This is what silently exhausted MATTX_PORT across repeated
+        // restarts: each leaked accepted-connection socket lingers in
+        // CLOSE_WAIT, still holding the port even after the listening
+        // socket itself is properly released -- which is why the
+        // listener's own retry-on-EADDRINUSE fix (this same PR) could
+        // still spin forever binding against a port that a *different*,
+        // leaked socket was still squatting on.
+        if (cluster_map[hdr->sender_id] && cluster_map[hdr->sender_id] != link) {
+            mattx_dbg("[SCHED] Replacing stale connection for Node %u -- disconnecting old link first\n", hdr->sender_id);
+            mattx_comm_disconnect(hdr->sender_id);
+        }
         link->node_id = hdr->sender_id;
         cluster_map[link->node_id] = link;
         mattx_dbg(" [SCHED] Registered new connection from Node %u\n", hdr->sender_id);

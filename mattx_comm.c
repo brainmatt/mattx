@@ -270,19 +270,87 @@ int mattx_listener_loop(void *data) {
     struct sockaddr_in addr;
     int err;
 
-    err = sock_create_kern(&init_net, PF_INET, SOCK_STREAM, IPPROTO_TCP, &listen_sock);
-    if (err < 0) return err;
-
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
     addr.sin_port = htons(MATTX_PORT);
     addr.sin_addr.s_addr = INADDR_ANY;
 
-    err = kernel_bind(listen_sock, MATTX_SA_CAST(&addr), sizeof(addr));
-    if (err < 0) { sock_release(listen_sock); return err; }
+    // --- mattx#17: THE DANGLING LISTENER FIX ---
+    // A kthread must NEVER return before mattx_exit() calls kthread_stop()
+    // on it -- if it does, the task fully exits and gets reaped on its
+    // own, leaving the stored task_struct* (listener_thread, in
+    // mattx_main.c) dangling. mattx_exit() unconditionally calls
+    // kthread_stop() on that pointer on every unload, so a stale pointer
+    // here is a guaranteed use-after-free. Confirmed via kdump on the lab
+    // cluster: "refcount_t: addition on 0; use-after-free" inside
+    // kthread_stop(), called from mattx_exit(), immediately followed by a
+    // NULL-pointer-dereference panic in kthread_stop() itself -- on a
+    // *second* "systemctl restart mattx", never the first.
+    //
+    // Root cause: this function used to return immediately if
+    // sock_create_kern()/kernel_bind()/kernel_listen() failed, BEFORE ever
+    // reaching the kthread_should_stop() loop below. kernel_bind() can
+    // fail with -EADDRINUSE right after a restart because the previous
+    // incarnation's peer connections on MATTX_PORT are still draining
+    // through TCP TIME_WAIT and this socket never set SO_REUSEADDR -- a
+    // textbook "server can't restart quickly" bug. That's exactly what
+    // requires a REPEATED restart to trigger: the first-ever load has
+    // nothing in TIME_WAIT yet, so it always binds fine; only a restart
+    // shortly after a prior one can hit this.
+    //
+    // Fix: (1) set SO_REUSEADDR so the bind itself stops failing in the
+    // first place, and (2) retry setup indefinitely (while still honoring
+    // kthread_should_stop()) instead of ever returning early, so this
+    // thread can no longer exit before mattx_exit() actually asks it to,
+    // regardless of the failure cause.
+    while (!kthread_should_stop()) {
+        if (listen_sock) { sock_release(listen_sock); listen_sock = NULL; }
 
-    err = kernel_listen(listen_sock, 5);
-    if (err < 0) { sock_release(listen_sock); return err; }
+        err = sock_create_kern(&init_net, PF_INET, SOCK_STREAM, IPPROTO_TCP, &listen_sock);
+        if (err < 0) {
+            printk(KERN_ERR "MattX: [COMM] Listener: sock_create_kern failed (%d), retrying...\n", err);
+            listen_sock = NULL;
+            msleep(500);
+            continue;
+        }
+
+        // Allow immediate rebinding to MATTX_PORT even while old
+        // connections from a previous module load are still winding down
+        // through TIME_WAIT -- the actual trigger for the bind failure
+        // described above.
+        sock_set_reuseaddr(listen_sock->sk);
+
+        err = kernel_bind(listen_sock, MATTX_SA_CAST(&addr), sizeof(addr));
+        if (err < 0) {
+            printk(KERN_ERR "MattX: [COMM] Listener: bind on port %d failed (%d), retrying...\n", MATTX_PORT, err);
+            sock_release(listen_sock);
+            listen_sock = NULL;
+            msleep(500);
+            continue;
+        }
+
+        err = kernel_listen(listen_sock, 5);
+        if (err < 0) {
+            printk(KERN_ERR "MattX: [COMM] Listener: listen failed (%d), retrying...\n", err);
+            sock_release(listen_sock);
+            listen_sock = NULL;
+            msleep(500);
+            continue;
+        }
+
+        break; // Fully set up -- fall through to the accept loop below.
+    }
+
+    if (!listen_sock) {
+        // We only get here if kthread_should_stop() became true while we
+        // were still retrying setup (mattx_exit() asked us to stop before
+        // we ever got a working socket). Exit cleanly -- nothing to
+        // accept on, and nothing left dangling for kthread_stop() to trip
+        // over, since it's the very call that woke us up.
+        return 0;
+    }
+
+    mattx_dbg("[COMM] Listener socket bound and listening on port %d.\n", MATTX_PORT);
 
     while (!kthread_should_stop()) {
         struct socket *client_sock = NULL;
