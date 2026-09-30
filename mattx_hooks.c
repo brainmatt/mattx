@@ -4729,6 +4729,11 @@ static int entry_handler_shmem_fault(struct kretprobe_instance *ri, struct pt_re
     struct shmem_fault_kretprobe_data *data = (struct shmem_fault_kretprobe_data *)ri->data;
     data->needs_sync = false;
 
+    // --- THE VIP PASS ---
+    // Never intercept Kernel Threads! If a Kworker triggers a page fault while 
+    // pumping data, let the Linux kernel handle it natively!
+    if (current->flags & PF_KTHREAD) return 0;
+
     if (config_dsm_mode == 2) {
         // shmem_fault is a standard C function, so the first arg (vmf) is in DI
         struct vm_fault *vmf = (struct vm_fault *)regs->di;

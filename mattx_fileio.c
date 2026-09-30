@@ -4411,10 +4411,33 @@ static void mattx_dsm_update_kworker(struct work_struct *work) {
                 if (strncmp(vma->vm_file->f_path.dentry->d_name.name, "SYSV", 4) == 0) {
                     if (vma->vm_file->f_inode->i_ino == ctx->req.shmid) {
                         unsigned long target_addr = vma->vm_start + ctx->req.offset;
+
                         if (target_addr < vma->vm_end) {
                             // THE BOMB: Overwrite the physical RAM on the Home Node!
                             access_process_vm(deputy, target_addr, ctx->req.data, 4096, FOLL_WRITE | FOLL_FORCE);
                             mattx_dbg("[DSM_SYNC] VM1 updated physical RAM for SHMID %u at offset %lu\n", ctx->req.shmid, ctx->req.offset);
+                            
+                            // --- THE FUNERAL DIRECTORY CLEANUP ---
+                            if (config_dsm_mode == 2) {
+                                unsigned long page_idx = ctx->req.offset / PAGE_SIZE;
+                                spin_lock(&mattx_dsm_lock);
+                                for (int d = 0; d < MAX_DSM_SEGMENTS; d++) {
+                                    if (mattx_global_dsm_dir[d].in_use && mattx_global_dsm_dir[d].shmid == ctx->req.shmid) {
+                                        // If the incoming data bomb is from the EXCLUSIVE owner, downgrade it to SHARED!
+                                        if (mattx_global_dsm_dir[d].page_state[page_idx] == MATTX_PAGE_EXCLUSIVE &&
+                                            mattx_global_dsm_dir[d].page_owner_pid[page_idx] == ctx->req.orig_pid) {
+                                            
+                                            mattx_global_dsm_dir[d].page_state[page_idx] = MATTX_PAGE_SHARED;
+                                            mattx_global_dsm_dir[d].page_owner_pid[page_idx] = 0;
+                                            memset(mattx_global_dsm_dir[d].page_shared_mask[page_idx], 0, sizeof(u64) * (MAX_NODES / 64));
+                                            mattx_dbg("[MESI_VM1] Directory cleaned up! SHMID %u Offset %lu is now SHARED.\n", ctx->req.shmid, ctx->req.offset);
+                                        }
+                                        break;
+                                    }
+                                }
+                                spin_unlock(&mattx_dsm_lock);
+                            }
+                            // ------------------------------------------
                         }
                         break;
                     }
