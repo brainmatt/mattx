@@ -1455,6 +1455,7 @@ static void mattx_rpc_worker(struct work_struct *work) {
                 spin_unlock(&guest_lock);
                 if (regs) regs->ax = error;
 
+
             } else if (rpc->is_shmctl) {
                 struct pt_regs *regs = task_pt_regs(surrogate);
                 int error = -EINTR; void *read_buf = NULL;
@@ -4719,6 +4720,81 @@ static int ret_handler_shmat(struct kretprobe_instance *ri, struct pt_regs *regs
 
 
 // ============================================================================
+// THE NATIVE HOME NODE INTERCEPTOR (VM1)
+// ============================================================================
+struct shmem_fault_kretprobe_data { bool needs_sync; u32 shmid; unsigned long offset; bool is_write; };
+static struct kretprobe shmem_fault_kprobe;
+
+static int entry_handler_shmem_fault(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    struct shmem_fault_kretprobe_data *data = (struct shmem_fault_kretprobe_data *)ri->data;
+    data->needs_sync = false;
+
+    if (config_dsm_mode == 2) {
+        // shmem_fault is a standard C function, so the first arg (vmf) is in DI
+        struct vm_fault *vmf = (struct vm_fault *)regs->di;
+        
+        if (vmf && vmf->vma && vmf->vma->vm_file && vmf->vma->vm_file->f_path.dentry->d_name.name) {
+            if (strncmp(vmf->vma->vm_file->f_path.dentry->d_name.name, "SYSV", 4) == 0) {
+                u32 shmid = vmf->vma->vm_file->f_inode->i_ino;
+                unsigned long offset = (vmf->address & PAGE_MASK) - vmf->vma->vm_start;
+                bool is_write = (vmf->flags & FAULT_FLAG_WRITE) ? true : false;
+
+                spin_lock(&mattx_dsm_lock);
+                for (int d = 0; d < MAX_DSM_SEGMENTS; d++) {
+                    if (mattx_global_dsm_dir[d].in_use && mattx_global_dsm_dir[d].shmid == shmid) {
+                        unsigned long page_idx = offset / PAGE_SIZE;
+                        u8 state = mattx_global_dsm_dir[d].page_state[page_idx];
+                        u32 owner = mattx_global_dsm_dir[d].page_owner_pid[page_idx];
+                        
+                        if (state == MATTX_PAGE_EXCLUSIVE && owner != 0) {
+                            data->needs_sync = true; // We must flush the remote owner!
+                        } else if (is_write && state == MATTX_PAGE_SHARED) {
+                            // We must invalidate remote sharers!
+                            for (int n = 0; n < MAX_NODES; n++) {
+                                int n_idx = n / 64; int n_bit = n % 64;
+                                if (mattx_global_dsm_dir[d].page_shared_mask[page_idx][n_idx] & (1ULL << n_bit)) {
+                                    data->needs_sync = true; break;
+                                }
+                            }
+                        }
+                        break;
+                    }
+                }
+                spin_unlock(&mattx_dsm_lock);
+
+                if (data->needs_sync) {
+                    data->shmid = shmid;
+                    data->offset = offset;
+                    data->is_write = is_write;
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+
+static int ret_handler_shmem_fault(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    struct shmem_fault_kretprobe_data *data = (struct shmem_fault_kretprobe_data *)ri->data;
+    
+    if (data->needs_sync) {
+        // THE MAGIC TRICK: Force the kernel to drop its locks and retry the fault later!
+        regs->ax = VM_FAULT_RETRY;
+        
+        mattx_dbg("[MESI_VM1] Native Fault intercepted! Freezing PID %d to sync network...\n", current->pid);
+        send_sig(SIGSTOP, current, 0);
+        
+        // Call the dedicated VM1 sync scheduler!
+        mattx_schedule_vm1_sync(current->pid, data->shmid, data->offset, data->is_write);
+    }
+    return 0;
+}
+
+
+
+
+
+// ============================================================================
 // MODE 3: THE HARDWARE EXCEPTION CATCHER (DIE NOTIFIER)
 // ============================================================================
 
@@ -5433,6 +5509,15 @@ int mattx_hooks_init(void) {
     ret = register_kretprobe(&shmat_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for shmat, returned %d\n", ret);
 
+    memset(&shmem_fault_kprobe, 0, sizeof(shmem_fault_kprobe));
+    shmem_fault_kprobe.kp.symbol_name = "shmem_fault";
+    shmem_fault_kprobe.entry_handler = entry_handler_shmem_fault;
+    shmem_fault_kprobe.handler = ret_handler_shmem_fault;
+    shmem_fault_kprobe.data_size = sizeof(struct shmem_fault_kretprobe_data);
+    shmem_fault_kprobe.maxactive = 64;
+    ret = register_kretprobe(&shmem_fault_kprobe);
+    if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for shmem_fault, returned %d\n", ret);
+
     // --- Stale-deadline clock_nanosleep() fixup (mattx#20) ---
     // Non-fatal if either fails to resolve: these are internal, unexported
     // helper symbols that could legitimately move/vanish/get inlined on a
@@ -5467,6 +5552,7 @@ int mattx_hooks_init(void) {
 void mattx_hooks_exit(void) {
     unregister_kretprobe(&clock_nanosleep_kprobe);
     unregister_kretprobe(&clock_nanosleep_timens_kprobe);
+    unregister_kretprobe(&shmem_fault_kprobe);
     unregister_kretprobe(&shmat_kprobe);
     unregister_kretprobe(&shmdt_kprobe);
     unregister_kretprobe(&shmctl_kprobe);

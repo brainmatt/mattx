@@ -1016,13 +1016,13 @@ struct mattx_rpc_work {
     bool is_shmget;
     bool is_shmctl;
     bool is_shmdt;
-    bool is_shmat; // <-- NEW
+    bool is_shmat;
     int shm_key;
     size_t shm_size;
     int shm_flg;
     int shm_id;
     int shm_cmd;
-    unsigned long shm_addr;    
+    unsigned long shm_addr;
 };
 
 struct mattx_link {
@@ -1526,6 +1526,11 @@ extern mattx_x86_fsbase_write_task_fn real_x86_fsbase_write_task;
 extern mattx_x86_gsbase_write_task_fn real_x86_gsbase_write_task;
 
 
+// --- THE PTE SHOOTDOWN RESOLVER ---
+struct address_space;
+typedef void (*mattx_unmap_mapping_range_fn)(struct address_space *mapping, loff_t const holebegin, loff_t const holelen, int even_cows);
+extern mattx_unmap_mapping_range_fn real_unmap_mapping_range;
+
 
 // The Extreme Debugging Macro ---
 // This replaces printk(KERN_INFO...). It checks the flag before printing!
@@ -1599,6 +1604,9 @@ extern const struct inode_operations mattx_iops;
 
 // DSM single step mode 3
 void mattx_inject_dsm_cleanup(u32 orig_pid, int home_node, u32 shmid, unsigned long fault_addr, bool is_write);
+// MESI mode 2 VM1 native worker sync
+void mattx_schedule_vm1_sync(pid_t pid, u32 shmid, unsigned long offset, bool is_write);
+
 
 
 // API for MattXFS ---

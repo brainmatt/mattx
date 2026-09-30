@@ -76,6 +76,7 @@ mattx_sys_shmat_fn real_sys_shmat = NULL;
 mattx_x86_task_fpu_fn real_x86_task_fpu = NULL;
 mattx_zap_vma_ptes_fn real_zap_vma_ptes = NULL;
 mattx_vmf_insert_pfn_prot_fn real_vmf_insert_pfn_prot = NULL;
+mattx_unmap_mapping_range_fn real_unmap_mapping_range = NULL;
 
 
 static void mattx_resolve_hidden_symbols(void) {
@@ -408,6 +409,16 @@ static void mattx_resolve_hidden_symbols(void) {
         real_vmf_insert_pfn_prot = (mattx_vmf_insert_pfn_prot_fn)kp.addr; 
         unregister_kprobe(&kp); 
     }
+
+    // --- THE PTE SHOOTDOWN RESOLVER ---
+    memset(&kp, 0, sizeof(kp)); 
+    kp.symbol_name = "unmap_mapping_range";
+    if (register_kprobe(&kp) == 0) { 
+        real_unmap_mapping_range = (mattx_unmap_mapping_range_fn)kp.addr; 
+        unregister_kprobe(&kp); 
+    }
+
+
 }
 
 
