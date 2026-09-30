@@ -211,67 +211,91 @@ static int dsm_show(struct seq_file *m, void *v) {
     spin_unlock(&guest_lock);
 
     // --- 2. EXPORTER VIEW (VM1 - The Physical RAM & Global Directory) ---
-    spin_lock(&export_lock);
-    for (i = 0; i < export_count; i++) {
-        struct task_struct *deputy = NULL;
-        
-        rcu_read_lock();
-        deputy = pid_task(find_vpid(export_registry[i].orig_pid), PIDTYPE_PID);
-        if (deputy) get_task_struct(deputy);
-        rcu_read_unlock();
+    
+    // Allocate a local copy of the export registry to avoid holding the spinlock!
+    struct mattx_export_info *local_exports = kmalloc_array(MAX_GUESTS, sizeof(struct mattx_export_info), GFP_KERNEL);
+    int local_export_count = 0;
 
-        if (deputy && deputy->mm) {
-            mmap_read_lock(deputy->mm);
-            struct vm_area_struct *vma;
-            VMA_ITERATOR(vmi, deputy->mm, 0);
+    if (local_exports) {
+        spin_lock(&export_lock);
+        local_export_count = export_count;
+        memcpy(local_exports, export_registry, export_count * sizeof(struct mattx_export_info));
+        spin_unlock(&export_lock);
+
+        for (i = 0; i < local_export_count; i++) {
+            struct task_struct *deputy = NULL;
             
-            for_each_vma(vmi, vma) {
-                if (vma->vm_file && vma->vm_file->f_path.dentry->d_name.name) {
-                    if (strncmp(vma->vm_file->f_path.dentry->d_name.name, "SYSV", 4) == 0) {
-                        u32 shmid = (u32)vma->vm_file->f_inode->i_ino;
-                        unsigned long base = vma->vm_start;
-                        unsigned long size = vma->vm_end - vma->vm_start;
-                        
-                        // Look up the Global Directory State!
-                        char state_str[32] = "UNTRACKED";
-                        spin_lock(&mattx_dsm_lock);
-                        for (int gd = 0; gd < MAX_DSM_SEGMENTS; gd++) {
-                            if (mattx_global_dsm_dir[gd].in_use && mattx_global_dsm_dir[gd].shmid == shmid) {
-                                u8 p_state = mattx_global_dsm_dir[gd].page_state[0];
-                                if (p_state == MATTX_PAGE_EXCLUSIVE) {
-                                    snprintf(state_str, sizeof(state_str), "EXCL(P:%u)", mattx_global_dsm_dir[gd].page_owner_pid[0]);
-                                } else if (p_state == MATTX_PAGE_SHARED) {
-                                    snprintf(state_str, sizeof(state_str), "SHARED");
-                                } else {
-                                    snprintf(state_str, sizeof(state_str), "INVALID");
-                                }
-                                break;
+            rcu_read_lock();
+            deputy = pid_task(find_vpid(local_exports[i].orig_pid), PIDTYPE_PID);
+            if (deputy) get_task_struct(deputy);
+            rcu_read_unlock();
+
+            if (deputy && deputy->mm) {
+                // We can have multiple SHM segments, so we store them temporarily
+                struct { unsigned long base; unsigned long size; u32 shmid; } shms[16];
+                int shm_count = 0;
+
+                // 1. Grab the lock just long enough to find the addresses
+                mmap_read_lock(deputy->mm);
+                struct vm_area_struct *vma;
+                VMA_ITERATOR(vmi, deputy->mm, 0);
+                
+                for_each_vma(vmi, vma) {
+                    if (vma->vm_file && vma->vm_file->f_path.dentry->d_name.name) {
+                        if (strncmp(vma->vm_file->f_path.dentry->d_name.name, "SYSV", 4) == 0) {
+                            if (shm_count < 16) {
+                                shms[shm_count].shmid = (u32)vma->vm_file->f_inode->i_ino;
+                                shms[shm_count].base = vma->vm_start;
+                                shms[shm_count].size = vma->vm_end - vma->vm_start;
+                                shm_count++;
                             }
                         }
-                        spin_unlock(&mattx_dsm_lock);
-
-                        memset(hex_buf, 0, sizeof(hex_buf));
-                        // Read directly from the physical RAM on VM1!
-                        bytes_read = access_process_vm(deputy, base, hex_buf, 16, FOLL_FORCE);
-
-                        seq_printf(m, "[EXPORT] %-6d %-4d  %-10u  0x%-16lx  %-10lu  %-10s  ", 
-                                   export_registry[i].orig_pid, export_registry[i].target_node, 
-                                   shmid, base, size, state_str);
-                        
-                        if (bytes_read > 0) {
-                            for (int b = 0; b < bytes_read; b++) seq_printf(m, "%02x ", hex_buf[b]);
-                        } else {
-                            seq_printf(m, "<FAULT/UNREADABLE>");
-                        }
-                        seq_printf(m, "\n");
                     }
                 }
+                mmap_read_unlock(deputy->mm); // 2. DROP THE MMAP LOCK BEFORE SLEEPING!
+
+                // 3. Now we are completely lock-free! We can safely trigger Page Faults!
+                for (int s = 0; s < shm_count; s++) {
+                    char state_str[32] = "UNTRACKED";
+                    
+                    spin_lock(&mattx_dsm_lock);
+                    for (int gd = 0; gd < MAX_DSM_SEGMENTS; gd++) {
+                        if (mattx_global_dsm_dir[gd].in_use && mattx_global_dsm_dir[gd].shmid == shms[s].shmid) {
+                            u8 p_state = mattx_global_dsm_dir[gd].page_state[0];
+                            if (p_state == MATTX_PAGE_EXCLUSIVE) {
+                                snprintf(state_str, sizeof(state_str), "EXCL(P:%u)", mattx_global_dsm_dir[gd].page_owner_pid[0]);
+                            } else if (p_state == MATTX_PAGE_SHARED) {
+                                snprintf(state_str, sizeof(state_str), "SHARED");
+                            } else {
+                                snprintf(state_str, sizeof(state_str), "INVALID");
+                            }
+                            break;
+                        }
+                    }
+                    spin_unlock(&mattx_dsm_lock);
+
+                    memset(hex_buf, 0, sizeof(hex_buf));
+                    
+                    // THE MAGIC TRICK: This will trigger the native Page Fault, freeze the 'cat' process,
+                    // sync the data from VM2, and resume! All completely safe because we hold NO locks!
+                    bytes_read = access_process_vm(deputy, shms[s].base, hex_buf, 16, FOLL_FORCE);
+
+                    seq_printf(m, "[EXPORT] %-6d %-4d  %-10u  0x%-16lx  %-10lu  %-10s  ", 
+                               local_exports[i].orig_pid, local_exports[i].target_node, 
+                               shms[s].shmid, shms[s].base, shms[s].size, state_str);
+                    
+                    if (bytes_read > 0) {
+                        for (int b = 0; b < bytes_read; b++) seq_printf(m, "%02x ", hex_buf[b]);
+                    } else {
+                        seq_printf(m, "<FAULT/UNREADABLE>");
+                    }
+                    seq_printf(m, "\n");
+                }
             }
-            mmap_read_unlock(deputy->mm);
+            if (deputy) put_task_struct(deputy);
         }
-        if (deputy) put_task_struct(deputy);
+        kfree(local_exports);
     }
-    spin_unlock(&export_lock);
 
     return 0;
 }
