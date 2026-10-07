@@ -3877,10 +3877,16 @@ static vm_fault_t mattx_dsm_pfn_mkwrite(struct vm_fault *vmf) {
         mattx_comm_send(cluster_map[home_node], MATTX_MSG_DSM_WRITE_ACQUIRE_REQ, &acq_req, sizeof(acq_req));
         
         // 4. THE FREEZE: Sleep until VM1 invalidates the other nodes!
-        wait_event_interruptible(vfs_rpc_registry[slot].wq, vfs_rpc_registry[slot].done);
+        int wait_ret = wait_event_interruptible(vfs_rpc_registry[slot].wq, vfs_rpc_registry[slot].done);
         
         int err = vfs_rpc_registry[slot].error;
         spin_lock(&vfs_rpc_lock); vfs_rpc_registry[slot].in_use = false; spin_unlock(&vfs_rpc_lock);
+
+        // If we were interrupted by a signal (like migration SIGSTOP/SIGKILL), abort!
+        if (wait_ret == -ERESTARTSYS) {
+            mattx_dbg("[MESI_VM2] Write-Acquire interrupted by signal! Aborting upgrade.\n");
+            return VM_FAULT_RETRY; // Tell the kernel to retry the fault later!
+        }
 
         if (err != 0) return VM_FAULT_SIGBUS;
 
@@ -4648,74 +4654,81 @@ static void mattx_dsm_write_acquire_kworker(struct work_struct *work) {
     struct mattx_dsm_write_acquire_kworker_ctx *ctx = container_of(work, struct mattx_dsm_write_acquire_kworker_ctx, work);
     struct mattx_dsm_write_acquire_reply reply = { .req_id = ctx->req.req_id, .error = 0 };
     
-    // --- MODE 2 GLOBAL DIRECTORY LOOKUP ---
+    u64 local_shared_mask[MAX_NODES / 64];
+    memset(local_shared_mask, 0, sizeof(local_shared_mask));
+    bool found = false;
+
+    // --- MODE 2 GLOBAL DIRECTORY LOOKUP (QUICK GRAB) ---
     spin_lock(&mattx_dsm_lock);
     for (int d = 0; d < MAX_DSM_SEGMENTS; d++) {
         if (mattx_global_dsm_dir[d].in_use && mattx_global_dsm_dir[d].shmid == ctx->req.shmid) {
             unsigned long page_idx = ctx->req.offset / PAGE_SIZE;
 
-            // 1. Send Invalidates to EVERYONE in the mask!
-            for (int node = 0; node < MAX_NODES; node++) {
-                int n_idx = node / 64;
-                int n_bit = node % 64;
-                
-                // Explicit bitwise test!
-                if (mattx_global_dsm_dir[d].page_shared_mask[page_idx][n_idx] & (1ULL << n_bit)) {
-                    if (cluster_map[node]) {
-                        struct mattx_dsm_invalidate_req inv_req = {
-                            .req_id = 0, .orig_pid = ctx->req.orig_pid, // Pass the requester's PID!
-                            .shmid = ctx->req.shmid, .offset = ctx->req.offset
-                        };
-                        // Fire and forget!
-                        mattx_comm_send(cluster_map[node], MATTX_MSG_DSM_INVALIDATE_REQ, &inv_req, sizeof(inv_req));
-                        mattx_dbg("[MESI_VM1] Sent INVALIDATE to Node %d for SHMID %u Offset %lu\n", node, ctx->req.shmid, ctx->req.offset);
-                    }
+            // 1. Copy the mask locally!
+            memcpy(local_shared_mask, mattx_global_dsm_dir[d].page_shared_mask[page_idx], sizeof(local_shared_mask));
+            
+            // 2. Update Directory to EXCLUSIVE immediately
+            mattx_global_dsm_dir[d].page_state[page_idx] = MATTX_PAGE_EXCLUSIVE;
+            mattx_global_dsm_dir[d].page_owner_pid[page_idx] = ctx->req.orig_pid;
+            
+            // Clear the global mask
+            memset(mattx_global_dsm_dir[d].page_shared_mask[page_idx], 0, sizeof(local_shared_mask));
+            
+            found = true;
+            break;
+        }
+    }
+    spin_unlock(&mattx_dsm_lock); // DROP THE LOCK!
+    
+    // --- THE HEAVY LIFTING (LOCK-FREE) ---
+    if (found) {
+        mattx_dbg("[MESI_VM1] PID %u granted EXCLUSIVE lock for SHMID %u Offset %lu\n", ctx->req.orig_pid, ctx->req.shmid, ctx->req.offset);
+
+        // 1. Send Invalidates to EVERYONE in the local mask!
+        for (int node = 0; node < MAX_NODES; node++) {
+            int n_idx = node / 64;
+            int n_bit = node % 64;
+            
+            if (local_shared_mask[n_idx] & (1ULL << n_bit)) {
+                if (cluster_map[node]) {
+                    struct mattx_dsm_invalidate_req inv_req = {
+                        .req_id = 0, .orig_pid = ctx->req.orig_pid,
+                        .shmid = ctx->req.shmid, .offset = ctx->req.offset
+                    };
+                    mattx_comm_send(cluster_map[node], MATTX_MSG_DSM_INVALIDATE_REQ, &inv_req, sizeof(inv_req));
+                    mattx_dbg("[MESI_VM1] Sent INVALIDATE to Node %d for SHMID %u Offset %lu\n", node, ctx->req.shmid, ctx->req.offset);
                 }
             }
+        }
+        
+        // 2. THE PTE SHOOTDOWN (VM1)
+        if (real_unmap_mapping_range) {
+            struct task_struct *deputy = NULL;
+            rcu_read_lock();
+            deputy = pid_task(find_vpid(ctx->req.orig_pid), PIDTYPE_PID);
+            if (deputy) get_task_struct(deputy);
+            rcu_read_unlock();
             
-            // 2. Update Directory to EXCLUSIVE
-            mattx_global_dsm_dir[d].page_state[page_idx] = MATTX_PAGE_EXCLUSIVE;
-            mattx_global_dsm_dir[d].page_owner_pid[page_idx] = ctx->req.orig_pid; // <-- PID TRACKING!
-            
-            // Clear the 16 u64s for this page!
-            memset(mattx_global_dsm_dir[d].page_shared_mask[page_idx], 0, sizeof(u64) * (MAX_NODES / 64));
-            
-            mattx_dbg("[MESI_VM1] PID %u granted EXCLUSIVE lock for SHMID %u Offset %lu\n", ctx->req.orig_pid, ctx->req.shmid, ctx->req.offset);
-            
-            // --- 3. THE PTE SHOOTDOWN (VM1) ---
-            if (real_unmap_mapping_range) {
-                struct task_struct *deputy = NULL;
-                rcu_read_lock();
-                deputy = pid_task(find_vpid(ctx->req.orig_pid), PIDTYPE_PID);
-                if (deputy) get_task_struct(deputy);
-                rcu_read_unlock();
-                
-                if (deputy && deputy->mm) {
-                    mmap_read_lock(deputy->mm);
-                    struct vm_area_struct *vma;
-                    VMA_ITERATOR(vmi, deputy->mm, 0);
-                    for_each_vma(vmi, vma) {
-                        if (vma->vm_file && vma->vm_file->f_path.dentry->d_name.name) {
-                            if (strncmp(vma->vm_file->f_path.dentry->d_name.name, "SYSV", 4) == 0) {
-                                if (vma->vm_file->f_inode->i_ino == ctx->req.shmid) {
-                                    // Shoot down the exact 4KB page across ALL processes on VM1!
-                                    real_unmap_mapping_range(vma->vm_file->f_mapping, ctx->req.offset, PAGE_SIZE, 1);
-                                    mattx_dbg("[MESI_VM1] Shot down native PTEs for SHMID %u Offset %lu\n", ctx->req.shmid, ctx->req.offset);
-                                    break; // Break the VMA loop
-                                }
+            if (deputy && deputy->mm) {
+                mmap_read_lock(deputy->mm); // Safe to sleep here now!
+                struct vm_area_struct *vma;
+                VMA_ITERATOR(vmi, deputy->mm, 0);
+                for_each_vma(vmi, vma) {
+                    if (vma->vm_file && vma->vm_file->f_path.dentry->d_name.name) {
+                        if (strncmp(vma->vm_file->f_path.dentry->d_name.name, "SYSV", 4) == 0) {
+                            if (vma->vm_file->f_inode->i_ino == ctx->req.shmid) {
+                                real_unmap_mapping_range(vma->vm_file->f_mapping, ctx->req.offset, PAGE_SIZE, 1);
+                                mattx_dbg("[MESI_VM1] Shot down native PTEs for SHMID %u Offset %lu\n", ctx->req.shmid, ctx->req.offset);
+                                break;
                             }
                         }
                     }
-                    mmap_read_unlock(deputy->mm);
-                    put_task_struct(deputy);
                 }
+                mmap_read_unlock(deputy->mm);
+                put_task_struct(deputy);
             }
-            // ------------------------------------
-            
-            break; // Break the MAX_DSM_SEGMENTS loop
         }
     }
-    spin_unlock(&mattx_dsm_lock);
     
     if (cluster_map[ctx->target_node]) {
         mattx_comm_send(cluster_map[ctx->target_node], MATTX_MSG_DSM_WRITE_ACQUIRE_REPLY, &reply, sizeof(reply));
