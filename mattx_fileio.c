@@ -4202,6 +4202,7 @@ static void mattx_dsm_fault_kworker(struct work_struct *work) {
                                             dir_idx = d;
                                             mattx_global_dsm_dir[d].in_use = true;
                                             mattx_global_dsm_dir[d].shmid = ctx->req.shmid;
+                                            mattx_global_dsm_dir[d].home_pid = ctx->req.orig_pid; // <-- Save the Home PID!                                            
                                             memset(mattx_global_dsm_dir[d].page_state, MATTX_PAGE_INVALID, sizeof(mattx_global_dsm_dir[d].page_state));
                                             memset(mattx_global_dsm_dir[d].page_owner_pid, 0, sizeof(mattx_global_dsm_dir[d].page_owner_pid));
                                             memset(mattx_global_dsm_dir[d].page_shared_mask, 0, sizeof(mattx_global_dsm_dir[d].page_shared_mask));

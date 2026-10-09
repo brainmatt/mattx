@@ -1077,8 +1077,9 @@ struct mattx_guest_info {
 
 // DSM MESI: The Master Directory (VM1) ---
 struct mattx_dsm_master_dir {
-    bool in_use;                        // <-- NEW: Tracks if this slot is active
+    bool in_use;                        // <-- Tracks if this slot is active
     u32 shmid;
+    u32 home_pid;                       // <-- The PID on VM1 to use for memory reading!    
     u8 page_state[MAX_DSM_PAGES];       // Global state of the page
     u32 page_owner_pid[MAX_DSM_PAGES];  // PID of the EXCLUSIVE owner
 
