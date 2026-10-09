@@ -27,6 +27,7 @@
 #include <linux/namei.h> // For kern_path
 #include <linux/nsproxy.h>
 #include <linux/highmem.h> // Required for kmap_local_page
+#include <linux/pagemap.h> // Required for read_mapping_page
 
 #define MAX_VFS_RPC 64
 
@@ -4994,7 +4995,7 @@ static void mattx_vm1_shm_sync_kworker(struct work_struct *work) {
                     spin_lock(&vfs_rpc_lock); vfs_rpc_registry[slot].in_use = false; spin_unlock(&vfs_rpc_lock);
 
                     if (flush_err == 0) {
-                        // Write to physical RAM
+                        // Write directly to physical RAM bypassing the frozen process's page tables!
                         struct task_struct *deputy = NULL;
                         rcu_read_lock(); deputy = pid_task(find_vpid(rpc->local_pid), PIDTYPE_PID); if (deputy) get_task_struct(deputy); rcu_read_unlock();
                         if (deputy) {
@@ -5003,8 +5004,21 @@ static void mattx_vm1_shm_sync_kworker(struct work_struct *work) {
                             for_each_vma(vmi, vma) {
                                 if (vma->vm_file && vma->vm_file->f_path.dentry->d_name.name && strncmp(vma->vm_file->f_path.dentry->d_name.name, "SYSV", 4) == 0) {
                                     if (vma->vm_file->f_inode->i_ino == shmid) {
-                                        unsigned long target_addr = vma->vm_start + offset;
-                                        access_process_vm(deputy, target_addr, flush_buf, PAGE_SIZE, FOLL_WRITE | FOLL_FORCE);
+                                        
+                                        // --- THE DIRECT PHYSICAL WRITE TRICK ---
+                                        // Grab the physical page directly from the kernel's page cache!
+                                        struct page *page = read_mapping_page(vma->vm_file->f_mapping, offset / PAGE_SIZE, NULL);
+                                        if (!IS_ERR(page)) {
+                                            void *kaddr = kmap_local_page(page);
+                                            memcpy(kaddr, flush_buf, PAGE_SIZE);
+                                            kunmap_local(kaddr);
+                                            set_page_dirty(page); // Tell the kernel we modified it!
+                                            put_page(page);
+                                        } else {
+                                            mattx_dbg("[MESI_VM1] ERROR: Failed to read shmem physical page!\n");
+                                        }
+                                        // ---------------------------------------
+                                        
                                         break;
                                     }
                                 }
@@ -5014,7 +5028,7 @@ static void mattx_vm1_shm_sync_kworker(struct work_struct *work) {
                         }
                         mattx_dbg("[MESI_VM1] Native Fault: Successfully flushed dirty data from PID %u.\n", owner_pid);
                     }
-                    
+
                     spin_lock(&mattx_dsm_lock);
                     if (dir_idx != -1) {
                         mattx_global_dsm_dir[dir_idx].page_state[page_idx] = MATTX_PAGE_SHARED;
