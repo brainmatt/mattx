@@ -26,6 +26,7 @@
 #include <linux/poll.h>
 #include <linux/eventpoll.h>
 #include <linux/kdebug.h>
+#include <linux/pagemap.h> // Required for unlock_page and put_page
 
 // Helper for modern x86_64 syscall wrappers (__x64_sys_*)
 // The first argument (regs->di) is a pointer to the real pt_regs!
@@ -4719,24 +4720,25 @@ static int ret_handler_shmat(struct kretprobe_instance *ri, struct pt_regs *regs
 }
 
 
+
 // ============================================================================
 // THE NATIVE HOME NODE INTERCEPTOR (VM1)
 // ============================================================================
-struct shmem_fault_kretprobe_data { bool needs_sync; u32 shmid; unsigned long offset; bool is_write; };
+struct shmem_fault_kretprobe_data { bool needs_sync; u32 shmid; unsigned long offset; bool is_write; struct vm_fault *vmf; };
 static struct kretprobe shmem_fault_kprobe;
+static struct kretprobe shmem_page_mkwrite_kprobe; // <-- NEW: Catch native writes to SHARED pages!
 
 static int entry_handler_shmem_fault(struct kretprobe_instance *ri, struct pt_regs *regs) {
     struct shmem_fault_kretprobe_data *data = (struct shmem_fault_kretprobe_data *)ri->data;
     data->needs_sync = false;
+    data->vmf = NULL;
 
     // --- THE VIP PASS ---
-    // Never intercept Kernel Threads! If a Kworker triggers a page fault while 
-    // pumping data, let the Linux kernel handle it natively!
     if (current->flags & PF_KTHREAD) return 0;
 
     if (config_dsm_mode == 2) {
-        // shmem_fault is a standard C function, so the first arg (vmf) is in DI
         struct vm_fault *vmf = (struct vm_fault *)regs->di;
+        data->vmf = vmf; // Save the VMF pointer so we can unlock the page later!
         
         if (vmf && vmf->vma && vmf->vma->vm_file && vmf->vma->vm_file->f_path.dentry->d_name.name) {
             if (strncmp(vmf->vma->vm_file->f_path.dentry->d_name.name, "SYSV", 4) == 0) {
@@ -4783,19 +4785,26 @@ static int ret_handler_shmem_fault(struct kretprobe_instance *ri, struct pt_regs
     struct shmem_fault_kretprobe_data *data = (struct shmem_fault_kretprobe_data *)ri->data;
     
     if (data->needs_sync) {
-        // THE MAGIC TRICK: Force the kernel to drop its locks and retry the fault later!
+        // --- THE LOCK PICK ---
+        // shmem_fault locked the physical page. Because we are aborting the fault,
+        // we MUST unlock and release the page, otherwise our Kworker will deadlock trying to read it!
+        if ((regs->ax & VM_FAULT_LOCKED) && data->vmf && data->vmf->page) {
+            unlock_page(data->vmf->page);
+            put_page(data->vmf->page);
+            data->vmf->page = NULL;
+        }
+
+        // Force the kernel to drop its mmap locks and retry the fault later!
         regs->ax = VM_FAULT_RETRY;
         
         mattx_dbg("[MESI_VM1] Native Fault intercepted! Freezing PID %d to sync network...\n", current->pid);
         send_sig(SIGSTOP, current, 0);
         
-        // Call the dedicated VM1 sync scheduler!
+        // Call the dedicated VM1 sync scheduler! (Clean cross-file API!)
         mattx_schedule_vm1_sync(current->pid, data->shmid, data->offset, data->is_write);
     }
     return 0;
 }
-
-
 
 
 
@@ -5523,6 +5532,16 @@ int mattx_hooks_init(void) {
     ret = register_kretprobe(&shmem_fault_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for shmem_fault, returned %d\n", ret);
 
+    memset(&shmem_page_mkwrite_kprobe, 0, sizeof(shmem_page_mkwrite_kprobe));
+    shmem_page_mkwrite_kprobe.kp.symbol_name = "shmem_page_mkwrite";
+    shmem_page_mkwrite_kprobe.entry_handler = entry_handler_shmem_fault; // Reuse the exact same handler!
+    shmem_page_mkwrite_kprobe.handler = ret_handler_shmem_fault;         // Reuse the exact same handler!
+    shmem_page_mkwrite_kprobe.data_size = sizeof(struct shmem_fault_kretprobe_data);
+    shmem_page_mkwrite_kprobe.maxactive = 64;
+    ret = register_kretprobe(&shmem_page_mkwrite_kprobe);
+    if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for shmem_page_mkwrite, returned %d\n", ret);
+
+
     // --- Stale-deadline clock_nanosleep() fixup (mattx#20) ---
     // Non-fatal if either fails to resolve: these are internal, unexported
     // helper symbols that could legitimately move/vanish/get inlined on a
@@ -5557,6 +5576,7 @@ int mattx_hooks_init(void) {
 void mattx_hooks_exit(void) {
     unregister_kretprobe(&clock_nanosleep_kprobe);
     unregister_kretprobe(&clock_nanosleep_timens_kprobe);
+    unregister_kretprobe(&shmem_page_mkwrite_kprobe);
     unregister_kretprobe(&shmem_fault_kprobe);
     unregister_kretprobe(&shmat_kprobe);
     unregister_kretprobe(&shmdt_kprobe);
