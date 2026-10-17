@@ -394,10 +394,14 @@ static ssize_t admin_write(struct file *file, const char __user *ubuf, size_t co
                         return count;
                     }
 
+                    // pid_task() is NULL for a PID that does not exist, and the reference must be
+                    // taken on the task we actually keep (the Mother), not on the thread we looked up.
                     rcu_read_lock();
                     task = pid_task(find_vpid(arg1), PIDTYPE_PID);
-                    if (task) get_task_struct(task);
-                    task = task->group_leader; // Grab the Mother!
+                    if (task) {
+                        task = task->group_leader; // Grab the Mother!
+                        get_task_struct(task);
+                    }
                     rcu_read_unlock();
 
                     if (task) {
