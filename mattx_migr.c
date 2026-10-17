@@ -501,6 +501,17 @@ void mattx_freeze_task_safely(struct task_struct *task) {
 EXPORT_SYMBOL(mattx_freeze_task_safely);
 
 
+/*
+ * An exited task (zombie, or PF_EXITING) has had its kernel stack freed:
+ * task->stack is NULL, so task_pt_regs(task) -- stack + THREAD_SIZE - sizeof(pt_regs) --
+ * is a read at 0x3f48 and oopses (mattx#37). Such a task has nothing left to migrate.
+ */
+static bool mattx_task_capturable(struct task_struct *task)
+{
+    return !(READ_ONCE(task->flags) & PF_EXITING) && !READ_ONCE(task->exit_state) &&
+           READ_ONCE(task->stack);
+}
+
 void mattx_capture_and_send_state(struct task_struct *task, int target_node) {
     struct mm_struct *mm;
     struct vm_area_struct *vma;
@@ -512,6 +523,11 @@ void mattx_capture_and_send_state(struct task_struct *task, int target_node) {
     unsigned char rip_buf[8] = {0}; 
 
     is_returning = false; 
+
+    if (!mattx_task_capturable(task)) {
+        printk(KERN_WARNING "MattX:[EXTRACT] PID %d (%s) has already exited, nothing to migrate.\n", task->pid, task->comm);
+        return;
+    }
 
     max_payload_size = sizeof(struct mattx_migration_req) + (MAX_VMAS * sizeof(struct mattx_vma_info));
     
@@ -618,7 +634,19 @@ void mattx_capture_and_send_state(struct task_struct *task, int target_node) {
     } while (stable_scans < MATTX_REQUIRED_STABLE_SCANS && --stabilize_retries > 0);
 
     req->thread_count = t_count;
+    bool gone = false;
     for (int i = 0; i < t_count; i++) {
+        // A thread can still exit while we freeze/scan the gang; its stack (and so its
+        // pt_regs) is then gone. Give up on the whole capture if any thread has lost it:
+        // a blueprint without that thread is wrong. (The stack is freed only after the
+        // task has fully died, long after PF_EXITING is set, and the threads are frozen,
+        // so checking right before the copy is enough; put_task_stack() is not exported
+        // to modules, so the stack cannot be pinned.)
+        if (gone || !mattx_task_capturable(threads[i])) {
+            gone = true;
+            put_task_struct(threads[i]);
+            continue;
+        }
         req->threads[i].tid = threads[i]->pid;
         struct pt_regs *t_regs = task_pt_regs(threads[i]);
         if (t_regs) {
@@ -651,6 +679,12 @@ void mattx_capture_and_send_state(struct task_struct *task, int target_node) {
             }
         }
         put_task_struct(threads[i]);
+    }
+    if (gone) {
+        printk(KERN_WARNING "MattX:[EXTRACT] PID %d exited while it was being captured, migration aborted.\n", task->pid);
+        kvfree(req);
+        send_sig(SIGCONT, task, 0); // undo the SIGSTOP fallback of the drainer, if it was used
+        return;
     }
     mattx_dbg("[EXTRACT] Packed %d threads into the Gang Blueprint!\n", t_count);
 
