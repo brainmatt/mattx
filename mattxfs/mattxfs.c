@@ -488,7 +488,12 @@ static struct file_system_type mattxfs_type = {
     .name           = "mattxfs",
     .owner          = THIS_MODULE,
     .mount          = mattxfs_mount,
-    .kill_sb        = kill_litter_super,
+    // Not kill_litter_super(): that d_genocide()s the tree, i.e. drops one reference from every
+    // dentry on the assumption that each was pinned by the filesystem (ramfs-style). mattxfs
+    // dentries are ordinary lookup dentries with no extra pin, so their refcounts went negative,
+    // the umount could not evict them ("VFS: Busy inodes after unmount", BUG at fs/super.c:650)
+    // or spun forever in shrink_dcache_parent()/d_walk(). Same as the fs_context path above.
+    .kill_sb        = kill_anon_super,
 };
 
 #endif
