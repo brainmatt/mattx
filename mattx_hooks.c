@@ -4964,6 +4964,33 @@ static int ret_handler_clock_nanosleep(struct kretprobe_instance *ri, struct pt_
 
 // --- KPROBE REGISTRATION ---
 
+/*
+ * Kretprobes that registered successfully, in registration order.
+ *
+ * Some hook targets do not exist on every kernel (e.g. shmem_page_mkwrite is
+ * gone on 6.12: register_kretprobe() returns -ENOENT) and a failed
+ * registration is deliberately non-fatal. Calling unregister_kretprobe() on
+ * such a probe is not safe though: it does rethook_free(rp->rh) with rp->rh
+ * still NULL and oopses, which took the node down on every "rmmod mattx"
+ * (mattx#36). So only probes that registered are ever unregistered.
+ */
+static struct kretprobe *mattx_registered_krp[128];
+static int mattx_nregistered_krp;
+
+static int mattx_register_kretprobe(struct kretprobe *rp)
+{
+    int ret;
+
+    if (mattx_nregistered_krp >= ARRAY_SIZE(mattx_registered_krp)) {
+        printk(KERN_ERR "MattX: too many kretprobes, raise mattx_registered_krp[]\n");
+        return -ENOSPC;
+    }
+    ret = register_kretprobe(rp);
+    if (ret == 0)
+        mattx_registered_krp[mattx_nregistered_krp++] = rp;
+    return ret;
+}
+
 int mattx_hooks_init(void) {
     int ret;
     memset(&openat_kprobe, 0, sizeof(openat_kprobe));
@@ -4973,7 +5000,7 @@ int mattx_hooks_init(void) {
     openat_kprobe.data_size = sizeof(struct kretprobe_data); 
     openat_kprobe.maxactive = 64; 
 
-    ret = register_kretprobe(&openat_kprobe);
+    ret = mattx_register_kretprobe(&openat_kprobe);
     if (ret < 0) {
         printk(KERN_ERR "MattX: register_kretprobe failed, returned %d\n", ret);
         return ret;
@@ -4986,7 +5013,7 @@ int mattx_hooks_init(void) {
     dup_kprobe.data_size = sizeof(struct dup_kretprobe_data);
     dup_kprobe.maxactive = 64;
 
-    ret = register_kretprobe(&dup_kprobe);
+    ret = mattx_register_kretprobe(&dup_kprobe);
     if (ret < 0) {
         printk(KERN_ERR "MattX: register_kretprobe failed for dup, returned %d\n", ret);
     }
@@ -4998,7 +5025,7 @@ int mattx_hooks_init(void) {
     dup2_kprobe.data_size = sizeof(struct dup_kretprobe_data);
     dup2_kprobe.maxactive = 64;
 
-    ret = register_kretprobe(&dup2_kprobe);
+    ret = mattx_register_kretprobe(&dup2_kprobe);
     if (ret < 0) {
         printk(KERN_ERR "MattX: register_kretprobe failed for dup2, returned %d\n", ret);
     }
@@ -5010,7 +5037,7 @@ int mattx_hooks_init(void) {
     unlinkat_kprobe.data_size = sizeof(struct unlinkat_kretprobe_data);
     unlinkat_kprobe.maxactive = 64;
 
-    ret = register_kretprobe(&unlinkat_kprobe);
+    ret = mattx_register_kretprobe(&unlinkat_kprobe);
     if (ret < 0) {
         printk(KERN_ERR "MattX: register_kretprobe failed for unlinkat, returned %d\n", ret);
     }
@@ -5022,7 +5049,7 @@ int mattx_hooks_init(void) {
     socket_kprobe.data_size = sizeof(struct socket_kretprobe_data);
     socket_kprobe.maxactive = 64;
 
-    ret = register_kretprobe(&socket_kprobe);
+    ret = mattx_register_kretprobe(&socket_kprobe);
     if (ret < 0) {
         printk(KERN_ERR "MattX: register_kretprobe failed for socket, returned %d\n", ret);
     }
@@ -5034,7 +5061,7 @@ int mattx_hooks_init(void) {
     connect_kprobe.data_size = sizeof(struct connect_kretprobe_data);
     connect_kprobe.maxactive = 64;
 
-    ret = register_kretprobe(&connect_kprobe);
+    ret = mattx_register_kretprobe(&connect_kprobe);
     if (ret < 0) {
         printk(KERN_ERR "MattX: register_kretprobe failed for connect, returned %d\n", ret);
     }
@@ -5046,7 +5073,7 @@ int mattx_hooks_init(void) {
     bind_kprobe.data_size = sizeof(struct connect_kretprobe_data); // we reuse connect data structure
     bind_kprobe.maxactive = 64;
 
-    ret = register_kretprobe(&bind_kprobe);
+    ret = mattx_register_kretprobe(&bind_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for bind, returned %d\n", ret);
 
     memset(&listen_kprobe, 0, sizeof(listen_kprobe));
@@ -5056,7 +5083,7 @@ int mattx_hooks_init(void) {
     listen_kprobe.data_size = sizeof(struct listen_kretprobe_data);
     listen_kprobe.maxactive = 64;
 
-    ret = register_kretprobe(&listen_kprobe);
+    ret = mattx_register_kretprobe(&listen_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for listen, returned %d\n", ret);
 
     // SENDTO / RECVFROM ---
@@ -5067,7 +5094,7 @@ int mattx_hooks_init(void) {
     sendto_kprobe.data_size = sizeof(struct sendto_kretprobe_data);
     sendto_kprobe.maxactive = 64;
 
-    ret = register_kretprobe(&sendto_kprobe);
+    ret = mattx_register_kretprobe(&sendto_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for sendto, returned %d\n", ret);
 
     memset(&recvfrom_kprobe, 0, sizeof(recvfrom_kprobe));
@@ -5077,7 +5104,7 @@ int mattx_hooks_init(void) {
     recvfrom_kprobe.data_size = sizeof(struct recvfrom_kretprobe_data);
     recvfrom_kprobe.maxactive = 64;
 
-    ret = register_kretprobe(&recvfrom_kprobe);
+    ret = mattx_register_kretprobe(&recvfrom_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for recvfrom, returned %d\n", ret);
 
     memset(&accept_kprobe, 0, sizeof(accept_kprobe));
@@ -5087,7 +5114,7 @@ int mattx_hooks_init(void) {
     accept_kprobe.data_size = sizeof(struct accept_kretprobe_data);
     accept_kprobe.maxactive = 64;
     
-    ret = register_kretprobe(&accept_kprobe);
+    ret = mattx_register_kretprobe(&accept_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for accept, returned %d\n", ret);
 
     memset(&poll_kprobe, 0, sizeof(poll_kprobe));
@@ -5097,7 +5124,7 @@ int mattx_hooks_init(void) {
     poll_kprobe.data_size = sizeof(struct poll_kretprobe_data);
     poll_kprobe.maxactive = 64;
 
-    ret = register_kretprobe(&poll_kprobe);
+    ret = mattx_register_kretprobe(&poll_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for poll, returned %d\n", ret);
 
     memset(&select_kprobe, 0, sizeof(select_kprobe));
@@ -5107,7 +5134,7 @@ int mattx_hooks_init(void) {
     select_kprobe.data_size = sizeof(struct select_kretprobe_data);
     select_kprobe.maxactive = 64;
     
-    ret = register_kretprobe(&select_kprobe);
+    ret = mattx_register_kretprobe(&select_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for select, returned %d\n", ret);
 
     memset(&pselect6_kprobe, 0, sizeof(pselect6_kprobe));
@@ -5117,7 +5144,7 @@ int mattx_hooks_init(void) {
     pselect6_kprobe.data_size = sizeof(struct pselect6_kretprobe_data);
     pselect6_kprobe.maxactive = 64;
     
-    ret = register_kretprobe(&pselect6_kprobe);
+    ret = mattx_register_kretprobe(&pselect6_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for pselect6, returned %d\n", ret);
     
     memset(&read_kprobe, 0, sizeof(read_kprobe));
@@ -5126,7 +5153,7 @@ int mattx_hooks_init(void) {
     read_kprobe.handler = ret_handler_read;
     read_kprobe.data_size = sizeof(struct rw_kretprobe_data);
     read_kprobe.maxactive = 64;
-    ret = register_kretprobe(&read_kprobe);
+    ret = mattx_register_kretprobe(&read_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for read, returned %d\n", ret);
 
     memset(&write_kprobe, 0, sizeof(write_kprobe));
@@ -5135,7 +5162,7 @@ int mattx_hooks_init(void) {
     write_kprobe.handler = ret_handler_write;
     write_kprobe.data_size = sizeof(struct rw_kretprobe_data);
     write_kprobe.maxactive = 64;
-    ret = register_kretprobe(&write_kprobe);
+    ret = mattx_register_kretprobe(&write_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for write, returned %d\n", ret);
 
     memset(&lseek_kprobe, 0, sizeof(lseek_kprobe));
@@ -5144,7 +5171,7 @@ int mattx_hooks_init(void) {
     lseek_kprobe.handler = ret_handler_fileio;         // Use the unified handler!
     lseek_kprobe.data_size = sizeof(struct fileio_kretprobe_data);
     lseek_kprobe.maxactive = 64;
-    ret = register_kretprobe(&lseek_kprobe);
+    ret = mattx_register_kretprobe(&lseek_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for lseek, returned %d\n", ret);
 
     memset(&fsync_kprobe, 0, sizeof(fsync_kprobe));
@@ -5153,7 +5180,7 @@ int mattx_hooks_init(void) {
     fsync_kprobe.handler = ret_handler_fileio;         // Use the unified handler!
     fsync_kprobe.data_size = sizeof(struct fileio_kretprobe_data);
     fsync_kprobe.maxactive = 64;
-    ret = register_kretprobe(&fsync_kprobe);
+    ret = mattx_register_kretprobe(&fsync_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for fsync, returned %d\n", ret);
 
     memset(&statx_kprobe, 0, sizeof(statx_kprobe));
@@ -5162,7 +5189,7 @@ int mattx_hooks_init(void) {
     statx_kprobe.handler = ret_handler_fileio;         // Use the unified handler!
     statx_kprobe.data_size = sizeof(struct fileio_kretprobe_data);
     statx_kprobe.maxactive = 64;
-    ret = register_kretprobe(&statx_kprobe);
+    ret = mattx_register_kretprobe(&statx_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for statx, returned %d\n", ret);
 
     memset(&epoll_ctl_kprobe, 0, sizeof(epoll_ctl_kprobe));
@@ -5171,7 +5198,7 @@ int mattx_hooks_init(void) {
     epoll_ctl_kprobe.handler = ret_handler_epoll_ctl;
     epoll_ctl_kprobe.data_size = sizeof(struct epoll_ctl_kretprobe_data);
     epoll_ctl_kprobe.maxactive = 64;
-    ret = register_kretprobe(&epoll_ctl_kprobe);
+    ret = mattx_register_kretprobe(&epoll_ctl_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for epoll_ctl, returned %d\n", ret); 
 
     memset(&epoll_wait_kprobe, 0, sizeof(epoll_wait_kprobe));
@@ -5180,7 +5207,7 @@ int mattx_hooks_init(void) {
     epoll_wait_kprobe.handler = ret_handler_epoll_wait;
     epoll_wait_kprobe.data_size = sizeof(struct epoll_wait_kretprobe_data); // <-- THIS ONE!
     epoll_wait_kprobe.maxactive = 64;
-    ret = register_kretprobe(&epoll_wait_kprobe);
+    ret = mattx_register_kretprobe(&epoll_wait_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for epoll_wait, returned %d\n", ret);
 
     memset(&epoll_create_kprobe, 0, sizeof(epoll_create_kprobe));
@@ -5189,7 +5216,7 @@ int mattx_hooks_init(void) {
     epoll_create_kprobe.handler = ret_handler_epoll_create;
     epoll_create_kprobe.data_size = sizeof(struct epoll_create_kretprobe_data);
     epoll_create_kprobe.maxactive = 64;
-    ret = register_kretprobe(&epoll_create_kprobe);
+    ret = mattx_register_kretprobe(&epoll_create_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for epoll_create, returned %d\n", ret);
 
     memset(&epoll_create1_kprobe, 0, sizeof(epoll_create1_kprobe));
@@ -5198,7 +5225,7 @@ int mattx_hooks_init(void) {
     epoll_create1_kprobe.handler = ret_handler_epoll_create;
     epoll_create1_kprobe.data_size = sizeof(struct epoll_create_kretprobe_data);
     epoll_create1_kprobe.maxactive = 64;
-    ret = register_kretprobe(&epoll_create1_kprobe);
+    ret = mattx_register_kretprobe(&epoll_create1_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for epoll_create1, returned %d\n", ret   );
 
     // --- SOCKNAME & PEERNAME ---
@@ -5208,7 +5235,7 @@ int mattx_hooks_init(void) {
     getsockname_kprobe.handler = ret_handler_sockname;
     getsockname_kprobe.data_size = sizeof(struct sockname_kretprobe_data);
     getsockname_kprobe.maxactive = 64;
-    ret = register_kretprobe(&getsockname_kprobe);
+    ret = mattx_register_kretprobe(&getsockname_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for getsockname, returned %d\n", ret);
 
     memset(&getpeername_kprobe, 0, sizeof(getpeername_kprobe));
@@ -5217,7 +5244,7 @@ int mattx_hooks_init(void) {
     getpeername_kprobe.handler = ret_handler_sockname;         // Shared!
     getpeername_kprobe.data_size = sizeof(struct sockname_kretprobe_data);
     getpeername_kprobe.maxactive = 64;
-    ret = register_kretprobe(&getpeername_kprobe);
+    ret = mattx_register_kretprobe(&getpeername_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for getpeername, returned %d\n", ret );
 
     // --- SOCKOPTS ---
@@ -5227,7 +5254,7 @@ int mattx_hooks_init(void) {
     setsockopt_kprobe.handler = ret_handler_sockopt;
     setsockopt_kprobe.data_size = sizeof(struct sockopt_kretprobe_data);
     setsockopt_kprobe.maxactive = 64;
-    ret = register_kretprobe(&setsockopt_kprobe);
+    ret = mattx_register_kretprobe(&setsockopt_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for setsockopt, returned %d\n", ret);
 
     memset(&getsockopt_kprobe, 0, sizeof(getsockopt_kprobe));
@@ -5236,7 +5263,7 @@ int mattx_hooks_init(void) {
     getsockopt_kprobe.handler = ret_handler_sockopt;         // Shared!
     getsockopt_kprobe.data_size = sizeof(struct sockopt_kretprobe_data);
     getsockopt_kprobe.maxactive = 64;
-    ret = register_kretprobe(&getsockopt_kprobe);
+    ret = mattx_register_kretprobe(&getsockopt_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for getsockopt, returned %d\n", ret);
 
     // --- SENDMSG & RECVMSG ---
@@ -5246,7 +5273,7 @@ int mattx_hooks_init(void) {
     sendmsg_kprobe.handler = ret_handler_msg;
     sendmsg_kprobe.data_size = sizeof(struct msg_kretprobe_data);
     sendmsg_kprobe.maxactive = 64;
-    ret = register_kretprobe(&sendmsg_kprobe);
+    ret = mattx_register_kretprobe(&sendmsg_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for sendmsg, returned %d\n", ret);
 
     memset(&recvmsg_kprobe, 0, sizeof(recvmsg_kprobe));
@@ -5255,7 +5282,7 @@ int mattx_hooks_init(void) {
     recvmsg_kprobe.handler = ret_handler_msg;         // Shared!
     recvmsg_kprobe.data_size = sizeof(struct msg_kretprobe_data);
     recvmsg_kprobe.maxactive = 64;
-    ret = register_kretprobe(&recvmsg_kprobe);
+    ret = mattx_register_kretprobe(&recvmsg_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for recvmsg, returned %d\n", ret);
 
     memset(&getpid_kprobe, 0, sizeof(getpid_kprobe));
@@ -5263,7 +5290,7 @@ int mattx_hooks_init(void) {
     getpid_kprobe.entry_handler = entry_handler_getpid;
     getpid_kprobe.handler = ret_handler_getpid;
     getpid_kprobe.maxactive = 64;
-    ret = register_kretprobe(&getpid_kprobe);
+    ret = mattx_register_kretprobe(&getpid_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for getpid, returned %d\n", ret);
 
     memset(&gettid_kprobe, 0, sizeof(gettid_kprobe));
@@ -5271,7 +5298,7 @@ int mattx_hooks_init(void) {
     gettid_kprobe.entry_handler = entry_handler_getpid; // Reusing getpid handler to spoof main thread!
     gettid_kprobe.handler = ret_handler_getpid;
     gettid_kprobe.maxactive = 64;
-    ret = register_kretprobe(&gettid_kprobe);
+    ret = mattx_register_kretprobe(&gettid_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for gettid, returned %d\n", ret);
 
     memset(&uname_kprobe, 0, sizeof(uname_kprobe));
@@ -5280,7 +5307,7 @@ int mattx_hooks_init(void) {
     uname_kprobe.handler = ret_handler_uname;
     uname_kprobe.data_size = sizeof(struct uname_kretprobe_data);
     uname_kprobe.maxactive = 64;
-    ret = register_kretprobe(&uname_kprobe);
+    ret = mattx_register_kretprobe(&uname_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for uname, returned %d\n", ret   );
 
     memset(&prlimit64_kprobe, 0, sizeof(prlimit64_kprobe));
@@ -5289,7 +5316,7 @@ int mattx_hooks_init(void) {
     prlimit64_kprobe.handler = ret_handler_prlimit64;
     prlimit64_kprobe.data_size = sizeof(struct prlimit_kretprobe_data);
     prlimit64_kprobe.maxactive = 64;
-    ret = register_kretprobe(&prlimit64_kprobe);
+    ret = mattx_register_kretprobe(&prlimit64_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for prlimit64, returned %d\n", ret   );
 
     memset(&prctl_kprobe, 0, sizeof(prctl_kprobe));
@@ -5298,7 +5325,7 @@ int mattx_hooks_init(void) {
     prctl_kprobe.handler = ret_handler_prctl;
     prctl_kprobe.data_size = sizeof(struct prctl_kretprobe_data);
     prctl_kprobe.maxactive = 64;
-    ret = register_kretprobe(&prctl_kprobe);
+    ret = mattx_register_kretprobe(&prctl_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for prctl, returned %d\n", ret);
 
     memset(&fcntl_kprobe, 0, sizeof(fcntl_kprobe));
@@ -5307,7 +5334,7 @@ int mattx_hooks_init(void) {
     fcntl_kprobe.handler = ret_handler_fcntl;
     fcntl_kprobe.data_size = sizeof(struct fcntl_kretprobe_data);
     fcntl_kprobe.maxactive = 64;
-    ret = register_kretprobe(&fcntl_kprobe);
+    ret = mattx_register_kretprobe(&fcntl_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for fcntl, returned %d\n", ret);
 
     memset(&ioctl_kprobe, 0, sizeof(ioctl_kprobe));
@@ -5316,7 +5343,7 @@ int mattx_hooks_init(void) {
     ioctl_kprobe.handler = ret_handler_fcntl;         // Reused!
     ioctl_kprobe.data_size = sizeof(struct fcntl_kretprobe_data);
     ioctl_kprobe.maxactive = 64;
-    ret = register_kretprobe(&ioctl_kprobe);
+    ret = mattx_register_kretprobe(&ioctl_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for ioctl, returned %d\n", ret);
 
     memset(&pread64_kprobe, 0, sizeof(pread64_kprobe));
@@ -5325,7 +5352,7 @@ int mattx_hooks_init(void) {
     pread64_kprobe.handler = ret_handler_pread64;
     pread64_kprobe.data_size = sizeof(struct pread64_kretprobe_data);
     pread64_kprobe.maxactive = 64;
-    ret = register_kretprobe(&pread64_kprobe);
+    ret = mattx_register_kretprobe(&pread64_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for pread64, returned %d\n", ret);
 
     memset(&statfs_kprobe, 0, sizeof(statfs_kprobe)); 
@@ -5334,7 +5361,7 @@ int mattx_hooks_init(void) {
     statfs_kprobe.handler = ret_handler_statfs; 
     statfs_kprobe.data_size = sizeof(struct statfs_kretprobe_data); 
     statfs_kprobe.maxactive = 64; 
-    ret = register_kretprobe(&statfs_kprobe);
+    ret = mattx_register_kretprobe(&statfs_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for statfs, returned %d\n", ret);
 
     memset(&fstatfs_kprobe, 0, sizeof(fstatfs_kprobe)); 
@@ -5343,7 +5370,7 @@ int mattx_hooks_init(void) {
     fstatfs_kprobe.handler = ret_handler_fstatfs; 
     fstatfs_kprobe.data_size = sizeof(struct fstatfs_kretprobe_data); 
     fstatfs_kprobe.maxactive = 64; 
-    ret = register_kretprobe(&fstatfs_kprobe);
+    ret = mattx_register_kretprobe(&fstatfs_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for fstatfs, returned %d\n", ret);
 
     memset(&newfstatat_kprobe, 0, sizeof(newfstatat_kprobe)); 
@@ -5352,7 +5379,7 @@ int mattx_hooks_init(void) {
     newfstatat_kprobe.handler = ret_handler_newfstatat; 
     newfstatat_kprobe.data_size = sizeof(struct newfstatat_kretprobe_data); 
     newfstatat_kprobe.maxactive = 64; 
-    ret = register_kretprobe(&newfstatat_kprobe);
+    ret = mattx_register_kretprobe(&newfstatat_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for newfstatat, returned %d\n", ret);
 
     memset(&faccessat2_kprobe, 0, sizeof(faccessat2_kprobe)); 
@@ -5361,7 +5388,7 @@ int mattx_hooks_init(void) {
     faccessat2_kprobe.handler = ret_handler_faccessat2; 
     faccessat2_kprobe.data_size = sizeof(struct faccessat2_kretprobe_data); 
     faccessat2_kprobe.maxactive = 64; 
-    ret = register_kretprobe(&faccessat2_kprobe);
+    ret = mattx_register_kretprobe(&faccessat2_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for faccessat2, returned %d\n", ret);
 
     memset(&readlink_kprobe, 0, sizeof(readlink_kprobe)); 
@@ -5370,7 +5397,7 @@ int mattx_hooks_init(void) {
     readlink_kprobe.handler = ret_handler_readlink; 
     readlink_kprobe.data_size = sizeof(struct readlink_kretprobe_data); 
     readlink_kprobe.maxactive = 64; 
-    ret = register_kretprobe(&readlink_kprobe);
+    ret = mattx_register_kretprobe(&readlink_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for readlink, returned %d\n", ret);
 
     memset(&readlinkat_kprobe, 0, sizeof(readlinkat_kprobe)); 
@@ -5379,7 +5406,7 @@ int mattx_hooks_init(void) {
     readlinkat_kprobe.handler = ret_handler_readlinkat; 
     readlinkat_kprobe.data_size = sizeof(struct readlinkat_kretprobe_data); 
     readlinkat_kprobe.maxactive = 64; 
-    ret = register_kretprobe(&readlinkat_kprobe);
+    ret = mattx_register_kretprobe(&readlinkat_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for readlinkat, returned %d\n", ret);
 
     memset(&getdents64_kprobe, 0, sizeof(getdents64_kprobe)); 
@@ -5388,7 +5415,7 @@ int mattx_hooks_init(void) {
     getdents64_kprobe.handler = ret_handler_getdents64; 
     getdents64_kprobe.data_size = sizeof(struct getdents64_kretprobe_data); 
     getdents64_kprobe.maxactive = 64; 
-    ret = register_kretprobe(&getdents64_kprobe);
+    ret = mattx_register_kretprobe(&getdents64_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for getdents64, returned %d\n", ret);
 
     memset(&pipe2_kprobe, 0, sizeof(pipe2_kprobe)); 
@@ -5397,7 +5424,7 @@ int mattx_hooks_init(void) {
     pipe2_kprobe.handler = ret_handler_pipe2; 
     pipe2_kprobe.data_size = sizeof(struct pipe2_kretprobe_data); 
     pipe2_kprobe.maxactive = 64; 
-    ret = register_kretprobe(&pipe2_kprobe);
+    ret = mattx_register_kretprobe(&pipe2_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for pipe2, returned %d\n", ret);
 
     memset(&brk_kprobe, 0, sizeof(brk_kprobe));
@@ -5405,7 +5432,7 @@ int mattx_hooks_init(void) {
     brk_kprobe.entry_handler = entry_handler_brk;
     brk_kprobe.handler = ret_handler_brk;
     brk_kprobe.maxactive = 64;
-    ret = register_kretprobe(&brk_kprobe);
+    ret = mattx_register_kretprobe(&brk_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for brk, returned %d\n", ret);
 
     memset(&munmap_kprobe, 0, sizeof(munmap_kprobe));
@@ -5413,7 +5440,7 @@ int mattx_hooks_init(void) {
     munmap_kprobe.entry_handler = entry_handler_munmap;
     munmap_kprobe.handler = ret_handler_munmap;
     munmap_kprobe.maxactive = 64;
-    ret = register_kretprobe(&munmap_kprobe);
+    ret = mattx_register_kretprobe(&munmap_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for munmap, returned %d\n", ret);
 
     memset(&mremap_kprobe, 0, sizeof(mremap_kprobe));
@@ -5421,7 +5448,7 @@ int mattx_hooks_init(void) {
     mremap_kprobe.entry_handler = entry_handler_mremap;
     mremap_kprobe.handler = ret_handler_mremap;
     mremap_kprobe.maxactive = 64;
-    ret = register_kretprobe(&mremap_kprobe);
+    ret = mattx_register_kretprobe(&mremap_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for mremap, returned %d\n", ret);
 
     memset(&mmap_kprobe, 0, sizeof(mmap_kprobe));
@@ -5430,7 +5457,7 @@ int mattx_hooks_init(void) {
     mmap_kprobe.handler = ret_handler_mmap;
     mmap_kprobe.data_size = sizeof(struct mmap_kretprobe_data);
     mmap_kprobe.maxactive = 64;
-    ret = register_kretprobe(&mmap_kprobe);
+    ret = mattx_register_kretprobe(&mmap_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for mmap, returned %d\n", ret);
 
     // --- BATCH 3.2 KPROBES ---
@@ -5439,7 +5466,7 @@ int mattx_hooks_init(void) {
     mprotect_kprobe.entry_handler = entry_handler_mprotect;
     mprotect_kprobe.handler = ret_handler_mprotect;
     mprotect_kprobe.maxactive = 64;
-    ret = register_kretprobe(&mprotect_kprobe);
+    ret = mattx_register_kretprobe(&mprotect_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for mprotect, returned %d\n", ret);
 
     memset(&madvise_kprobe, 0, sizeof(madvise_kprobe));
@@ -5447,7 +5474,7 @@ int mattx_hooks_init(void) {
     madvise_kprobe.entry_handler = entry_handler_madvise;
     madvise_kprobe.handler = ret_handler_madvise;
     madvise_kprobe.maxactive = 64;
-    ret = register_kretprobe(&madvise_kprobe);
+    ret = mattx_register_kretprobe(&madvise_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for madvise, returned %d\n", ret);
 
     memset(&mbind_kprobe, 0, sizeof(mbind_kprobe));
@@ -5455,7 +5482,7 @@ int mattx_hooks_init(void) {
     mbind_kprobe.entry_handler = entry_handler_mbind;
     mbind_kprobe.handler = ret_handler_mbind;
     mbind_kprobe.maxactive = 64;
-    ret = register_kretprobe(&mbind_kprobe);
+    ret = mattx_register_kretprobe(&mbind_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for mbind, returned %d\n", ret);
 
     memset(&sched_getaffinity_kprobe, 0, sizeof(sched_getaffinity_kprobe));
@@ -5463,7 +5490,7 @@ int mattx_hooks_init(void) {
     sched_getaffinity_kprobe.entry_handler = entry_handler_sched_getaffinity;
     sched_getaffinity_kprobe.handler = ret_handler_sched_getaffinity;
     sched_getaffinity_kprobe.maxactive = 64;
-    ret = register_kretprobe(&sched_getaffinity_kprobe);
+    ret = mattx_register_kretprobe(&sched_getaffinity_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for sched_getaffinity, returned %d\n", ret);
 
     memset(&sched_setaffinity_kprobe, 0, sizeof(sched_setaffinity_kprobe));
@@ -5471,7 +5498,7 @@ int mattx_hooks_init(void) {
     sched_setaffinity_kprobe.entry_handler = entry_handler_sched_setaffinity;
     sched_setaffinity_kprobe.handler = ret_handler_sched_setaffinity;
     sched_setaffinity_kprobe.maxactive = 64;
-    ret = register_kretprobe(&sched_setaffinity_kprobe);
+    ret = mattx_register_kretprobe(&sched_setaffinity_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for sched_setaffinity, returned %d\n", ret);
 
     memset(&sched_yield_kprobe, 0, sizeof(sched_yield_kprobe));
@@ -5479,7 +5506,7 @@ int mattx_hooks_init(void) {
     sched_yield_kprobe.entry_handler = entry_handler_sched_yield;
     sched_yield_kprobe.handler = ret_handler_sched_yield;
     sched_yield_kprobe.maxactive = 64;
-    ret = register_kretprobe(&sched_yield_kprobe);
+    ret = mattx_register_kretprobe(&sched_yield_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for sched_yield, returned %d\n", ret);
 
     // --- THE CRADLE INTERCEPTOR ---
@@ -5495,32 +5522,32 @@ int mattx_hooks_init(void) {
     tgkill_kprobe.entry_handler = entry_handler_tgkill;
     tgkill_kprobe.handler = ret_handler_tgkill;
     tgkill_kprobe.maxactive = 64;
-    ret = register_kretprobe(&tgkill_kprobe);
+    ret = mattx_register_kretprobe(&tgkill_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for tgkill, returned %d\n", ret);
 
     // DSM - shared memory syscalls
     memset(&shmget_kprobe, 0, sizeof(shmget_kprobe)); shmget_kprobe.kp.symbol_name = "__x64_sys_shmget";
     shmget_kprobe.entry_handler = entry_handler_shmget; shmget_kprobe.handler = ret_handler_shmget;
     shmget_kprobe.data_size = sizeof(struct shmget_kretprobe_data); shmget_kprobe.maxactive = 64;
-    ret = register_kretprobe(&shmget_kprobe);
+    ret = mattx_register_kretprobe(&shmget_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for shmget, returned %d\n", ret);
 
     memset(&shmctl_kprobe, 0, sizeof(shmctl_kprobe)); shmctl_kprobe.kp.symbol_name = "__x64_sys_shmctl";
     shmctl_kprobe.entry_handler = entry_handler_shmctl; shmctl_kprobe.handler = ret_handler_shmctl;
     shmctl_kprobe.data_size = sizeof(struct shmctl_kretprobe_data); shmctl_kprobe.maxactive = 64;
-    ret = register_kretprobe(&shmctl_kprobe);
+    ret = mattx_register_kretprobe(&shmctl_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for shmctl, returned %d\n", ret);
 
     memset(&shmdt_kprobe, 0, sizeof(shmdt_kprobe)); shmdt_kprobe.kp.symbol_name = "__x64_sys_shmdt";
     shmdt_kprobe.entry_handler = entry_handler_shmdt; shmdt_kprobe.handler = ret_handler_shmdt;
     shmdt_kprobe.data_size = sizeof(struct shmdt_kretprobe_data); shmdt_kprobe.maxactive = 64;
-    ret = register_kretprobe(&shmdt_kprobe);
+    ret = mattx_register_kretprobe(&shmdt_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for shmdt, returned %d\n", ret);
 
     memset(&shmat_kprobe, 0, sizeof(shmat_kprobe)); shmat_kprobe.kp.symbol_name = "__x64_sys_shmat";
     shmat_kprobe.entry_handler = entry_handler_shmat; shmat_kprobe.handler = ret_handler_shmat;
     shmat_kprobe.data_size = sizeof(struct shmat_kretprobe_data); shmat_kprobe.maxactive = 64;
-    ret = register_kretprobe(&shmat_kprobe);
+    ret = mattx_register_kretprobe(&shmat_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for shmat, returned %d\n", ret);
 
     memset(&shmem_fault_kprobe, 0, sizeof(shmem_fault_kprobe));
@@ -5529,7 +5556,7 @@ int mattx_hooks_init(void) {
     shmem_fault_kprobe.handler = ret_handler_shmem_fault;
     shmem_fault_kprobe.data_size = sizeof(struct shmem_fault_kretprobe_data);
     shmem_fault_kprobe.maxactive = 64;
-    ret = register_kretprobe(&shmem_fault_kprobe);
+    ret = mattx_register_kretprobe(&shmem_fault_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for shmem_fault, returned %d\n", ret);
 
     memset(&shmem_page_mkwrite_kprobe, 0, sizeof(shmem_page_mkwrite_kprobe));
@@ -5538,7 +5565,7 @@ int mattx_hooks_init(void) {
     shmem_page_mkwrite_kprobe.handler = ret_handler_shmem_fault;         // Reuse the exact same handler!
     shmem_page_mkwrite_kprobe.data_size = sizeof(struct shmem_fault_kretprobe_data);
     shmem_page_mkwrite_kprobe.maxactive = 64;
-    ret = register_kretprobe(&shmem_page_mkwrite_kprobe);
+    ret = mattx_register_kretprobe(&shmem_page_mkwrite_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for shmem_page_mkwrite, returned %d\n", ret);
 
 
@@ -5552,7 +5579,7 @@ int mattx_hooks_init(void) {
     clock_nanosleep_timens_kprobe.entry_handler = entry_handler_clock_nanosleep;
     clock_nanosleep_timens_kprobe.handler = ret_handler_clock_nanosleep;
     clock_nanosleep_timens_kprobe.maxactive = 64;
-    ret = register_kretprobe(&clock_nanosleep_timens_kprobe);
+    ret = mattx_register_kretprobe(&clock_nanosleep_timens_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for common_nsleep_timens, returned %d (post-migration clock_nanosleep deadlines will NOT be corrected!)\n", ret);
 
     memset(&clock_nanosleep_kprobe, 0, sizeof(clock_nanosleep_kprobe));
@@ -5560,7 +5587,7 @@ int mattx_hooks_init(void) {
     clock_nanosleep_kprobe.entry_handler = entry_handler_clock_nanosleep;
     clock_nanosleep_kprobe.handler = ret_handler_clock_nanosleep;
     clock_nanosleep_kprobe.maxactive = 64;
-    ret = register_kretprobe(&clock_nanosleep_kprobe);
+    ret = mattx_register_kretprobe(&clock_nanosleep_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for common_nsleep, returned %d (defensive fallback only, non-fatal)\n", ret);
 
 
@@ -5574,71 +5601,10 @@ int mattx_hooks_init(void) {
 }
 
 void mattx_hooks_exit(void) {
-    unregister_kretprobe(&clock_nanosleep_kprobe);
-    unregister_kretprobe(&clock_nanosleep_timens_kprobe);
-    unregister_kretprobe(&shmem_page_mkwrite_kprobe);
-    unregister_kretprobe(&shmem_fault_kprobe);
-    unregister_kretprobe(&shmat_kprobe);
-    unregister_kretprobe(&shmdt_kprobe);
-    unregister_kretprobe(&shmctl_kprobe);
-    unregister_kretprobe(&shmget_kprobe);
-    unregister_kretprobe(&tgkill_kprobe);
+    // Reverse registration order, registered probes only (see mattx_register_kretprobe).
+    while (mattx_nregistered_krp > 0)
+        unregister_kretprobe(mattx_registered_krp[--mattx_nregistered_krp]);
     unregister_kprobe(&wake_up_new_task_kprobe);
-    unregister_kretprobe(&sched_getaffinity_kprobe);
-    unregister_kretprobe(&sched_setaffinity_kprobe);
-    unregister_kretprobe(&sched_yield_kprobe);
-    unregister_kretprobe(&mprotect_kprobe);
-    unregister_kretprobe(&madvise_kprobe);
-    unregister_kretprobe(&mbind_kprobe);
-    unregister_kretprobe(&brk_kprobe);
-    unregister_kretprobe(&munmap_kprobe);
-    unregister_kretprobe(&mremap_kprobe);
-    unregister_kretprobe(&mmap_kprobe);
-    unregister_kretprobe(&getdents64_kprobe);
-    unregister_kretprobe(&pipe2_kprobe);
-    unregister_kretprobe(&statfs_kprobe);
-    unregister_kretprobe(&fstatfs_kprobe);
-    unregister_kretprobe(&newfstatat_kprobe);
-    unregister_kretprobe(&faccessat2_kprobe);
-    unregister_kretprobe(&readlink_kprobe);
-    unregister_kretprobe(&readlinkat_kprobe);
-    unregister_kretprobe(&fcntl_kprobe);
-    unregister_kretprobe(&ioctl_kprobe);
-    unregister_kretprobe(&pread64_kprobe);
-    unregister_kretprobe(&getpid_kprobe);
-    unregister_kretprobe(&gettid_kprobe);
-    unregister_kretprobe(&uname_kprobe);
-    unregister_kretprobe(&prlimit64_kprobe);
-    unregister_kretprobe(&prctl_kprobe);
-    unregister_kretprobe(&sendmsg_kprobe);
-    unregister_kretprobe(&recvmsg_kprobe);
-    unregister_kretprobe(&getsockname_kprobe);
-    unregister_kretprobe(&getpeername_kprobe);
-    unregister_kretprobe(&getsockopt_kprobe);
-    unregister_kretprobe(&setsockopt_kprobe);
-    unregister_kretprobe(&epoll_create_kprobe);
-    unregister_kretprobe(&epoll_create1_kprobe);
-    unregister_kretprobe(&epoll_wait_kprobe);
-    unregister_kretprobe(&epoll_ctl_kprobe);
-    unregister_kretprobe(&pselect6_kprobe);    
-    unregister_kretprobe(&write_kprobe);
-    unregister_kretprobe(&read_kprobe);    
-    unregister_kretprobe(&lseek_kprobe);    
-    unregister_kretprobe(&fsync_kprobe);    
-    unregister_kretprobe(&statx_kprobe);    
-    unregister_kretprobe(&select_kprobe);
-    unregister_kretprobe(&poll_kprobe);
-    unregister_kretprobe(&accept_kprobe);
-    unregister_kretprobe(&recvfrom_kprobe);
-    unregister_kretprobe(&sendto_kprobe);
-    unregister_kretprobe(&listen_kprobe);
-    unregister_kretprobe(&bind_kprobe);
-    unregister_kretprobe(&connect_kprobe);
-    unregister_kretprobe(&socket_kprobe);
-    unregister_kretprobe(&unlinkat_kprobe);
-    unregister_kretprobe(&dup2_kprobe);
-    unregister_kretprobe(&dup_kprobe);
-    unregister_kretprobe(&openat_kprobe);
 
     unregister_die_notifier(&mattx_die_notifier);
 
