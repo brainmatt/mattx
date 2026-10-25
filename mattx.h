@@ -261,6 +261,7 @@ enum mattx_msg_type {
     MATTX_MSG_DSM_FLUSH_REQ,
     MATTX_MSG_DSM_FLUSH_REPLY,
     MATTX_MSG_SYS_EPOLL_WAIT_CANCEL, // appended last so the numbering of the older messages is unchanged
+    MATTX_MSG_SYS_REQ_CANCEL,        // generic: a Surrogate thread gives up on a ticket-based request
 };
 
 struct mattx_header {
@@ -404,12 +405,14 @@ struct mattx_sys_read_req {
     u32 orig_pid;
     u32 fd;
     size_t count;
+    u32 req_id; // ticket id: matches the reply to the one thread that waits for it (0 = none)
 };
 
 struct mattx_sys_read_reply {
     u32 orig_pid;
     ssize_t bytes_read;
     int error;
+    u32 req_id; // echo of the request's ticket id; 0 = legacy reply (pread64 reuses this struct)
     char data[];
 };
 
@@ -630,6 +633,33 @@ struct mattx_sys_epoll_wait_cancel {
     u32 orig_pid;
     u32 req_id;
 };
+/*
+ * THE TICKET: one proxied request that exactly ONE Surrogate thread waits for (the skeleton is in
+ * mattx_fileio.c, the pattern in mattx_read_tw_fn() in mattx_hooks.c). The syscall-specific parts
+ * stay flat and per syscall; only this small skeleton is shared.
+ */
+struct mattx_ticket {
+    struct list_head node;
+    u32 orig_pid;
+    int home_node;
+    u32 req_id;                 // never 0
+    struct completion done;
+    long retval;                // the syscall's result on the home node, or -errno
+    void *data;                 // optional reply payload (kmalloc'ed), owned by the ticket
+    size_t data_len;
+    size_t data_cap;            // most bytes the waiter can take: a bigger reply is a protocol error
+};
+
+// A Surrogate thread gives up on a ticket-based request: the home node finishes it (generic CANCEL)
+struct mattx_sys_req_cancel {
+    u32 orig_pid;
+    u32 req_id;
+};
+
+struct mattx_ticket *mattx_ticket_add(u32 orig_pid, int home_node, size_t data_cap);
+void mattx_ticket_del(struct mattx_ticket *t);
+bool mattx_ticket_complete(int home_node, u32 orig_pid, u32 req_id, long retval, const void *data, size_t len);
+int mattx_ticket_wait(struct mattx_ticket *t, long timeout);
 struct mattx_epoll_pending *mattx_epoll_pending_add(u32 orig_pid, int home_node);
 void mattx_epoll_pending_del(struct mattx_epoll_pending *p);
 void mattx_epoll_cancelled_purge(void);

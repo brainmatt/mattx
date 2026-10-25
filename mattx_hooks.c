@@ -2959,6 +2959,80 @@ static int entry_handler_read(struct kretprobe_instance *ri, struct pt_regs *reg
     return 0;
 }
 
+/*
+ * IPC WORMHOLE read(): the thread that called read() waits for the reply on its own ticket, in a
+ * task_work that runs when the (sabotaged) syscall returns to user mode. Only this thread sleeps;
+ * the other threads of the process keep running (no SIGSTOP of the whole group) and the reply is
+ * matched by req_id, not through a slot shared by the whole process.
+ */
+struct mattx_read_tw {
+    struct callback_head cb;
+    u32 orig_pid;
+    int home_node;
+    int fd;
+    void __user *buf;
+    size_t count;
+};
+
+static void mattx_read_tw_fn(struct callback_head *cb) {
+    struct mattx_read_tw *tw = container_of(cb, struct mattx_read_tw, cb);
+    struct pt_regs *regs = task_pt_regs(current);
+    size_t count = min_t(size_t, tw->count, 4096);
+    struct mattx_sys_read_req req;
+    struct mattx_ticket *t;
+    struct mattx_link *link;
+    long ret = -EINTR;
+
+    if (fatal_signal_pending(current) || tw->home_node < 0 || tw->home_node >= MAX_NODES)
+        goto out;
+
+    link = READ_ONCE(cluster_map[tw->home_node]);
+    if (!link) {
+        ret = -EIO;
+        goto out;
+    }
+
+    t = mattx_ticket_add(tw->orig_pid, tw->home_node, count);
+    if (!t) {
+        ret = -ENOMEM;
+        goto out;
+    }
+
+    memset(&req, 0, sizeof(req));
+    req.orig_pid = tw->orig_pid;
+    req.fd = tw->fd;
+    req.count = count;
+    req.req_id = t->req_id;
+
+    mattx_dbg("[RPC] Thread %d: read(fd=%d, %zu) as req %u, sleeping on its own ticket...\n", current->pid, tw->fd, count, t->req_id);
+
+    if (mattx_comm_send(link, MATTX_MSG_SYS_READ_REQ, &req, sizeof(req)) < 0) {
+        // Never sleep for a reply to a request that was never sent
+        mattx_dbg("[RPC] Thread %d: READ_REQ send failed\n", current->pid);
+        ret = -EIO;
+        goto done;
+    }
+
+    // Interrupted (signal, freeze of a migration or recall)? The wait cancels the request and still
+    // hands back the bytes if the home node had already read them; otherwise we return -EINTR.
+    if (mattx_ticket_wait(t, MAX_SCHEDULE_TIMEOUT) == 0) {
+        ret = t->retval;
+        if (ret > 0) {
+            if (!t->data || (size_t)ret > t->data_len)
+                ret = -EIO;
+            else if (copy_to_user(tw->buf, t->data, ret))
+                ret = -EFAULT;
+        }
+    }
+    mattx_dbg("[RPC] Illusion Complete! read() on Ghost FD returned %ld (thread %d)\n", ret, current->pid);
+
+done:
+    mattx_ticket_del(t);
+out:
+    regs->ax = ret;
+    kfree(tw);
+}
+
 static int ret_handler_read(struct kretprobe_instance *ri, struct pt_regs *regs) {
     pid_t my_pid = current->pid;
     struct rw_kretprobe_data *data = (struct rw_kretprobe_data *)ri->data;
@@ -2973,7 +3047,6 @@ static int ret_handler_read(struct kretprobe_instance *ri, struct pt_regs *regs)
         if (guest_registry[i].local_pid == current->tgid) {
             home_node = guest_registry[i].home_node;
             orig_pid = guest_registry[i].orig_pid;
-            guest_registry[i].rpc_done = false; 
             break;
         }
     }
@@ -2989,18 +3062,49 @@ static int ret_handler_read(struct kretprobe_instance *ri, struct pt_regs *regs)
             return 0;
         }
 
-        struct mattx_rpc_work *rpc = kzalloc(sizeof(*rpc), GFP_ATOMIC); 
+        if (real_task_work_add) {
+            struct mattx_read_tw *tw = kzalloc(sizeof(*tw), GFP_ATOMIC);
+            if (tw) {
+                init_task_work(&tw->cb, mattx_read_tw_fn);
+                tw->orig_pid = orig_pid;
+                tw->home_node = home_node;
+                tw->fd = data->fd;
+                tw->buf = data->buf;
+                tw->count = data->count;
+
+                mattx_dbg("[HOOK] Intercepted read(fd=%d). Thread %d waits on its own ticket...\n", data->fd, my_pid);
+                // The sabotaged call returns -EBADF; the task_work overwrites it with the real result.
+                regs->ax = -EINTR;
+
+                if (real_task_work_add(current, &tw->cb, TWA_RESUME))
+                    kfree(tw);
+            }
+            return 0;
+        }
+
+        // Fallback if the task_work resolver is missing: the old way (freeze the whole group, the
+        // rpc worker polls the per-guest slot). The home node answers with req_id 0 then.
+        struct mattx_rpc_work *rpc = kzalloc(sizeof(*rpc), GFP_ATOMIC);
         if (rpc) {
+            spin_lock(&guest_lock);
+            for (i = 0; i < guest_count; i++) {
+                if (guest_registry[i].local_pid == current->tgid) {
+                    guest_registry[i].rpc_done = false;
+                    break;
+                }
+            }
+            spin_unlock(&guest_lock);
+
             INIT_WORK(&rpc->work, mattx_rpc_worker);
             rpc->local_pid = my_pid;
             rpc->orig_pid = orig_pid;
             rpc->home_node = home_node;
             rpc->is_read = true;
-            rpc->remote_fd = data->fd; 
+            rpc->remote_fd = data->fd;
             rpc->buff = data->buf;
             rpc->len = data->count;
 
-            mattx_dbg("[HOOK] Intercepted read(fd=%d). Freezing Surrogate %d...\n", data->fd, my_pid);
+            mattx_dbg("[HOOK] Intercepted read(fd=%d). Freezing Surrogate %d (fallback)...\n", data->fd, my_pid);
             send_sig(SIGSTOP, current, 0);
             schedule_work(&rpc->work);
         }
