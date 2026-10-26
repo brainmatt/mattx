@@ -2477,6 +2477,103 @@ static int entry_handler_recvfrom(struct kretprobe_instance *ri, struct pt_regs 
     return 0;
 }
 
+/*
+ * recv()/recvfrom() on a socket that lives on the home node: the thread that called it waits for the
+ * reply on its own ticket, in a task_work that runs when the (sabotaged) syscall returns to user mode.
+ * Same pattern as the wormhole read(): only this thread sleeps, the reply is matched by req_id.
+ */
+struct mattx_recvfrom_tw {
+    struct callback_head cb;
+    u32 orig_pid;
+    int home_node;
+    int remote_fd;
+    void __user *ubuf;
+    size_t size;
+    unsigned int flags;
+};
+
+// One request of at most 4096 bytes: the bytes (or -errno) the home node received, already copied to
+// user space at ubuf + off. -EINTR when interrupted before anything arrived.
+static long mattx_recvfrom_one(struct mattx_recvfrom_tw *tw, size_t chunk, size_t off)
+{
+    struct mattx_sys_recv_req req;
+    struct mattx_ticket *t;
+    struct mattx_link *link;
+    long ret = -EINTR;
+
+    link = READ_ONCE(cluster_map[tw->home_node]);
+    if (!link)
+        return -EIO;
+
+    t = mattx_ticket_add(tw->orig_pid, tw->home_node, chunk);
+    if (!t)
+        return -ENOMEM;
+
+    memset(&req, 0, sizeof(req));
+    req.orig_pid = tw->orig_pid;
+    req.fd = tw->remote_fd;
+    req.size = chunk;
+    req.flags = tw->flags;
+    req.req_id = t->req_id;
+
+    mattx_dbg("[RPC] Thread %d: recvfrom(fd=%d, %zu) as req %u, sleeping on its own ticket...\n", current->pid, tw->remote_fd, chunk, t->req_id);
+
+    if (mattx_comm_send(link, MATTX_MSG_SYS_RECV_REQ, &req, sizeof(req)) < 0) {
+        // Never sleep for a reply to a request that was never sent
+        mattx_dbg("[RPC] Thread %d: RECV_REQ send failed\n", current->pid);
+        ret = -EIO;
+        goto done;
+    }
+
+    // Interrupted (signal, freeze of a migration or recall)? The wait cancels the request and still
+    // hands back the bytes if the home node had already received them; otherwise we return -EINTR.
+    if (mattx_ticket_wait(t, MAX_SCHEDULE_TIMEOUT) == 0) {
+        ret = t->retval;
+        if (ret > 0) {
+            size_t n = min_t(size_t, ret, t->data_len);     // MSG_TRUNC: ret can be the real datagram length
+
+            if (!t->data || copy_to_user(tw->ubuf + off, t->data, n))
+                ret = -EFAULT;
+        }
+    }
+
+done:
+    mattx_ticket_del(t);
+    return ret;
+}
+
+static void mattx_recvfrom_tw_fn(struct callback_head *cb) {
+    struct mattx_recvfrom_tw *tw = container_of(cb, struct mattx_recvfrom_tw, cb);
+    struct pt_regs *regs = task_pt_regs(current);
+    // MSG_WAITALL may ask for more than one request carries (4096 bytes): ask chunk by chunk
+    bool waitall = (tw->flags & MSG_WAITALL) && !(tw->flags & MSG_PEEK);
+    size_t total = 0;
+    long ret = -EINTR;
+
+    if (fatal_signal_pending(current) || tw->home_node < 0 || tw->home_node >= MAX_NODES)
+        goto out;
+
+    do {
+        size_t chunk = min_t(size_t, tw->size - total, 4096);
+        long r = mattx_recvfrom_one(tw, chunk, total);
+
+        if (r < 0) {
+            ret = total ? (long)total : r;      // bytes already in the user buffer win over the error
+            goto out;
+        }
+        total += r;
+        if ((size_t)r < chunk)
+            break;                              // EOF, a datagram, a non-blocking socket: short is final
+    } while (waitall && total < tw->size);
+
+    ret = total;
+    mattx_dbg("[RPC] Illusion Complete! recvfrom on Ghost FD returned %ld (thread %d)\n", ret, current->pid);
+
+out:
+    regs->ax = ret;
+    kfree(tw);
+}
+
 static int ret_handler_recvfrom(struct kretprobe_instance *ri, struct pt_regs *regs) {
     pid_t my_pid = current->pid;
     struct recvfrom_kretprobe_data *data = (struct recvfrom_kretprobe_data *)ri->data;
@@ -2491,7 +2588,6 @@ static int ret_handler_recvfrom(struct kretprobe_instance *ri, struct pt_regs *r
         if (guest_registry[i].local_pid == current->tgid) {
             home_node = guest_registry[i].home_node;
             orig_pid = guest_registry[i].orig_pid;
-            guest_registry[i].rpc_done = false; 
             break;
         }
     }
@@ -2507,20 +2603,52 @@ static int ret_handler_recvfrom(struct kretprobe_instance *ri, struct pt_regs *r
             return 0;
         }
 
-        struct mattx_rpc_work *rpc = kzalloc(sizeof(*rpc), GFP_ATOMIC); 
+        if (real_task_work_add) {
+            struct mattx_recvfrom_tw *tw = kzalloc(sizeof(*tw), GFP_ATOMIC);
+            if (tw) {
+                init_task_work(&tw->cb, mattx_recvfrom_tw_fn);
+                tw->orig_pid = orig_pid;
+                tw->home_node = home_node;
+                tw->remote_fd = data->remote_fd;
+                tw->ubuf = data->ubuf;
+                tw->size = data->size;
+                tw->flags = data->flags;
+
+                mattx_dbg("[HOOK] Intercepted recvfrom(fd=%d). Thread %d waits on its own ticket...\n", data->fd, my_pid);
+                // The sabotaged call returns -EBADF; the task_work overwrites it with the real result.
+                regs->ax = -EINTR;
+
+                if (real_task_work_add(current, &tw->cb, TWA_RESUME))
+                    kfree(tw);
+            }
+            return 0;
+        }
+
+        // Fallback if the task_work resolver is missing: the old way (freeze the whole group, the
+        // rpc worker polls the per-guest slot). The home node answers with req_id 0 then.
+        struct mattx_rpc_work *rpc = kzalloc(sizeof(*rpc), GFP_ATOMIC);
         if (rpc) {
+            spin_lock(&guest_lock);
+            for (i = 0; i < guest_count; i++) {
+                if (guest_registry[i].local_pid == current->tgid) {
+                    guest_registry[i].rpc_done = false;
+                    break;
+                }
+            }
+            spin_unlock(&guest_lock);
+
             INIT_WORK(&rpc->work, mattx_rpc_worker);
             rpc->local_pid = my_pid;
             rpc->orig_pid = orig_pid;
             rpc->home_node = home_node;
-            
+
             rpc->is_recvfrom = true;
             rpc->remote_fd = data->remote_fd;
             rpc->buff = data->ubuf;
             rpc->size = data->size;
             rpc->flags = data->flags;
 
-            mattx_dbg("[HOOK] Intercepted recvfrom(fd=%d). Freezing Surrogate %d...\n", data->fd, my_pid);
+            mattx_dbg("[HOOK] Intercepted recvfrom(fd=%d). Freezing Surrogate %d (fallback)...\n", data->fd, my_pid);
             send_sig(SIGSTOP, current, 0);
             schedule_work(&rpc->work);
         }

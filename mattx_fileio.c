@@ -984,8 +984,8 @@ struct mattx_read_kworker_ctx {
     int target_node;
 };
 
-static atomic_t mattx_read_inflight = ATOMIC_INIT(0);   // read kworkers that still run
-static bool mattx_read_stopping;                        // set by mattx_fileio_exit()
+static atomic_t mattx_cancellable_inflight = ATOMIC_INIT(0);   // cancellable kworkers (read, recvfrom, ...) that still run
+static bool mattx_cancellable_stopping;                        // set by mattx_fileio_exit()
 
 static bool mattx_req_take_cancelled(int sender, u32 orig_pid, u32 req_id);
 
@@ -1022,7 +1022,7 @@ static ssize_t mattx_read_cancellable(struct file *file, struct task_struct *dep
                 mattx_dbg("[WORMHOLE] READ for PID %u req %u cancelled by the Surrogate, nothing consumed\n", orig_pid, req_id);
                 return -EINTR;
             }
-            if (READ_ONCE(mattx_read_stopping) || !READ_ONCE(cluster_map[sender])) {
+            if (READ_ONCE(mattx_cancellable_stopping) || !READ_ONCE(cluster_map[sender])) {
                 *abandoned = true;
                 return -EINTR;
             }
@@ -1137,14 +1137,14 @@ static void mattx_read_kworker(struct work_struct *work) {
 
     if (reply) kfree(reply);
     kfree(ctx);
-    atomic_dec(&mattx_read_inflight);
+    atomic_dec(&mattx_cancellable_inflight);
 }
 
 static void handle_sys_read_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
     struct mattx_read_kworker_ctx *ctx;
 
     if (!payload || hdr->length < sizeof(struct mattx_sys_read_req)) return;
-    if (hdr->sender_id >= MAX_NODES || READ_ONCE(mattx_read_stopping)) return;
+    if (hdr->sender_id >= MAX_NODES || READ_ONCE(mattx_cancellable_stopping)) return;
 
     ctx = kmalloc(sizeof(*ctx), GFP_ATOMIC);
     if (!ctx) {
@@ -1154,7 +1154,7 @@ static void handle_sys_read_req(struct mattx_link *link, struct mattx_header *hd
     INIT_WORK(&ctx->work, mattx_read_kworker);
     memcpy(&ctx->req, payload, sizeof(ctx->req));
     ctx->target_node = hdr->sender_id;
-    atomic_inc(&mattx_read_inflight);
+    atomic_inc(&mattx_cancellable_inflight);
     schedule_work(&ctx->work);
 }
 
@@ -1939,33 +1939,127 @@ static void handle_sys_send_req(struct mattx_link *link, struct mattx_header *hd
 
 
 // === DATA PLANE: RECVFROM ===
+/*
+ * RECV_REQ (recv()/recvfrom() on a socket that lives on the home node)
+ *
+ * Same contract as the wormhole read: the request runs in its own kworker, is CANCELLABLE, and gets
+ * exactly ONE reply (req_id echoed): the real result (bytes that were received are never thrown
+ * away) or -EINTR when the Surrogate's CANCEL came first and nothing was consumed.
+ *
+ * The socket is only ever read with MSG_DONTWAIT; the waiting is done here, so the blocking
+ * semantics are the application's, not the kworker's:
+ *   - MSG_DONTWAIT, or an O_NONBLOCK socket: -EAGAIN at once when nothing is queued. The kernel's own
+ *     recvfrom() adds the O_NONBLOCK of the file, kernel_recvmsg() does not: the old code BLOCKED
+ *     the kworker for a non-blocking socket.
+ *   - SO_RCVTIMEO is honoured (-EAGAIN when it expires).
+ *   - MSG_WAITALL is honoured for stream sockets (a cancel or an error after some bytes returns them).
+ * The wait sleeps on the socket's own wait queue (sk_sleep, like sk_wait_data): data, EOF and errors
+ * wake us at once, and a 10 ms ceiling looks at cancel / unload / lost link.
+ */
 struct mattx_recvfrom_kworker_ctx {
     struct work_struct work;
     u32 orig_pid;
+    u32 req_id;
     int fd;
     size_t size;
     int flags;
     int target_node;
 };
 
+// Returns the bytes received (for MSG_TRUNC on a datagram: its real length), 0 (EOF) or -errno;
+// -EINTR: cancelled, nothing consumed. *abandoned: nobody is left to answer (unload, link gone).
+static ssize_t mattx_recv_cancellable(struct socket *sock, struct file *file, void *buf, size_t size, int flags,
+                                      int sender, u32 orig_pid, u32 req_id, bool *abandoned)
+{
+    bool nonblock = (flags & MSG_DONTWAIT) || (file->f_flags & O_NONBLOCK);
+    bool waitall = (flags & MSG_WAITALL) && !(flags & MSG_PEEK) && sock->type == SOCK_STREAM;
+    long rcvtimeo = nonblock ? 0 : READ_ONCE(sock->sk->sk_rcvtimeo);
+    bool timed = !nonblock && rcvtimeo != MAX_SCHEDULE_TIMEOUT;
+    unsigned long deadline = jiffies + rcvtimeo;
+    DEFINE_WAIT_FUNC(wait, woken_wake_function);
+    size_t total = 0;
+    ssize_t result;
+    ssize_t ret;
+
+    // On the wait queue BEFORE the first look, so that no wake-up can slip between look and sleep
+    add_wait_queue(sk_sleep(sock->sk), &wait);
+
+    for (;;) {
+        struct msghdr msg = {0};
+        struct kvec iov = { .iov_base = buf + total, .iov_len = size - total };
+
+        // 1. Look: never blocks
+        ret = kernel_recvmsg(sock, &msg, &iov, 1, size - total, (flags & ~MSG_WAITALL) | MSG_DONTWAIT);
+        if (ret > 0) {
+            if ((size_t)ret > size - total) {   // MSG_TRUNC: the real length of a datagram
+                result = ret;
+                goto out;
+            }
+            total += ret;
+            if (!waitall || total >= size) {
+                result = total;
+                goto out;
+            }
+            continue;                           // MSG_WAITALL: more, right away
+        }
+        if (ret != -EAGAIN) {                   // EOF (0) or a real error: bytes in hand win
+            result = total ? (ssize_t)total : ret;
+            goto out;
+        }
+
+        // 2. Nothing (more) queued right now
+        if (nonblock || (timed && time_after(jiffies, deadline))) {
+            result = total ? (ssize_t)total : -EAGAIN;
+            goto out;
+        }
+        if (mattx_req_take_cancelled(sender, orig_pid, req_id)) {
+            mattx_dbg("[WORMHOLE] RECV for PID %u req %u cancelled by the Surrogate (%zu bytes in hand)\n", orig_pid, req_id, total);
+            result = total ? (ssize_t)total : -EINTR;
+            goto out;
+        }
+        if (READ_ONCE(mattx_cancellable_stopping) || !READ_ONCE(cluster_map[sender])) {
+            *abandoned = true;
+            result = -EINTR;
+            goto out;
+        }
+
+        // 3. Sleep until the socket wakes us (or 10 ms, or the SO_RCVTIMEO deadline)
+        {
+            long to = msecs_to_jiffies(10);
+
+            if (timed && (long)(deadline - jiffies) < to)
+                to = (long)(deadline - jiffies) > 0 ? (long)(deadline - jiffies) : 1;
+            wait_woken(&wait, TASK_INTERRUPTIBLE, to);
+        }
+    }
+
+out:
+    remove_wait_queue(sk_sleep(sock->sk), &wait);
+    return result;
+}
+
 static void mattx_recvfrom_kworker(struct work_struct *work) {
     struct mattx_recvfrom_kworker_ctx *ctx = container_of(work, struct mattx_recvfrom_kworker_ctx, work);
+    struct mattx_sys_recv_reply fail = { .orig_pid = ctx->orig_pid, .req_id = ctx->req_id };
+    struct mattx_sys_recv_reply *reply = NULL;
     struct file *file = mattx_get_remote_file(ctx->orig_pid, ctx->fd);
-    int ret = -EBADF;
-    void *recv_buf = NULL;
+    struct mattx_link *link;
+    // The Surrogate asks for at most 4096 bytes per request as well
+    size_t count = min_t(size_t, ctx->size, 4096);
+    bool abandoned = false;
+    ssize_t ret = -EBADF;
+
+    mattx_dbg("[WORMHOLE] Received RECV request for FD %d (req %u) from Node %d (kworker)...\n", ctx->fd, ctx->req_id, ctx->target_node);
 
     if (file) {
         struct socket *sock = sock_from_file(file);
-        if (sock) {
-            recv_buf = kmalloc(ctx->size, GFP_KERNEL);
-            if (recv_buf) {
-                struct msghdr msg = {0};
-                struct kvec iov;
-                iov.iov_base = recv_buf;
-                iov.iov_len = ctx->size;
-                
-                // Execute the recv natively in the Kworker!
-                ret = kernel_recvmsg(sock, &msg, &iov, 1, ctx->size, ctx->flags);
+        if (sock && sock->sk) {
+            reply = kmalloc(sizeof(*reply) + count, GFP_KERNEL);
+            if (reply) {
+                memset(reply, 0, sizeof(*reply));
+                // Receives straight into the reply buffer; may wait, but can be cancelled
+                ret = mattx_recv_cancellable(sock, file, reply->data, count, ctx->flags,
+                                             ctx->target_node, ctx->orig_pid, ctx->req_id, &abandoned);
             } else {
                 ret = -ENOMEM;
             }
@@ -1975,43 +2069,72 @@ static void mattx_recvfrom_kworker(struct work_struct *work) {
         fput(file);
     }
 
-    size_t reply_size = sizeof(struct mattx_sys_recv_reply) + (ret > 0 ? ret : 0);
-    struct mattx_sys_recv_reply *reply = kzalloc(reply_size, GFP_KERNEL);
-    if (reply) {
+    link = READ_ONCE(cluster_map[ctx->target_node]);
+    if (abandoned || !link) {
+        mattx_dbg("[WORMHOLE] RECV for FD %d (req %u): nobody left to answer, reply dropped\n", ctx->fd, ctx->req_id);
+    } else if (reply) {
+        // Only what fits travels (bytes_recv may be bigger: MSG_TRUNC)
+        size_t n = ret > 0 ? min_t(size_t, ret, count) : 0;
+
         reply->orig_pid = ctx->orig_pid;
+        reply->req_id = ctx->req_id;
         reply->bytes_recv = ret;
         reply->error = (ret < 0) ? ret : 0;
-        if (ret > 0 && recv_buf) {
-            memcpy(reply->data, recv_buf, ret);
-        }
-        if (cluster_map[ctx->target_node]) {
-            mattx_comm_send(cluster_map[ctx->target_node], MATTX_MSG_SYS_RECV_REPLY, reply, reply_size);
-        }
-        kfree(reply);
+        mattx_comm_send(link, MATTX_MSG_SYS_RECV_REPLY, reply, sizeof(*reply) + n);
+    } else {
+        // No such socket (-EBADF / -ENOTSOCK) or out of memory: still answer, the Surrogate is waiting!
+        fail.bytes_recv = ret;
+        fail.error = ret;
+        mattx_comm_send(link, MATTX_MSG_SYS_RECV_REPLY, &fail, sizeof(fail));
     }
-    if (recv_buf) kfree(recv_buf);
+
+    kfree(reply);
     kfree(ctx);
+    atomic_dec(&mattx_cancellable_inflight);
 }
 
 static void handle_sys_recv_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
-    if (payload) {
-        struct mattx_sys_recv_req *req = payload;
-        struct mattx_recvfrom_kworker_ctx *ctx = kmalloc(sizeof(*ctx), GFP_ATOMIC);
-        if (ctx) {
-            INIT_WORK(&ctx->work, mattx_recvfrom_kworker);
-            ctx->orig_pid = req->orig_pid;
-            ctx->fd = req->fd;
-            ctx->size = req->size;
-            ctx->flags = req->flags;
-            ctx->target_node = hdr->sender_id;
-            
-            schedule_work(&ctx->work); // Dispatch to the Data Plane!
-        }
+    struct mattx_sys_recv_req *req = payload;
+    struct mattx_recvfrom_kworker_ctx *ctx;
+
+    if (!payload || hdr->length < sizeof(*req)) return;
+    if (hdr->sender_id >= MAX_NODES || READ_ONCE(mattx_cancellable_stopping)) return;
+
+    ctx = kmalloc(sizeof(*ctx), GFP_ATOMIC);
+    if (!ctx) {
+        printk(KERN_ERR "MattX:[WORMHOLE] RECV_REQ dropped: out of memory\n");
+        return;
     }
+    INIT_WORK(&ctx->work, mattx_recvfrom_kworker);
+    ctx->orig_pid = req->orig_pid;
+    ctx->req_id = req->req_id;
+    ctx->fd = req->fd;
+    ctx->size = req->size;
+    ctx->flags = req->flags;
+    ctx->target_node = hdr->sender_id;
+    atomic_inc(&mattx_cancellable_inflight);
+    schedule_work(&ctx->work); // Dispatch to the Data Plane!
 }
 
 
 static void handle_sys_recv_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    // A reply that carries a ticket id belongs to exactly one waiting thread (mattx_ticket_*).
+    // req_id 0 is the legacy reply of the SIGSTOP fallback path: it goes through the slot below.
+    if (payload && hdr->length >= sizeof(struct mattx_sys_recv_reply) &&
+        ((struct mattx_sys_recv_reply *)payload)->req_id) {
+        struct mattx_sys_recv_reply *reply = (struct mattx_sys_recv_reply *)payload;
+        size_t datalen = hdr->length - sizeof(*reply);
+        long retval = reply->bytes_recv;
+        // MSG_TRUNC: retval is the real length of a datagram, only what fitted travelled with it
+        size_t n = retval > 0 ? min_t(size_t, retval, datalen) : 0;
+
+        mattx_dbg("[RPC] Received RECV_REPLY for Orig PID %u req %u. Bytes recv: %zd\n",
+                  reply->orig_pid, reply->req_id, reply->bytes_recv);
+        if (!mattx_ticket_complete(hdr->sender_id, reply->orig_pid, reply->req_id, retval, reply->data, n))
+            mattx_dbg("[RPC] RECV_REPLY req %u: nobody waits for it any more, dropped\n", reply->req_id);
+        return;
+    }
+
     if (payload) {
         struct mattx_sys_recv_reply *reply = (struct mattx_sys_recv_reply *)payload;
         int i;
@@ -7147,15 +7270,15 @@ void mattx_fileio_exit(void) {
         spin_unlock(&mattx_fwd_write_lock);
     }
 
-    // 0b. Cancellable read kworkers: tell them to stop and wait (bounded) until the last one is gone
+    // 0b. Cancellable kworkers (read, recvfrom, ...): tell them to stop and wait (bounded) until the last one is gone
     {
         int waited;
 
-        WRITE_ONCE(mattx_read_stopping, true);
-        for (waited = 0; atomic_read(&mattx_read_inflight) > 0 && waited < 500; waited++)
+        WRITE_ONCE(mattx_cancellable_stopping, true);
+        for (waited = 0; atomic_read(&mattx_cancellable_inflight) > 0 && waited < 500; waited++)
             msleep(10);
-        if (atomic_read(&mattx_read_inflight) > 0)
-            printk(KERN_WARNING "MattX:[FILEIO] %d READ kworker(s) still running at unload\n", atomic_read(&mattx_read_inflight));
+        if (atomic_read(&mattx_cancellable_inflight) > 0)
+            printk(KERN_WARNING "MattX:[FILEIO] %d cancellable kworker(s) still running at unload\n", atomic_read(&mattx_cancellable_inflight));
     }
 
     // 1. Clean up MFS open files
