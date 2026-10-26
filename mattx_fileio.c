@@ -2172,11 +2172,75 @@ static void handle_sys_recv_reply(struct mattx_link *link, struct mattx_header *
 
 
 // --- DATA PLANE: ACCEPT4 (Kworker Native Injector) ---
+/*
+ * ACCEPT_REQ (accept()/accept4() on a listening socket that lives on the home node)
+ *
+ * Same contract as the wormhole read and recvfrom: its own kworker, CANCELLABLE, exactly ONE reply
+ * (req_id echoed): the real result - an accepted connection is never thrown away - or -EINTR when the
+ * Surrogate's CANCEL came first and nothing was accepted.
+ *
+ * kernel_accept() is only ever called with O_NONBLOCK, the waiting is done here, on the listening
+ * socket's own wait queue (a new connection wakes it, like sk_data_ready of any socket), so the
+ * blocking semantics are the application's:
+ *   - an O_NONBLOCK listening socket returns -EAGAIN at once when no connection is pending,
+ *   - SO_RCVTIMEO of the listening socket is honoured (-EAGAIN), like the kernel's own accept().
+ * (The SOCK_NONBLOCK / SOCK_CLOEXEC of accept4() belong to the NEW socket, see below.)
+ */
 struct mattx_accept_kworker_ctx {
     struct work_struct work;
     struct mattx_sys_accept_req req;
     int target_node;
 };
+
+// Waits for a pending connection of the listening socket. 0: *newsock is the accepted socket.
+// -EAGAIN: non-blocking socket / SO_RCVTIMEO expired. -EINTR: cancelled (nothing was accepted), or
+// nobody is left to answer (*abandoned: unload, link gone). Other: a real error of kernel_accept().
+static int mattx_accept_cancellable(struct socket *sock, struct file *file, struct socket **newsock,
+                                    int sender, u32 orig_pid, u32 req_id, bool *abandoned)
+{
+    bool nonblock = file->f_flags & O_NONBLOCK;
+    long rcvtimeo = nonblock ? 0 : READ_ONCE(sock->sk->sk_rcvtimeo);
+    bool timed = !nonblock && rcvtimeo != MAX_SCHEDULE_TIMEOUT;
+    unsigned long deadline = jiffies + rcvtimeo;
+    DEFINE_WAIT_FUNC(wait, woken_wake_function);
+    int err;
+
+    // On the wait queue BEFORE the first look, so that no wake-up can slip between look and sleep
+    add_wait_queue(sk_sleep(sock->sk), &wait);
+
+    for (;;) {
+        // 1. Look: never blocks
+        err = kernel_accept(sock, newsock, O_NONBLOCK);
+        if (err != -EAGAIN)
+            break;                              // a connection (0) or a real error
+
+        // 2. No connection pending right now
+        if (nonblock || (timed && time_after(jiffies, deadline)))
+            break;                              // err stays -EAGAIN
+        if (mattx_req_take_cancelled(sender, orig_pid, req_id)) {
+            mattx_dbg("[WORMHOLE] ACCEPT for PID %u req %u cancelled by the Surrogate, nothing accepted\n", orig_pid, req_id);
+            err = -EINTR;
+            break;
+        }
+        if (READ_ONCE(mattx_cancellable_stopping) || !READ_ONCE(cluster_map[sender])) {
+            *abandoned = true;
+            err = -EINTR;
+            break;
+        }
+
+        // 3. Sleep until the listening socket wakes us (or 10 ms, or the SO_RCVTIMEO deadline)
+        {
+            long to = msecs_to_jiffies(10);
+
+            if (timed && (long)(deadline - jiffies) < to)
+                to = (long)(deadline - jiffies) > 0 ? (long)(deadline - jiffies) : 1;
+            wait_woken(&wait, TASK_INTERRUPTIBLE, to);
+        }
+    }
+
+    remove_wait_queue(sk_sleep(sock->sk), &wait);
+    return err;
+}
 
 static void mattx_accept_kworker(struct work_struct *work) {
     struct mattx_accept_kworker_ctx *ctx = container_of(work, struct mattx_accept_kworker_ctx, work);
@@ -2186,25 +2250,29 @@ static void mattx_accept_kworker(struct work_struct *work) {
     struct socket *newsock = NULL;
     struct file *newfile = NULL;
     struct task_struct *deputy = NULL;
+    struct mattx_link *link;
+    bool abandoned = false;
     int remote_fd = -1;
     int err = -EBADF;
 
     memset(&reply, 0, sizeof(reply));
     reply.orig_pid = ctx->req.orig_pid;
+    reply.req_id = ctx->req.req_id;
+
+    mattx_dbg("[WORMHOLE] Received ACCEPT request for FD %u (req %u) from Node %d (kworker)...\n", ctx->req.fd, ctx->req.req_id, ctx->target_node);
 
     if (file) {
         sock = sock_from_file(file);
-        if (sock) {
-            // 1. Use kernel_accept to do the heavy lifting!
-            // The flags passed to kernel_accept are the O_NONBLOCK from the listening socket's file
-            int accept_flags = file->f_flags & O_NONBLOCK;
-            err = kernel_accept(sock, &newsock, accept_flags);
-            
+        if (sock && sock->sk) {
+            // 1. Wait for a connection, cancellable. Never blocks inside kernel_accept().
+            err = mattx_accept_cancellable(sock, file, &newsock, ctx->target_node,
+                                           ctx->req.orig_pid, ctx->req.req_id, &abandoned);
+
             if (err == 0 && newsock) {
                 // 2. Map accept4 flags (SOCK_NONBLOCK, SOCK_CLOEXEC) to file flags
                 int file_flags = ctx->req.flags & (O_CLOEXEC | O_NONBLOCK);
                 newfile = sock_alloc_file(newsock, file_flags, NULL);
-                
+
                 if (IS_ERR(newfile)) {
                     err = PTR_ERR(newfile);
                     sock_release(newsock);
@@ -2228,14 +2296,14 @@ static void mattx_accept_kworker(struct work_struct *work) {
                         }
                         spin_unlock(&deputy->files->file_lock);
                     }
-                    
+
                     if (remote_fd == -1) {
                         fput(newfile);
                         err = -ENFILE;
                     } else {
                         err = 0;
                         mattx_dbg("[KWORKER] Successfully injected accepted socket into Deputy Native FD: %d\n", remote_fd);
-                        
+
                         // 3. Extract the peer name (client IP) natively!
                         if (newsock->ops && newsock->ops->getname) {
                             int len = newsock->ops->getname(newsock, (struct sockaddr *)&reply.addr, 2); // 2 = peer
@@ -2256,31 +2324,64 @@ static void mattx_accept_kworker(struct work_struct *work) {
     reply.remote_fd = remote_fd;
     reply.error = err;
 
-    if (cluster_map[ctx->target_node]) {
-        mattx_comm_send(cluster_map[ctx->target_node], MATTX_MSG_SYS_ACCEPT_REPLY, &reply, sizeof(reply));
+    link = READ_ONCE(cluster_map[ctx->target_node]);
+    if (abandoned || !link) {
+        mattx_dbg("[WORMHOLE] ACCEPT for FD %u (req %u): nobody left to answer, reply dropped\n", ctx->req.fd, ctx->req.req_id);
+    } else {
+        mattx_comm_send(link, MATTX_MSG_SYS_ACCEPT_REPLY, &reply, sizeof(reply));
     }
 
     kfree(ctx);
+    atomic_dec(&mattx_cancellable_inflight);
 }
 
 static void handle_sys_accept_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
-    if (payload) {
-        struct mattx_sys_accept_req *req = payload;
-        struct mattx_accept_kworker_ctx *ctx = kmalloc(sizeof(*ctx), GFP_ATOMIC);
-        
-        if (ctx) {
-            INIT_WORK(&ctx->work, mattx_accept_kworker);
-            memcpy(&ctx->req, req, sizeof(*req));
-            ctx->target_node = hdr->sender_id;
-            
-            mattx_dbg("[RPC] Dispatching ACCEPT_REQ to Kworker...\n");
-            schedule_work(&ctx->work);
-        }
+    struct mattx_sys_accept_req *req = payload;
+    struct mattx_accept_kworker_ctx *ctx;
+
+    if (!payload || hdr->length < sizeof(*req)) return;
+    if (hdr->sender_id >= MAX_NODES || READ_ONCE(mattx_cancellable_stopping)) return;
+
+    ctx = kmalloc(sizeof(*ctx), GFP_ATOMIC);
+    if (!ctx) {
+        printk(KERN_ERR "MattX:[WORMHOLE] ACCEPT_REQ dropped: out of memory\n");
+        return;
     }
+    INIT_WORK(&ctx->work, mattx_accept_kworker);
+    memcpy(&ctx->req, req, sizeof(*req));
+    ctx->target_node = hdr->sender_id;
+
+    mattx_dbg("[RPC] Dispatching ACCEPT_REQ to Kworker...\n");
+    atomic_inc(&mattx_cancellable_inflight);
+    schedule_work(&ctx->work);
 }
 
 
 static void handle_sys_accept_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    // A reply that carries a ticket id belongs to exactly one waiting thread (mattx_ticket_*).
+    // req_id 0 is the legacy reply of the SIGSTOP fallback path: it goes through the slot below.
+    if (payload && hdr->length >= sizeof(struct mattx_sys_accept_reply) &&
+        ((struct mattx_sys_accept_reply *)payload)->req_id) {
+        struct mattx_sys_accept_reply *reply = (struct mattx_sys_accept_reply *)payload;
+        // The ticket's result is the new remote FD, or -errno; the peer address travels as its data
+        long retval = reply->error ? reply->error : reply->remote_fd;
+        size_t alen = (reply->error == 0 && reply->addrlen > 0 && reply->addrlen <= sizeof(reply->addr)) ? reply->addrlen : 0;
+
+        mattx_dbg("[RPC] Received ACCEPT_REPLY for Orig PID %u req %u. New Remote FD: %d, error %d\n",
+                  reply->orig_pid, reply->req_id, reply->remote_fd, reply->error);
+        if (!mattx_ticket_complete(hdr->sender_id, reply->orig_pid, reply->req_id, retval, &reply->addr, alen)) {
+            mattx_dbg("[RPC] ACCEPT_REPLY req %u: nobody waits for it any more\n", reply->req_id);
+            // The thread gave up for good (dead link, killed) and nobody will ever claim the connection
+            // the home node accepted for it: close the orphaned FD there instead of leaking it.
+            if (reply->error == 0 && reply->remote_fd >= 0) {
+                struct mattx_sys_close_req close_req = { .orig_pid = reply->orig_pid, .remote_fd = reply->remote_fd };
+
+                mattx_comm_send(link, MATTX_MSG_SYS_CLOSE_REQ, &close_req, sizeof(close_req));
+            }
+        }
+        return;
+    }
+
     if (payload) {
         struct mattx_sys_accept_reply *reply = (struct mattx_sys_accept_reply *)payload;
         int i;

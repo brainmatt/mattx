@@ -550,12 +550,14 @@ struct mattx_sys_accept_req {
     u32 orig_pid;
     u32 fd; // The listening socket
     int flags;
+    u32 req_id; // ticket id: matches the reply to the one thread that waits for it (0 = legacy SIGSTOP path)
 };
 
 struct mattx_sys_accept_reply {
     u32 orig_pid;
     int remote_fd; // The newly created socket for the connection
     int error;
+    u32 req_id; // echo of the request's ticket id (0 = legacy reply)
     struct sockaddr_storage addr; // The IP of the client who connected
     int addrlen;
 };

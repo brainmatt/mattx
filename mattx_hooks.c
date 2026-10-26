@@ -2686,6 +2686,149 @@ static int entry_handler_accept(struct kretprobe_instance *ri, struct pt_regs *r
     return 0;
 }
 
+/*
+ * accept()/accept4() on a listening socket that lives on the home node: the thread that called it
+ * waits for the reply on its own ticket, in a task_work that runs when the (sabotaged) syscall returns
+ * to user mode. Same pattern as read() and recvfrom(): only this thread sleeps (the other threads of
+ * the server keep serving the connections they already have), the reply is matched by req_id.
+ *
+ * What is new: accept() returns a new FD. The thread now allocates it natively in its OWN fd table
+ * (get_unused_fd_flags + fd_install: fd table expansion, RLIMIT_NOFILE and O_CLOEXEC are handled by
+ * the kernel) instead of a foreign kworker scanning the table of a stopped task.
+ */
+struct mattx_accept_tw {
+    struct callback_head cb;
+    u32 orig_pid;
+    int home_node;
+    int remote_fd;
+    int flags;
+    struct sockaddr __user *usockaddr;
+    int __user *uaddrlen;
+};
+
+// Tells the home node to close an FD it accepted for us but that we cannot hand to the application
+static void mattx_accept_tw_close_remote(struct mattx_accept_tw *tw, int remote_fd)
+{
+    struct mattx_sys_close_req close_req = { .orig_pid = tw->orig_pid, .remote_fd = remote_fd };
+    struct mattx_link *link = READ_ONCE(cluster_map[tw->home_node]);
+
+    if (link)
+        mattx_comm_send(link, MATTX_MSG_SYS_CLOSE_REQ, &close_req, sizeof(close_req));
+}
+
+static void mattx_accept_tw_fn(struct callback_head *cb) {
+    struct mattx_accept_tw *tw = container_of(cb, struct mattx_accept_tw, cb);
+    struct pt_regs *regs = task_pt_regs(current);
+    struct mattx_sys_accept_req req;
+    struct mattx_ticket *t;
+    struct mattx_link *link;
+    long ret = -EINTR;
+
+    if (fatal_signal_pending(current) || tw->home_node < 0 || tw->home_node >= MAX_NODES)
+        goto out;
+
+    link = READ_ONCE(cluster_map[tw->home_node]);
+    if (!link) {
+        ret = -EIO;
+        goto out;
+    }
+
+    t = mattx_ticket_add(tw->orig_pid, tw->home_node, sizeof(struct sockaddr_storage));
+    if (!t) {
+        ret = -ENOMEM;
+        goto out;
+    }
+
+    memset(&req, 0, sizeof(req));
+    req.orig_pid = tw->orig_pid;
+    req.fd = tw->remote_fd;
+    req.flags = tw->flags;
+    req.req_id = t->req_id;
+
+    mattx_dbg("[RPC] Thread %d: accept(fd=%d) as req %u, sleeping on its own ticket...\n", current->pid, tw->remote_fd, t->req_id);
+
+    if (mattx_comm_send(link, MATTX_MSG_SYS_ACCEPT_REQ, &req, sizeof(req)) < 0) {
+        // Never sleep for a reply to a request that was never sent
+        mattx_dbg("[RPC] Thread %d: ACCEPT_REQ send failed\n", current->pid);
+        ret = -EIO;
+        goto done;
+    }
+
+    // Interrupted (signal, freeze of a migration or recall)? The wait cancels the request and still
+    // hands back the connection if the home node had already accepted it; otherwise we return -EINTR.
+    if (mattx_ticket_wait(t, MAX_SCHEDULE_TIMEOUT) == 0) {
+        ret = t->retval;
+
+        if (ret >= 0) {
+            // The home node accepted a connection and injected it as FD 'remote_fd': build the proxy FD
+            int remote_fd = ret;
+            struct mattx_fake_fd_info *fd_info;
+            struct file *fake_file;
+            int local_fd;
+
+            fd_info = kmalloc(sizeof(*fd_info), GFP_KERNEL);
+            if (!fd_info) {
+                mattx_accept_tw_close_remote(tw, remote_fd);
+                ret = -ENOMEM;
+                goto done;
+            }
+            fd_info->home_node = tw->home_node;
+            fd_info->orig_pid = tw->orig_pid;
+            fd_info->remote_fd = remote_fd;
+
+            fake_file = anon_inode_getfile("mattx_vfs_proxy", &mattx_fops, fd_info, O_RDWR);
+            if (IS_ERR(fake_file)) {
+                kfree(fd_info);
+                mattx_accept_tw_close_remote(tw, remote_fd);
+                ret = -ENFILE;
+                goto done;
+            }
+
+            local_fd = get_unused_fd_flags((tw->flags & O_CLOEXEC) ? O_CLOEXEC : 0);
+            if (local_fd < 0) {
+                fput(fake_file);                // its release closes the remote FD at the home node
+                ret = local_fd;
+                goto done;
+            }
+
+            // Like the kernel's move_addr_to_user(): copy the peer address out BEFORE the new FD becomes
+            // visible, truncated to the length the application offered; *addrlen gets the real size.
+            if (tw->usockaddr) {
+                size_t klen = t->data ? t->data_len : 0;
+                int len;
+                int uerr = 0;
+
+                if (get_user(len, tw->uaddrlen))
+                    uerr = -EFAULT;
+                else if (len < 0)
+                    uerr = -EINVAL;
+                else {
+                    if ((size_t)len > klen)
+                        len = klen;
+                    if ((len && copy_to_user(tw->usockaddr, t->data, len)) || put_user((int)klen, tw->uaddrlen))
+                        uerr = -EFAULT;
+                }
+                if (uerr) {
+                    put_unused_fd(local_fd);
+                    fput(fake_file);        // its release closes the remote FD at the home node
+                    ret = uerr;
+                    goto done;
+                }
+            }
+
+            fd_install(local_fd, fake_file);
+            ret = local_fd;
+            mattx_dbg("[RPC] Illusion Complete! Mapped New Remote FD %d to Local FD %d (thread %d)\n", remote_fd, local_fd, current->pid);
+        }
+    }
+
+done:
+    mattx_ticket_del(t);
+out:
+    regs->ax = ret;
+    kfree(tw);
+}
+
 static int ret_handler_accept(struct kretprobe_instance *ri, struct pt_regs *regs) {
     pid_t my_pid = current->pid;
     struct accept_kretprobe_data *data = (struct accept_kretprobe_data *)ri->data;
@@ -2700,7 +2843,6 @@ static int ret_handler_accept(struct kretprobe_instance *ri, struct pt_regs *reg
         if (guest_registry[i].local_pid == current->tgid) {
             home_node = guest_registry[i].home_node;
             orig_pid = guest_registry[i].orig_pid;
-            guest_registry[i].rpc_done = false; 
             break;
         }
     }
@@ -2716,22 +2858,54 @@ static int ret_handler_accept(struct kretprobe_instance *ri, struct pt_regs *reg
             return 0;
         }
 
-        struct mattx_rpc_work *rpc = kzalloc(sizeof(*rpc), GFP_ATOMIC); 
+        if (real_task_work_add) {
+            struct mattx_accept_tw *tw = kzalloc(sizeof(*tw), GFP_ATOMIC);
+            if (tw) {
+                init_task_work(&tw->cb, mattx_accept_tw_fn);
+                tw->orig_pid = orig_pid;
+                tw->home_node = home_node;
+                tw->remote_fd = data->remote_fd;
+                tw->flags = data->flags;
+                tw->usockaddr = data->upeer_sockaddr;
+                tw->uaddrlen = data->upeer_addrlen;
+
+                mattx_dbg("[HOOK] Intercepted accept(fd=%d). Thread %d waits on its own ticket...\n", data->fd, my_pid);
+                // The sabotaged call returns -EBADF; the task_work overwrites it with the real result.
+                regs->ax = -EINTR;
+
+                if (real_task_work_add(current, &tw->cb, TWA_RESUME))
+                    kfree(tw);
+            }
+            return 0;
+        }
+
+        // Fallback if the task_work resolver is missing: the old way (freeze the whole group, the
+        // rpc worker polls the per-guest slot). The home node answers with req_id 0 then.
+        struct mattx_rpc_work *rpc = kzalloc(sizeof(*rpc), GFP_ATOMIC);
         if (rpc) {
+            spin_lock(&guest_lock);
+            for (i = 0; i < guest_count; i++) {
+                if (guest_registry[i].local_pid == current->tgid) {
+                    guest_registry[i].rpc_done = false;
+                    break;
+                }
+            }
+            spin_unlock(&guest_lock);
+
             INIT_WORK(&rpc->work, mattx_rpc_worker);
             rpc->local_pid = my_pid;
             rpc->orig_pid = orig_pid;
             rpc->home_node = home_node;
-            
+
             rpc->is_accept = true;
             rpc->remote_fd = data->remote_fd;
             rpc->flags = data->flags;
-            
-            // We save the user-space pointers so we can copy the client IP later!
-            rpc->buff = data->upeer_sockaddr; 
-            rpc->size = (size_t)data->upeer_addrlen; 
 
-            mattx_dbg("[HOOK] Intercepted accept(fd=%d). Freezing Surrogate %d...\n", data->fd, my_pid);
+            // We save the user-space pointers so we can copy the client IP later!
+            rpc->buff = data->upeer_sockaddr;
+            rpc->size = (size_t)data->upeer_addrlen;
+
+            mattx_dbg("[HOOK] Intercepted accept(fd=%d). Freezing Surrogate %d (fallback)...\n", data->fd, my_pid);
             send_sig(SIGSTOP, current, 0);
             schedule_work(&rpc->work);
         }
