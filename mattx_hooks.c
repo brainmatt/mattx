@@ -2165,6 +2165,80 @@ static int entry_handler_connect(struct kretprobe_instance *ri, struct pt_regs *
     return 0;
 }
 
+/*
+ * connect() on a socket that lives on the home node: the thread that called it waits for the reply on
+ * its own ticket, in a task_work that runs when the (sabotaged) syscall returns to user mode. Same
+ * pattern as read(), recvfrom() and accept(): only this thread sleeps (the other threads of the
+ * process keep running), the reply is matched by req_id.
+ *
+ * The result is what the kernel's own connect() would return: 0, -EINPROGRESS (non-blocking socket, or
+ * SO_SNDTIMEO expired), the handshake error, or -EINTR when we were interrupted (signal, freeze of a
+ * migration or recall). Like the native -EINTR, that does NOT abort the handshake: it keeps running on
+ * the home node and a repeated connect() answers -EALREADY / 0 / -EISCONN, natively.
+ */
+struct mattx_connect_tw {
+    struct callback_head cb;
+    u32 orig_pid;
+    int home_node;
+    int remote_fd;
+    int addrlen;
+    struct sockaddr_storage addr;
+};
+
+static void mattx_connect_tw_fn(struct callback_head *cb) {
+    struct mattx_connect_tw *tw = container_of(cb, struct mattx_connect_tw, cb);
+    struct pt_regs *regs = task_pt_regs(current);
+    struct mattx_sys_connect_req req;
+    struct mattx_ticket *t;
+    struct mattx_link *link;
+    long ret = -EINTR;
+
+    if (fatal_signal_pending(current) || tw->home_node < 0 || tw->home_node >= MAX_NODES)
+        goto out;
+
+    link = READ_ONCE(cluster_map[tw->home_node]);
+    if (!link) {
+        ret = -EIO;
+        goto out;
+    }
+
+    // The reply carries no data: only the result
+    t = mattx_ticket_add(tw->orig_pid, tw->home_node, 0);
+    if (!t) {
+        ret = -ENOMEM;
+        goto out;
+    }
+
+    memset(&req, 0, sizeof(req));
+    req.orig_pid = tw->orig_pid;
+    req.fd = tw->remote_fd;
+    req.addrlen = min_t(int, tw->addrlen, sizeof(req.addr));
+    memcpy(&req.addr, &tw->addr, req.addrlen);
+    req.req_id = t->req_id;
+
+    mattx_dbg("[RPC] Thread %d: connect(fd=%d) as req %u, sleeping on its own ticket...\n", current->pid, tw->remote_fd, t->req_id);
+
+    if (mattx_comm_send(link, MATTX_MSG_SYS_CONNECT_REQ, &req, sizeof(req)) < 0) {
+        // Never sleep for a reply to a request that was never sent
+        mattx_dbg("[RPC] Thread %d: CONNECT_REQ send failed\n", current->pid);
+        ret = -EIO;
+        goto done;
+    }
+
+    // Interrupted (signal, freeze of a migration or recall)? The wait cancels the request and still
+    // hands back the result if the home node had already finished it; otherwise we return -EINTR.
+    if (mattx_ticket_wait(t, MAX_SCHEDULE_TIMEOUT) == 0)
+        ret = t->retval;
+
+    mattx_dbg("[RPC] Illusion Complete! connect() on Ghost FD returned %ld (thread %d)\n", ret, current->pid);
+
+done:
+    mattx_ticket_del(t);
+out:
+    regs->ax = ret;
+    kfree(tw);
+}
+
 static int ret_handler_connect(struct kretprobe_instance *ri, struct pt_regs *regs) {
     pid_t my_pid = current->pid;
     struct connect_kretprobe_data *data = (struct connect_kretprobe_data *)ri->data;
@@ -2179,7 +2253,6 @@ static int ret_handler_connect(struct kretprobe_instance *ri, struct pt_regs *re
         if (guest_registry[i].local_pid == current->tgid) {
             home_node = guest_registry[i].home_node;
             orig_pid = guest_registry[i].orig_pid;
-            guest_registry[i].rpc_done = false; 
             break;
         }
     }
@@ -2195,20 +2268,51 @@ static int ret_handler_connect(struct kretprobe_instance *ri, struct pt_regs *re
             return 0;
         }
 
-        struct mattx_rpc_work *rpc = kzalloc(sizeof(*rpc), GFP_ATOMIC); 
+        if (real_task_work_add) {
+            struct mattx_connect_tw *tw = kzalloc(sizeof(*tw), GFP_ATOMIC);
+            if (tw) {
+                init_task_work(&tw->cb, mattx_connect_tw_fn);
+                tw->orig_pid = orig_pid;
+                tw->home_node = home_node;
+                tw->remote_fd = data->remote_fd;
+                tw->addrlen = data->addrlen;
+                memcpy(&tw->addr, &data->addr, data->addrlen);
+
+                mattx_dbg("[HOOK] Intercepted connect(fd=%d). Thread %d waits on its own ticket...\n", data->fd, my_pid);
+                // The sabotaged call returns -EBADF; the task_work overwrites it with the real result.
+                regs->ax = -EINTR;
+
+                if (real_task_work_add(current, &tw->cb, TWA_RESUME))
+                    kfree(tw);
+            }
+            return 0;
+        }
+
+        // Fallback if the task_work resolver is missing: the old way (freeze the whole group, the
+        // rpc worker polls the per-guest slot). The home node answers with req_id 0 then.
+        struct mattx_rpc_work *rpc = kzalloc(sizeof(*rpc), GFP_ATOMIC);
         if (rpc) {
+            spin_lock(&guest_lock);
+            for (i = 0; i < guest_count; i++) {
+                if (guest_registry[i].local_pid == current->tgid) {
+                    guest_registry[i].rpc_done = false;
+                    break;
+                }
+            }
+            spin_unlock(&guest_lock);
+
             INIT_WORK(&rpc->work, mattx_rpc_worker);
             rpc->local_pid = my_pid;
             rpc->orig_pid = orig_pid;
             rpc->home_node = home_node;
-            
+
             rpc->is_connect = true;
             rpc->remote_fd = data->remote_fd;
             rpc->addrlen = data->addrlen;
             memcpy(&rpc->addr, &data->addr, data->addrlen);
 
-            mattx_dbg("[HOOK] Intercepted connect(fd=%d). Freezing Surrogate %d and escaping to Workqueue...\n", data->fd, my_pid);
-            
+            mattx_dbg("[HOOK] Intercepted connect(fd=%d). Freezing Surrogate %d and escaping to Workqueue (fallback)...\n", data->fd, my_pid);
+
             send_sig(SIGSTOP, current, 0);
             schedule_work(&rpc->work);
         }

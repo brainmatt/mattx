@@ -1570,85 +1570,162 @@ static void handle_sys_bind_req(struct mattx_link *link, struct mattx_header *hd
 }
 
 // --- DATA PLANE: CONNECT (Kworker Native Injector & Smart Waiter) ---
+/*
+ * CONNECT_REQ (connect() on a socket that lives on the home node)
+ *
+ * Same contract as the wormhole read, recvfrom and accept: its own kworker, CANCELLABLE, exactly ONE
+ * reply (req_id echoed): the real result, or -EINTR when the Surrogate's CANCEL came first.
+ *
+ * kernel_connect() is only ever called with O_NONBLOCK, so it never sleeps where the CANCEL cannot
+ * reach us. The waiting is done here, on the socket's own wait queue (the state change of the
+ * handshake wakes it, like sk_state_change of any socket), and the blocking semantics are the
+ * application's, like the kernel's own connect():
+ *   - an O_NONBLOCK socket returns -EINPROGRESS at once and the handshake runs on,
+ *   - SO_SNDTIMEO of the socket is honoured (-EINPROGRESS when it expires, the handshake runs on),
+ *   - a cancel returns -EINTR and does NOT abort the handshake: a repeated connect() then answers
+ *     -EALREADY / 0 / -EISCONN natively (exactly what the kernel does after a signal).
+ * The old 50 ms poll loop (no timeout, no cancel) is gone.
+ */
 struct mattx_connect_kworker_ctx {
     struct work_struct work;
     struct mattx_sys_connect_req req;
     int target_node;
 };
 
+// Connects without ever blocking in kernel_connect(). 0: connected. -EINPROGRESS: non-blocking socket /
+// SO_SNDTIMEO expired. -EINTR: cancelled, or nobody is left to answer (*abandoned: unload, link gone).
+// Other: the real error of the connect or of the handshake.
+static int mattx_connect_cancellable(struct socket *sock, struct file *file, struct sockaddr_storage *addr,
+                                     int addrlen, int sender, u32 orig_pid, u32 req_id, bool *abandoned)
+{
+    bool nonblock = file->f_flags & O_NONBLOCK;
+    long sndtimeo = nonblock ? 0 : READ_ONCE(sock->sk->sk_sndtimeo);
+    bool timed = !nonblock && sndtimeo != MAX_SCHEDULE_TIMEOUT;
+    unsigned long deadline = jiffies + sndtimeo;
+    bool connecting = false;
+    DEFINE_WAIT_FUNC(wait, woken_wake_function);
+    int err;
+
+    // On the wait queue BEFORE the first look, so that no wake-up can slip between look and sleep
+    add_wait_queue(sk_sleep(sock->sk), &wait);
+
+    for (;;) {
+        // 1. Look: never blocks
+        if (!connecting) {
+            err = kernel_connect(sock, MATTX_SA_CAST(addr), addrlen, O_NONBLOCK);
+            mattx_dbg("[KWORKER] Executed kernel_connect natively. Result: %d (NonBlock: %d)\n", err, nonblock);
+            if (err == -EINPROGRESS) {
+                // The handshake is under way: from now on we only wait for its end
+                connecting = true;
+                if (!nonblock)
+                    mattx_dbg("[CONNECT_DEBUG] Blocking connect returned -EINPROGRESS. Waiting for the handshake...\n");
+            } else if (err == -EAGAIN && !nonblock && sock->sk->sk_family == AF_UNIX) {
+                // The listener's backlog is full: a blocking connect() waits for room. Try again below.
+            } else {
+                break;                          // connected (0) or a real error
+            }
+        } else {
+            __poll_t mask = vfs_poll(file, NULL);
+
+            if (mask & (EPOLLOUT | EPOLLERR | EPOLLHUP)) {
+                mattx_dbg("[CONNECT_DEBUG] Socket handshake complete! Leaving the wait.\n");
+                // Check the final socket error state to see if the handshake succeeded!
+                err = -sock_error(sock->sk);    // sock_error() returns positive: we need negative
+                mattx_dbg("[CONNECT_DEBUG] Final handshake result: %d\n", err);
+                break;
+            }
+        }
+
+        // 2. Not connected yet
+        if (nonblock)
+            break;                              // err stays -EINPROGRESS
+        if (timed && time_after(jiffies, deadline))
+            break;                              // err stays -EINPROGRESS (-EAGAIN for a full AF_UNIX backlog)
+        if (mattx_req_take_cancelled(sender, orig_pid, req_id)) {
+            mattx_dbg("[WORMHOLE] CONNECT for PID %u req %u cancelled by the Surrogate, handshake keeps running\n", orig_pid, req_id);
+            err = -EINTR;
+            break;
+        }
+        if (READ_ONCE(mattx_cancellable_stopping) || !READ_ONCE(cluster_map[sender])) {
+            *abandoned = true;
+            err = -EINTR;
+            break;
+        }
+
+        // 3. Sleep until the socket wakes us (or 10 ms, or the SO_SNDTIMEO deadline)
+        {
+            long to = msecs_to_jiffies(10);
+
+            if (timed && (long)(deadline - jiffies) < to)
+                to = (long)(deadline - jiffies) > 0 ? (long)(deadline - jiffies) : 1;
+            wait_woken(&wait, TASK_INTERRUPTIBLE, to);
+        }
+    }
+
+    remove_wait_queue(sk_sleep(sock->sk), &wait);
+    return err;
+}
+
 static void mattx_connect_kworker(struct work_struct *work) {
     struct mattx_connect_kworker_ctx *ctx = container_of(work, struct mattx_connect_kworker_ctx, work);
     struct mattx_sys_connect_reply reply;
     struct file *file = mattx_get_remote_file(ctx->req.orig_pid, ctx->req.fd);
+    struct mattx_link *link;
+    bool abandoned = false;
     int err = -EBADF;
 
     memset(&reply, 0, sizeof(reply));
     reply.orig_pid = ctx->req.orig_pid;
+    reply.req_id = ctx->req.req_id;
+
+    mattx_dbg("[WORMHOLE] Received CONNECT request for FD %u (req %u) from Node %d (kworker)...\n", ctx->req.fd, ctx->req.req_id, ctx->target_node);
 
     if (file) {
         struct socket *sock = sock_from_file(file);
-        if (sock) {
-            bool is_nonblock = (file->f_flags & O_NONBLOCK) != 0;
-            
-            // Execute natively!
-            err = kernel_connect(sock, MATTX_SA_CAST(&ctx->req.addr), ctx->req.addrlen, file->f_flags);
-            mattx_dbg("[KWORKER] Executed kernel_connect natively. Result: %d (NonBlock: %d)\n", err, is_nonblock);
-            
-            // --- THE SMART CONNECTOR WAIT LOOP ---
-            // If it's a blocking socket and the TCP handshake is in progress, we wait right here!
-            if (err == -EINPROGRESS && !is_nonblock) {
-                mattx_dbg("[CONNECT_DEBUG] Blocking connect returned -EINPROGRESS. Entering poll loop...\n");
-                
-                while (1) {
-                    struct poll_wqueues table;
-                    poll_initwait(&table);
-                    __poll_t mask = vfs_poll(file, &table.pt);
-                    
-                    if (mask & (EPOLLOUT | EPOLLERR | EPOLLHUP)) {
-                        mattx_dbg("[CONNECT_DEBUG] Socket handshake complete! Breaking poll loop.\n");
-                        poll_freewait(&table);
-                        break;
-                    }
-                    
-                    schedule_timeout_interruptible(msecs_to_jiffies(50));
-                    poll_freewait(&table);
-                }
-                
-                // Check the final socket error state to see if the handshake succeeded!
-                if (sock->sk) {
-                    err = sock_error(sock->sk);
-                    if (err) err = -err; // sock_error returns positive, we need negative!
-                    mattx_dbg("[CONNECT_DEBUG] Final handshake result: %d\n", err);
-                } else {
-                    err = -ENOTSOCK;
-                }
-            }
-        } else {
+
+        if (!sock || !sock->sk) {
             err = -ENOTSOCK;
+        } else if (ctx->req.addrlen < 0 || (size_t)ctx->req.addrlen > sizeof(ctx->req.addr)) {
+            err = -EINVAL;
+        } else {
+            err = mattx_connect_cancellable(sock, file, &ctx->req.addr, ctx->req.addrlen,
+                                            ctx->target_node, ctx->req.orig_pid, ctx->req.req_id, &abandoned);
         }
         fput(file);
     }
 
     reply.error = err;
-    if (cluster_map[ctx->target_node]) {
-        mattx_comm_send(cluster_map[ctx->target_node], MATTX_MSG_SYS_CONNECT_REPLY, &reply, sizeof(reply));
+
+    link = READ_ONCE(cluster_map[ctx->target_node]);
+    if (abandoned || !link) {
+        mattx_dbg("[WORMHOLE] CONNECT for FD %u (req %u): nobody left to answer, reply dropped\n", ctx->req.fd, ctx->req.req_id);
+    } else {
+        mattx_comm_send(link, MATTX_MSG_SYS_CONNECT_REPLY, &reply, sizeof(reply));
     }
+
     kfree(ctx);
+    atomic_dec(&mattx_cancellable_inflight);
 }
 
 static void handle_sys_connect_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
-    if (payload) {
-        struct mattx_sys_connect_req *req = payload;
-        struct mattx_connect_kworker_ctx *ctx = kmalloc(sizeof(*ctx), GFP_ATOMIC);
-        if (ctx) {
-            INIT_WORK(&ctx->work, mattx_connect_kworker);
-            memcpy(&ctx->req, req, sizeof(*req));
-            ctx->target_node = hdr->sender_id;
-            
-            mattx_dbg("[RPC] Dispatching CONNECT_REQ to Kworker...\n");
-            schedule_work(&ctx->work);
-        }
+    struct mattx_sys_connect_req *req = payload;
+    struct mattx_connect_kworker_ctx *ctx;
+
+    if (!payload || hdr->length < sizeof(*req)) return;
+    if (hdr->sender_id >= MAX_NODES || READ_ONCE(mattx_cancellable_stopping)) return;
+
+    ctx = kmalloc(sizeof(*ctx), GFP_ATOMIC);
+    if (!ctx) {
+        printk(KERN_ERR "MattX:[WORMHOLE] CONNECT_REQ dropped: out of memory\n");
+        return;
     }
+    INIT_WORK(&ctx->work, mattx_connect_kworker);
+    memcpy(&ctx->req, req, sizeof(*req));
+    ctx->target_node = hdr->sender_id;
+
+    mattx_dbg("[RPC] Dispatching CONNECT_REQ to Kworker...\n");
+    atomic_inc(&mattx_cancellable_inflight);
+    schedule_work(&ctx->work);
 }
 
 
@@ -1776,6 +1853,19 @@ static void handle_sys_socket_reply(struct mattx_link *link, struct mattx_header
 }
 
 static void handle_sys_connect_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    // A reply that carries a ticket id belongs to exactly one waiting thread (mattx_ticket_*).
+    // req_id 0 is the legacy reply of the SIGSTOP fallback path: it goes through the slot below.
+    if (payload && hdr->length >= sizeof(struct mattx_sys_connect_reply) &&
+        ((struct mattx_sys_connect_reply *)payload)->req_id) {
+        struct mattx_sys_connect_reply *reply = (struct mattx_sys_connect_reply *)payload;
+
+        mattx_dbg("[RPC] Received CONNECT_REPLY for Orig PID %u req %u. Error: %d\n", reply->orig_pid, reply->req_id, reply->error);
+        // Nothing to clean up if the thread gave up: a connected socket simply stays connected on the home node
+        if (!mattx_ticket_complete(hdr->sender_id, reply->orig_pid, reply->req_id, reply->error, NULL, 0))
+            mattx_dbg("[RPC] CONNECT_REPLY req %u: nobody waits for it any more, dropped\n", reply->req_id);
+        return;
+    }
+
     if (payload) {
         struct mattx_sys_connect_reply *reply = (struct mattx_sys_connect_reply *)payload;
         int i;
@@ -2716,7 +2806,7 @@ static void mattx_epoll_ctl_cb(struct callback_head *cb) {
     struct pt_regs *task_regs = task_pt_regs(current); // We are the Deputy!
     struct pt_regs regs;
     int ret = -EFAULT;
-    struct mattx_sys_connect_reply reply; 
+    struct mattx_sys_bind_reply reply;  // {orig_pid, error} for handle_sys_generic_int_reply (not the connect reply: it carries a req_id now)
 
     // --- THE USER-SPACE SCRATCHPAD HACK ---
     // x86_64 has a 128-byte "red zone" below the stack pointer.
