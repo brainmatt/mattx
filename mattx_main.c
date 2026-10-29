@@ -327,6 +327,7 @@ static void __exit mattx_exit(void) {
     
     mattx_proc_exit();
     mattx_hooks_exit();
+    mattx_migr_exit();      // a recall in flight needs the receivers: they are still alive here
     mattx_fileio_exit();
     
     for (i = 0; i < MAX_NODES; i++) mattx_comm_disconnect(i);

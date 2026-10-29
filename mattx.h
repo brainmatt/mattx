@@ -1669,6 +1669,7 @@ void mattx_hooks_exit(void);
 void mattx_sched_init_handlers(void);
 void mattx_import_init_handlers(void);
 void mattx_migr_init_handlers(void);
+void mattx_migr_exit(void); // waits for a recall that is still being served
 void mattx_guest_init_handlers(void);
 void mattx_fileio_init_handlers(void);
 void mattx_fileio_exit(void); // The Cleanup function!
