@@ -943,8 +943,22 @@ static void mattx_rpc_worker(struct work_struct *work) {
                 spin_unlock(&guest_lock);
 
                 if (success && reply_data) {
-                    // FIX: Use access_process_vm!
-                    if (access_process_vm(surrogate, (unsigned long)rpc->poll_ufds, reply_data->fds, sizeof(struct pollfd) * rpc->nfds, FOLL_WRITE | FOLL_FORCE) != (sizeof(struct pollfd) * rpc->nfds)) {
+                    // Only the revents of each entry go back (the application's fd and events stay as they
+                    // are, like native poll), and the user's entries are struct pollfd (8 bytes), not our
+                    // struct mattx_pollfd (16 bytes).
+                    bool wfault = false;
+                    int j;
+
+                    for (j = 0; j < rpc->nfds && j < 16; j++) {
+                        short rev = reply_data->fds[j].revents;
+
+                        if (access_process_vm(surrogate, (unsigned long)rpc->poll_ufds + j * sizeof(struct pollfd) + offsetof(struct pollfd, revents),
+                                              &rev, sizeof(rev), FOLL_WRITE | FOLL_FORCE) != sizeof(rev)) {
+                            wfault = true;
+                            break;
+                        }
+                    }
+                    if (wfault) {
                         regs->ax = -EFAULT;
                     } else {
                         regs->ax = retval; 
@@ -3043,9 +3057,18 @@ static int entry_handler_poll(struct kretprobe_instance *ri, struct pt_regs *reg
     data->is_wormhole = false;
 
     if (data->nfds > 0 && data->nfds <= 16) {
-        if (copy_from_user(data->fds, data->ufds, data->nfds * sizeof(struct pollfd)) == 0) {
+        // The user's array is struct pollfd (8 bytes per entry), ours is struct mattx_pollfd (16 bytes per
+        // entry): copy it entry by entry, not as one block.
+        struct pollfd kfds[16];
+
+        if (copy_from_user(kfds, data->ufds, data->nfds * sizeof(struct pollfd)) == 0) {
             for (i = 0; i < data->nfds; i++) {
                 int remote_fd = -1;
+
+                data->fds[i].fd = kfds[i].fd;
+                data->fds[i].events = kfds[i].events;
+                data->fds[i].revents = 0;
+                data->fds[i].user_data = 0;
                 if (is_wormhole_fd(data->fds[i].fd, &remote_fd)) {
                     if (remote_fd != -1) data->fds[i].fd = remote_fd; // Translate if known!
                     data->is_wormhole = true;
@@ -3056,6 +3079,95 @@ static int entry_handler_poll(struct kretprobe_instance *ri, struct pt_regs *reg
 
     if (data->is_wormhole) sys_regs->di = 0; // Sabotage!
     return 0;
+}
+
+/*
+ * poll() on files that live on the home node: the thread that called it waits for the reply on its own
+ * ticket, in a task_work that runs when the (sabotaged) syscall returns to user mode. Same pattern as
+ * read(), recvfrom(), accept() and connect(): only this thread sleeps (the other threads of the process
+ * keep running), the reply is matched by req_id. The timeout is enforced by the home node.
+ *
+ * Like the native poll(), only the revents of the entries are written back: the application's fd and
+ * events fields are never touched. -EINTR (signal, freeze of a migration or recall) cancels the request.
+ */
+struct mattx_poll_tw {
+    struct callback_head cb;
+    u32 orig_pid;
+    int home_node;
+    int nfds;
+    int timeout;
+    struct pollfd __user *ufds;
+    struct mattx_pollfd fds[16];
+};
+
+static void mattx_poll_tw_fn(struct callback_head *cb) {
+    struct mattx_poll_tw *tw = container_of(cb, struct mattx_poll_tw, cb);
+    struct pt_regs *regs = task_pt_regs(current);
+    struct mattx_sys_poll_req req;
+    struct mattx_ticket *t;
+    struct mattx_link *link;
+    long ret = -EINTR;
+    int j;
+
+    if (fatal_signal_pending(current) || tw->home_node < 0 || tw->home_node >= MAX_NODES ||
+        tw->nfds <= 0 || tw->nfds > 16)
+        goto out;
+
+    link = READ_ONCE(cluster_map[tw->home_node]);
+    if (!link) {
+        ret = -EIO;
+        goto out;
+    }
+
+    // The reply's data is the revents array: one struct mattx_pollfd per entry
+    t = mattx_ticket_add(tw->orig_pid, tw->home_node, tw->nfds * sizeof(struct mattx_pollfd));
+    if (!t) {
+        ret = -ENOMEM;
+        goto out;
+    }
+
+    memset(&req, 0, sizeof(req));
+    req.orig_pid = tw->orig_pid;
+    req.nfds = tw->nfds;
+    req.timeout = tw->timeout;
+    req.req_id = t->req_id;
+    memcpy(req.fds, tw->fds, tw->nfds * sizeof(struct mattx_pollfd));
+
+    mattx_dbg("[RPC] Thread %d: poll(nfds=%d, timeout=%d) as req %u, sleeping on its own ticket...\n", current->pid, tw->nfds, tw->timeout, t->req_id);
+
+    if (mattx_comm_send(link, MATTX_MSG_SYS_POLL_REQ, &req, sizeof(req)) < 0) {
+        // Never sleep for a reply to a request that was never sent
+        mattx_dbg("[RPC] Thread %d: POLL_REQ send failed\n", current->pid);
+        ret = -EIO;
+        goto done;
+    }
+
+    // Interrupted (signal, freeze of a migration or recall)? The wait cancels the request and still
+    // hands back the result if the home node had already finished it; otherwise we return -EINTR.
+    if (mattx_ticket_wait(t, MAX_SCHEDULE_TIMEOUT) == 0) {
+        ret = t->retval;
+        if (ret >= 0) {
+            const struct mattx_pollfd *res = t->data;
+
+            if (!res || t->data_len < tw->nfds * sizeof(*res)) {
+                ret = -EIO;
+            } else {
+                for (j = 0; j < tw->nfds; j++) {
+                    if (put_user(res[j].revents, &tw->ufds[j].revents)) {
+                        ret = -EFAULT;
+                        break;
+                    }
+                }
+            }
+        }
+        mattx_dbg("[RPC] Illusion Complete! poll returned %ld (thread %d)\n", ret, current->pid);
+    }
+
+done:
+    mattx_ticket_del(t);
+out:
+    regs->ax = ret;
+    kfree(tw);
 }
 
 static int ret_handler_poll(struct kretprobe_instance *ri, struct pt_regs *regs) {
@@ -3072,7 +3184,6 @@ static int ret_handler_poll(struct kretprobe_instance *ri, struct pt_regs *regs)
         if (guest_registry[i].local_pid == current->tgid) {
             home_node = guest_registry[i].home_node;
             orig_pid = guest_registry[i].orig_pid;
-            guest_registry[i].rpc_done = false; 
             break;
         }
     }
@@ -3088,8 +3199,40 @@ static int ret_handler_poll(struct kretprobe_instance *ri, struct pt_regs *regs)
             return 0;
         }
 
-        struct mattx_rpc_work *rpc = kzalloc(sizeof(*rpc), GFP_ATOMIC); 
+        if (real_task_work_add) {
+            struct mattx_poll_tw *tw = kzalloc(sizeof(*tw), GFP_ATOMIC);
+            if (tw) {
+                init_task_work(&tw->cb, mattx_poll_tw_fn);
+                tw->orig_pid = orig_pid;
+                tw->home_node = home_node;
+                tw->nfds = data->nfds;
+                tw->timeout = data->timeout;
+                tw->ufds = (struct pollfd __user *)data->ufds;
+                memcpy(tw->fds, data->fds, sizeof(struct mattx_pollfd) * data->nfds);
+
+                mattx_dbg("[HOOK] Intercepted poll(). Thread %d waits on its own ticket...\n", my_pid);
+                // The sabotaged call returns -EFAULT; the task_work overwrites it with the real result.
+                regs->ax = -EINTR;
+
+                if (real_task_work_add(current, &tw->cb, TWA_RESUME))
+                    kfree(tw);
+            }
+            return 0;
+        }
+
+        // Fallback if the task_work resolver is missing: the old way (freeze the whole group, the
+        // rpc worker polls the per-guest slot). The home node answers with req_id 0 then.
+        struct mattx_rpc_work *rpc = kzalloc(sizeof(*rpc), GFP_ATOMIC);
         if (rpc) {
+            spin_lock(&guest_lock);
+            for (i = 0; i < guest_count; i++) {
+                if (guest_registry[i].local_pid == current->tgid) {
+                    guest_registry[i].rpc_done = false;
+                    break;
+                }
+            }
+            spin_unlock(&guest_lock);
+
             INIT_WORK(&rpc->work, mattx_rpc_worker);
             rpc->local_pid = my_pid;
             rpc->orig_pid = orig_pid;
@@ -3101,7 +3244,7 @@ static int ret_handler_poll(struct kretprobe_instance *ri, struct pt_regs *regs)
             rpc->poll_ufds = data->ufds;
             memcpy(rpc->poll_fds, data->fds, sizeof(struct mattx_pollfd) * data->nfds);
 
-            mattx_dbg("[HOOK] Intercepted poll(). Freezing Surrogate %d...\n", my_pid);
+            mattx_dbg("[HOOK] Intercepted poll(). Freezing Surrogate %d (fallback)...\n", my_pid);
             send_sig(SIGSTOP, current, 0);
             schedule_work(&rpc->work);
         }

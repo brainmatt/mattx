@@ -576,6 +576,7 @@ struct mattx_sys_poll_req {
     u32 orig_pid;
     int nfds;
     int timeout;
+    u32 req_id; // ticket id: matches the reply to the one thread that waits for it (0 = legacy SIGSTOP path: select, pselect6, fallback)
     struct mattx_pollfd fds[16]; // Max 16 FDs for this prototype
 };
 
@@ -584,6 +585,7 @@ struct mattx_sys_poll_reply {
     int nfds;
     int error;
     int retval; // The number of FDs with events
+    u32 req_id; // echo of the request's ticket id (0 = legacy reply)
     struct mattx_pollfd fds[16];
 };
 

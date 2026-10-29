@@ -2512,168 +2512,245 @@ static void handle_sys_accept_reply(struct mattx_link *link, struct mattx_header
 
 
 // --- THE TRUE POLL WORKER (Stack Diet Edition) ---
-static void mattx_poll_worker(struct work_struct *work) {
-    struct mattx_rpc_work *rpc = container_of(work, struct mattx_rpc_work, work);
-    struct mattx_sys_poll_reply *reply;
-    struct file **poll_files;
+/*
+ * POLL_REQ (poll(), and select()/pselect6() translated to poll, on files that live on the home node)
+ *
+ * Same contract as the wormhole read, recvfrom, accept and connect: its own kworker, CANCELLABLE,
+ * exactly ONE reply (req_id echoed): the real result, or -EINTR when the Surrogate's CANCEL came first.
+ *
+ * The wait is event-driven like the kernel's own do_poll(): the files are resolved ONCE and held for the
+ * whole wait, the poll table registers this kworker on the wait queue of every file in the first round
+ * and the kworker sleeps until one of them wakes it. The sleep is capped at 10 ms so that the cancel, the
+ * unload and the lost-link checks still run. The timeout is the application's: 0 is one round, < 0 is
+ * infinite, > 0 is a deadline.
+ *
+ * Requests with a ticket (req_id != 0, poll()) report like native poll(): POLLERR, POLLHUP (and POLLNVAL
+ * for an FD that does not exist) are always reported, whether asked for or not. select()/pselect6() send
+ * req_id 0, translate the events themselves and keep the old "only what was asked for" mask until they get
+ * their own conversion.
+ */
+struct mattx_poll_kworker_ctx {
+    struct work_struct work;
+    struct mattx_sys_poll_req req;
+    int target_node;
+};
+
+// The Deputy is alive as long as its entry exists in the export registry
+static bool mattx_poll_deputy_alive(u32 orig_pid)
+{
+    bool alive = false;
     int i;
-    unsigned long expire;
-    bool has_timeout = (rpc->timeout >= 0);
-    
+
+    spin_lock(&export_lock);
+    for (i = 0; i < export_count; i++) {
+        if (export_registry[i].orig_pid == orig_pid) {
+            alive = true;
+            break;
+        }
+    }
+    spin_unlock(&export_lock);
+    return alive;
+}
+
+static void mattx_poll_kworker(struct work_struct *work) {
+    struct mattx_poll_kworker_ctx *ctx = container_of(work, struct mattx_poll_kworker_ctx, work);
+    struct mattx_sys_poll_req *req = &ctx->req;
+    struct mattx_sys_poll_reply *reply;
+    struct file *poll_files[16];
+    struct poll_wqueues table;
+    struct mattx_link *link;
+    bool abandoned = false;
+    bool table_ready = false;
+    bool timed = (req->timeout >= 0);
+    unsigned long expire = 0;
+    // A ticketed request reports like native poll(): POLLERR/POLLHUP/POLLNVAL are always reported
+    __poll_t always = req->req_id ? (EPOLLERR | EPOLLHUP | EPOLLNVAL) : 0;
+    int nfds = req->nfds;
+    int j;
+
+    memset(poll_files, 0, sizeof(poll_files));
+
     // --- THE STACK DIET FIX ---
     // Move large structs off the kernel stack and onto the heap!
     reply = kzalloc(sizeof(*reply), GFP_KERNEL);
-    poll_files = kcalloc(16, sizeof(struct file *), GFP_KERNEL);
+    if (!reply) {
+        // Always answer: -ENOMEM used to leave the Surrogate waiting forever
+        struct mattx_sys_poll_reply fail;
 
-    if (!reply || !poll_files) {
-        if (reply) kfree(reply);
-        if (poll_files) kfree(poll_files);
-        kfree(rpc);
-        return;
+        memset(&fail, 0, sizeof(fail));
+        fail.orig_pid = req->orig_pid;
+        fail.req_id = req->req_id;
+        fail.error = -ENOMEM;
+        link = READ_ONCE(cluster_map[ctx->target_node]);
+        if (link)
+            mattx_comm_send(link, MATTX_MSG_SYS_POLL_REPLY, &fail, sizeof(fail));
+        goto out_ctx;
     }
 
-    reply->orig_pid = rpc->orig_pid;
-    reply->nfds = rpc->nfds;
-    memcpy(reply->fds, rpc->poll_fds, sizeof(struct mattx_pollfd) * rpc->nfds);
+    reply->orig_pid = req->orig_pid;
+    reply->req_id = req->req_id;
 
-    mattx_dbg("[RPC] Poll Worker started for Deputy PID %u (Timeout: %dms)\n", rpc->orig_pid, rpc->timeout);
-
-    if (has_timeout) {
-        expire = jiffies + msecs_to_jiffies(rpc->timeout);
+    if (nfds < 0 || nfds > 16) {
+        reply->error = -EINVAL;
+        goto answer;
     }
+    reply->nfds = nfds;
+    memcpy(reply->fds, req->fds, sizeof(struct mattx_pollfd) * nfds);
+
+    mattx_dbg("[RPC] Poll Worker started for Deputy PID %u (req %u, Timeout: %dms)\n", req->orig_pid, req->req_id, req->timeout);
+
+    if (timed)
+        expire = jiffies + msecs_to_jiffies(req->timeout);
+
+    // The files are resolved once and held for the whole wait, like the fdget() of the native poll()
+    for (j = 0; j < nfds; j++) {
+        int remote_fd = reply->fds[j].fd;
+
+        reply->fds[j].revents = 0;
+        if (remote_fd >= 0)
+            poll_files[j] = mattx_get_remote_file(req->orig_pid, remote_fd);
+    }
+
+    poll_initwait(&table);
+    table_ready = true;
 
     // --- THE WAIT QUEUE LOOP ---
-    while (1) {
+    for (;;) {
         int ready_count = 0;
-        bool deputy_alive = false;
-        
-        // Clear the poll_files array for this iteration
-        memset(poll_files, 0, 16 * sizeof(struct file *));
 
-// 1. Check if the Deputy is still alive and grab the files!
-        spin_lock(&export_lock);
-        for (i = 0; i < export_count; i++) {
-            if (export_registry[i].orig_pid == rpc->orig_pid) {
-                deputy_alive = true;
-                
-                // Standard poll logic (No more epoll Master Watch List!)
-                for (int j = 0; j < rpc->nfds; j++) {
-                    int remote_fd = reply->fds[j].fd;
-                    if (remote_fd >= 1000) {
-                        int slot = remote_fd - 1000;
-                        if (slot < MAX_FDS && export_registry[i].remote_files[slot]) {
-                            poll_files[j] = export_registry[i].remote_files[slot];
-                            get_file(poll_files[j]); 
-                        }
-                    }
-                }
-                break;
-            }
-        }
-        spin_unlock(&export_lock);
-
-        if (!deputy_alive) {
+        if (!mattx_poll_deputy_alive(req->orig_pid)) {
             reply->error = -ESRCH;
             break;
         }
 
-        // 2. Do the actual polling SAFELY OUTSIDE the spinlock!
-        for (int j = 0; j < rpc->nfds; j++) {
-            int remote_fd = reply->fds[j].fd;
+        // 1. Look: never blocks. The first round registers us on every file's wait queue.
+        for (j = 0; j < nfds; j++) {
             struct file *f = poll_files[j];
-            struct task_struct *deputy = NULL;
+            short events = reply->fds[j].events;
+            __poll_t mask = 0;
 
-            if (!f && remote_fd >= 0 && remote_fd < 1000) {
-                rcu_read_lock();
-                deputy = pid_task(find_vpid(rpc->orig_pid), PIDTYPE_PID);
-                if (deputy) get_task_struct(deputy);
-                rcu_read_unlock();
-
-                if (deputy) {
-                    struct files_struct *files = deputy->files;
-                    if (files) {
-                        spin_lock(&files->file_lock);
-                        struct fdtable *fdt = files_fdtable(files);
-                        if (remote_fd < fdt->max_fds) {
-                            f = rcu_dereference_raw(fdt->fd[remote_fd]);
-                            if (f) get_file(f);
-                        }
-                        spin_unlock(&files->file_lock);
-                    }
-                    put_task_struct(deputy);
-                }
-            }
+            reply->fds[j].revents = 0;
+            if (reply->fds[j].fd < 0)
+                continue;                               // a negative FD is ignored, like native poll()
 
             if (f) {
-                struct poll_wqueues table;
-                poll_initwait(&table);
-                
-                __poll_t mask = vfs_poll(f, &table.pt);
-                
-                if (rpc->is_epoll_wait) {
-                    mattx_dbg("[EPOLL_DEBUG] Polled FD %d. Mask returned: %x. Looking for: %x\n", 
-                           remote_fd, mask, reply->fds[j].events);
-                }
-                
-                reply->fds[j].revents = mask & reply->fds[j].events;
-                if (reply->fds[j].revents) {
-                    ready_count++;
-                }
-                
-                poll_freewait(&table);
-                fput(f); 
+                // What is reported: what was asked for, plus POLLERR/POLLHUP for a ticketed (native) poll()
+                __poll_t keep = (__poll_t)(u16)events | always;
+
+                table.pt._key = (__poll_t)(u16)events | EPOLLERR | EPOLLHUP;
+                mask = vfs_poll(f, &table.pt) & keep;
             } else {
-                if (rpc->is_epoll_wait) mattx_dbg("[EPOLL_DEBUG] ERROR: Could not find struct file for FD %d!\n", remote_fd);
+                mask = always & EPOLLNVAL;              // no such FD
             }
+
+            reply->fds[j].revents = mask;
+            if (mask)
+                ready_count++;
         }
+        table.pt._qproc = NULL;                         // registered: the next rounds only look
 
         if (ready_count > 0) {
             reply->retval = ready_count;
             break;
         }
-
-        if (has_timeout && time_after(jiffies, expire)) {
-            reply->retval = 0; 
+        if (table.error) {
+            reply->error = table.error;
             break;
         }
 
-        // Sleep for a tiny fraction of a second to let the CPU breathe, 
-        // but rely on the poll_table to catch the events!
-        schedule_timeout_interruptible(msecs_to_jiffies(10));
+        // 2. Nothing ready
+        if (timed && time_after_eq(jiffies, expire)) {
+            reply->retval = 0;
+            break;
+        }
+        if (mattx_req_take_cancelled(ctx->target_node, req->orig_pid, req->req_id)) {
+            mattx_dbg("[RPC] POLL for PID %u req %u cancelled by the Surrogate\n", req->orig_pid, req->req_id);
+            reply->error = -EINTR;
+            break;
+        }
+        if (READ_ONCE(mattx_cancellable_stopping) || !READ_ONCE(cluster_map[ctx->target_node])) {
+            abandoned = true;
+            break;
+        }
+
+        // 3. Sleep until one of the files wakes us (or 10 ms, or the deadline)
+        {
+            long to = msecs_to_jiffies(10);
+
+            if (timed && (long)(expire - jiffies) < to)
+                to = (long)(expire - jiffies) > 0 ? (long)(expire - jiffies) : 1;
+
+            set_current_state(TASK_INTERRUPTIBLE);
+            if (!READ_ONCE(table.triggered))
+                schedule_timeout(to);
+            __set_current_state(TASK_RUNNING);
+            smp_store_mb(table.triggered, 0);
+        }
     }
 
-    if (cluster_map[rpc->home_node]) {
-        mattx_dbg("[RPC] Sending POLL_REPLY (Ready: %d) back to Node %u...\n", reply->retval, rpc->home_node);
+    if (table_ready)
+        poll_freewait(&table);
+    for (j = 0; j < nfds; j++) {
+        if (poll_files[j])
+            fput(poll_files[j]);
+    }
+
+answer:
+    link = READ_ONCE(cluster_map[ctx->target_node]);
+    if (abandoned || !link) {
+        mattx_dbg("[RPC] POLL for PID %u (req %u): nobody left to answer, reply dropped\n", req->orig_pid, req->req_id);
+    } else {
+        mattx_dbg("[RPC] Sending POLL_REPLY (Ready: %d, error %d, req %u) back to Node %d...\n", reply->retval, reply->error, req->req_id, ctx->target_node);
         // POLL_REPLY is data, not a droppable control message: mattx_comm_send_ctrl() uses mutex_trylock and
         // silently drops the message when the send mutex is busy. The Surrogate then waits forever (poll
         // with an infinite timeout). A kworker may simply wait for the mutex.
-        mattx_comm_send(cluster_map[rpc->home_node], MATTX_MSG_SYS_POLL_REPLY, reply, sizeof(*reply));
+        mattx_comm_send(link, MATTX_MSG_SYS_POLL_REPLY, reply, sizeof(*reply));
     }
-    
     kfree(reply);
-    kfree(poll_files);
-    kfree(rpc);
+
+out_ctx:
+    kfree(ctx);
+    atomic_dec(&mattx_cancellable_inflight);
 }
 
 
 static void handle_sys_poll_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
-    if (payload) {
-        struct mattx_sys_poll_req *req = (struct mattx_sys_poll_req *)payload;
-        
-        struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC);
-        if (rpc) {
-            INIT_WORK(&rpc->work, mattx_poll_worker);
-            rpc->orig_pid = req->orig_pid;
-            rpc->home_node = hdr->sender_id;
-            rpc->nfds = req->nfds;
-            rpc->timeout = req->timeout;
-            memcpy(rpc->poll_fds, req->fds, sizeof(struct mattx_pollfd) * req->nfds);
-            schedule_work(&rpc->work);
-        }
+    struct mattx_sys_poll_req *req = (struct mattx_sys_poll_req *)payload;
+    struct mattx_poll_kworker_ctx *ctx;
+
+    if (!payload || hdr->length < sizeof(*req)) return;
+    if (hdr->sender_id >= MAX_NODES || READ_ONCE(mattx_cancellable_stopping)) return;
+
+    ctx = kmalloc(sizeof(*ctx), GFP_ATOMIC);
+    if (!ctx) {
+        printk(KERN_ERR "MattX:[RPC] POLL_REQ dropped: out of memory\n");
+        return;
     }
+    INIT_WORK(&ctx->work, mattx_poll_kworker);
+    memcpy(&ctx->req, req, sizeof(*req));
+    ctx->target_node = hdr->sender_id;
+
+    atomic_inc(&mattx_cancellable_inflight);
+    schedule_work(&ctx->work);
 }
 
 static void handle_sys_poll_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    // A reply that carries a ticket id belongs to exactly one waiting thread (mattx_ticket_*).
+    // req_id 0 is the legacy reply (select, pselect6, the SIGSTOP fallback): it goes through the slot below.
+    if (payload && hdr->length >= sizeof(struct mattx_sys_poll_reply) &&
+        ((struct mattx_sys_poll_reply *)payload)->req_id) {
+        struct mattx_sys_poll_reply *reply = (struct mattx_sys_poll_reply *)payload;
+        // The ticket's result is the number of ready entries, or -errno; the revents travel as its data
+        long retval = reply->error ? reply->error : reply->retval;
+        size_t dlen = (reply->error == 0 && reply->nfds > 0 && reply->nfds <= 16) ? reply->nfds * sizeof(struct mattx_pollfd) : 0;
+
+        mattx_dbg("[RPC] Received POLL_REPLY for Orig PID %u req %u. Ready FDs: %d, error %d\n",
+                  reply->orig_pid, reply->req_id, reply->retval, reply->error);
+        if (!mattx_ticket_complete(hdr->sender_id, reply->orig_pid, reply->req_id, retval, reply->fds, dlen))
+            mattx_dbg("[RPC] POLL_REPLY req %u: nobody waits for it any more, dropped\n", reply->req_id);
+        return;
+    }
+
     if (payload) {
         struct mattx_sys_poll_reply *reply = (struct mattx_sys_poll_reply *)payload;
         int i;
