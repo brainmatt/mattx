@@ -3253,6 +3253,228 @@ static int ret_handler_poll(struct kretprobe_instance *ri, struct pt_regs *regs)
     return 0;
 }
 
+/*
+ * select() and pselect6() on files that live on the home node.
+ *
+ * The thread that called it waits for the reply on its own ticket, in a task_work that runs when the
+ * (sabotaged) syscall returns to user mode. Same pattern as read(), recvfrom(), accept(), connect() and
+ * poll(): only this thread sleeps, the reply is matched by req_id, the timeout is enforced by the home node.
+ *
+ * select() and pselect6() only differ in the timeout format, exactly like in the kernel (core_sys_select()),
+ * so they share this core: the translation of the three fd sets into a POLL_REQ (the same request, the same
+ * home worker and the same reply as poll()) and the translation of the revents back into the three sets.
+ * The two syscalls keep their own hooks, their own task_work and their own timeout parsing.
+ *
+ * Like the native select(): the result is the number of bits set in the three sets, a bit is set only in
+ * the set it was asked for (POLLERR and POLLHUP count as readable, POLLERR as writable), all three sets are
+ * rewritten (cleared on a timeout), and an FD that does not exist is -EBADF.
+ */
+struct mattx_select_tw {
+    struct callback_head cb;
+    u32 orig_pid;
+    int home_node;
+    int n;
+    void __user *inp;
+    void __user *outp;
+    void __user *exp;
+    void __user *tvp;   // struct __kernel_old_timeval (select) or struct __kernel_timespec (pselect6)
+    fd_set in_fds;
+    fd_set out_fds;
+    fd_set ex_fds;
+};
+
+// What the kernel's do_select() reports for each of the three sets
+#define MATTX_SEL_IN_ASK    (EPOLLIN | EPOLLRDNORM | EPOLLRDBAND)
+#define MATTX_SEL_OUT_ASK   (EPOLLOUT | EPOLLWRNORM | EPOLLWRBAND)
+#define MATTX_SEL_EX_ASK    (EPOLLPRI)
+#define MATTX_SEL_IN_SET    (MATTX_SEL_IN_ASK | EPOLLHUP | EPOLLERR)
+#define MATTX_SEL_OUT_SET   (MATTX_SEL_OUT_ASK | EPOLLERR)
+#define MATTX_SEL_EX_SET    (EPOLLPRI)
+
+// Copies the user's three fd sets and tells whether one of the fds asked for lives on the home node.
+// If none does (or the sets cannot be read), the kernel's own select() is left alone to do its job.
+static bool mattx_select_scan(int n, void __user *inp, void __user *outp, void __user *exp,
+                              fd_set *in, fd_set *out, fd_set *ex)
+{
+    size_t copy_size;
+    int fd;
+
+    memset(in, 0, sizeof(*in));
+    memset(out, 0, sizeof(*out));
+    memset(ex, 0, sizeof(*ex));
+
+    if (n <= 0)
+        return false;
+    if (n > (int)sizeof(fd_set) * 8)
+        n = (int)sizeof(fd_set) * 8;
+    copy_size = (n + 7) / 8;
+
+    if (inp && copy_from_user(in, inp, copy_size)) return false;
+    if (outp && copy_from_user(out, outp, copy_size)) return false;
+    if (exp && copy_from_user(ex, exp, copy_size)) return false;
+
+    for (fd = 0; fd < n; fd++) {
+        if (!test_bit(fd, in->fds_bits) && !test_bit(fd, out->fds_bits) && !test_bit(fd, ex->fds_bits))
+            continue;
+        if (is_wormhole_fd(fd, NULL))
+            return true;
+    }
+    return false;
+}
+
+// select(): struct __kernel_old_timeval -> milliseconds (-1: no timeout), rounded UP like the kernel does
+static long mattx_select_timeval_ms(const void __user *tvp, int *timeout_ms)
+{
+    struct __kernel_old_timeval tv;
+    s64 ms;
+
+    *timeout_ms = -1;
+    if (!tvp)
+        return 0;
+    if (copy_from_user(&tv, tvp, sizeof(tv)))
+        return -EFAULT;
+    if (tv.tv_sec < 0 || tv.tv_usec < 0 || tv.tv_usec >= USEC_PER_SEC)
+        return -EINVAL;
+
+    ms = (s64)tv.tv_sec * MSEC_PER_SEC + DIV_ROUND_UP((s64)tv.tv_usec, USEC_PER_MSEC);
+    *timeout_ms = ms > INT_MAX ? INT_MAX : (int)ms;
+    return 0;
+}
+
+// pselect6(): struct __kernel_timespec -> milliseconds (-1: no timeout), rounded UP like the kernel does
+static long mattx_select_timespec_ms(const void __user *tsp, int *timeout_ms)
+{
+    struct __kernel_timespec ts;
+    s64 ms;
+
+    *timeout_ms = -1;
+    if (!tsp)
+        return 0;
+    if (copy_from_user(&ts, tsp, sizeof(ts)))
+        return -EFAULT;
+    if (ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= NSEC_PER_SEC)
+        return -EINVAL;
+
+    if (ts.tv_sec > INT_MAX / MSEC_PER_SEC)
+        ms = INT_MAX;
+    else
+        ms = ts.tv_sec * MSEC_PER_SEC + DIV_ROUND_UP((s64)ts.tv_nsec, NSEC_PER_MSEC);
+    *timeout_ms = ms > INT_MAX ? INT_MAX : (int)ms;
+    return 0;
+}
+
+static long mattx_select_core(struct mattx_select_tw *tw, int timeout_ms)
+{
+    struct mattx_sys_poll_req req;
+    struct mattx_ticket *t;
+    struct mattx_link *link;
+    int n = min_t(int, tw->n, (int)sizeof(fd_set) * 8);
+    int lfd[16];
+    u8 want[16];    // 1: asked for reading, 2: for writing, 4: for exceptions
+    int nent = 0;
+    int fd, j;
+    long ret = -EINTR;
+
+    if (fatal_signal_pending(current) || tw->home_node < 0 || tw->home_node >= MAX_NODES)
+        return ret;
+
+    link = READ_ONCE(cluster_map[tw->home_node]);
+    if (!link)
+        return -EIO;
+
+    // The three sets become one entry per fd that lives on the home node (max 16 for this prototype)
+    memset(&req, 0, sizeof(req));
+    for (fd = 0; fd < n; fd++) {
+        short events = 0;
+        u8 w = 0;
+        int remote_fd = -1;
+
+        if (test_bit(fd, tw->in_fds.fds_bits))  { events |= MATTX_SEL_IN_ASK;  w |= 1; }
+        if (test_bit(fd, tw->out_fds.fds_bits)) { events |= MATTX_SEL_OUT_ASK; w |= 2; }
+        if (test_bit(fd, tw->ex_fds.fds_bits))  { events |= MATTX_SEL_EX_ASK;  w |= 4; }
+        if (!w)
+            continue;
+        if (!is_wormhole_fd(fd, &remote_fd))
+            continue;               // a local fd: never reported, as before
+
+        if (nent >= 16) {
+            mattx_dbg("[RPC] Thread %d: select(): more than 16 FDs on the home node, FD %d and the following are not watched\n", current->pid, fd);
+            break;
+        }
+        lfd[nent] = fd;
+        want[nent] = w;
+        req.fds[nent].fd = (remote_fd != -1) ? remote_fd : fd;
+        req.fds[nent].events = events;
+        nent++;
+    }
+
+    // The reply's data is the revents array: one struct mattx_pollfd per entry
+    t = mattx_ticket_add(tw->orig_pid, tw->home_node, nent * sizeof(struct mattx_pollfd));
+    if (!t)
+        return -ENOMEM;
+
+    req.orig_pid = tw->orig_pid;
+    req.nfds = nent;
+    req.timeout = timeout_ms;
+    req.req_id = t->req_id;
+
+    mattx_dbg("[RPC] Thread %d: select(n=%d) as poll of %d FDs, timeout=%d, req %u, sleeping on its own ticket...\n",
+              current->pid, tw->n, nent, timeout_ms, t->req_id);
+
+    if (mattx_comm_send(link, MATTX_MSG_SYS_POLL_REQ, &req, sizeof(req)) < 0) {
+        // Never sleep for a reply to a request that was never sent
+        mattx_dbg("[RPC] Thread %d: POLL_REQ (select) send failed\n", current->pid);
+        ret = -EIO;
+        goto done;
+    }
+
+    // Interrupted (signal, freeze of a migration or recall)? The wait cancels the request and still
+    // hands back the result if the home node had already finished it; otherwise we return -EINTR.
+    if (mattx_ticket_wait(t, MAX_SCHEDULE_TIMEOUT) == 0) {
+        ret = t->retval;
+        if (ret >= 0) {
+            const struct mattx_pollfd *res = t->data;
+            size_t bytes = (n + 7) / 8;
+            long cnt = 0;
+
+            if (nent && (!res || t->data_len < nent * sizeof(*res))) {
+                ret = -EIO;
+            } else {
+                // The three sets are rewritten from scratch: only what is ready, in the set it was asked for
+                memset(&tw->in_fds, 0, sizeof(fd_set));
+                memset(&tw->out_fds, 0, sizeof(fd_set));
+                memset(&tw->ex_fds, 0, sizeof(fd_set));
+
+                for (j = 0; j < nent; j++) {
+                    unsigned int rev = (unsigned short)res[j].revents;
+
+                    if (rev & EPOLLNVAL) {
+                        ret = -EBADF;   // an FD that does not exist, like the kernel's select()
+                        break;
+                    }
+                    if ((want[j] & 1) && (rev & MATTX_SEL_IN_SET))  { __set_bit(lfd[j], tw->in_fds.fds_bits);  cnt++; }
+                    if ((want[j] & 2) && (rev & MATTX_SEL_OUT_SET)) { __set_bit(lfd[j], tw->out_fds.fds_bits); cnt++; }
+                    if ((want[j] & 4) && (rev & MATTX_SEL_EX_SET))  { __set_bit(lfd[j], tw->ex_fds.fds_bits);  cnt++; }
+                }
+
+                if (ret != -EBADF) {
+                    if ((tw->inp && copy_to_user(tw->inp, &tw->in_fds, bytes)) ||
+                        (tw->outp && copy_to_user(tw->outp, &tw->out_fds, bytes)) ||
+                        (tw->exp && copy_to_user(tw->exp, &tw->ex_fds, bytes)))
+                        ret = -EFAULT;
+                    else
+                        ret = cnt;
+                }
+            }
+        }
+        mattx_dbg("[RPC] Illusion Complete! select returned %ld (thread %d)\n", ret, current->pid);
+    }
+
+done:
+    mattx_ticket_del(t);
+    return ret;
+}
+
 // --- SELECT HOOK ---
 struct select_kretprobe_data {
     int n;
@@ -3260,6 +3482,10 @@ struct select_kretprobe_data {
     void __user *outp;
     void __user *exp;
     void __user *tvp;
+    bool is_wormhole;   // one of the fds asked for lives on the home node
+    fd_set in_fds;      // the user's sets, copied once in the entry handler
+    fd_set out_fds;
+    fd_set ex_fds;
 };
 
 static struct kretprobe select_kprobe;
@@ -3278,8 +3504,24 @@ static int entry_handler_select(struct kretprobe_instance *ri, struct pt_regs *r
     data->exp = (void __user *)sys_regs->r10;
     data->tvp = (void __user *)sys_regs->r8;
 
-    sys_regs->di = -1; // Sabotage inner FD count!
+    // Only a select() that has an fd on the home node is sent there: all others stay with the kernel
+    data->is_wormhole = mattx_select_scan(data->n, data->inp, data->outp, data->exp,
+                                          &data->in_fds, &data->out_fds, &data->ex_fds);
+    if (data->is_wormhole)
+        sys_regs->di = -1; // Sabotage inner FD count!
     return 0;
+}
+
+static void mattx_select_tw_fn(struct callback_head *cb) {
+    struct mattx_select_tw *tw = container_of(cb, struct mattx_select_tw, cb);
+    struct pt_regs *regs = task_pt_regs(current);
+    int timeout_ms;
+    long ret = mattx_select_timeval_ms(tw->tvp, &timeout_ms);
+
+    if (!ret)
+        ret = mattx_select_core(tw, timeout_ms);
+    regs->ax = ret;
+    kfree(tw);
 }
 
 static int ret_handler_select(struct kretprobe_instance *ri, struct pt_regs *regs) {
@@ -3289,14 +3531,13 @@ static int ret_handler_select(struct kretprobe_instance *ri, struct pt_regs *reg
     u32 orig_pid = 0;
     int i;
 
-    if (!is_guest_process(my_pid) || !config_migrate_network_io) return 0;
+    if (!is_guest_process(my_pid) || !config_migrate_network_io || !data->is_wormhole) return 0;
 
     spin_lock(&guest_lock);
     for (i = 0; i < guest_count; i++) {
         if (guest_registry[i].local_pid == current->tgid) {
             home_node = guest_registry[i].home_node;
             orig_pid = guest_registry[i].orig_pid;
-            guest_registry[i].rpc_done = false; 
             break;
         }
     }
@@ -3312,8 +3553,44 @@ static int ret_handler_select(struct kretprobe_instance *ri, struct pt_regs *reg
             return 0;
         }
 
-        struct mattx_rpc_work *rpc = kzalloc(sizeof(*rpc), GFP_ATOMIC); 
+        if (real_task_work_add) {
+            struct mattx_select_tw *tw = kzalloc(sizeof(*tw), GFP_ATOMIC);
+            if (tw) {
+                init_task_work(&tw->cb, mattx_select_tw_fn);
+                tw->orig_pid = orig_pid;
+                tw->home_node = home_node;
+                tw->n = data->n;
+                tw->inp = data->inp;
+                tw->outp = data->outp;
+                tw->exp = data->exp;
+                tw->tvp = data->tvp;
+                memcpy(&tw->in_fds, &data->in_fds, sizeof(fd_set));
+                memcpy(&tw->out_fds, &data->out_fds, sizeof(fd_set));
+                memcpy(&tw->ex_fds, &data->ex_fds, sizeof(fd_set));
+
+                mattx_dbg("[HOOK] Intercepted select(). Thread %d waits on its own ticket...\n", my_pid);
+                // The sabotaged call returns -EINVAL; the task_work overwrites it with the real result.
+                regs->ax = -EINTR;
+
+                if (real_task_work_add(current, &tw->cb, TWA_RESUME))
+                    kfree(tw);
+            }
+            return 0;
+        }
+
+        // Fallback if the task_work resolver is missing: the old way (freeze the whole group, the
+        // rpc worker polls the per-guest slot). The home node answers with req_id 0 then.
+        struct mattx_rpc_work *rpc = kzalloc(sizeof(*rpc), GFP_ATOMIC);
         if (rpc) {
+            spin_lock(&guest_lock);
+            for (i = 0; i < guest_count; i++) {
+                if (guest_registry[i].local_pid == current->tgid) {
+                    guest_registry[i].rpc_done = false;
+                    break;
+                }
+            }
+            spin_unlock(&guest_lock);
+
             INIT_WORK(&rpc->work, mattx_rpc_worker);
             rpc->local_pid = my_pid;
             rpc->orig_pid = orig_pid;
@@ -3354,7 +3631,7 @@ static int ret_handler_select(struct kretprobe_instance *ri, struct pt_regs *reg
                 rpc->timeout_ms = -1;
             }
 
-            mattx_dbg("[HOOK] Intercepted select(). Freezing Surrogate %d...\n", my_pid);
+            mattx_dbg("[HOOK] Intercepted select(). Freezing Surrogate %d (fallback)...\n", my_pid);
             send_sig(SIGSTOP, current, 0);
             schedule_work(&rpc->work);
         }
@@ -3371,6 +3648,10 @@ struct pselect6_kretprobe_data {
     void __user *exp;
     void __user *tsp;
     void __user *sig;
+    bool is_wormhole;   // one of the fds asked for lives on the home node
+    fd_set in_fds;      // the user's sets, copied once in the entry handler
+    fd_set out_fds;
+    fd_set ex_fds;
 };
 
 static struct kretprobe pselect6_kprobe;
@@ -3390,8 +3671,24 @@ static int entry_handler_pselect6(struct kretprobe_instance *ri, struct pt_regs 
     data->tsp = (void __user *)sys_regs->r8;
     data->sig = (void __user *)sys_regs->r9;
 
-    sys_regs->di = -1; // Sabotage inner FD count!
+    // Only a pselect6() that has an fd on the home node is sent there: all others stay with the kernel
+    data->is_wormhole = mattx_select_scan(data->n, data->inp, data->outp, data->exp,
+                                          &data->in_fds, &data->out_fds, &data->ex_fds);
+    if (data->is_wormhole)
+        sys_regs->di = -1; // Sabotage inner FD count!
     return 0;
+}
+
+static void mattx_pselect6_tw_fn(struct callback_head *cb) {
+    struct mattx_select_tw *tw = container_of(cb, struct mattx_select_tw, cb);
+    struct pt_regs *regs = task_pt_regs(current);
+    int timeout_ms;
+    long ret = mattx_select_timespec_ms(tw->tvp, &timeout_ms);
+
+    if (!ret)
+        ret = mattx_select_core(tw, timeout_ms);
+    regs->ax = ret;
+    kfree(tw);
 }
 
 static int ret_handler_pselect6(struct kretprobe_instance *ri, struct pt_regs *regs) {
@@ -3401,14 +3698,13 @@ static int ret_handler_pselect6(struct kretprobe_instance *ri, struct pt_regs *r
     u32 orig_pid = 0;
     int i;
 
-    if (!is_guest_process(my_pid) || !config_migrate_network_io) return 0;
+    if (!is_guest_process(my_pid) || !config_migrate_network_io || !data->is_wormhole) return 0;
 
     spin_lock(&guest_lock);
     for (i = 0; i < guest_count; i++) {
         if (guest_registry[i].local_pid == current->tgid) {
             home_node = guest_registry[i].home_node;
             orig_pid = guest_registry[i].orig_pid;
-            guest_registry[i].rpc_done = false; 
             break;
         }
     }
@@ -3424,8 +3720,44 @@ static int ret_handler_pselect6(struct kretprobe_instance *ri, struct pt_regs *r
             return 0;
         }
 
-        struct mattx_rpc_work *rpc = kzalloc(sizeof(*rpc), GFP_ATOMIC); 
+        if (real_task_work_add) {
+            struct mattx_select_tw *tw = kzalloc(sizeof(*tw), GFP_ATOMIC);
+            if (tw) {
+                init_task_work(&tw->cb, mattx_pselect6_tw_fn);
+                tw->orig_pid = orig_pid;
+                tw->home_node = home_node;
+                tw->n = data->n;
+                tw->inp = data->inp;
+                tw->outp = data->outp;
+                tw->exp = data->exp;
+                tw->tvp = data->tsp;
+                memcpy(&tw->in_fds, &data->in_fds, sizeof(fd_set));
+                memcpy(&tw->out_fds, &data->out_fds, sizeof(fd_set));
+                memcpy(&tw->ex_fds, &data->ex_fds, sizeof(fd_set));
+
+                mattx_dbg("[HOOK] Intercepted pselect6(). Thread %d waits on its own ticket...\n", my_pid);
+                // The sabotaged call returns -EINVAL; the task_work overwrites it with the real result.
+                regs->ax = -EINTR;
+
+                if (real_task_work_add(current, &tw->cb, TWA_RESUME))
+                    kfree(tw);
+            }
+            return 0;
+        }
+
+        // Fallback if the task_work resolver is missing: the old way (freeze the whole group, the
+        // rpc worker polls the per-guest slot). The home node answers with req_id 0 then.
+        struct mattx_rpc_work *rpc = kzalloc(sizeof(*rpc), GFP_ATOMIC);
         if (rpc) {
+            spin_lock(&guest_lock);
+            for (i = 0; i < guest_count; i++) {
+                if (guest_registry[i].local_pid == current->tgid) {
+                    guest_registry[i].rpc_done = false;
+                    break;
+                }
+            }
+            spin_unlock(&guest_lock);
+
             INIT_WORK(&rpc->work, mattx_rpc_worker);
             rpc->local_pid = my_pid;
             rpc->orig_pid = orig_pid;
@@ -3466,7 +3798,7 @@ static int ret_handler_pselect6(struct kretprobe_instance *ri, struct pt_regs *r
                 rpc->timeout_ms = -1;
             }
 
-            mattx_dbg("[HOOK] Intercepted pselect6(). Freezing Surrogate %d...\n", my_pid);
+            mattx_dbg("[HOOK] Intercepted pselect6(). Freezing Surrogate %d (fallback)...\n", my_pid);
             send_sig(SIGSTOP, current, 0);
             schedule_work(&rpc->work);
         }

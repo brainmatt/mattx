@@ -2524,10 +2524,10 @@ static void handle_sys_accept_reply(struct mattx_link *link, struct mattx_header
  * unload and the lost-link checks still run. The timeout is the application's: 0 is one round, < 0 is
  * infinite, > 0 is a deadline.
  *
- * Requests with a ticket (req_id != 0, poll()) report like native poll(): POLLERR, POLLHUP (and POLLNVAL
- * for an FD that does not exist) are always reported, whether asked for or not. select()/pselect6() send
- * req_id 0, translate the events themselves and keep the old "only what was asked for" mask until they get
- * their own conversion.
+ * Requests with a ticket (req_id != 0: poll(), select() and pselect6()) report like native poll(): POLLERR,
+ * POLLHUP (and POLLNVAL for an FD that does not exist) are always reported, whether asked for or not; the
+ * Surrogate maps them to what its syscall reports. Only the SIGSTOP fallback (req_id 0) keeps the old "only
+ * what was asked for" mask, because its events translation expects exactly that.
  */
 struct mattx_poll_kworker_ctx {
     struct work_struct work;
@@ -2736,7 +2736,7 @@ static void handle_sys_poll_req(struct mattx_link *link, struct mattx_header *hd
 
 static void handle_sys_poll_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
     // A reply that carries a ticket id belongs to exactly one waiting thread (mattx_ticket_*).
-    // req_id 0 is the legacy reply (select, pselect6, the SIGSTOP fallback): it goes through the slot below.
+    // req_id 0 is the legacy reply (the SIGSTOP fallback of poll, select and pselect6): it goes through the slot below.
     if (payload && hdr->length >= sizeof(struct mattx_sys_poll_reply) &&
         ((struct mattx_sys_poll_reply *)payload)->req_id) {
         struct mattx_sys_poll_reply *reply = (struct mattx_sys_poll_reply *)payload;
