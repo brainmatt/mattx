@@ -1386,6 +1386,19 @@ struct mattx_dsm_flush_reply {
 
 
 
+// The DSM tables of a mapping (guest_registry[].dsm_map[]) and of the master directory hold MAX_DSM_PAGES
+// pages per segment. A segment is bigger than that in real life (MPICH: ~4 MB): indexing them with the page
+// of such an offset reads and writes the NEIGHBOURING entries. Every handler that indexes them with an offset
+// asks this first and refuses (or leaves the page untracked) instead.
+static inline bool mattx_dsm_page_in_range(u32 shmid, unsigned long offset)
+{
+    if (likely(offset / PAGE_SIZE < MAX_DSM_PAGES))
+        return true;
+    pr_err_ratelimited("MattX:[DSM] SHMID %u: page %lu is beyond MAX_DSM_PAGES (%d pages = %lu bytes per segment): the DSM cannot track it\n",
+                       shmid, offset / PAGE_SIZE, MAX_DSM_PAGES, (unsigned long)MAX_DSM_PAGES * PAGE_SIZE);
+    return false;
+}
+
 // This defines the standard signature for all message handlers
 typedef void (*mattx_msg_handler_fn)(struct mattx_link *link, struct mattx_header *hdr, void *payload);
 

@@ -4705,6 +4705,10 @@ static vm_fault_t mattx_dsm_fault(struct vm_fault *vmf) {
 
 
     // 2. CONCURRENCY: Allocate a sterile RPC slot
+    // The DSM tables of a mapping hold MAX_DSM_PAGES pages: never index beyond them (see mattx.h)
+    if (!mattx_dsm_page_in_range(shmid, offset))
+        return VM_FAULT_SIGBUS;
+
     unsigned long page_idx = offset / PAGE_SIZE;
     int slot = -1;
     u64 req_id = 0;
@@ -4914,6 +4918,9 @@ static vm_fault_t mattx_dsm_pfn_mkwrite(struct vm_fault *vmf) {
     if (!found || home_node == -1 || !cluster_map[home_node]) {
         return VM_FAULT_SIGBUS;
     }
+
+    if (!mattx_dsm_page_in_range(shmid, offset))
+        return VM_FAULT_SIGBUS;
 
     if (config_dsm_mode == 2) {
         mattx_dbg("[MESI_VM2] Write-Protect Fault at 0x%lx. Requesting EXCLUSIVE lock...\n", fault_addr);
@@ -5246,6 +5253,10 @@ static void mattx_dsm_fault_kworker(struct work_struct *work) {
         }
         mmap_read_unlock(deputy->mm); // DROP THE LOCK IMMEDIATELY!
 
+        // The DSM tables hold MAX_DSM_PAGES pages per segment: answer with an error beyond that
+        if (target_addr != 0 && !mattx_dsm_page_in_range(ctx->req.shmid, ctx->req.offset))
+            target_addr = 0;
+
         // 2. THE MESI SYNC & PUMP (Completely Lock-Free!)
         if (target_addr != 0) {
             unsigned long page_idx = ctx->req.offset / PAGE_SIZE;
@@ -5533,7 +5544,7 @@ static void mattx_dsm_update_kworker(struct work_struct *work) {
             fput(shm_file); // Release the file
 
             // --- THE FUNERAL DIRECTORY CLEANUP ---
-            if (config_dsm_mode == 2) {
+            if (config_dsm_mode == 2 && mattx_dsm_page_in_range(ctx->req.shmid, ctx->req.offset)) {
                 unsigned long page_idx = ctx->req.offset / PAGE_SIZE;
                 spin_lock(&mattx_dsm_lock);
                 for (int d = 0; d < MAX_DSM_SEGMENTS; d++) {
@@ -5744,7 +5755,7 @@ static void mattx_dsm_cleanup_cb(struct callback_head *cb) {
                     if (ctx->fault_addr >= base && ctx->fault_addr < base + size) {
                         offset = ctx->fault_addr - base;
                         unsigned long page_idx = offset / PAGE_SIZE;
-                        kaddr = guest_registry[i].dsm_map[d].pages[page_idx];
+                        kaddr = (page_idx < MAX_DSM_PAGES) ? guest_registry[i].dsm_map[d].pages[page_idx] : NULL;
                         break;
                     }
                 }
@@ -5821,6 +5832,15 @@ static void mattx_dsm_write_acquire_kworker(struct work_struct *work) {
     u64 local_shared_mask[MAX_NODES / 64];
     memset(local_shared_mask, 0, sizeof(local_shared_mask));
     bool found = false;
+
+    // The directory holds MAX_DSM_PAGES pages per segment: answer with an error beyond that
+    if (!mattx_dsm_page_in_range(ctx->req.shmid, ctx->req.offset)) {
+        reply.error = -ERANGE;
+        if (cluster_map[ctx->target_node])
+            mattx_comm_send(cluster_map[ctx->target_node], MATTX_MSG_DSM_WRITE_ACQUIRE_REPLY, &reply, sizeof(reply));
+        kfree(ctx);
+        return;
+    }
 
     // --- MODE 2 GLOBAL DIRECTORY LOOKUP (QUICK GRAB) ---
     spin_lock(&mattx_dsm_lock);
@@ -5918,6 +5938,11 @@ struct mattx_dsm_invalidate_kworker_ctx { struct work_struct work; struct mattx_
 static void mattx_dsm_invalidate_kworker(struct work_struct *work) {
     struct mattx_dsm_invalidate_kworker_ctx *ctx = container_of(work, struct mattx_dsm_invalidate_kworker_ctx, work);
 
+    if (!mattx_dsm_page_in_range(ctx->req.shmid, ctx->req.offset)) {
+        kfree(ctx);
+        return;
+    }
+
     spin_lock(&guest_lock);
     for (int i = 0; i < guest_count; i++) {
         // THE FIX: Skip the process that is currently acquiring the EXCLUSIVE lock!
@@ -5998,6 +6023,15 @@ static void mattx_dsm_flush_kworker(struct work_struct *work) {
     if (!reply) { kfree(ctx); return; }
     reply->req_id = ctx->req.req_id;
     reply->error = -ENOENT;
+
+    if (!mattx_dsm_page_in_range(ctx->req.shmid, ctx->req.offset)) {
+        reply->error = -ERANGE;
+        if (cluster_map[ctx->target_node])
+            mattx_comm_send(cluster_map[ctx->target_node], MATTX_MSG_DSM_FLUSH_REPLY, reply, sizeof(*reply));
+        kfree(reply);
+        kfree(ctx);
+        return;
+    }
 
     spin_lock(&guest_lock);
     for (int i = 0; i < guest_count; i++) {

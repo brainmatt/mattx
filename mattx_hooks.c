@@ -5928,6 +5928,11 @@ static int entry_handler_shmem_fault(struct kretprobe_instance *ri, struct pt_re
                 unsigned long offset = (vmf->address & PAGE_MASK) - vmf->vma->vm_start;
                 bool is_write = (vmf->flags & FAULT_FLAG_WRITE) ? true : false;
 
+                // A page beyond the DSM tables (MAX_DSM_PAGES per segment) cannot be tracked: the native
+                // fault is left alone, and never reads the directory out of bounds.
+                if (!mattx_dsm_page_in_range(shmid, offset))
+                    return 0;
+
                 spin_lock(&mattx_dsm_lock);
                 for (int d = 0; d < MAX_DSM_SEGMENTS; d++) {
                     if (mattx_global_dsm_dir[d].in_use && mattx_global_dsm_dir[d].shmid == shmid) {
