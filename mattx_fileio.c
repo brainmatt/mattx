@@ -2552,67 +2552,50 @@ static bool mattx_poll_deputy_alive(u32 orig_pid)
     return alive;
 }
 
-static void mattx_poll_kworker(struct work_struct *work) {
-    struct mattx_poll_kworker_ctx *ctx = container_of(work, struct mattx_poll_kworker_ctx, work);
-    struct mattx_sys_poll_req *req = &ctx->req;
-    struct mattx_sys_poll_reply *reply;
-    struct file *poll_files[16];
+/*
+ * The state of one poll wait. struct poll_wqueues alone is ~0.8 KB (it carries the inline poll table
+ * entries) and the reply is ~0.3 KB: together they must not live on a kworker's stack (frame size).
+ */
+struct mattx_poll_state {
     struct poll_wqueues table;
+    struct file *files[16];
+    struct mattx_sys_poll_reply reply;
+};
+
+// Always answer: a failed allocation used to leave the Surrogate waiting forever. noinline_for_stack: the
+// reply on this function's stack is only paid for in the (rare) case that it is needed.
+static noinline_for_stack void mattx_poll_answer_nomem(struct mattx_poll_kworker_ctx *ctx)
+{
+    struct mattx_sys_poll_reply fail;
     struct mattx_link *link;
-    bool abandoned = false;
-    bool table_ready = false;
+
+    memset(&fail, 0, sizeof(fail));
+    fail.orig_pid = ctx->req.orig_pid;
+    fail.req_id = ctx->req.req_id;
+    fail.error = -ENOMEM;
+    link = READ_ONCE(cluster_map[ctx->target_node]);
+    if (link)
+        mattx_comm_send(link, MATTX_MSG_SYS_POLL_REPLY, &fail, sizeof(fail));
+}
+
+// The wait: fills st->reply (revents, retval or error). *abandoned: nobody is left to answer (unload, link gone).
+static noinline_for_stack void mattx_poll_wait(struct mattx_poll_kworker_ctx *ctx, struct mattx_poll_state *st,
+                                               bool *abandoned)
+{
+    struct mattx_sys_poll_req *req = &ctx->req;
+    struct mattx_sys_poll_reply *reply = &st->reply;
+    struct poll_wqueues *table = &st->table;
     bool timed = (req->timeout >= 0);
     unsigned long expire = 0;
     // A ticketed request reports like native poll(): POLLERR/POLLHUP/POLLNVAL are always reported
     __poll_t always = req->req_id ? (EPOLLERR | EPOLLHUP | EPOLLNVAL) : 0;
-    int nfds = req->nfds;
+    int nfds = reply->nfds;
     int j;
-
-    memset(poll_files, 0, sizeof(poll_files));
-
-    // --- THE STACK DIET FIX ---
-    // Move large structs off the kernel stack and onto the heap!
-    reply = kzalloc(sizeof(*reply), GFP_KERNEL);
-    if (!reply) {
-        // Always answer: -ENOMEM used to leave the Surrogate waiting forever
-        struct mattx_sys_poll_reply fail;
-
-        memset(&fail, 0, sizeof(fail));
-        fail.orig_pid = req->orig_pid;
-        fail.req_id = req->req_id;
-        fail.error = -ENOMEM;
-        link = READ_ONCE(cluster_map[ctx->target_node]);
-        if (link)
-            mattx_comm_send(link, MATTX_MSG_SYS_POLL_REPLY, &fail, sizeof(fail));
-        goto out_ctx;
-    }
-
-    reply->orig_pid = req->orig_pid;
-    reply->req_id = req->req_id;
-
-    if (nfds < 0 || nfds > 16) {
-        reply->error = -EINVAL;
-        goto answer;
-    }
-    reply->nfds = nfds;
-    memcpy(reply->fds, req->fds, sizeof(struct mattx_pollfd) * nfds);
-
-    mattx_dbg("[RPC] Poll Worker started for Deputy PID %u (req %u, Timeout: %dms)\n", req->orig_pid, req->req_id, req->timeout);
 
     if (timed)
         expire = jiffies + msecs_to_jiffies(req->timeout);
 
-    // The files are resolved once and held for the whole wait, like the fdget() of the native poll()
-    for (j = 0; j < nfds; j++) {
-        int remote_fd = reply->fds[j].fd;
-
-        reply->fds[j].revents = 0;
-        if (remote_fd >= 0)
-            poll_files[j] = mattx_get_remote_file(req->orig_pid, remote_fd);
-    }
-
-    poll_initwait(&table);
-    table_ready = true;
+    poll_initwait(table);
 
     // --- THE WAIT QUEUE LOOP ---
     for (;;) {
@@ -2625,7 +2608,7 @@ static void mattx_poll_kworker(struct work_struct *work) {
 
         // 1. Look: never blocks. The first round registers us on every file's wait queue.
         for (j = 0; j < nfds; j++) {
-            struct file *f = poll_files[j];
+            struct file *f = st->files[j];
             short events = reply->fds[j].events;
             __poll_t mask = 0;
 
@@ -2637,8 +2620,8 @@ static void mattx_poll_kworker(struct work_struct *work) {
                 // What is reported: what was asked for, plus POLLERR/POLLHUP for a ticketed (native) poll()
                 __poll_t keep = (__poll_t)(u16)events | always;
 
-                table.pt._key = (__poll_t)(u16)events | EPOLLERR | EPOLLHUP;
-                mask = vfs_poll(f, &table.pt) & keep;
+                table->pt._key = (__poll_t)(u16)events | EPOLLERR | EPOLLHUP;
+                mask = vfs_poll(f, &table->pt) & keep;
             } else {
                 mask = always & EPOLLNVAL;              // no such FD
             }
@@ -2647,14 +2630,14 @@ static void mattx_poll_kworker(struct work_struct *work) {
             if (mask)
                 ready_count++;
         }
-        table.pt._qproc = NULL;                         // registered: the next rounds only look
+        table->pt._qproc = NULL;                        // registered: the next rounds only look
 
         if (ready_count > 0) {
             reply->retval = ready_count;
             break;
         }
-        if (table.error) {
-            reply->error = table.error;
+        if (table->error) {
+            reply->error = table->error;
             break;
         }
 
@@ -2669,7 +2652,7 @@ static void mattx_poll_kworker(struct work_struct *work) {
             break;
         }
         if (READ_ONCE(mattx_cancellable_stopping) || !READ_ONCE(cluster_map[ctx->target_node])) {
-            abandoned = true;
+            *abandoned = true;
             break;
         }
 
@@ -2681,18 +2664,61 @@ static void mattx_poll_kworker(struct work_struct *work) {
                 to = (long)(expire - jiffies) > 0 ? (long)(expire - jiffies) : 1;
 
             set_current_state(TASK_INTERRUPTIBLE);
-            if (!READ_ONCE(table.triggered))
+            if (!READ_ONCE(table->triggered))
                 schedule_timeout(to);
             __set_current_state(TASK_RUNNING);
-            smp_store_mb(table.triggered, 0);
+            smp_store_mb(table->triggered, 0);
         }
     }
 
-    if (table_ready)
-        poll_freewait(&table);
+    poll_freewait(table);
+}
+
+static void mattx_poll_kworker(struct work_struct *work) {
+    struct mattx_poll_kworker_ctx *ctx = container_of(work, struct mattx_poll_kworker_ctx, work);
+    struct mattx_sys_poll_req *req = &ctx->req;
+    struct mattx_poll_state *st;
+    struct mattx_sys_poll_reply *reply;
+    struct mattx_link *link;
+    bool abandoned = false;
+    int nfds = req->nfds;
+    int j;
+
+    // --- THE STACK DIET FIX ---
+    // Move large structs off the kernel stack and onto the heap!
+    st = kzalloc(sizeof(*st), GFP_KERNEL);
+    if (!st) {
+        mattx_poll_answer_nomem(ctx);
+        goto out_ctx;
+    }
+    reply = &st->reply;
+
+    reply->orig_pid = req->orig_pid;
+    reply->req_id = req->req_id;
+
+    if (nfds < 0 || nfds > 16) {
+        reply->error = -EINVAL;
+        goto answer;
+    }
+    reply->nfds = nfds;
+    memcpy(reply->fds, req->fds, sizeof(struct mattx_pollfd) * nfds);
+
+    mattx_dbg("[RPC] Poll Worker started for Deputy PID %u (req %u, Timeout: %dms)\n", req->orig_pid, req->req_id, req->timeout);
+
+    // The files are resolved once and held for the whole wait, like the fdget() of the native poll()
     for (j = 0; j < nfds; j++) {
-        if (poll_files[j])
-            fput(poll_files[j]);
+        int remote_fd = reply->fds[j].fd;
+
+        reply->fds[j].revents = 0;
+        if (remote_fd >= 0)
+            st->files[j] = mattx_get_remote_file(req->orig_pid, remote_fd);
+    }
+
+    mattx_poll_wait(ctx, st, &abandoned);
+
+    for (j = 0; j < nfds; j++) {
+        if (st->files[j])
+            fput(st->files[j]);
     }
 
 answer:
@@ -2706,7 +2732,7 @@ answer:
         // with an infinite timeout). A kworker may simply wait for the mutex.
         mattx_comm_send(link, MATTX_MSG_SYS_POLL_REPLY, reply, sizeof(*reply));
     }
-    kfree(reply);
+    kfree(st);
 
 out_ctx:
     kfree(ctx);
