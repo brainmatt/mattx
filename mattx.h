@@ -1158,16 +1158,22 @@ struct mattx_dsm_master_dir {
     bool in_use;                        // <-- Tracks if this slot is active
     u32 shmid;
     u32 home_pid;                       // <-- The PID on VM1 to use for memory reading!    
-    u8 page_state[MAX_DSM_PAGES];       // Global state of the page
-    u32 page_owner_pid[MAX_DSM_PAGES];  // PID of the EXCLUSIVE owner
+    // The tables have one entry per page of the segment (npages): there is no limit on the size of a segment
+    unsigned long npages;               // DIV_ROUND_UP(segment size, PAGE_SIZE)
+    unsigned long sweep_pos;            // where the native sweeper continues (it shoots down a few pages per round)
+    u8 *page_state;                     // Global state of the page
+    u32 *page_owner_pid;                // PID of the EXCLUSIVE owner
 
-    // A foolproof 2D array. 1024 nodes / 64 bits = 16 u64s per page!
-    u64 page_shared_mask[MAX_DSM_PAGES][MAX_NODES / 64]; 
+    // The sharers of a page: a bitmap of MAX_NODES bits (16 u64s), allocated lazily for the pages that really
+    // are shared (xarray: page index -> u64[MAX_NODES / 64])
+    struct xarray *page_shared_mask;
 };
 
 
 // --- The Global Node-Local Directory & Lock ---
-extern struct mattx_dsm_master_dir mattx_global_dsm_dir[MAX_DSM_SEGMENTS];
+// A dynamic array: it grows on demand, its entries never move (an index stays valid). Under mattx_dsm_lock.
+extern struct mattx_dsm_master_dir *mattx_global_dsm_dir;
+extern int mattx_dsm_dir_cap;
 extern spinlock_t mattx_dsm_lock;
 
 
@@ -1177,10 +1183,6 @@ struct mattx_export_info {
     struct file *remote_files[MAX_FDS]; 
     bool abort_rpc; // The Kworker Kill-Switch! ---
     bool is_growing_gang; // The Gang Grower Flag!
-
-    // DSM MESI Directory ---
-    int dsm_dir_count;
-    struct mattx_dsm_master_dir dsm_dirs[MAX_DSM_SEGMENTS];    
 };
 
 struct mattx_vfs_getattr_req {
@@ -1391,18 +1393,15 @@ struct mattx_dsm_flush_reply {
 
 
 
-// The DSM tables of a mapping (guest_registry[].dsm_map[]) and of the master directory hold MAX_DSM_PAGES
-// pages per segment. A segment is bigger than that in real life (MPICH: ~4 MB): indexing them with the page
-// of such an offset reads and writes the NEIGHBOURING entries. Every handler that indexes them with an offset
-// asks this first and refuses (or leaves the page untracked) instead.
-static inline bool mattx_dsm_page_in_range(u32 shmid, unsigned long offset)
-{
-    if (likely(offset / PAGE_SIZE < MAX_DSM_PAGES))
-        return true;
-    pr_err_ratelimited("MattX:[DSM] SHMID %u: page %lu is beyond MAX_DSM_PAGES (%d pages = %lu bytes per segment): the DSM cannot track it\n",
-                       shmid, offset / PAGE_SIZE, MAX_DSM_PAGES, (unsigned long)MAX_DSM_PAGES * PAGE_SIZE);
-    return false;
-}
+// The master directory of the DSM (VM1, mattx_fileio.c): one entry per segment, sized by the segment. All of
+// these need mattx_dsm_lock, except the ones that say otherwise.
+struct mattx_dsm_master_dir *mattx_dsm_dir_lookup(u32 shmid, unsigned long page_idx); // NULL: unknown segment, or the page is beyond its end
+u64 *mattx_dsm_mask(struct mattx_dsm_master_dir *dir, unsigned long page_idx);        // the sharers of a page; NULL: nobody
+u64 *mattx_dsm_mask_get(struct mattx_dsm_master_dir *dir, unsigned long page_idx);    // creates the mask; NULL: out of memory
+void mattx_dsm_mask_clear(struct mattx_dsm_master_dir *dir, unsigned long page_idx);  // nobody shares the page any more
+int mattx_dsm_dir_register(u32 shmid, u32 home_pid, unsigned long npages);            // may sleep: NO lock held
+void mattx_dsm_dir_reap(void);                                                        // may sleep: NO lock held
+void mattx_dsm_dir_exit(void);                                                        // module unload
 
 // This defines the standard signature for all message handlers
 typedef void (*mattx_msg_handler_fn)(struct mattx_link *link, struct mattx_header *hdr, void *payload);

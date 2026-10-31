@@ -5745,8 +5745,9 @@ static int ret_handler_shmctl(struct kretprobe_instance *ri, struct pt_regs *reg
     // we must remove it from the Global Directory to keep the Matrix Monitor clean!
     if (regs->ax == 0 && data->cmd == IPC_RMID) {
         spin_lock(&mattx_dsm_lock);
-        for (int d = 0; d < MAX_DSM_SEGMENTS; d++) {
+        for (int d = 0; d < mattx_dsm_dir_cap; d++) {
             if (mattx_global_dsm_dir[d].in_use && mattx_global_dsm_dir[d].shmid == data->shmid) {
+                // Only in_use is cleared here: this handler must not sleep, the sweeper thread frees the tables
                 mattx_global_dsm_dir[d].in_use = false;
                 mattx_dbg("[MESI_VM1] Garbage Collector: SHMID %d destroyed. Directory slot %d freed.\n", data->shmid, d);
                 break;
@@ -5897,30 +5898,28 @@ static int entry_handler_shmem_fault(struct kretprobe_instance *ri, struct pt_re
                 unsigned long offset = (vmf->address & PAGE_MASK) - vmf->vma->vm_start;
                 bool is_write = (vmf->flags & FAULT_FLAG_WRITE) ? true : false;
 
-                // A page beyond the DSM tables (MAX_DSM_PAGES per segment) cannot be tracked: the native
-                // fault is left alone, and never reads the directory out of bounds.
-                if (!mattx_dsm_page_in_range(shmid, offset))
-                    return 0;
+                unsigned long page_idx = offset / PAGE_SIZE;
+                struct mattx_dsm_master_dir *dir;
 
+                // A page the directory does not know (no directory yet, or beyond the segment) is left alone
                 spin_lock(&mattx_dsm_lock);
-                for (int d = 0; d < MAX_DSM_SEGMENTS; d++) {
-                    if (mattx_global_dsm_dir[d].in_use && mattx_global_dsm_dir[d].shmid == shmid) {
-                        unsigned long page_idx = offset / PAGE_SIZE;
-                        u8 state = mattx_global_dsm_dir[d].page_state[page_idx];
-                        u32 owner = mattx_global_dsm_dir[d].page_owner_pid[page_idx];
-                        
-                        if (state == MATTX_PAGE_EXCLUSIVE && owner != 0) {
-                            data->needs_sync = true; // We must flush the remote owner!
-                        } else if (is_write && state == MATTX_PAGE_SHARED) {
-                            // We must invalidate remote sharers!
-                            for (int n = 0; n < MAX_NODES; n++) {
-                                int n_idx = n / 64; int n_bit = n % 64;
-                                if (mattx_global_dsm_dir[d].page_shared_mask[page_idx][n_idx] & (1ULL << n_bit)) {
-                                    data->needs_sync = true; break;
-                                }
+                dir = mattx_dsm_dir_lookup(shmid, page_idx);
+                if (dir) {
+                    u8 state = dir->page_state[page_idx];
+                    u32 owner = dir->page_owner_pid[page_idx];
+
+                    if (state == MATTX_PAGE_EXCLUSIVE && owner != 0) {
+                        data->needs_sync = true; // We must flush the remote owner!
+                    } else if (is_write && state == MATTX_PAGE_SHARED) {
+                        // We must invalidate remote sharers!
+                        u64 *mask = mattx_dsm_mask(dir, page_idx);
+
+                        for (int n = 0; mask && n < MAX_NODES; n++) {
+                            int n_idx = n / 64; int n_bit = n % 64;
+                            if (mask[n_idx] & (1ULL << n_bit)) {
+                                data->needs_sync = true; break;
                             }
                         }
-                        break;
                     }
                 }
                 spin_unlock(&mattx_dsm_lock);

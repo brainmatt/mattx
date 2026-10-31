@@ -95,8 +95,251 @@ static int mattx_vfs_rpc_wait(int slot)
 // ============================================================================
 // THE GLOBAL NODE-LOCAL MESI DIRECTORY (VM1)
 // ============================================================================
-struct mattx_dsm_master_dir mattx_global_dsm_dir[MAX_DSM_SEGMENTS];
+struct mattx_dsm_master_dir *mattx_global_dsm_dir;
+int mattx_dsm_dir_cap;
 DEFINE_SPINLOCK(mattx_dsm_lock);
+
+/*
+ * The master directory has one entry per SYSV segment, sized by the segment (npages): there is no limit on
+ * the size of a segment or on the number of segments. The array of entries grows on demand and its entries
+ * never move inside it, so an index stays valid. Everything below needs mattx_dsm_lock unless it says
+ * otherwise. The sharers of a page (a bitmap of MAX_NODES bits) are allocated lazily, one small mask per page
+ * that really is shared (xarray: page index -> u64[MAX_NODES / 64]); a bigger chunk could not be allocated
+ * under the spinlock.
+ */
+#define MATTX_DSM_MASK_WORDS (MAX_NODES / 64)
+
+// The tables of a segment; an entry that is not in_use may still hold some until the reaper frees them
+struct mattx_dsm_dir_tabs {
+    u8 *state;
+    u32 *owner;
+    struct xarray *masks;
+};
+
+// Frees the tables of a segment. May sleep: never under a spinlock.
+static void mattx_dsm_tabs_release(struct mattx_dsm_dir_tabs *t)
+{
+    if (t->masks) {
+        unsigned long idx;
+        void *entry;
+
+        xa_for_each(t->masks, idx, entry)
+            kfree(entry);
+        xa_destroy(t->masks);
+        kfree(t->masks);
+    }
+    kvfree(t->state);
+    kvfree(t->owner);
+    memset(t, 0, sizeof(*t));
+}
+
+// Takes the tables out of a directory entry (the entry keeps none)
+static void mattx_dsm_dir_detach_tabs(struct mattx_dsm_master_dir *dir, struct mattx_dsm_dir_tabs *t)
+{
+    t->state = dir->page_state;
+    t->owner = dir->page_owner_pid;
+    t->masks = dir->page_shared_mask;
+    dir->page_state = NULL;
+    dir->page_owner_pid = NULL;
+    dir->page_shared_mask = NULL;
+    dir->npages = 0;
+}
+
+// The directory of a segment, or NULL if the segment is unknown or the page is beyond its end
+struct mattx_dsm_master_dir *mattx_dsm_dir_lookup(u32 shmid, unsigned long page_idx)
+{
+    int d;
+
+    for (d = 0; d < mattx_dsm_dir_cap; d++) {
+        struct mattx_dsm_master_dir *dir = &mattx_global_dsm_dir[d];
+
+        if (dir->in_use && dir->shmid == shmid)
+            return page_idx < dir->npages ? dir : NULL;
+    }
+    return NULL;
+}
+
+// The sharers of a page, or NULL if nobody shares it
+u64 *mattx_dsm_mask(struct mattx_dsm_master_dir *dir, unsigned long page_idx)
+{
+    return xa_load(dir->page_shared_mask, page_idx);
+}
+
+// The sharers of a page; creates the mask if there is none (GFP_ATOMIC: we hold the spinlock). NULL: out of memory.
+u64 *mattx_dsm_mask_get(struct mattx_dsm_master_dir *dir, unsigned long page_idx)
+{
+    u64 *mask = xa_load(dir->page_shared_mask, page_idx);
+    void *old;
+
+    if (mask)
+        return mask;
+    mask = kzalloc(sizeof(u64) * MATTX_DSM_MASK_WORDS, GFP_ATOMIC);
+    if (!mask)
+        return NULL;
+    old = xa_store(dir->page_shared_mask, page_idx, mask, GFP_ATOMIC);
+    if (xa_is_err(old)) {
+        kfree(mask);
+        return NULL;
+    }
+    return mask;
+}
+
+// Nobody shares the page any more
+void mattx_dsm_mask_clear(struct mattx_dsm_master_dir *dir, unsigned long page_idx)
+{
+    kfree(xa_erase(dir->page_shared_mask, page_idx));
+}
+
+// Registers a segment in the directory unless it is there already. May sleep: call it without any lock.
+int mattx_dsm_dir_register(u32 shmid, u32 home_pid, unsigned long npages)
+{
+    struct mattx_dsm_dir_tabs mine = { 0 }, stale = { 0 };
+    struct mattx_dsm_master_dir *grown = NULL, *old = NULL;
+    int grown_cap = 0, slot = -1, ret = 0, d;
+    bool known = false;
+
+    if (!npages)
+        return -EINVAL;
+
+    spin_lock(&mattx_dsm_lock);
+    for (d = 0; d < mattx_dsm_dir_cap; d++) {
+        if (mattx_global_dsm_dir[d].in_use && mattx_global_dsm_dir[d].shmid == shmid) {
+            known = true;
+            break;
+        }
+    }
+    spin_unlock(&mattx_dsm_lock);
+    if (known)
+        return 0;
+
+    // The tables are sized by the segment: allocated before we take the spinlock (MATTX_PAGE_INVALID is 0)
+    mine.state = kvzalloc(npages, GFP_KERNEL);
+    mine.owner = kvcalloc(npages, sizeof(u32), GFP_KERNEL);
+    mine.masks = kmalloc(sizeof(*mine.masks), GFP_KERNEL);
+    if (!mine.state || !mine.owner || !mine.masks) {
+        ret = -ENOMEM;
+        goto out;
+    }
+    xa_init(mine.masks);
+
+    for (;;) {
+        int need = 0;
+
+        spin_lock(&mattx_dsm_lock);
+        for (d = 0; d < mattx_dsm_dir_cap; d++) {
+            if (mattx_global_dsm_dir[d].in_use && mattx_global_dsm_dir[d].shmid == shmid) {
+                slot = -2;                  // somebody registered it meanwhile
+                break;
+            }
+        }
+        if (slot == -1) {
+            for (d = 0; d < mattx_dsm_dir_cap; d++) {
+                if (!mattx_global_dsm_dir[d].in_use) {
+                    slot = d;
+                    break;
+                }
+            }
+        }
+        if (slot == -1 && grown && grown_cap > mattx_dsm_dir_cap) {
+            // No free entry: grow with the array we allocated outside the lock (the entries keep their index)
+            if (mattx_dsm_dir_cap)
+                memcpy(grown, mattx_global_dsm_dir, mattx_dsm_dir_cap * sizeof(*grown));
+            old = mattx_global_dsm_dir;
+            slot = mattx_dsm_dir_cap;
+            mattx_global_dsm_dir = grown;
+            mattx_dsm_dir_cap = grown_cap;
+            grown = NULL;
+        }
+        if (slot >= 0) {
+            struct mattx_dsm_master_dir *dir = &mattx_global_dsm_dir[slot];
+
+            mattx_dsm_dir_detach_tabs(dir, &stale);     // a reaped-later leftover of the entry
+            dir->in_use = true;
+            dir->shmid = shmid;
+            dir->home_pid = home_pid;
+            dir->npages = npages;
+            dir->sweep_pos = 0;
+            dir->page_state = mine.state;
+            dir->page_owner_pid = mine.owner;
+            dir->page_shared_mask = mine.masks;
+            memset(&mine, 0, sizeof(mine));             // the directory owns them now
+        } else if (slot == -1) {
+            need = mattx_dsm_dir_cap ? mattx_dsm_dir_cap * 2 : 8;
+        }
+        spin_unlock(&mattx_dsm_lock);
+
+        if (slot >= 0) {
+            mattx_dbg("[MESI_VM1] Dynamically registered SHMID %u in Global Directory at slot %d (%lu pages)\n", shmid, slot, npages);
+            break;
+        }
+        if (slot == -2)
+            break;
+
+        kvfree(grown);
+        grown = kvcalloc(need, sizeof(*grown), GFP_KERNEL);
+        grown_cap = need;
+        if (!grown) {
+            ret = -ENOMEM;
+            break;
+        }
+    }
+
+out:
+    kvfree(old);
+    kvfree(grown);
+    mattx_dsm_tabs_release(&stale);
+    mattx_dsm_tabs_release(&mine);      // unused if the segment was known or something failed
+    return ret;
+}
+
+// Frees the tables of the entries that are not in use any more (a destroyed segment): the garbage collector of
+// the shmctl(IPC_RMID) kprobe only clears in_use, because it must not sleep. Called by the sweeper thread.
+void mattx_dsm_dir_reap(void)
+{
+    int rounds;
+
+    for (rounds = 0; rounds < 8; rounds++) {
+        struct mattx_dsm_dir_tabs dead = { 0 };
+        int d;
+
+        spin_lock(&mattx_dsm_lock);
+        for (d = 0; d < mattx_dsm_dir_cap; d++) {
+            struct mattx_dsm_master_dir *dir = &mattx_global_dsm_dir[d];
+
+            if (!dir->in_use && dir->page_state) {
+                mattx_dsm_dir_detach_tabs(dir, &dead);
+                break;
+            }
+        }
+        spin_unlock(&mattx_dsm_lock);
+
+        if (!dead.state)
+            return;
+        mattx_dsm_tabs_release(&dead);
+    }
+}
+
+// Module unload: gives the whole directory back
+void mattx_dsm_dir_exit(void)
+{
+    struct mattx_dsm_master_dir *dirs;
+    int cap, d;
+
+    spin_lock(&mattx_dsm_lock);
+    dirs = mattx_global_dsm_dir;
+    cap = mattx_dsm_dir_cap;
+    mattx_global_dsm_dir = NULL;
+    mattx_dsm_dir_cap = 0;
+    spin_unlock(&mattx_dsm_lock);
+
+    for (d = 0; d < cap; d++) {
+        struct mattx_dsm_dir_tabs t;
+
+        mattx_dsm_dir_detach_tabs(&dirs[d], &t);
+        mattx_dsm_tabs_release(&t);
+    }
+    kvfree(dirs);
+}
 
 // --- THE HPC FAST-PATH HELPER ---
 bool is_hpc_local_lib(const char *path) {
@@ -5252,6 +5495,7 @@ static void mattx_dsm_fault_kworker(struct work_struct *work) {
     struct task_struct *deputy = NULL;
     int ret = -EFAULT;
     unsigned long target_addr = 0;
+    unsigned long seg_npages = 0;       // size of the segment in pages: the directory of the segment is sized by it
 
     reply = kzalloc(sizeof(*reply), GFP_KERNEL);
     if (!reply) { kfree(ctx); return; }
@@ -5272,6 +5516,7 @@ static void mattx_dsm_fault_kworker(struct work_struct *work) {
             if (vma->vm_file && vma->vm_file->f_path.dentry->d_name.name) {
                 if (strncmp(vma->vm_file->f_path.dentry->d_name.name, "SYSV", 4) == 0) {
                     if (vma->vm_file->f_inode->i_ino == ctx->req.shmid) {
+                        seg_npages = DIV_ROUND_UP(i_size_read(vma->vm_file->f_inode), PAGE_SIZE);
                         if (vma->vm_start + ctx->req.offset < vma->vm_end) {
                             target_addr = vma->vm_start + ctx->req.offset;
                         }
@@ -5282,10 +5527,6 @@ static void mattx_dsm_fault_kworker(struct work_struct *work) {
         }
         mmap_read_unlock(deputy->mm); // DROP THE LOCK IMMEDIATELY!
 
-        // The DSM tables hold MAX_DSM_PAGES pages per segment: answer with an error beyond that
-        if (target_addr != 0 && !mattx_dsm_page_in_range(ctx->req.shmid, ctx->req.offset))
-            target_addr = 0;
-
         // 2. THE MESI SYNC & PUMP (Completely Lock-Free!)
         if (target_addr != 0) {
             unsigned long page_idx = ctx->req.offset / PAGE_SIZE;
@@ -5294,33 +5535,12 @@ static void mattx_dsm_fault_kworker(struct work_struct *work) {
             if (config_dsm_mode == 2) {
                 u32 owner_pid = 0;
                 int owner_node = -1;
-                int dir_idx = -1;
-                int e_idx = -1;
-
-                spin_lock(&export_lock);
-                for (int e = 0; e < export_count; e++) {
-                    if (export_registry[e].orig_pid == ctx->req.orig_pid) {
-                        e_idx = e;
-                        for (int d = 0; d < export_registry[e].dsm_dir_count; d++) {
-                            if (export_registry[e].dsm_dirs[d].shmid == ctx->req.shmid) {
-                                dir_idx = d;
-                                break;
-                            }
-                        }
-                        break;
-                    }
-                }
-                spin_unlock(&export_lock);
+                struct mattx_dsm_master_dir *dir;
 
                 spin_lock(&mattx_dsm_lock);
-                for (int d = 0; d < MAX_DSM_SEGMENTS; d++) {
-                    if (mattx_global_dsm_dir[d].in_use && mattx_global_dsm_dir[d].shmid == ctx->req.shmid) {
-                        if (mattx_global_dsm_dir[d].page_state[page_idx] == MATTX_PAGE_EXCLUSIVE) {
-                            owner_pid = mattx_global_dsm_dir[d].page_owner_pid[page_idx];
-                        }
-                        break;
-                    }
-                }
+                dir = mattx_dsm_dir_lookup(ctx->req.shmid, page_idx);
+                if (dir && dir->page_state[page_idx] == MATTX_PAGE_EXCLUSIVE)
+                    owner_pid = dir->page_owner_pid[page_idx];
                 spin_unlock(&mattx_dsm_lock);
                 
                 if (owner_pid != 0 && owner_pid != ctx->req.orig_pid) {
@@ -5393,13 +5613,11 @@ static void mattx_dsm_fault_kworker(struct work_struct *work) {
 
                             // Update Directory: Downgrade to SHARED
                             spin_lock(&mattx_dsm_lock);
-                            for (int gd = 0; gd < MAX_DSM_SEGMENTS; gd++) {
-                                if (mattx_global_dsm_dir[gd].in_use && mattx_global_dsm_dir[gd].shmid == ctx->req.shmid) {
-                                    mattx_global_dsm_dir[gd].page_state[page_idx] = MATTX_PAGE_SHARED;
-                                    mattx_global_dsm_dir[gd].page_owner_pid[page_idx] = 0; 
-                                    memset(mattx_global_dsm_dir[gd].page_shared_mask[page_idx], 0, sizeof(u64) * (MAX_NODES / 64));
-                                    break;
-                                }
+                            dir = mattx_dsm_dir_lookup(ctx->req.shmid, page_idx);
+                            if (dir) {
+                                dir->page_state[page_idx] = MATTX_PAGE_SHARED;
+                                dir->page_owner_pid[page_idx] = 0;
+                                mattx_dsm_mask_clear(dir, page_idx);
                             }
                             spin_unlock(&mattx_dsm_lock);
                         }
@@ -5419,41 +5637,31 @@ static void mattx_dsm_fault_kworker(struct work_struct *work) {
 
                 // --- MODE 2 MASTER DIRECTORY UPDATE ---
                 if (config_dsm_mode == 2) {
+                    struct mattx_dsm_master_dir *dir;
+                    u64 *mask = NULL;
+
+                    // The directory of a segment is sized by the segment: registered once, outside the spinlock
+                    if (mattx_dsm_dir_register(ctx->req.shmid, ctx->req.orig_pid, seg_npages) != 0)
+                        mattx_dbg("[MESI_VM1] Could not register SHMID %u in the Global Directory\n", ctx->req.shmid);
+
                     spin_lock(&mattx_dsm_lock);
-                    int dir_idx = -1;
-                    for (int d = 0; d < MAX_DSM_SEGMENTS; d++) {
-                        if (mattx_global_dsm_dir[d].in_use && mattx_global_dsm_dir[d].shmid == ctx->req.shmid) {
-                            dir_idx = d; break;
+                    dir = mattx_dsm_dir_lookup(ctx->req.shmid, page_idx);
+                    if (dir) {
+                        mask = mattx_dsm_mask_get(dir, page_idx);
+                        if (mask) {
+                            if (dir->page_state[page_idx] == MATTX_PAGE_INVALID)
+                                dir->page_state[page_idx] = MATTX_PAGE_SHARED;
+                            mask[ctx->target_node / 64] |= (1ULL << (ctx->target_node % 64));
+
+                            mattx_dbg("[MESI_VM1] Page %lu of SHMID %u is now SHARED with Node %d\n", page_idx, ctx->req.shmid, ctx->target_node);
                         }
-                    }
-                    
-                    if (dir_idx == -1) {
-                        for (int d = 0; d < MAX_DSM_SEGMENTS; d++) {
-                            if (!mattx_global_dsm_dir[d].in_use) {
-                                dir_idx = d;
-                                mattx_global_dsm_dir[d].in_use = true;
-                                mattx_global_dsm_dir[d].shmid = ctx->req.shmid;
-                                mattx_global_dsm_dir[d].home_pid = ctx->req.orig_pid;
-                                memset(mattx_global_dsm_dir[d].page_state, MATTX_PAGE_INVALID, sizeof(mattx_global_dsm_dir[d].page_state));
-                                memset(mattx_global_dsm_dir[d].page_owner_pid, 0, sizeof(mattx_global_dsm_dir[d].page_owner_pid));
-                                memset(mattx_global_dsm_dir[d].page_shared_mask, 0, sizeof(mattx_global_dsm_dir[d].page_shared_mask));
-                                mattx_dbg("[MESI_VM1] Dynamically registered SHMID %u in Global Directory at slot %d\n", ctx->req.shmid, d);
-                                break;
-                            }
-                        }
-                    }
-                    
-                    if (dir_idx != -1) {
-                        if (mattx_global_dsm_dir[dir_idx].page_state[page_idx] == MATTX_PAGE_INVALID) {
-                            mattx_global_dsm_dir[dir_idx].page_state[page_idx] = MATTX_PAGE_SHARED;
-                        }
-                        int n_idx = ctx->target_node / 64;
-                        int n_bit = ctx->target_node % 64;
-                        mattx_global_dsm_dir[dir_idx].page_shared_mask[page_idx][n_idx] |= (1ULL << n_bit);
-                        
-                        mattx_dbg("[MESI_VM1] Page %lu of SHMID %u is now SHARED with Node %d\n", page_idx, ctx->req.shmid, ctx->target_node);
                     }
                     spin_unlock(&mattx_dsm_lock);
+
+                    // A sharer that cannot be recorded would never be invalidated: fail the fault instead of
+                    // handing out a page the directory does not know about
+                    if (dir && !mask)
+                        ret = -ENOMEM;
                 }
             } else {
                 mattx_dbg("[DSM_PUMP] ERROR: Failed to extract page! (Read %d bytes)\n", bytes); 
@@ -5573,21 +5781,21 @@ static void mattx_dsm_update_kworker(struct work_struct *work) {
             fput(shm_file); // Release the file
 
             // --- THE FUNERAL DIRECTORY CLEANUP ---
-            if (config_dsm_mode == 2 && mattx_dsm_page_in_range(ctx->req.shmid, ctx->req.offset)) {
+            if (config_dsm_mode == 2) {
                 unsigned long page_idx = ctx->req.offset / PAGE_SIZE;
+                struct mattx_dsm_master_dir *dir;
+
                 spin_lock(&mattx_dsm_lock);
-                for (int d = 0; d < MAX_DSM_SEGMENTS; d++) {
-                    if (mattx_global_dsm_dir[d].in_use && mattx_global_dsm_dir[d].shmid == ctx->req.shmid) {
-                        // If the incoming data bomb is from the EXCLUSIVE owner, downgrade it to SHARED!
-                        if (mattx_global_dsm_dir[d].page_state[page_idx] == MATTX_PAGE_EXCLUSIVE &&
-                            mattx_global_dsm_dir[d].page_owner_pid[page_idx] == ctx->req.orig_pid) {
-                            
-                            mattx_global_dsm_dir[d].page_state[page_idx] = MATTX_PAGE_SHARED;
-                            mattx_global_dsm_dir[d].page_owner_pid[page_idx] = 0;
-                            memset(mattx_global_dsm_dir[d].page_shared_mask[page_idx], 0, sizeof(u64) * (MAX_NODES / 64));
-                            mattx_dbg("[MESI_VM1] Directory cleaned up! SHMID %u Offset %lu is now SHARED.\n", ctx->req.shmid, ctx->req.offset);
-                        }
-                        break;
+                dir = mattx_dsm_dir_lookup(ctx->req.shmid, page_idx);
+                if (dir) {
+                    // If the incoming data bomb is from the EXCLUSIVE owner, downgrade it to SHARED!
+                    if (dir->page_state[page_idx] == MATTX_PAGE_EXCLUSIVE &&
+                        dir->page_owner_pid[page_idx] == ctx->req.orig_pid) {
+
+                        dir->page_state[page_idx] = MATTX_PAGE_SHARED;
+                        dir->page_owner_pid[page_idx] = 0;
+                        mattx_dsm_mask_clear(dir, page_idx);
+                        mattx_dbg("[MESI_VM1] Directory cleaned up! SHMID %u Offset %lu is now SHARED.\n", ctx->req.shmid, ctx->req.offset);
                     }
                 }
                 spin_unlock(&mattx_dsm_lock);
@@ -5691,21 +5899,28 @@ int mattx_dsm_sweeper_loop(void *data) {
             int shoot_count = 0;
 
             spin_lock(&mattx_dsm_lock);
-            for (int d = 0; d < MAX_DSM_SEGMENTS; d++) {
-                if (mattx_global_dsm_dir[d].in_use) {
-                    for (int p = 0; p < MAX_DSM_PAGES; p++) {
-                        // If it's SHARED, remote nodes have copies. We must shoot down native PTEs
-                        // to force a fault and catch potential silent native writes!
-                        if (mattx_global_dsm_dir[d].page_state[p] == MATTX_PAGE_SHARED) {
-                            if (shoot_count < 16) {
-                                to_shoot[shoot_count].shmid = mattx_global_dsm_dir[d].shmid;
-                                to_shoot[shoot_count].home_pid = mattx_global_dsm_dir[d].home_pid;
-                                to_shoot[shoot_count].offset = p * PAGE_SIZE;
-                                shoot_count++;
-                            }
-                        }
+            for (int d = 0; d < mattx_dsm_dir_cap && shoot_count < 16; d++) {
+                struct mattx_dsm_master_dir *dir = &mattx_global_dsm_dir[d];
+                unsigned long scanned;
+
+                if (!dir->in_use || !dir->npages)
+                    continue;
+
+                // Only 16 shootdowns per round: continue where the last round stopped, or the first 16 shared
+                // pages would be shot down again and again and the rest never
+                for (scanned = 0; scanned < dir->npages && shoot_count < 16; scanned++) {
+                    unsigned long p = (dir->sweep_pos + scanned) % dir->npages;
+
+                    // If it's SHARED, remote nodes have copies. We must shoot down native PTEs
+                    // to force a fault and catch potential silent native writes!
+                    if (dir->page_state[p] == MATTX_PAGE_SHARED) {
+                        to_shoot[shoot_count].shmid = dir->shmid;
+                        to_shoot[shoot_count].home_pid = dir->home_pid;
+                        to_shoot[shoot_count].offset = p * PAGE_SIZE;
+                        shoot_count++;
                     }
                 }
+                dir->sweep_pos = (dir->sweep_pos + scanned) % dir->npages;
             }
             spin_unlock(&mattx_dsm_lock);
 
@@ -5745,6 +5960,9 @@ int mattx_dsm_sweeper_loop(void *data) {
 
         }
         
+        // Free the tables of the segments that were destroyed (the shmctl kprobe must not sleep: it only clears in_use)
+        mattx_dsm_dir_reap();
+
         // Sleep for 50ms regardless of mode to prevent 100% CPU spin!
         msleep(50); 
     }
@@ -5859,35 +6077,27 @@ static void mattx_dsm_write_acquire_kworker(struct work_struct *work) {
     u64 local_shared_mask[MAX_NODES / 64];
     memset(local_shared_mask, 0, sizeof(local_shared_mask));
     bool found = false;
-
-    // The directory holds MAX_DSM_PAGES pages per segment: answer with an error beyond that
-    if (!mattx_dsm_page_in_range(ctx->req.shmid, ctx->req.offset)) {
-        reply.error = -ERANGE;
-        if (cluster_map[ctx->target_node])
-            mattx_comm_send(cluster_map[ctx->target_node], MATTX_MSG_DSM_WRITE_ACQUIRE_REPLY, &reply, sizeof(reply));
-        kfree(ctx);
-        return;
-    }
+    unsigned long page_idx = ctx->req.offset / PAGE_SIZE;
+    struct mattx_dsm_master_dir *dir;
 
     // --- MODE 2 GLOBAL DIRECTORY LOOKUP (QUICK GRAB) ---
     spin_lock(&mattx_dsm_lock);
-    for (int d = 0; d < MAX_DSM_SEGMENTS; d++) {
-        if (mattx_global_dsm_dir[d].in_use && mattx_global_dsm_dir[d].shmid == ctx->req.shmid) {
-            unsigned long page_idx = ctx->req.offset / PAGE_SIZE;
+    dir = mattx_dsm_dir_lookup(ctx->req.shmid, page_idx);
+    if (dir) {
+        u64 *mask = mattx_dsm_mask(dir, page_idx);
 
-            // 1. Copy the mask locally!
-            memcpy(local_shared_mask, mattx_global_dsm_dir[d].page_shared_mask[page_idx], sizeof(local_shared_mask));
-            
-            // 2. Update Directory to EXCLUSIVE immediately
-            mattx_global_dsm_dir[d].page_state[page_idx] = MATTX_PAGE_EXCLUSIVE;
-            mattx_global_dsm_dir[d].page_owner_pid[page_idx] = ctx->req.orig_pid;
-            
-            // Clear the global mask
-            memset(mattx_global_dsm_dir[d].page_shared_mask[page_idx], 0, sizeof(local_shared_mask));
-            
-            found = true;
-            break;
-        }
+        // 1. Copy the mask locally!
+        if (mask)
+            memcpy(local_shared_mask, mask, sizeof(local_shared_mask));
+
+        // 2. Update Directory to EXCLUSIVE immediately
+        dir->page_state[page_idx] = MATTX_PAGE_EXCLUSIVE;
+        dir->page_owner_pid[page_idx] = ctx->req.orig_pid;
+
+        // Clear the global mask
+        mattx_dsm_mask_clear(dir, page_idx);
+
+        found = true;
     }
     spin_unlock(&mattx_dsm_lock); // DROP THE LOCK!
     
@@ -6150,17 +6360,15 @@ static void mattx_vm1_shm_sync_kworker(struct work_struct *work) {
     
     u32 owner_pid = 0;
     int owner_node = -1;
-    int dir_idx = -1;
+    bool dir_found = false;
+    struct mattx_dsm_master_dir *dir;
     
     spin_lock(&mattx_dsm_lock);
-    for (int d = 0; d < MAX_DSM_SEGMENTS; d++) {
-        if (mattx_global_dsm_dir[d].in_use && mattx_global_dsm_dir[d].shmid == shmid) {
-            dir_idx = d;
-            if (mattx_global_dsm_dir[d].page_state[page_idx] == MATTX_PAGE_EXCLUSIVE) {
-                owner_pid = mattx_global_dsm_dir[d].page_owner_pid[page_idx];
-            }
-            break;
-        }
+    dir = mattx_dsm_dir_lookup(shmid, page_idx);
+    if (dir) {
+        dir_found = true;
+        if (dir->page_state[page_idx] == MATTX_PAGE_EXCLUSIVE)
+            owner_pid = dir->page_owner_pid[page_idx];
     }
     spin_unlock(&mattx_dsm_lock);
 
@@ -6239,10 +6447,11 @@ static void mattx_vm1_shm_sync_kworker(struct work_struct *work) {
                     }
 
                     spin_lock(&mattx_dsm_lock);
-                    if (dir_idx != -1) {
-                        mattx_global_dsm_dir[dir_idx].page_state[page_idx] = MATTX_PAGE_SHARED;
-                        mattx_global_dsm_dir[dir_idx].page_owner_pid[page_idx] = 0;
-                        memset(mattx_global_dsm_dir[dir_idx].page_shared_mask[page_idx], 0, sizeof(u64) * (MAX_NODES / 64));
+                    dir = mattx_dsm_dir_lookup(shmid, page_idx);
+                    if (dir) {
+                        dir->page_state[page_idx] = MATTX_PAGE_SHARED;
+                        dir->page_owner_pid[page_idx] = 0;
+                        mattx_dsm_mask_clear(dir, page_idx);
                     }
                     spin_unlock(&mattx_dsm_lock);
                 }
@@ -6252,11 +6461,27 @@ static void mattx_vm1_shm_sync_kworker(struct work_struct *work) {
     }
 
     // 2. INVALIDATE IF WRITE
-    if (is_write && dir_idx != -1) {
+    if (is_write && dir_found) {
+        u64 local_shared_mask[MAX_NODES / 64];
+
+        memset(local_shared_mask, 0, sizeof(local_shared_mask));
         spin_lock(&mattx_dsm_lock);
+        dir = mattx_dsm_dir_lookup(shmid, page_idx);
+        if (dir) {
+            u64 *mask = mattx_dsm_mask(dir, page_idx);
+
+            if (mask)
+                memcpy(local_shared_mask, mask, sizeof(local_shared_mask));
+            dir->page_state[page_idx] = MATTX_PAGE_EXCLUSIVE;
+            dir->page_owner_pid[page_idx] = 0; // 0 means VM1 owns it!
+            mattx_dsm_mask_clear(dir, page_idx);
+        }
+        spin_unlock(&mattx_dsm_lock);
+
+        // The Invalidates go out WITHOUT the spinlock: mattx_comm_send() sleeps on its mutex
         for (int node = 0; node < MAX_NODES; node++) {
             int n_idx = node / 64; int n_bit = node % 64;
-            if (mattx_global_dsm_dir[dir_idx].page_shared_mask[page_idx][n_idx] & (1ULL << n_bit)) {
+            if (local_shared_mask[n_idx] & (1ULL << n_bit)) {
                 if (cluster_map[node]) {
                     struct mattx_dsm_invalidate_req inv_req = {
                         .req_id = 0, .orig_pid = 0, .shmid = shmid, .offset = offset
@@ -6266,10 +6491,6 @@ static void mattx_vm1_shm_sync_kworker(struct work_struct *work) {
                 }
             }
         }
-        mattx_global_dsm_dir[dir_idx].page_state[page_idx] = MATTX_PAGE_EXCLUSIVE;
-        mattx_global_dsm_dir[dir_idx].page_owner_pid[page_idx] = 0; // 0 means VM1 owns it!
-        memset(mattx_global_dsm_dir[dir_idx].page_shared_mask[page_idx], 0, sizeof(u64) * (MAX_NODES / 64));
-        spin_unlock(&mattx_dsm_lock);
     }
 
     // Wake up the native process to retry the fault!
@@ -7650,6 +7871,9 @@ void mattx_fileio_exit(void) {
     }
     export_count = 0;
     spin_unlock(&export_lock);
+
+    // 3. The master directory of the DSM
+    mattx_dsm_dir_exit();
     
     mattx_dbg(" [FILEIO] File purge complete.\n");
 }
