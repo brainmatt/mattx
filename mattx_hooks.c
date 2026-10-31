@@ -1497,9 +1497,10 @@ static void mattx_rpc_worker(struct work_struct *work) {
                 unsigned long size_to_unmap = 0;
 
                 // --- THE FUNERAL FLUSH (MODE 2) ---
-                struct mattx_dsm_page_update_req *flush_reqs = NULL;
-                int flush_count = 0;
+                struct mattx_dsm_mapping dead;
+                bool have_dead = false;
 
+                memset(&dead, 0, sizeof(dead));
                 spin_lock(&guest_lock);
                 for (i = 0; i < guest_count; i++) {
                     if (mattx_pid_shares_tgid_with_guest(rpc->local_pid, guest_registry[i].local_pid)) {
@@ -1509,38 +1510,14 @@ static void mattx_rpc_worker(struct work_struct *work) {
                             for (int d = 0; d < guest_registry[i].dsm_count; d++) {
                                 if (guest_registry[i].dsm_map[d].base_addr == rpc->shm_addr) {
                                     size_to_unmap = guest_registry[i].dsm_map[d].size;
-                                    
-                                    // 1. Pack the dirty pages!
-                                    if (config_dsm_mode == 2) {
-                                        for (int p = 0; p < MAX_DSM_PAGES; p++) {
-                                            if (guest_registry[i].dsm_map[d].page_states[p] == MATTX_PAGE_EXCLUSIVE) flush_count++;
-                                        }
-                                        if (flush_count > 0) {
-                                            flush_reqs = kmalloc_array(flush_count, sizeof(*flush_reqs), GFP_ATOMIC);
-                                            if (flush_reqs) {
-                                                int idx = 0;
-                                                for (int p = 0; p < MAX_DSM_PAGES; p++) {
-                                                    if (guest_registry[i].dsm_map[d].page_states[p] == MATTX_PAGE_EXCLUSIVE) {
-                                                        flush_reqs[idx].orig_pid = rpc->orig_pid;
-                                                        flush_reqs[idx].shmid = guest_registry[i].dsm_map[d].shmid;
-                                                        flush_reqs[idx].offset = p * PAGE_SIZE;
-                                                        memcpy(flush_reqs[idx].data, guest_registry[i].dsm_map[d].pages[p], PAGE_SIZE);
-                                                        idx++;
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
 
-                                    // 2. Free the physical pages for this segment!
-                                    for (int p = 0; p < MAX_DSM_PAGES; p++) {
-                                        if (guest_registry[i].dsm_map[d].pages[p]) {
-                                            free_page((unsigned long)guest_registry[i].dsm_map[d].pages[p]);
-                                            guest_registry[i].dsm_map[d].pages[p] = NULL;
-                                        }
-                                    }
-
+                                    // The mapping (with the registry's reference on its tables) is ours now: it is
+                                    // flushed and freed outside the spinlock. The last slot moves into the hole and is
+                                    // CLEARED, so that a later shmat can never inherit its stale tables.
+                                    dead = guest_registry[i].dsm_map[d];
+                                    have_dead = true;
                                     guest_registry[i].dsm_map[d] = guest_registry[i].dsm_map[--guest_registry[i].dsm_count];
+                                    memset(&guest_registry[i].dsm_map[guest_registry[i].dsm_count], 0, sizeof(struct mattx_dsm_mapping));
                                     break;
                                 }
                             }
@@ -1550,15 +1527,11 @@ static void mattx_rpc_worker(struct work_struct *work) {
                 }
                 spin_unlock(&guest_lock);
 
-                // 3. Fire the Data Bombs safely outside the spinlock!
-                if (flush_reqs) {
-                    for (int f = 0; f < flush_count; f++) {
-                        if (cluster_map[rpc->home_node]) {
-                            mattx_comm_send(cluster_map[rpc->home_node], MATTX_MSG_DSM_PAGE_UPDATE, &flush_reqs[f], sizeof(struct mattx_dsm_page_update_req));
-                            mattx_dbg("[MESI_VM2] Funeral Flush (shmdt): Sent dirty page (SHMID %u, Offset %lu) to VM1\n", flush_reqs[f].shmid, flush_reqs[f].offset);
-                        }
-                    }
-                    kfree(flush_reqs);
+                // 3. Fire the Data Bombs safely outside the spinlock, then free the pages and the tables!
+                if (have_dead) {
+                    if (config_dsm_mode == 2)
+                        mattx_dsm_map_flush(&dead, rpc->orig_pid, rpc->home_node, "shmdt");
+                    mattx_dsm_map_put(&dead);
                 }
 
                 // The Magic Trick: Destroy the Hollow VMA on VM2!
@@ -1625,21 +1598,17 @@ static void mattx_rpc_worker(struct work_struct *work) {
                             vma->vm_ops = &mattx_dsm_vm_ops; // Lay the trap!
                             vm_flags_set(vma, vma->vm_flags | VM_PFNMAP); // Pure hardware PFN mapping!
                             
-                            // 3. Register it in the DSM Map
-                            spin_lock(&guest_lock);
-                            for (i = 0; i < guest_count; i++) {
-                                if (guest_registry[i].local_pid == surrogate->tgid) {
-                                    if (guest_registry[i].dsm_count < MAX_DSM_SEGMENTS) {
-                                        int d_idx = guest_registry[i].dsm_count++;
-                                        guest_registry[i].dsm_map[d_idx].base_addr = hollow_addr;
-                                        guest_registry[i].dsm_map[d_idx].size = shm_size;
-                                        guest_registry[i].dsm_map[d_idx].shmid = rpc->shm_id;
-                                        mattx_dbg("[DSM] Hollow VMA carved at 0x%lx (Size: %zu, SHMID: %d). Tripwire armed!\n", hollow_addr, shm_size, rpc->shm_id);
-                                    }
-                                    break;
-                                }
+                            // 3. Register it in the DSM Map: its tables are sized by the segment, and the
+                            // map of a guest grows on demand, so there is no limit on the segments
+                            {
+                                struct mattx_dsm_mapping dm;
+
+                                if (mattx_dsm_map_init(&dm, hollow_addr, rpc->shm_id, shm_size) == 0 &&
+                                    mattx_dsm_map_add(surrogate->tgid, &dm) == 0)
+                                    mattx_dbg("[DSM] Hollow VMA carved at 0x%lx (Size: %zu, SHMID: %d). Tripwire armed!\n", hollow_addr, shm_size, rpc->shm_id);
+                                else
+                                    printk(KERN_ERR "MattX:[DSM] Could not register the DSM mapping of SHMID %d (Size: %zu): out of memory or Surrogate gone\n", rpc->shm_id, shm_size);
                             }
-                            spin_unlock(&guest_lock);
                         }
                         mmap_write_unlock(surrogate->mm);
                         final_ret = (long)hollow_addr; // Safe 64-bit assignment!

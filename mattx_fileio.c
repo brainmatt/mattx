@@ -4667,6 +4667,16 @@ static void handle_sys_pipe2_reply(struct mattx_link *link, struct mattx_header 
 // THE DSM TRIPWIRE (VM2 PAGE FAULT HANDLER)
 // ============================================================================
 
+// VM2: is this offset inside the tables of its mapping (one entry per page of the segment)?
+static inline bool mattx_dsm_page_ok(u32 shmid, unsigned long offset, unsigned long npages)
+{
+    if (likely(offset / PAGE_SIZE < npages))
+        return true;
+    pr_err_ratelimited("MattX:[DSM] SHMID %u: offset %lu is beyond the end of the mapping (%lu pages): access refused\n",
+                       shmid, offset, npages);
+    return false;
+}
+
 static vm_fault_t mattx_dsm_fault(struct vm_fault *vmf) {
     struct vm_area_struct *vma = vmf->vma;
     unsigned long fault_addr = vmf->address & PAGE_MASK; // Align to 4KB boundary
@@ -4675,6 +4685,7 @@ static vm_fault_t mattx_dsm_fault(struct vm_fault *vmf) {
     int home_node = -1;
     u32 orig_pid = 0;
     bool found = false;
+    unsigned long npages = 0;
 
     // 1. TRANSLATION: Find the mapping in the registry
     spin_lock(&guest_lock);
@@ -4689,6 +4700,7 @@ static vm_fault_t mattx_dsm_fault(struct vm_fault *vmf) {
                     offset = fault_addr - base;
                     home_node = guest_registry[i].home_node;
                     orig_pid = guest_registry[i].orig_pid;
+                    npages = guest_registry[i].dsm_map[d].npages;
                     found = true;
                     break;
                 }
@@ -4705,8 +4717,8 @@ static vm_fault_t mattx_dsm_fault(struct vm_fault *vmf) {
 
 
     // 2. CONCURRENCY: Allocate a sterile RPC slot
-    // The DSM tables of a mapping hold MAX_DSM_PAGES pages: never index beyond them (see mattx.h)
-    if (!mattx_dsm_page_in_range(shmid, offset))
+    // The tables of a mapping hold one entry per page of the segment: never index beyond them
+    if (!mattx_dsm_page_ok(shmid, offset, npages))
         return VM_FAULT_SIGBUS;
 
     unsigned long page_idx = offset / PAGE_SIZE;
@@ -4764,24 +4776,39 @@ static vm_fault_t mattx_dsm_fault(struct vm_fault *vmf) {
     // 5. THE INJECTION: Wire the PFN into the Surrogate's brain!
     // disabled since defined before: unsigned long page_idx = offset / PAGE_SIZE;
     void *kaddr = NULL;
+    void *newpage = NULL;   // allocated outside the spinlock: __get_free_page(GFP_KERNEL) may sleep
 
-    spin_lock(&guest_lock);
-    for (int i = 0; i < guest_count; i++) {
-        if (guest_registry[i].local_pid == current->tgid) {
-            for (int d = 0; d < guest_registry[i].dsm_count; d++) {
-                if (guest_registry[i].dsm_map[d].base_addr == (fault_addr - offset)) {
-                    // Allocate the physical page if we haven't yet!
-                    if (!guest_registry[i].dsm_map[d].pages[page_idx]) {
-                        guest_registry[i].dsm_map[d].pages[page_idx] = (void *)__get_free_page(GFP_KERNEL | __GFP_ZERO);
+    for (;;) {
+        bool need_page = false;
+
+        spin_lock(&guest_lock);
+        for (int i = 0; i < guest_count; i++) {
+            if (guest_registry[i].local_pid == current->tgid) {
+                for (int d = 0; d < guest_registry[i].dsm_count; d++) {
+                    if (guest_registry[i].dsm_map[d].base_addr == (fault_addr - offset) && page_idx < guest_registry[i].dsm_map[d].npages) {
+                        // Allocate the physical page if we haven't yet!
+                        if (!guest_registry[i].dsm_map[d].pages[page_idx] && newpage) {
+                            guest_registry[i].dsm_map[d].pages[page_idx] = newpage;
+                            newpage = NULL;
+                        }
+                        kaddr = guest_registry[i].dsm_map[d].pages[page_idx];
+                        need_page = !kaddr;
+                        break;
                     }
-                    kaddr = guest_registry[i].dsm_map[d].pages[page_idx];
-                    break;
                 }
+                break;
             }
-            break;
         }
+        spin_unlock(&guest_lock);
+
+        if (!need_page)
+            break;
+        newpage = (void *)__get_free_page(GFP_KERNEL | __GFP_ZERO);
+        if (!newpage)
+            break;          // kaddr stays NULL: VM_FAULT_OOM below
     }
-    spin_unlock(&guest_lock);
+    if (newpage)
+        free_page((unsigned long)newpage);  // somebody else filled the slot meanwhile
 
     if (!kaddr) {
         kfree(page_buf);
@@ -4808,7 +4835,7 @@ static vm_fault_t mattx_dsm_fault(struct vm_fault *vmf) {
             for (int i = 0; i < guest_count; i++) {
                 if (guest_registry[i].local_pid == current->tgid) {
                     for (int d = 0; d < guest_registry[i].dsm_count; d++) {
-                        if (guest_registry[i].dsm_map[d].base_addr == (fault_addr - offset)) {
+                        if (guest_registry[i].dsm_map[d].base_addr == (fault_addr - offset) && page_idx < guest_registry[i].dsm_map[d].npages) {
                             guest_registry[i].dsm_map[d].page_states[page_idx] = MATTX_PAGE_SHARED;
                             mattx_dbg("[MESI_VM2] Injected Read-Only Trapdoor at 0x%lx. Local State: SHARED\n", fault_addr);
                             break;
@@ -4860,12 +4887,12 @@ static vm_fault_t mattx_dsm_fault(struct vm_fault *vmf) {
 
 
     // Mark the page as present so the Sweeper knows to clean it!
-    if (page_idx < MAX_DSM_PAGES) {
+    if (page_idx < npages) {
         spin_lock(&guest_lock);
         for (int i = 0; i < guest_count; i++) {
             if (guest_registry[i].local_pid == current->tgid) {
                 for (int d = 0; d < guest_registry[i].dsm_count; d++) {
-                    if (guest_registry[i].dsm_map[d].base_addr == (fault_addr - offset)) {
+                    if (guest_registry[i].dsm_map[d].base_addr == (fault_addr - offset) && page_idx < guest_registry[i].dsm_map[d].npages) {
                         set_bit(page_idx, guest_registry[i].dsm_map[d].present_pages);
                         break;
                     }
@@ -4892,6 +4919,7 @@ static vm_fault_t mattx_dsm_pfn_mkwrite(struct vm_fault *vmf) {
     int home_node = -1;
     u32 orig_pid = 0;
     bool found = false;
+    unsigned long npages = 0;
 
     // 1. TRANSLATION: Find the mapping in the registry
     spin_lock(&guest_lock);
@@ -4906,6 +4934,7 @@ static vm_fault_t mattx_dsm_pfn_mkwrite(struct vm_fault *vmf) {
                     offset = fault_addr - base;
                     home_node = guest_registry[i].home_node;
                     orig_pid = guest_registry[i].orig_pid;
+                    npages = guest_registry[i].dsm_map[d].npages;
                     found = true;
                     break;
                 }
@@ -4919,7 +4948,7 @@ static vm_fault_t mattx_dsm_pfn_mkwrite(struct vm_fault *vmf) {
         return VM_FAULT_SIGBUS;
     }
 
-    if (!mattx_dsm_page_in_range(shmid, offset))
+    if (!mattx_dsm_page_ok(shmid, offset, npages))
         return VM_FAULT_SIGBUS;
 
     if (config_dsm_mode == 2) {
@@ -4966,7 +4995,7 @@ static vm_fault_t mattx_dsm_pfn_mkwrite(struct vm_fault *vmf) {
         for (int i = 0; i < guest_count; i++) {
             if (guest_registry[i].local_pid == current->tgid) {
                 for (int d = 0; d < guest_registry[i].dsm_count; d++) {
-                    if (guest_registry[i].dsm_map[d].base_addr == (fault_addr - offset)) {
+                    if (guest_registry[i].dsm_map[d].base_addr == (fault_addr - offset) && page_idx < guest_registry[i].dsm_map[d].npages) {
                         guest_registry[i].dsm_map[d].page_states[page_idx] = MATTX_PAGE_EXCLUSIVE;
                         break;
                     }
@@ -5593,69 +5622,67 @@ int mattx_dsm_sweeper_loop(void *data) {
         
         if (config_dsm_mode == 1) {
             // --- PHASE 1: THE GUEST SWEEPER (VM2 - MODE 1 ONLY) ---
-            struct mattx_dsm_mapping *local_dsm = kmalloc_array(16, sizeof(struct mattx_dsm_mapping), GFP_KERNEL);
-            if (local_dsm) {
-                for (int i = 0; i < MAX_GUESTS; i++) {
-                    pid_t local_pid = -1; u32 orig_pid = 0; int home_node = -1; int dsm_count = 0;
+            for (int i = 0; i < MAX_GUESTS; i++) {
+                for (int d = 0; ; d++) {
+                    struct mattx_dsm_mapping m;
+                    pid_t local_pid = -1; u32 orig_pid = 0; int home_node = -1;
+                    struct task_struct *surrogate = NULL;
 
+                    // One mapping at a time: the reference keeps its tables alive while guest_lock is dropped
                     spin_lock(&guest_lock);
-                    if (i < guest_count && guest_registry[i].dsm_count > 0) {
+                    if (i < guest_count && d < guest_registry[i].dsm_count) {
                         local_pid = guest_registry[i].local_pid; orig_pid = guest_registry[i].orig_pid;
-                        home_node = guest_registry[i].home_node; dsm_count = guest_registry[i].dsm_count;
-                        memcpy(local_dsm, guest_registry[i].dsm_map, dsm_count * sizeof(struct mattx_dsm_mapping));
-                        
-                        for (int d = 0; d < dsm_count; d++) {
-                            memset(guest_registry[i].dsm_map[d].present_pages, 0, sizeof(guest_registry[i].dsm_map[d].present_pages));
-                        }
+                        home_node = guest_registry[i].home_node;
+                        m = guest_registry[i].dsm_map[d];
+                        mattx_dsm_map_get(&m);
                     }
                     spin_unlock(&guest_lock);
 
-                    if (local_pid != -1) {
-                        struct task_struct *surrogate = NULL;
-                        rcu_read_lock(); surrogate = pid_task(find_vpid(local_pid), PIDTYPE_PID); if (surrogate) get_task_struct(surrogate); rcu_read_unlock();
+                    if (local_pid == -1)
+                        break;
 
-                        if (surrogate && surrogate->mm) {
-                            for (int d = 0; d < dsm_count; d++) {
-                                unsigned long base = local_dsm[d].base_addr;
-                                unsigned long size = local_dsm[d].size;
-                                u32 shmid = local_dsm[d].shmid;
+                    rcu_read_lock(); surrogate = pid_task(find_vpid(local_pid), PIDTYPE_PID); if (surrogate) get_task_struct(surrogate); rcu_read_unlock();
 
-                                // 1. Sync present pages (The Data Bomb)
-                                for (int bit = 0; bit < MAX_DSM_PAGES; bit++) {
-                                    if (test_bit(bit, local_dsm[d].present_pages)) {
-                                        unsigned long offset = bit * PAGE_SIZE;
-                                        if (offset >= size) continue;
+                    if (surrogate && surrogate->mm) {
+                        unsigned long base = m.base_addr;
+                        unsigned long size = m.size;
+                        u32 shmid = m.shmid;
 
-                                        void *kaddr = local_dsm[d].pages[bit];
-                                        if (kaddr) {
-                                            size_t req_size = sizeof(struct mattx_dsm_page_update_req);
-                                            struct mattx_dsm_page_update_req *req = kmalloc(req_size, GFP_KERNEL);
-                                            if (req) {
-                                                req->orig_pid = orig_pid; req->shmid = shmid; req->offset = offset;
-                                                memcpy(req->data, kaddr, PAGE_SIZE); 
-                                                if (cluster_map[home_node]) mattx_comm_send(cluster_map[home_node], MATTX_MSG_DSM_PAGE_UPDATE, req, req_size);
-                                                kfree(req);
-                                            }
-                                        }
+                        // 1. Sync present pages (The Data Bomb)
+                        for (unsigned long bit = 0; bit < m.npages; bit++) {
+                            if (test_and_clear_bit(bit, m.present_pages)) {
+                                unsigned long offset = bit * PAGE_SIZE;
+                                if (offset >= size) continue;
+
+                                void *kaddr = m.pages[bit];
+                                if (kaddr) {
+                                    size_t req_size = sizeof(struct mattx_dsm_page_update_req);
+                                    struct mattx_dsm_page_update_req *req = kmalloc(req_size, GFP_KERNEL);
+                                    if (req) {
+                                        req->orig_pid = orig_pid; req->shmid = shmid; req->offset = offset;
+                                        memcpy(req->data, kaddr, PAGE_SIZE);
+                                        if (cluster_map[home_node]) mattx_comm_send(cluster_map[home_node], MATTX_MSG_DSM_PAGE_UPDATE, req, req_size);
+                                        kfree(req);
                                     }
-                                }
-
-                                // 2. The Zap! (Burn it all down SAFELY)
-                                if (real_zap_vma_ptes) {
-                                    mmap_read_lock(surrogate->mm);
-                                    struct vm_area_struct *vma = find_vma(surrogate->mm, base);
-                                    if (vma && vma->vm_start <= base) {
-                                        real_zap_vma_ptes(vma, base, size);
-                                        mattx_dbg("[DSM_SWEEPER] Zapped Hollow VMA at 0x%lx. Ready for next fault!\n", base);
-                                    }
-                                    mmap_read_unlock(surrogate->mm);
                                 }
                             }
-                            put_task_struct(surrogate);
+                        }
+
+                        // 2. The Zap! (Burn it all down SAFELY)
+                        if (real_zap_vma_ptes) {
+                            mmap_read_lock(surrogate->mm);
+                            struct vm_area_struct *vma = find_vma(surrogate->mm, base);
+                            if (vma && vma->vm_start <= base) {
+                                real_zap_vma_ptes(vma, base, size);
+                                mattx_dbg("[DSM_SWEEPER] Zapped Hollow VMA at 0x%lx. Ready for next fault!\n", base);
+                            }
+                            mmap_read_unlock(surrogate->mm);
                         }
                     }
+                    if (surrogate)
+                        put_task_struct(surrogate);
+                    mattx_dsm_map_put(&m);
                 }
-                kfree(local_dsm); 
             }
             
         } else if (config_dsm_mode == 2) {
@@ -5755,7 +5782,7 @@ static void mattx_dsm_cleanup_cb(struct callback_head *cb) {
                     if (ctx->fault_addr >= base && ctx->fault_addr < base + size) {
                         offset = ctx->fault_addr - base;
                         unsigned long page_idx = offset / PAGE_SIZE;
-                        kaddr = (page_idx < MAX_DSM_PAGES) ? guest_registry[i].dsm_map[d].pages[page_idx] : NULL;
+                        kaddr = (page_idx < guest_registry[i].dsm_map[d].npages) ? guest_registry[i].dsm_map[d].pages[page_idx] : NULL;
                         break;
                     }
                 }
@@ -5938,11 +5965,6 @@ struct mattx_dsm_invalidate_kworker_ctx { struct work_struct work; struct mattx_
 static void mattx_dsm_invalidate_kworker(struct work_struct *work) {
     struct mattx_dsm_invalidate_kworker_ctx *ctx = container_of(work, struct mattx_dsm_invalidate_kworker_ctx, work);
 
-    if (!mattx_dsm_page_in_range(ctx->req.shmid, ctx->req.offset)) {
-        kfree(ctx);
-        return;
-    }
-
     spin_lock(&guest_lock);
     for (int i = 0; i < guest_count; i++) {
         // THE FIX: Skip the process that is currently acquiring the EXCLUSIVE lock!
@@ -5952,7 +5974,7 @@ static void mattx_dsm_invalidate_kworker(struct work_struct *work) {
 
         // We must check ALL OTHER guests on this node for the SHMID!
         for (int d = 0; d < guest_registry[i].dsm_count; d++) {
-            if (guest_registry[i].dsm_map[d].shmid == ctx->req.shmid) {
+            if (guest_registry[i].dsm_map[d].shmid == ctx->req.shmid && ctx->req.offset / PAGE_SIZE < guest_registry[i].dsm_map[d].npages) {
                 unsigned long base = guest_registry[i].dsm_map[d].base_addr;
                 unsigned long fault_addr = base + ctx->req.offset;
                 unsigned long page_idx = ctx->req.offset / PAGE_SIZE;
@@ -6024,20 +6046,11 @@ static void mattx_dsm_flush_kworker(struct work_struct *work) {
     reply->req_id = ctx->req.req_id;
     reply->error = -ENOENT;
 
-    if (!mattx_dsm_page_in_range(ctx->req.shmid, ctx->req.offset)) {
-        reply->error = -ERANGE;
-        if (cluster_map[ctx->target_node])
-            mattx_comm_send(cluster_map[ctx->target_node], MATTX_MSG_DSM_FLUSH_REPLY, reply, sizeof(*reply));
-        kfree(reply);
-        kfree(ctx);
-        return;
-    }
-
     spin_lock(&guest_lock);
     for (int i = 0; i < guest_count; i++) {
         if (guest_registry[i].orig_pid == ctx->req.orig_pid) {
             for (int d = 0; d < guest_registry[i].dsm_count; d++) {
-                if (guest_registry[i].dsm_map[d].shmid == ctx->req.shmid) {
+                if (guest_registry[i].dsm_map[d].shmid == ctx->req.shmid && ctx->req.offset / PAGE_SIZE < guest_registry[i].dsm_map[d].npages) {
                     unsigned long page_idx = ctx->req.offset / PAGE_SIZE;
                     unsigned long base = guest_registry[i].dsm_map[d].base_addr;
                     unsigned long fault_addr = base + ctx->req.offset;

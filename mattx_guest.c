@@ -26,6 +26,219 @@
 // --- Guest Registry Implementation ---
 struct mattx_guest_info guest_registry[MAX_GUESTS];
 int guest_count = 0;
+
+// ============================================================================
+// DSM MAPPING TABLES (VM2): sized by the segment, not by a limit
+// ============================================================================
+// The three tables of a mapping (present bitmap, physical page pool, local MESI state) are ONE kvzalloc
+// block with one entry per page of the segment. The registry holds one reference on it, and a user that
+// works on the tables without holding guest_lock (the sweeper) takes another. The last put hands the block
+// to the garbage collector below: remove_guest_process() runs under guest_lock, and the pages and the
+// (vmalloc'ed) block must be freed where sleeping is allowed.
+struct mattx_dsm_tables {
+    refcount_t ref;
+    struct list_head gc;        // on mattx_dsm_gc_list while it waits to be freed
+    unsigned long npages;
+    // present_pages[BITS_TO_LONGS(npages)], pages[npages] and page_states[npages] follow
+};
+
+static inline unsigned long *mattx_tbl_present(struct mattx_dsm_tables *t) { return (unsigned long *)(t + 1); }
+static inline void **mattx_tbl_pages(struct mattx_dsm_tables *t) { return (void **)(mattx_tbl_present(t) + BITS_TO_LONGS(t->npages)); }
+static inline u8 *mattx_tbl_states(struct mattx_dsm_tables *t) { return (u8 *)(mattx_tbl_pages(t) + t->npages); }
+
+static LIST_HEAD(mattx_dsm_gc_list);
+static DEFINE_SPINLOCK(mattx_dsm_gc_lock);
+
+static void mattx_dsm_gc_fn(struct work_struct *work)
+{
+    struct mattx_dsm_tables *t, *tmp;
+    LIST_HEAD(dead);
+
+    spin_lock(&mattx_dsm_gc_lock);
+    list_splice_init(&mattx_dsm_gc_list, &dead);
+    spin_unlock(&mattx_dsm_gc_lock);
+
+    list_for_each_entry_safe(t, tmp, &dead, gc) {
+        void **pages = mattx_tbl_pages(t);
+        unsigned long p;
+
+        for (p = 0; p < t->npages; p++) {
+            if (pages[p])
+                free_page((unsigned long)pages[p]);
+            if (!(p & 0xfff))
+                cond_resched();
+        }
+        kvfree(t);
+    }
+}
+static DECLARE_WORK(mattx_dsm_gc_work, mattx_dsm_gc_fn);
+
+// Allocates the tables of a mapping. May sleep: never call it under a spinlock.
+int mattx_dsm_map_init(struct mattx_dsm_mapping *m, unsigned long base, u32 shmid, unsigned long size)
+{
+    unsigned long npages = DIV_ROUND_UP(size, PAGE_SIZE);
+    struct mattx_dsm_tables *t;
+    size_t bytes;
+
+    memset(m, 0, sizeof(*m));
+    m->base_addr = base;
+    m->shmid = shmid;
+    m->size = size;
+    if (!npages)
+        return 0;               // an empty segment: nothing to track, every fault is refused
+
+    bytes = size_add(sizeof(*t), size_add(size_mul(BITS_TO_LONGS(npages), sizeof(unsigned long)),
+                                          size_add(size_mul(npages, sizeof(void *)), npages)));
+    if (bytes == SIZE_MAX)
+        return -E2BIG;
+    t = kvzalloc(bytes, GFP_KERNEL);
+    if (!t)
+        return -ENOMEM;
+
+    refcount_set(&t->ref, 1);
+    INIT_LIST_HEAD(&t->gc);
+    t->npages = npages;
+    m->npages = npages;
+    m->tbl = t;
+    m->present_pages = mattx_tbl_present(t);
+    m->pages = mattx_tbl_pages(t);
+    m->page_states = mattx_tbl_states(t);
+    return 0;
+}
+
+// A reference for a copy of the mapping that is used without guest_lock
+void mattx_dsm_map_get(struct mattx_dsm_mapping *m)
+{
+    if (m->tbl)
+        refcount_inc(&m->tbl->ref);
+}
+
+// Drops a reference (and forgets the tables in THIS copy of the mapping). The last one hands the block to
+// the garbage collector: safe in any context, also under guest_lock.
+void mattx_dsm_map_put(struct mattx_dsm_mapping *m)
+{
+    struct mattx_dsm_tables *t = m->tbl;
+
+    m->tbl = NULL;
+    m->present_pages = NULL;
+    m->pages = NULL;
+    m->page_states = NULL;
+    if (t && refcount_dec_and_test(&t->ref)) {
+        spin_lock(&mattx_dsm_gc_lock);
+        list_add_tail(&t->gc, &mattx_dsm_gc_list);
+        spin_unlock(&mattx_dsm_gc_lock);
+        schedule_work(&mattx_dsm_gc_work);
+    }
+}
+
+// Puts a mapping into the registry of a guest. Takes over *m: it is in the registry on success, its tables
+// are released on failure. The array of a guest grows on demand, so there is no limit on the segments.
+// May sleep: never call it under a spinlock.
+int mattx_dsm_map_add(pid_t local_pid, struct mattx_dsm_mapping *m)
+{
+    struct mattx_dsm_mapping *grown = NULL, *old = NULL;
+    int grown_cap = 0;
+    int ret;
+
+    for (;;) {
+        struct mattx_guest_info *g = NULL;
+        int need = 0, i;
+
+        ret = -ESRCH;
+        spin_lock(&guest_lock);
+        for (i = 0; i < guest_count; i++) {
+            if (guest_registry[i].local_pid == local_pid) {
+                g = &guest_registry[i];
+                break;
+            }
+        }
+        if (g) {
+            if (g->dsm_count < g->dsm_cap) {
+                g->dsm_map[g->dsm_count++] = *m;
+                ret = 0;
+            } else if (grown && grown_cap > g->dsm_count) {
+                if (g->dsm_count)
+                    memcpy(grown, g->dsm_map, g->dsm_count * sizeof(*grown));
+                old = g->dsm_map;
+                g->dsm_map = grown;
+                g->dsm_cap = grown_cap;
+                grown = NULL;
+                g->dsm_map[g->dsm_count++] = *m;
+                ret = 0;
+            } else {
+                need = g->dsm_cap ? g->dsm_cap * 2 : 4;
+                ret = -ENOSPC;
+            }
+        }
+        spin_unlock(&guest_lock);
+
+        if (ret != -ENOSPC)
+            break;
+        kfree(grown);
+        grown = kcalloc(need, sizeof(*grown), GFP_KERNEL);
+        grown_cap = need;
+        if (!grown) {
+            ret = -ENOMEM;
+            break;
+        }
+    }
+    kfree(old);
+    kfree(grown);
+
+    if (ret)
+        mattx_dsm_map_put(m);
+    else
+        memset(m, 0, sizeof(*m));   // the registry owns the tables now
+    return ret;
+}
+
+// The Funeral Flush (MODE 2): sends every dirty (EXCLUSIVE) page of a mapping to the home node as a one-way
+// Data Bomb. Needs no big array: it works on the tables themselves, one page at a time. May sleep.
+void mattx_dsm_map_flush(struct mattx_dsm_mapping *m, u32 orig_pid, int home_node, const char *why)
+{
+    struct mattx_dsm_page_update_req *req;
+    unsigned long p;
+
+    if (!m->tbl || !m->npages)
+        return;
+    req = kmalloc(sizeof(*req), GFP_KERNEL);
+    if (!req) {
+        printk(KERN_ERR "MattX:[MESI_VM2] Funeral Flush (%s): out of memory, the dirty pages of SHMID %u are lost\n", why, m->shmid);
+        return;
+    }
+    for (p = 0; p < m->npages; p++) {
+        if (m->page_states[p] != MATTX_PAGE_EXCLUSIVE || !m->pages[p])
+            continue;
+        req->orig_pid = orig_pid;
+        req->shmid = m->shmid;
+        req->offset = p * PAGE_SIZE;
+        memcpy(req->data, m->pages[p], PAGE_SIZE);
+        if (home_node >= 0 && home_node < MAX_NODES && cluster_map[home_node]) {
+            mattx_comm_send(cluster_map[home_node], MATTX_MSG_DSM_PAGE_UPDATE, req, sizeof(*req));
+            mattx_dbg("[MESI_VM2] Funeral Flush (%s): Sent dirty page (SHMID %u, Offset %lu) to VM1\n", why, req->shmid, req->offset);
+        }
+    }
+    kfree(req);
+}
+
+// Module unload: gives the tables of all guests back and waits for the garbage collector
+void mattx_guest_exit(void)
+{
+    int i, d;
+
+    spin_lock(&guest_lock);
+    for (i = 0; i < guest_count; i++) {
+        for (d = 0; d < guest_registry[i].dsm_count; d++)
+            mattx_dsm_map_put(&guest_registry[i].dsm_map[d]);
+        kfree(guest_registry[i].dsm_map);
+        guest_registry[i].dsm_map = NULL;
+        guest_registry[i].dsm_count = 0;
+        guest_registry[i].dsm_cap = 0;
+    }
+    spin_unlock(&guest_lock);
+    flush_work(&mattx_dsm_gc_work);
+}
+
 DEFINE_SPINLOCK(guest_lock);
 
 // --- Clock-Offset Fixup Table -------------------------------------------
@@ -151,7 +364,8 @@ void add_guest_process(pid_t local_pid, u32 orig_pid, int home_node) {
 
         // Init DSM Map ---
         guest_registry[guest_count].dsm_count = 0;
-        memset(guest_registry[guest_count].dsm_map, 0, sizeof(guest_registry[guest_count].dsm_map));
+        guest_registry[guest_count].dsm_cap = 0;
+        guest_registry[guest_count].dsm_map = NULL; // allocated by mattx_dsm_map_add() on the first segment
 
         guest_count++;
     } else {
@@ -164,14 +378,10 @@ void remove_guest_process(int index) {
     if (index < 0 || index >= guest_count) return;
 
     // Free DSM Physical Pages! ---
-    for (int d = 0; d < guest_registry[index].dsm_count; d++) {
-        for (int p = 0; p < MAX_DSM_PAGES; p++) {
-            if (guest_registry[index].dsm_map[d].pages[p]) {
-                free_page((unsigned long)guest_registry[index].dsm_map[d].pages[p]);
-                guest_registry[index].dsm_map[d].pages[p] = NULL;
-            }
-        }
-    }
+    // We hold guest_lock: the garbage collector frees the pages and the tables where sleeping is allowed
+    for (int d = 0; d < guest_registry[index].dsm_count; d++)
+        mattx_dsm_map_put(&guest_registry[index].dsm_map[d]);
+    kfree(guest_registry[index].dsm_map);
 
     guest_registry[index] = guest_registry[guest_count - 1];
     guest_count--;

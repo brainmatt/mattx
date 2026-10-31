@@ -181,7 +181,7 @@ static int dsm_show(struct seq_file *m, void *v) {
             u32 shmid = guest_registry[i].dsm_map[d].shmid;
             
             // Extract the local MESI state for Page 0!
-            u8 p_state = guest_registry[i].dsm_map[d].page_states[0];
+            u8 p_state = guest_registry[i].dsm_map[d].npages ? guest_registry[i].dsm_map[d].page_states[0] : MATTX_PAGE_INVALID;
             char *state_str = (p_state == MATTX_PAGE_EXCLUSIVE) ? "EXCLUSIVE" : 
                               (p_state == MATTX_PAGE_SHARED) ? "SHARED" : "INVALID";
 
@@ -189,7 +189,7 @@ static int dsm_show(struct seq_file *m, void *v) {
             bytes_read = 0;
             
             // Read directly from our physical page pool!
-            if (guest_registry[i].dsm_map[d].pages[0]) {
+            if (guest_registry[i].dsm_map[d].npages && guest_registry[i].dsm_map[d].pages[0]) {
                 memcpy(hex_buf, guest_registry[i].dsm_map[d].pages[0], 16);
                 bytes_read = 16;
             }

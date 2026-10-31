@@ -1111,9 +1111,13 @@ struct mattx_dsm_mapping {
     unsigned long base_addr;
     u32 shmid;
     unsigned long size;
-    unsigned long present_pages[MAX_DSM_PAGES / BITS_PER_LONG]; // Tracks mapped pages!
-    void *pages[MAX_DSM_PAGES]; // The Physical Page Pool!
-    u8 page_states[MAX_DSM_PAGES]; // Local MESI State (VM2)
+    // The three tables have one entry per page of the segment (npages), allocated from the segment's size
+    // (mattx_dsm_map_init() in mattx_guest.c): there is no limit on the size of a segment.
+    unsigned long npages;           // DIV_ROUND_UP(size, PAGE_SIZE)
+    unsigned long *present_pages;   // Tracks mapped pages! (bitmap of npages bits)
+    void **pages;                   // The Physical Page Pool!
+    u8 *page_states;                // Local MESI State (VM2)
+    struct mattx_dsm_tables *tbl;   // owns the three tables (one reference-counted block); NULL: none
 };
 
 
@@ -1138,7 +1142,8 @@ struct mattx_guest_info {
 
     // The DSM Translation Map ---
     int dsm_count;
-    struct mattx_dsm_mapping dsm_map[MAX_DSM_SEGMENTS];
+    int dsm_cap;                            // entries allocated in dsm_map
+    struct mattx_dsm_mapping *dsm_map;      // grows on demand: there is no limit on the segments of a guest
 
     // --- MODE 3: Single-Step Tracking ---
     bool dsm_step_pending;
@@ -1666,6 +1671,15 @@ void mattx_clock_fixup_register(pid_t local_pid, s64 offset_ns, int thread_count
 bool mattx_clock_fixup_consume(pid_t local_pid, pid_t tid, s64 *out_offset_ns);
 
 void add_guest_process(pid_t local_pid, u32 orig_pid, int home_node);
+
+// DSM mapping tables of a Surrogate (mattx_guest.c): sized by the segment, freed outside the spinlocks
+int mattx_dsm_map_init(struct mattx_dsm_mapping *m, unsigned long base, u32 shmid, unsigned long size);
+void mattx_dsm_map_get(struct mattx_dsm_mapping *m);
+void mattx_dsm_map_put(struct mattx_dsm_mapping *m);
+int mattx_dsm_map_add(pid_t local_pid, struct mattx_dsm_mapping *m);
+void mattx_dsm_map_flush(struct mattx_dsm_mapping *m, u32 orig_pid, int home_node, const char *why);
+void mattx_guest_exit(void);
+
 void remove_guest_process(int index);
 
 void add_export_process(pid_t orig_pid, int target_node);

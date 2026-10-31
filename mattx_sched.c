@@ -265,48 +265,24 @@ restart_guest_loop:
                 bool is_migrating = guest_registry[i].is_migrating; 
                 
                 // --- THE FUNERAL FLUSH (MODE 2) ---
-                struct mattx_dsm_page_update_req *flush_reqs = NULL;
-                int flush_count = 0;
-                if (config_dsm_mode == 2) {
-                    // 1. Count the dirty pages
-                    for (int d = 0; d < guest_registry[i].dsm_count; d++) {
-                        for (int p = 0; p < MAX_DSM_PAGES; p++) {
-                            if (guest_registry[i].dsm_map[d].page_states[p] == MATTX_PAGE_EXCLUSIVE) flush_count++;
-                        }
-                    }
-                    // 2. Pack them into an array (Allocated with GFP_ATOMIC because we hold a spinlock!)
-                    if (flush_count > 0) {
-                        flush_reqs = kmalloc_array(flush_count, sizeof(*flush_reqs), GFP_ATOMIC);
-                        if (flush_reqs) {
-                            int idx = 0;
-                            for (int d = 0; d < guest_registry[i].dsm_count; d++) {
-                                for (int p = 0; p < MAX_DSM_PAGES; p++) {
-                                    if (guest_registry[i].dsm_map[d].page_states[p] == MATTX_PAGE_EXCLUSIVE) {
-                                        flush_reqs[idx].orig_pid = dead_orig_pid;
-                                        flush_reqs[idx].shmid = guest_registry[i].dsm_map[d].shmid;
-                                        flush_reqs[idx].offset = p * PAGE_SIZE;
-                                        memcpy(flush_reqs[idx].data, guest_registry[i].dsm_map[d].pages[p], PAGE_SIZE);
-                                        idx++;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
+                // The mappings leave the registry with the guest and are ours now: flushed and freed outside the
+                // spinlock, one page at a time (no big GFP_ATOMIC array that can fail and silently lose the data).
+                struct mattx_dsm_mapping *dead_maps = guest_registry[i].dsm_map;
+                int dead_count = guest_registry[i].dsm_count;
+                guest_registry[i].dsm_map = NULL;
+                guest_registry[i].dsm_count = 0;
+                guest_registry[i].dsm_cap = 0;
                 
                 remove_guest_process(i);
                 spin_unlock(&guest_lock); // DROP LOCK BEFORE CLEANUP!
                 
-                // 3. Fire the Data Bombs safely outside the spinlock!
-                if (flush_reqs) {
-                    for (int f = 0; f < flush_count; f++) {
-                        if (cluster_map[dead_home_node]) {
-                            mattx_comm_send(cluster_map[dead_home_node], MATTX_MSG_DSM_PAGE_UPDATE, &flush_reqs[f], sizeof(struct mattx_dsm_page_update_req));
-                            mattx_dbg("[MESI_VM2] Funeral Flush (Exit): Sent dirty page (SHMID %u, Offset %lu) to VM1\n", flush_reqs[f].shmid, flush_reqs[f].offset);
-                        }
-                    }
-                    kfree(flush_reqs);
+                // 3. Fire the Data Bombs safely outside the spinlock, then free the pages and the tables!
+                for (int d = 0; d < dead_count; d++) {
+                    if (config_dsm_mode == 2)
+                        mattx_dsm_map_flush(&dead_maps[d], dead_orig_pid, dead_home_node, "Exit");
+                    mattx_dsm_map_put(&dead_maps[d]);
                 }
+                kfree(dead_maps);
 
                 if (buf1) kfree(buf1);
                 if (buf2) kfree(buf2);

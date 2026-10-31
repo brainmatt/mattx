@@ -393,10 +393,41 @@ static void handle_migrate_done(struct mattx_link *link, struct mattx_header *hd
         add_guest_process(hijacked_stub_task->pid, pending_migration->orig_pid, pending_source_node);
 
         // Populate the TID Translation Map ---
+        // (the DSM mappings of the Surrogate are prepared first, see below)
+        // --- Prepare the DSM mappings of the Surrogate ---
+        // The tables are sized by the segments and allocated here: not under the spinlock (may sleep)
+        struct mattx_dsm_mapping *dsm_prep = NULL;
+        int dsm_prep_n = 0;
+        bool dsm_adopted = false;
+        {
+            int shm_vmas = 0;
+
+            for (int v = 0; v < pending_migration->vma_count; v++)
+                if (pending_migration->vmas[v].is_shm) shm_vmas++;
+            if (shm_vmas) {
+                dsm_prep = kcalloc(shm_vmas, sizeof(*dsm_prep), GFP_KERNEL);
+                for (int v = 0; dsm_prep && v < pending_migration->vma_count; v++) {
+                    unsigned long base = pending_migration->vmas[v].vm_start;
+
+                    if (!pending_migration->vmas[v].is_shm) continue;
+                    if (mattx_dsm_map_init(&dsm_prep[dsm_prep_n], base, pending_migration->vmas[v].shmid,
+                                           pending_migration->vmas[v].vm_end - base) != 0) {
+                        printk(KERN_ERR "MattX:[IMPORT] Out of memory for the DSM tables of SHMID %u: no DSM for this Surrogate\n", pending_migration->vmas[v].shmid);
+                        while (dsm_prep_n > 0) mattx_dsm_map_put(&dsm_prep[--dsm_prep_n]);
+                        break;
+                    }
+                    dsm_prep_n++;
+                }
+            }
+        }
         spin_lock(&guest_lock);
         for (i = 0; i < guest_count; i++) {
             if (guest_registry[i].local_pid == hijacked_stub_task->pid) {
                 guest_registry[i].thread_count = pending_migration->thread_count;
+                // The prepared mappings belong to the registry from here on (the loop below arms their tripwires)
+                guest_registry[i].dsm_map = dsm_prep;
+                guest_registry[i].dsm_cap = dsm_prep_n;
+                dsm_adopted = true;
                 int map_idx = 0;
                 struct task_struct *t_map;
                 rcu_read_lock();
@@ -417,7 +448,7 @@ static void handle_migrate_done(struct mattx_link *link, struct mattx_header *hd
                     mmap_write_lock(hijacked_stub_task->mm);
                     
                     for (int v = 0; v < pending_migration->vma_count; v++) {
-                        if (pending_migration->vmas[v].is_shm && guest_registry[i].dsm_count < MAX_DSM_SEGMENTS) {
+                        if (pending_migration->vmas[v].is_shm && guest_registry[i].dsm_count < dsm_prep_n) {
                             int d_idx = guest_registry[i].dsm_count++;
                             unsigned long base = pending_migration->vmas[v].vm_start;
                             
@@ -441,6 +472,11 @@ static void handle_migrate_done(struct mattx_link *link, struct mattx_header *hd
                 }
                 break;
             }
+        }
+        if (!dsm_adopted) {
+            // The guest is gone (or never registered): give the prepared tables back (safe under the spinlock)
+            while (dsm_prep_n > 0) mattx_dsm_map_put(&dsm_prep[--dsm_prep_n]);
+            kfree(dsm_prep);
         }
         spin_unlock(&guest_lock);
 
