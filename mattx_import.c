@@ -990,6 +990,8 @@ static void handle_return_done(struct mattx_link *link, struct mattx_header *hdr
         for (i = 0; i < export_count; i++) {
             if (export_registry[i].orig_pid == hijacked_stub_task->pid) {
                 remove_export_process(i);
+                atomic64_inc(&mattx_stat_return);
+                mattx_hist_bump(hijacked_stub_task->pid);
                 break;
             }
         }

@@ -368,6 +368,7 @@ void add_guest_process(pid_t local_pid, u32 orig_pid, int home_node) {
         guest_registry[guest_count].dsm_map = NULL; // allocated by mattx_dsm_map_add() on the first segment
 
         guest_count++;
+        atomic64_inc(&mattx_stat_in);
     } else {
         printk(KERN_WARNING "MattX: [REGISTRY] Guest registry is full!\n");
     }
@@ -385,6 +386,50 @@ void remove_guest_process(int index) {
 
     guest_registry[index] = guest_registry[guest_count - 1];
     guest_count--;
+    atomic64_inc(&mattx_stat_departed);
+}
+
+// --- Migration counters and per-pid history ---
+atomic64_t mattx_stat_out = ATOMIC64_INIT(0);
+atomic64_t mattx_stat_in = ATOMIC64_INIT(0);
+atomic64_t mattx_stat_return = ATOMIC64_INIT(0);
+atomic64_t mattx_stat_departed = ATOMIC64_INIT(0);
+atomic64_t mattx_stat_remote_exit = ATOMIC64_INIT(0);
+atomic64_t mattx_stat_reaped = ATOMIC64_INIT(0);
+
+// How many times each of our own processes changed place (forward and back). A small ring: when
+// more distinct pids than MATTX_HIST_SLOTS have migrated, the oldest slot is reused, so a count
+// is only reliable for recently active pids. Lock order: export_lock, then mattx_hist_lock.
+#define MATTX_HIST_SLOTS 256
+static struct { pid_t pid; u32 count; } mattx_hist[MATTX_HIST_SLOTS];
+static unsigned int mattx_hist_next;
+static DEFINE_SPINLOCK(mattx_hist_lock);
+
+void mattx_hist_bump(pid_t orig_pid) {
+    int i;
+    spin_lock(&mattx_hist_lock);
+    for (i = 0; i < MATTX_HIST_SLOTS; i++) {
+        if (mattx_hist[i].pid == orig_pid) {
+            mattx_hist[i].count++;
+            spin_unlock(&mattx_hist_lock);
+            return;
+        }
+    }
+    i = mattx_hist_next++ % MATTX_HIST_SLOTS;
+    mattx_hist[i].pid = orig_pid;
+    mattx_hist[i].count = 1;
+    spin_unlock(&mattx_hist_lock);
+}
+
+// 0 = slot filled, -1 = empty slot (skip), -2 = past the end
+int mattx_hist_get(int slot, pid_t *pid, u32 *count) {
+    int ret = 0;
+    if (slot < 0 || slot >= MATTX_HIST_SLOTS) return -2;
+    spin_lock(&mattx_hist_lock);
+    if (mattx_hist[slot].pid == 0) ret = -1;
+    else { *pid = mattx_hist[slot].pid; *count = mattx_hist[slot].count; }
+    spin_unlock(&mattx_hist_lock);
+    return ret;
 }
 
 // --- Export Registry Implementation ---
@@ -404,6 +449,8 @@ void add_export_process(pid_t orig_pid, int target_node) {
         export_registry[export_count].is_growing_gang = false;
 
         export_count++;
+        atomic64_inc(&mattx_stat_out);
+        mattx_hist_bump(orig_pid);
     } else {
         printk(KERN_WARNING "MattX: [REGISTRY] Export registry is full!\n");
     }
@@ -465,6 +512,7 @@ static void handle_process_exit(struct mattx_link *link, struct mattx_header *hd
                     memcpy(files_to_close, export_registry[i].remote_files, MAX_FDS * sizeof(struct file *));
                 }
                 remove_export_process(i);
+                atomic64_inc(&mattx_stat_remote_exit);
                 found = true;
                 break;
             }

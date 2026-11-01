@@ -323,6 +323,7 @@ restart_export_loop:
                 }
                 
                 remove_export_process(i);
+                atomic64_inc(&mattx_stat_reaped);
                 spin_unlock(&export_lock); // DROP LOCK BEFORE FPUT!
 
                 // Safely close all leaked files outside the spinlock!
