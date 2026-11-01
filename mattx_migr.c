@@ -862,7 +862,16 @@ void mattx_capture_and_return_state(struct task_struct *task, u32 orig_pid, int 
     } while (stable_scans < MATTX_REQUIRED_STABLE_SCANS && --stabilize_retries > 0);
 
     req->thread_count = t_count;
+    bool gone = false;
     for (int i = 0; i < t_count; i++) {
+        // Same as the forward capture (mattx#37): a gang thread that exited while the gang
+        // was frozen/scanned has no kernel stack left, task_pt_regs() would read 0x3f48.
+        // Recalling a Surrogate that is being killed (e.g. MattX unloaded under it) hit this.
+        if (gone || !mattx_task_capturable(threads[i])) {
+            gone = true;
+            put_task_struct(threads[i]);
+            continue;
+        }
         req->threads[i].tid = threads[i]->pid;
         struct pt_regs *t_regs = task_pt_regs(threads[i]);
         if (t_regs) {
@@ -889,6 +898,20 @@ void mattx_capture_and_return_state(struct task_struct *task, u32 orig_pid, int 
             }
         }
         put_task_struct(threads[i]);
+    }
+    if (gone) {
+        printk(KERN_WARNING "MattX:[EXTRACT] PID %d exited while it was being captured, recall aborted.\n", task->pid);
+        kvfree(req);
+        spin_lock(&guest_lock);
+        for (int i = 0; i < guest_count; i++) {
+            if (guest_registry[i].local_pid == task->pid) {
+                guest_registry[i].is_migrating = false;
+                break;
+            }
+        }
+        spin_unlock(&guest_lock);
+        send_sig(SIGCONT, task, 0); // undo the SIGSTOP fallback of the drainer, if it was used
+        return;
     }
     mattx_dbg("[EXTRACT] Packed %d threads into the Return Blueprint!\n", t_count);
 

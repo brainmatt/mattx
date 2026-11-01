@@ -321,6 +321,7 @@ static int __init mattx_init(void) {
 
 static void __exit mattx_exit(void) {
     int i;
+    mattx_fileio_waiters_stop();    // the poll/epoll waiter kworkers start leaving now
     if (balancer_thread) kthread_stop(balancer_thread);
     if (listener_thread) kthread_stop(listener_thread);
     if (dsm_sweeper_thread) kthread_stop(dsm_sweeper_thread);
@@ -332,6 +333,7 @@ static void __exit mattx_exit(void) {
     mattx_fileio_exit();
     
     for (i = 0; i < MAX_NODES; i++) mattx_comm_disconnect(i);
+    mattx_fileio_waiters_destroy(); // no receiver can queue a waiter any more; wait for the running ones
     mattx_epoll_cancelled_purge();   // all receiver threads are dead, nobody can queue a cancel anymore
     if (pending_migration) kvfree(pending_migration);
     if (hijacked_stub_task) put_task_struct(hijacked_stub_task);
