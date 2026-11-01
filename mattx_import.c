@@ -383,13 +383,6 @@ static void handle_migrate_done(struct mattx_link *link, struct mattx_header *hd
                        hijacked_stub_task->pid, clock_offset_ns, t_idx);
         }
 
-        mattx_dbg("[IMPORT] IT'S ALIVE! Waking %d threads in Gang PID %d\n", current_threads, hijacked_stub_task->pid);
-        rcu_read_lock();
-        for_each_thread(hijacked_stub_task, t) {
-            send_sig(SIGCONT, t, 0);
-        }
-        rcu_read_unlock();
-        
         add_guest_process(hijacked_stub_task->pid, pending_migration->orig_pid, pending_source_node);
 
         // Populate the TID Translation Map ---
@@ -424,7 +417,7 @@ static void handle_migrate_done(struct mattx_link *link, struct mattx_header *hd
         for (i = 0; i < guest_count; i++) {
             if (guest_registry[i].local_pid == hijacked_stub_task->pid) {
                 guest_registry[i].thread_count = pending_migration->thread_count;
-                // The prepared mappings belong to the registry from here on (the loop below arms their tripwires)
+                // The prepared mappings belong to the registry from here on
                 guest_registry[i].dsm_map = dsm_prep;
                 guest_registry[i].dsm_cap = dsm_prep_n;
                 dsm_adopted = true;
@@ -440,36 +433,8 @@ static void handle_migrate_done(struct mattx_link *link, struct mattx_header *hd
                 }
                 rcu_read_unlock();
 
-                // --- Populate the DSM Translation Map & Arm Tripwires ---
-                guest_registry[i].dsm_count = 0;
-                
-                if (hijacked_stub_task->mm) {
-                    // We need the write lock to modify the VMA flags and ops!
-                    mmap_write_lock(hijacked_stub_task->mm);
-                    
-                    for (int v = 0; v < pending_migration->vma_count; v++) {
-                        if (pending_migration->vmas[v].is_shm && guest_registry[i].dsm_count < dsm_prep_n) {
-                            int d_idx = guest_registry[i].dsm_count++;
-                            unsigned long base = pending_migration->vmas[v].vm_start;
-                            
-                            guest_registry[i].dsm_map[d_idx].base_addr = base;
-                            guest_registry[i].dsm_map[d_idx].size = pending_migration->vmas[v].vm_end - base;
-                            guest_registry[i].dsm_map[d_idx].shmid = pending_migration->vmas[v].shmid;
-                            
-                            // --- ARM THE TRIPWIRE ---
-                            struct vm_area_struct *vma = find_vma(hijacked_stub_task->mm, base);
-                            if (vma && vma->vm_start == base) {
-                                vma->vm_ops = &mattx_dsm_vm_ops; // Lay the trap!
-                                // Add VM_PFNMAP so the kernel doesn't touch our pages!
-                                vm_flags_set(vma, vma->vm_flags | VM_PFNMAP); // Pure hardware PFN mapping!
-                                
-                                mattx_dbg("[IMPORT] Armed DSM Tripwire at 0x%lx (ID: %u, Size: %lu)\n", 
-                                          base, pending_migration->vmas[v].shmid, guest_registry[i].dsm_map[d_idx].size);
-                            }
-                        }
-                    }
-                    mmap_write_unlock(hijacked_stub_task->mm);
-                }
+                // --- Publish the DSM Translation Map (the tripwires are armed below, outside the spinlock) ---
+                guest_registry[i].dsm_count = dsm_prep_n;
                 break;
             }
         }
@@ -479,6 +444,40 @@ static void handle_migrate_done(struct mattx_link *link, struct mattx_header *hd
             kfree(dsm_prep);
         }
         spin_unlock(&guest_lock);
+
+        // --- Arm the DSM Tripwires ---
+        // Outside the spinlock: mmap_write_lock() sleeps. Nothing of the registry is needed for it.
+        if (dsm_prep_n > 0 && hijacked_stub_task->mm) {
+            // We need the write lock to modify the VMA flags and ops!
+            mmap_write_lock(hijacked_stub_task->mm);
+
+            for (int v = 0; v < pending_migration->vma_count; v++) {
+                if (pending_migration->vmas[v].is_shm) {
+                    unsigned long base = pending_migration->vmas[v].vm_start;
+
+                    // --- ARM THE TRIPWIRE ---
+                    struct vm_area_struct *vma = find_vma(hijacked_stub_task->mm, base);
+                    if (vma && vma->vm_start == base) {
+                        vma->vm_ops = &mattx_dsm_vm_ops; // Lay the trap!
+                        // Add VM_PFNMAP so the kernel doesn't touch our pages!
+                        vm_flags_set(vma, vma->vm_flags | VM_PFNMAP); // Pure hardware PFN mapping!
+
+                        mattx_dbg("[IMPORT] Armed DSM Tripwire at 0x%lx (ID: %u, Size: %lu)\n",
+                                  base, pending_migration->vmas[v].shmid, pending_migration->vmas[v].vm_end - base);
+                    }
+                }
+            }
+            mmap_write_unlock(hijacked_stub_task->mm);
+        }
+
+        // The guest is registered and the tripwires are armed: NOW the threads may run. (Before, they were
+        // woken first and could touch a shared segment through the native, unarmed mapping.)
+        mattx_dbg("[IMPORT] IT'S ALIVE! Waking %d threads in Gang PID %d\n", current_threads, hijacked_stub_task->pid);
+        rcu_read_lock();
+        for_each_thread(hijacked_stub_task, t) {
+            send_sig(SIGCONT, t, 0);
+        }
+        rcu_read_unlock();
 
         // --- CLEANUP ---
         put_task_struct(hijacked_stub_task);

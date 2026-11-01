@@ -1527,12 +1527,9 @@ static void mattx_rpc_worker(struct work_struct *work) {
                 }
                 spin_unlock(&guest_lock);
 
-                // 3. Fire the Data Bombs safely outside the spinlock, then free the pages and the tables!
-                if (have_dead) {
-                    if (config_dsm_mode == 2)
-                        mattx_dsm_map_flush(&dead, rpc->orig_pid, rpc->home_node, "shmdt");
-                    mattx_dsm_map_put(&dead);
-                }
+                // 3. Fire the Data Bombs safely outside the spinlock (the pages are freed further down)
+                if (have_dead && config_dsm_mode == 2)
+                    mattx_dsm_map_flush(&dead, rpc->orig_pid, rpc->home_node, "shmdt");
 
                 // The Magic Trick: Destroy the Hollow VMA on VM2!
                 if (error == 0 && size_to_unmap > 0) {
@@ -1545,6 +1542,11 @@ static void mattx_rpc_worker(struct work_struct *work) {
                         mattx_dbg("[DSM] Warning: Surrogate has no mm, cannot unmap Hollow VMA.\n");
                     }
                 }
+
+                // Only now, with the Hollow VMA gone and no PTE left that points at them, the pages and the
+                // tables can be freed (before, a PTE could point at a freed page for a moment)
+                if (have_dead)
+                    mattx_dsm_map_put(&dead);
 
                 if (regs) regs->ax = error;
 

@@ -5020,6 +5020,9 @@ static vm_fault_t mattx_dsm_fault(struct vm_fault *vmf) {
     // disabled since defined before: unsigned long page_idx = offset / PAGE_SIZE;
     void *kaddr = NULL;
     void *newpage = NULL;   // allocated outside the spinlock: __get_free_page(GFP_KERNEL) may sleep
+    struct mattx_dsm_mapping held;  // a reference on the tables: a concurrent shmdt must not free the page under us
+
+    memset(&held, 0, sizeof(held));
 
     for (;;) {
         bool need_page = false;
@@ -5036,6 +5039,11 @@ static vm_fault_t mattx_dsm_fault(struct vm_fault *vmf) {
                         }
                         kaddr = guest_registry[i].dsm_map[d].pages[page_idx];
                         need_page = !kaddr;
+                        if (kaddr) {
+                            // Held until the page is in the page tables: the pages are only freed with the last reference
+                            held = guest_registry[i].dsm_map[d];
+                            mattx_dsm_map_get(&held);
+                        }
                         break;
                     }
                 }
@@ -5125,6 +5133,7 @@ static vm_fault_t mattx_dsm_fault(struct vm_fault *vmf) {
     kfree(page_buf);
 
     if (ret != VM_FAULT_NOPAGE) {
+        mattx_dsm_map_put(&held);
         return ret;
     }
 
@@ -5146,6 +5155,7 @@ static vm_fault_t mattx_dsm_fault(struct vm_fault *vmf) {
         spin_unlock(&guest_lock);
     }
 
+    mattx_dsm_map_put(&held);   // the page is wired in: a shmdt may free the tables now (it unmaps the VMA first)
     mattx_dbg("[DSM] Illusion Complete! Page successfully injected at 0x%lx!\n", fault_addr);
     return VM_FAULT_NOPAGE;
 }
@@ -5990,7 +6000,9 @@ static void mattx_dsm_cleanup_cb(struct callback_head *cb) {
     if (ctx->is_write) {
         void *kaddr = NULL;
         unsigned long offset = 0;
-        
+        struct mattx_dsm_mapping held;  // keeps the page alive while we copy it outside the spinlock
+
+        memset(&held, 0, sizeof(held));
         spin_lock(&guest_lock);
         for (int i = 0; i < guest_count; i++) {
             if (guest_registry[i].local_pid == current->tgid) {
@@ -6001,6 +6013,10 @@ static void mattx_dsm_cleanup_cb(struct callback_head *cb) {
                         offset = ctx->fault_addr - base;
                         unsigned long page_idx = offset / PAGE_SIZE;
                         kaddr = (page_idx < guest_registry[i].dsm_map[d].npages) ? guest_registry[i].dsm_map[d].pages[page_idx] : NULL;
+                        if (kaddr) {
+                            held = guest_registry[i].dsm_map[d];
+                            mattx_dsm_map_get(&held);
+                        }
                         break;
                     }
                 }
@@ -6026,6 +6042,7 @@ static void mattx_dsm_cleanup_cb(struct callback_head *cb) {
                 mattx_dbg("[DSM_MODE3] Synced dirty page at 0x%lx to VM1.\n", ctx->fault_addr);
             }
         }
+        mattx_dsm_map_put(&held);
     }
 
     // 2. THE ZAP (Burn it down!)
@@ -6172,8 +6189,23 @@ static void handle_dsm_write_acquire_req(struct mattx_link *link, struct mattx_h
 // --- VM3: INVALIDATE KWORKER ---
 struct mattx_dsm_invalidate_kworker_ctx { struct work_struct work; struct mattx_dsm_invalidate_req req; int target_node; };
 
+// A page of a Surrogate to zap: collected under guest_lock, zapped after it is dropped (mmap_read_lock() sleeps)
+struct mattx_zap_target {
+    struct task_struct *task;
+    unsigned long base;
+    unsigned long fault_addr;
+};
+
 static void mattx_dsm_invalidate_kworker(struct work_struct *work) {
     struct mattx_dsm_invalidate_kworker_ctx *ctx = container_of(work, struct mattx_dsm_invalidate_kworker_ctx, work);
+    struct mattx_zap_target *tg = kvmalloc_array(MAX_GUESTS, sizeof(*tg), GFP_KERNEL);
+    int n = 0;
+
+    if (!tg) {
+        printk(KERN_ERR "MattX:[MESI_VM2] INVALIDATE dropped: out of memory\n");
+        kfree(ctx);
+        return;
+    }
 
     spin_lock(&guest_lock);
     for (int i = 0; i < guest_count; i++) {
@@ -6192,27 +6224,41 @@ static void mattx_dsm_invalidate_kworker(struct work_struct *work) {
                 // 1. Update local state to INVALID
                 guest_registry[i].dsm_map[d].page_states[page_idx] = MATTX_PAGE_INVALID;
                 
-                // 2. Zap the PTE!
-                struct task_struct *surrogate = NULL;
-                rcu_read_lock();
-                surrogate = pid_task(find_vpid(guest_registry[i].local_pid), PIDTYPE_PID);
-                if (surrogate) get_task_struct(surrogate);
-                rcu_read_unlock();
-                
-                if (surrogate && surrogate->mm && real_zap_vma_ptes) {
-                    mmap_read_lock(surrogate->mm);
-                    struct vm_area_struct *vma = find_vma(surrogate->mm, base);
-                    if (vma && vma->vm_start <= base) {
-                        real_zap_vma_ptes(vma, fault_addr, PAGE_SIZE);
-                        mattx_dbg("[MESI_VM2] Zapped invalidated page at 0x%lx for PID %d\n", fault_addr, surrogate->pid);
+                // 2. Zap the PTE! Only the task is looked up here, the zapping is done below
+                if (n < MAX_GUESTS) {
+                    struct task_struct *surrogate = NULL;
+                    rcu_read_lock();
+                    surrogate = pid_task(find_vpid(guest_registry[i].local_pid), PIDTYPE_PID);
+                    if (surrogate) get_task_struct(surrogate);
+                    rcu_read_unlock();
+
+                    if (surrogate) {
+                        tg[n].task = surrogate;
+                        tg[n].base = base;
+                        tg[n].fault_addr = fault_addr;
+                        n++;
                     }
-                    mmap_read_unlock(surrogate->mm);
-                    put_task_struct(surrogate);
                 }
             }
         }
     }
     spin_unlock(&guest_lock);
+
+    for (int k = 0; k < n; k++) {
+        struct task_struct *surrogate = tg[k].task;
+
+        if (surrogate->mm && real_zap_vma_ptes) {
+            mmap_read_lock(surrogate->mm);
+            struct vm_area_struct *vma = find_vma(surrogate->mm, tg[k].base);
+            if (vma && vma->vm_start <= tg[k].base) {
+                real_zap_vma_ptes(vma, tg[k].fault_addr, PAGE_SIZE);
+                mattx_dbg("[MESI_VM2] Zapped invalidated page at 0x%lx for PID %d\n", tg[k].fault_addr, surrogate->pid);
+            }
+            mmap_read_unlock(surrogate->mm);
+        }
+        put_task_struct(surrogate);
+    }
+    kvfree(tg);
     kfree(ctx);
 }
 
@@ -6256,6 +6302,9 @@ static void mattx_dsm_flush_kworker(struct work_struct *work) {
     reply->req_id = ctx->req.req_id;
     reply->error = -ENOENT;
 
+    struct task_struct *zap_task = NULL;    // looked up under guest_lock, zapped after it is dropped
+    unsigned long zap_base = 0, zap_addr = 0;
+
     spin_lock(&guest_lock);
     for (int i = 0; i < guest_count; i++) {
         if (guest_registry[i].orig_pid == ctx->req.orig_pid) {
@@ -6274,23 +6323,13 @@ static void mattx_dsm_flush_kworker(struct work_struct *work) {
                         // 2. Downgrade local state to INVALID
                         guest_registry[i].dsm_map[d].page_states[page_idx] = MATTX_PAGE_INVALID;
 
-                        // 3. Zap the PTE!
-                        struct task_struct *surrogate = NULL;
+                        // 3. Zap the PTE! Only the task is looked up here, the zapping is done below
                         rcu_read_lock();
-                        surrogate = pid_task(find_vpid(guest_registry[i].local_pid), PIDTYPE_PID);
-                        if (surrogate) get_task_struct(surrogate);
+                        zap_task = pid_task(find_vpid(guest_registry[i].local_pid), PIDTYPE_PID);
+                        if (zap_task) get_task_struct(zap_task);
                         rcu_read_unlock();
-
-                        if (surrogate && surrogate->mm && real_zap_vma_ptes) {
-                            mmap_read_lock(surrogate->mm);
-                            struct vm_area_struct *vma = find_vma(surrogate->mm, base);
-                            if (vma && vma->vm_start <= base) {
-                                real_zap_vma_ptes(vma, fault_addr, PAGE_SIZE);
-                                mattx_dbg("[MESI_VM2] Flushed dirty data and zapped page at 0x%lx\n", fault_addr);
-                            }
-                            mmap_read_unlock(surrogate->mm);
-                            put_task_struct(surrogate);
-                        }
+                        zap_base = base;
+                        zap_addr = fault_addr;
                     }
                     break;
                 }
@@ -6299,6 +6338,19 @@ static void mattx_dsm_flush_kworker(struct work_struct *work) {
         }
     }
     spin_unlock(&guest_lock);
+
+    if (zap_task) {
+        if (zap_task->mm && real_zap_vma_ptes) {
+            mmap_read_lock(zap_task->mm);
+            struct vm_area_struct *vma = find_vma(zap_task->mm, zap_base);
+            if (vma && vma->vm_start <= zap_base) {
+                real_zap_vma_ptes(vma, zap_addr, PAGE_SIZE);
+                mattx_dbg("[MESI_VM2] Flushed dirty data and zapped page at 0x%lx\n", zap_addr);
+            }
+            mmap_read_unlock(zap_task->mm);
+        }
+        put_task_struct(zap_task);
+    }
 
     if (cluster_map[ctx->target_node]) {
         mattx_comm_send(cluster_map[ctx->target_node], MATTX_MSG_DSM_FLUSH_REPLY, reply, sizeof(*reply));
