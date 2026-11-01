@@ -1322,12 +1322,70 @@ static void handle_recall_req(struct mattx_link *link, struct mattx_header *hdr,
     }
 }
 
+/*
+ * RECALL_REQ must NOT be served in the receiver kthread.
+ *
+ * handle_recall_req() drains the Surrogate: mattx_freeze_task_safely() waits for every thread of the
+ * Surrogate to reach a stable state. A thread that sleeps in mattx_ticket_wait() (read, recvfrom, accept4,
+ * connect, poll, select, ...) is interrupted by that drain, sends its CANCEL and then waits for the home
+ * node's final answer, which only the per-link receiver kthread can deliver to the ticket. Served inline,
+ * the receiver sat in the drain waiting for the thread while the thread sat in the ticket waiting for the
+ * receiver: a 5 s stall (MATTX_TICKET_CANCEL_WAIT) per blocked thread and per retry, and the recall never
+ * got to the data transfer.
+ *
+ * So the receiver only queues the request. The queue is ordered: recalls run one after the other, like they
+ * did in the receiver kthread (the capture code keeps its state in file-scope statics).
+ */
+struct mattx_recall_work {
+    struct work_struct work;
+    struct mattx_header hdr;
+    struct mattx_recall_req req;
+};
+
+static struct workqueue_struct *mattx_recall_wq;
+
+static void mattx_recall_worker(struct work_struct *work) {
+    struct mattx_recall_work *rw = container_of(work, struct mattx_recall_work, work);
+
+    handle_recall_req(NULL, &rw->hdr, &rw->req);
+    kfree(rw);
+}
+
+static void handle_recall_req_queue(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    struct mattx_recall_work *rw;
+
+    if (!payload || hdr->length < sizeof(struct mattx_recall_req))
+        return;
+
+    rw = mattx_recall_wq ? kmalloc(sizeof(*rw), GFP_KERNEL) : NULL;
+    if (!rw) {
+        // No queue (or no memory): serve it inline like before. Slow if threads are blocked, but never lost.
+        printk(KERN_WARNING "MattX:[EXPORT] No recall worker available, serving RECALL inline\n");
+        handle_recall_req(link, hdr, payload);
+        return;
+    }
+    INIT_WORK(&rw->work, mattx_recall_worker);
+    memcpy(&rw->hdr, hdr, sizeof(rw->hdr));
+    memcpy(&rw->req, payload, sizeof(rw->req));
+    queue_work(mattx_recall_wq, &rw->work);
+}
+
+// Module unload: waits for a recall that is still being served. The receivers must still be alive here
+// (they deliver the replies the drain waits for).
+void mattx_migr_exit(void) {
+    if (mattx_recall_wq) {
+        destroy_workqueue(mattx_recall_wq);
+        mattx_recall_wq = NULL;
+    }
+}
+
 void mattx_migr_init_handlers(void) {
     // Resolve hidden kernel 7.x symbols before we do anything else!
     mattx_resolve_hidden_symbols();
 
     mattx_register_handler(MATTX_MSG_READY_FOR_DATA, handle_ready_for_data);
-    mattx_register_handler(MATTX_MSG_RECALL_REQ, handle_recall_req);
+    mattx_recall_wq = alloc_ordered_workqueue("mattx_recall", 0);
+    mattx_register_handler(MATTX_MSG_RECALL_REQ, handle_recall_req_queue);
     mattx_dbg(" [EXPORT] Network handlers registered.\n");
 }
 

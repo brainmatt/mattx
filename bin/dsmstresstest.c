@@ -55,10 +55,12 @@ int main(int argc, char *argv[]) {
 
     num_workers = atoi(argv[1]);
     int max_ops = atoi(argv[2]);
-    int action_delay = atoi(argv[3]);
 
-    if (num_workers <= 0 || max_ops <= 0) {
-        printf("Arguments must be > 0\n");
+    // 🚨 MATTX UPDATE: Parse as float for sub-second precision!
+    float action_delay = atof(argv[3]);    
+
+    if (num_workers <= 0 || max_ops <= 0 || action_delay < 0.0) {
+        printf("Arguments must be > 0 (action_delay can be >= 0)\n");
         exit(1);
     }
 
@@ -129,7 +131,10 @@ int main(int argc, char *argv[]) {
                         printf("  -> [PID %d] Read data: '%s'\n", getpid(), (char *)shm_data);
                     }
                     // usleep(500000); // Sleep 0.5s between ops to allow observation
-                    sleep(action_delay); // Sleep for the specified action delay
+                    // sleep(action_delay); // Sleep for the specified action delay
+
+                    // 🚨 MATTX UPDATE: Convert float seconds to microseconds!
+                    usleep((useconds_t)(action_delay * 1000000.0)); 
                 }
             }
 

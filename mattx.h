@@ -261,6 +261,7 @@ enum mattx_msg_type {
     MATTX_MSG_DSM_FLUSH_REQ,
     MATTX_MSG_DSM_FLUSH_REPLY,
     MATTX_MSG_SYS_EPOLL_WAIT_CANCEL, // appended last so the numbering of the older messages is unchanged
+    MATTX_MSG_SYS_REQ_CANCEL,        // generic: a Surrogate thread gives up on a ticket-based request
 };
 
 struct mattx_header {
@@ -404,12 +405,14 @@ struct mattx_sys_read_req {
     u32 orig_pid;
     u32 fd;
     size_t count;
+    u32 req_id; // ticket id: matches the reply to the one thread that waits for it (0 = none)
 };
 
 struct mattx_sys_read_reply {
     u32 orig_pid;
     ssize_t bytes_read;
     int error;
+    u32 req_id; // echo of the request's ticket id; 0 = legacy reply (pread64 reuses this struct)
     char data[];
 };
 
@@ -482,11 +485,13 @@ struct mattx_sys_connect_req {
     u32 fd;
     struct sockaddr_storage addr;
     int addrlen;
+    u32 req_id; // ticket id: matches the reply to the one thread that waits for it (0 = legacy SIGSTOP path)
 };
 
 struct mattx_sys_connect_reply {
     u32 orig_pid;
     int error;
+    u32 req_id; // echo of the request's ticket id (0 = legacy reply)
 };
 
 struct mattx_sys_bind_req {
@@ -532,12 +537,14 @@ struct mattx_sys_recv_req {
     u32 fd;
     size_t size;
     int flags;
+    u32 req_id; // ticket id: matches the reply to the one thread that waits for it (0 = legacy SIGSTOP path)
 };
 
 struct mattx_sys_recv_reply {
     u32 orig_pid;
     ssize_t bytes_recv;
     int error;
+    u32 req_id; // echo of the request's ticket id (0 = legacy reply)
     char data[];
 };
 
@@ -545,12 +552,14 @@ struct mattx_sys_accept_req {
     u32 orig_pid;
     u32 fd; // The listening socket
     int flags;
+    u32 req_id; // ticket id: matches the reply to the one thread that waits for it (0 = legacy SIGSTOP path)
 };
 
 struct mattx_sys_accept_reply {
     u32 orig_pid;
     int remote_fd; // The newly created socket for the connection
     int error;
+    u32 req_id; // echo of the request's ticket id (0 = legacy reply)
     struct sockaddr_storage addr; // The IP of the client who connected
     int addrlen;
 };
@@ -567,6 +576,7 @@ struct mattx_sys_poll_req {
     u32 orig_pid;
     int nfds;
     int timeout;
+    u32 req_id; // ticket id: matches the reply to the one thread that waits for it (0 = legacy SIGSTOP path: select, pselect6, fallback)
     struct mattx_pollfd fds[16]; // Max 16 FDs for this prototype
 };
 
@@ -575,6 +585,7 @@ struct mattx_sys_poll_reply {
     int nfds;
     int error;
     int retval; // The number of FDs with events
+    u32 req_id; // echo of the request's ticket id (0 = legacy reply)
     struct mattx_pollfd fds[16];
 };
 
@@ -630,6 +641,33 @@ struct mattx_sys_epoll_wait_cancel {
     u32 orig_pid;
     u32 req_id;
 };
+/*
+ * THE TICKET: one proxied request that exactly ONE Surrogate thread waits for (the skeleton is in
+ * mattx_fileio.c, the pattern in mattx_read_tw_fn() in mattx_hooks.c). The syscall-specific parts
+ * stay flat and per syscall; only this small skeleton is shared.
+ */
+struct mattx_ticket {
+    struct list_head node;
+    u32 orig_pid;
+    int home_node;
+    u32 req_id;                 // never 0
+    struct completion done;
+    long retval;                // the syscall's result on the home node, or -errno
+    void *data;                 // optional reply payload (kmalloc'ed), owned by the ticket
+    size_t data_len;
+    size_t data_cap;            // most bytes the waiter can take: a bigger reply is a protocol error
+};
+
+// A Surrogate thread gives up on a ticket-based request: the home node finishes it (generic CANCEL)
+struct mattx_sys_req_cancel {
+    u32 orig_pid;
+    u32 req_id;
+};
+
+struct mattx_ticket *mattx_ticket_add(u32 orig_pid, int home_node, size_t data_cap);
+void mattx_ticket_del(struct mattx_ticket *t);
+bool mattx_ticket_complete(int home_node, u32 orig_pid, u32 req_id, long retval, const void *data, size_t len);
+int mattx_ticket_wait(struct mattx_ticket *t, long timeout);
 struct mattx_epoll_pending *mattx_epoll_pending_add(u32 orig_pid, int home_node);
 void mattx_epoll_pending_del(struct mattx_epoll_pending *p);
 void mattx_epoll_cancelled_purge(void);
@@ -1073,9 +1111,13 @@ struct mattx_dsm_mapping {
     unsigned long base_addr;
     u32 shmid;
     unsigned long size;
-    unsigned long present_pages[MAX_DSM_PAGES / BITS_PER_LONG]; // Tracks mapped pages!
-    void *pages[MAX_DSM_PAGES]; // The Physical Page Pool!
-    u8 page_states[MAX_DSM_PAGES]; // Local MESI State (VM2)
+    // The three tables have one entry per page of the segment (npages), allocated from the segment's size
+    // (mattx_dsm_map_init() in mattx_guest.c): there is no limit on the size of a segment.
+    unsigned long npages;           // DIV_ROUND_UP(size, PAGE_SIZE)
+    unsigned long *present_pages;   // Tracks mapped pages! (bitmap of npages bits)
+    void **pages;                   // The Physical Page Pool!
+    u8 *page_states;                // Local MESI State (VM2)
+    struct mattx_dsm_tables *tbl;   // owns the three tables (one reference-counted block); NULL: none
 };
 
 
@@ -1100,7 +1142,8 @@ struct mattx_guest_info {
 
     // The DSM Translation Map ---
     int dsm_count;
-    struct mattx_dsm_mapping dsm_map[MAX_DSM_SEGMENTS];
+    int dsm_cap;                            // entries allocated in dsm_map
+    struct mattx_dsm_mapping *dsm_map;      // grows on demand: there is no limit on the segments of a guest
 
     // --- MODE 3: Single-Step Tracking ---
     bool dsm_step_pending;
@@ -1115,16 +1158,22 @@ struct mattx_dsm_master_dir {
     bool in_use;                        // <-- Tracks if this slot is active
     u32 shmid;
     u32 home_pid;                       // <-- The PID on VM1 to use for memory reading!    
-    u8 page_state[MAX_DSM_PAGES];       // Global state of the page
-    u32 page_owner_pid[MAX_DSM_PAGES];  // PID of the EXCLUSIVE owner
+    // The tables have one entry per page of the segment (npages): there is no limit on the size of a segment
+    unsigned long npages;               // DIV_ROUND_UP(segment size, PAGE_SIZE)
+    unsigned long sweep_pos;            // where the native sweeper continues (it shoots down a few pages per round)
+    u8 *page_state;                     // Global state of the page
+    u32 *page_owner_pid;                // PID of the EXCLUSIVE owner
 
-    // A foolproof 2D array. 1024 nodes / 64 bits = 16 u64s per page!
-    u64 page_shared_mask[MAX_DSM_PAGES][MAX_NODES / 64]; 
+    // The sharers of a page: a bitmap of MAX_NODES bits (16 u64s), allocated lazily for the pages that really
+    // are shared (xarray: page index -> u64[MAX_NODES / 64])
+    struct xarray *page_shared_mask;
 };
 
 
 // --- The Global Node-Local Directory & Lock ---
-extern struct mattx_dsm_master_dir mattx_global_dsm_dir[MAX_DSM_SEGMENTS];
+// A dynamic array: it grows on demand, its entries never move (an index stays valid). Under mattx_dsm_lock.
+extern struct mattx_dsm_master_dir *mattx_global_dsm_dir;
+extern int mattx_dsm_dir_cap;
 extern spinlock_t mattx_dsm_lock;
 
 
@@ -1134,9 +1183,6 @@ struct mattx_export_info {
     struct file *remote_files[MAX_FDS]; 
     bool abort_rpc; // The Kworker Kill-Switch! ---
     bool is_growing_gang; // The Gang Grower Flag!
-    // (The per-export copy of the DSM directory that used to live here was never written, and at
-    // MAX_DSM_SEGMENTS x ~34 KB it made export_registry[] 560 MB of zeroed memory per insmod. The
-    // directory is the global mattx_global_dsm_dir[].)
 };
 
 struct mattx_vfs_getattr_req {
@@ -1346,6 +1392,16 @@ struct mattx_dsm_flush_reply {
 };
 
 
+
+// The master directory of the DSM (VM1, mattx_fileio.c): one entry per segment, sized by the segment. All of
+// these need mattx_dsm_lock, except the ones that say otherwise.
+struct mattx_dsm_master_dir *mattx_dsm_dir_lookup(u32 shmid, unsigned long page_idx); // NULL: unknown segment, or the page is beyond its end
+u64 *mattx_dsm_mask(struct mattx_dsm_master_dir *dir, unsigned long page_idx);        // the sharers of a page; NULL: nobody
+u64 *mattx_dsm_mask_get(struct mattx_dsm_master_dir *dir, unsigned long page_idx);    // creates the mask; NULL: out of memory
+void mattx_dsm_mask_clear(struct mattx_dsm_master_dir *dir, unsigned long page_idx);  // nobody shares the page any more
+int mattx_dsm_dir_register(u32 shmid, u32 home_pid, unsigned long npages);            // may sleep: NO lock held
+void mattx_dsm_dir_reap(void);                                                        // may sleep: NO lock held
+void mattx_dsm_dir_exit(void);                                                        // module unload
 
 // This defines the standard signature for all message handlers
 typedef void (*mattx_msg_handler_fn)(struct mattx_link *link, struct mattx_header *hdr, void *payload);
@@ -1614,6 +1670,15 @@ void mattx_clock_fixup_register(pid_t local_pid, s64 offset_ns, int thread_count
 bool mattx_clock_fixup_consume(pid_t local_pid, pid_t tid, s64 *out_offset_ns);
 
 void add_guest_process(pid_t local_pid, u32 orig_pid, int home_node);
+
+// DSM mapping tables of a Surrogate (mattx_guest.c): sized by the segment, freed outside the spinlocks
+int mattx_dsm_map_init(struct mattx_dsm_mapping *m, unsigned long base, u32 shmid, unsigned long size);
+void mattx_dsm_map_get(struct mattx_dsm_mapping *m);
+void mattx_dsm_map_put(struct mattx_dsm_mapping *m);
+int mattx_dsm_map_add(pid_t local_pid, struct mattx_dsm_mapping *m);
+void mattx_dsm_map_flush(struct mattx_dsm_mapping *m, u32 orig_pid, int home_node, const char *why);
+void mattx_guest_exit(void);
+
 void remove_guest_process(int index);
 
 void add_export_process(pid_t orig_pid, int target_node);
@@ -1630,6 +1695,7 @@ void mattx_hooks_exit(void);
 void mattx_sched_init_handlers(void);
 void mattx_import_init_handlers(void);
 void mattx_migr_init_handlers(void);
+void mattx_migr_exit(void); // waits for a recall that is still being served
 void mattx_guest_init_handlers(void);
 void mattx_fileio_init_handlers(void);
 void mattx_fileio_exit(void); // The Cleanup function!

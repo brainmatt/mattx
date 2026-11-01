@@ -95,8 +95,251 @@ static int mattx_vfs_rpc_wait(int slot)
 // ============================================================================
 // THE GLOBAL NODE-LOCAL MESI DIRECTORY (VM1)
 // ============================================================================
-struct mattx_dsm_master_dir mattx_global_dsm_dir[MAX_DSM_SEGMENTS];
+struct mattx_dsm_master_dir *mattx_global_dsm_dir;
+int mattx_dsm_dir_cap;
 DEFINE_SPINLOCK(mattx_dsm_lock);
+
+/*
+ * The master directory has one entry per SYSV segment, sized by the segment (npages): there is no limit on
+ * the size of a segment or on the number of segments. The array of entries grows on demand and its entries
+ * never move inside it, so an index stays valid. Everything below needs mattx_dsm_lock unless it says
+ * otherwise. The sharers of a page (a bitmap of MAX_NODES bits) are allocated lazily, one small mask per page
+ * that really is shared (xarray: page index -> u64[MAX_NODES / 64]); a bigger chunk could not be allocated
+ * under the spinlock.
+ */
+#define MATTX_DSM_MASK_WORDS (MAX_NODES / 64)
+
+// The tables of a segment; an entry that is not in_use may still hold some until the reaper frees them
+struct mattx_dsm_dir_tabs {
+    u8 *state;
+    u32 *owner;
+    struct xarray *masks;
+};
+
+// Frees the tables of a segment. May sleep: never under a spinlock.
+static void mattx_dsm_tabs_release(struct mattx_dsm_dir_tabs *t)
+{
+    if (t->masks) {
+        unsigned long idx;
+        void *entry;
+
+        xa_for_each(t->masks, idx, entry)
+            kfree(entry);
+        xa_destroy(t->masks);
+        kfree(t->masks);
+    }
+    kvfree(t->state);
+    kvfree(t->owner);
+    memset(t, 0, sizeof(*t));
+}
+
+// Takes the tables out of a directory entry (the entry keeps none)
+static void mattx_dsm_dir_detach_tabs(struct mattx_dsm_master_dir *dir, struct mattx_dsm_dir_tabs *t)
+{
+    t->state = dir->page_state;
+    t->owner = dir->page_owner_pid;
+    t->masks = dir->page_shared_mask;
+    dir->page_state = NULL;
+    dir->page_owner_pid = NULL;
+    dir->page_shared_mask = NULL;
+    dir->npages = 0;
+}
+
+// The directory of a segment, or NULL if the segment is unknown or the page is beyond its end
+struct mattx_dsm_master_dir *mattx_dsm_dir_lookup(u32 shmid, unsigned long page_idx)
+{
+    int d;
+
+    for (d = 0; d < mattx_dsm_dir_cap; d++) {
+        struct mattx_dsm_master_dir *dir = &mattx_global_dsm_dir[d];
+
+        if (dir->in_use && dir->shmid == shmid)
+            return page_idx < dir->npages ? dir : NULL;
+    }
+    return NULL;
+}
+
+// The sharers of a page, or NULL if nobody shares it
+u64 *mattx_dsm_mask(struct mattx_dsm_master_dir *dir, unsigned long page_idx)
+{
+    return xa_load(dir->page_shared_mask, page_idx);
+}
+
+// The sharers of a page; creates the mask if there is none (GFP_ATOMIC: we hold the spinlock). NULL: out of memory.
+u64 *mattx_dsm_mask_get(struct mattx_dsm_master_dir *dir, unsigned long page_idx)
+{
+    u64 *mask = xa_load(dir->page_shared_mask, page_idx);
+    void *old;
+
+    if (mask)
+        return mask;
+    mask = kzalloc(sizeof(u64) * MATTX_DSM_MASK_WORDS, GFP_ATOMIC);
+    if (!mask)
+        return NULL;
+    old = xa_store(dir->page_shared_mask, page_idx, mask, GFP_ATOMIC);
+    if (xa_is_err(old)) {
+        kfree(mask);
+        return NULL;
+    }
+    return mask;
+}
+
+// Nobody shares the page any more
+void mattx_dsm_mask_clear(struct mattx_dsm_master_dir *dir, unsigned long page_idx)
+{
+    kfree(xa_erase(dir->page_shared_mask, page_idx));
+}
+
+// Registers a segment in the directory unless it is there already. May sleep: call it without any lock.
+int mattx_dsm_dir_register(u32 shmid, u32 home_pid, unsigned long npages)
+{
+    struct mattx_dsm_dir_tabs mine = { 0 }, stale = { 0 };
+    struct mattx_dsm_master_dir *grown = NULL, *old = NULL;
+    int grown_cap = 0, slot = -1, ret = 0, d;
+    bool known = false;
+
+    if (!npages)
+        return -EINVAL;
+
+    spin_lock(&mattx_dsm_lock);
+    for (d = 0; d < mattx_dsm_dir_cap; d++) {
+        if (mattx_global_dsm_dir[d].in_use && mattx_global_dsm_dir[d].shmid == shmid) {
+            known = true;
+            break;
+        }
+    }
+    spin_unlock(&mattx_dsm_lock);
+    if (known)
+        return 0;
+
+    // The tables are sized by the segment: allocated before we take the spinlock (MATTX_PAGE_INVALID is 0)
+    mine.state = kvzalloc(npages, GFP_KERNEL);
+    mine.owner = kvcalloc(npages, sizeof(u32), GFP_KERNEL);
+    mine.masks = kmalloc(sizeof(*mine.masks), GFP_KERNEL);
+    if (!mine.state || !mine.owner || !mine.masks) {
+        ret = -ENOMEM;
+        goto out;
+    }
+    xa_init(mine.masks);
+
+    for (;;) {
+        int need = 0;
+
+        spin_lock(&mattx_dsm_lock);
+        for (d = 0; d < mattx_dsm_dir_cap; d++) {
+            if (mattx_global_dsm_dir[d].in_use && mattx_global_dsm_dir[d].shmid == shmid) {
+                slot = -2;                  // somebody registered it meanwhile
+                break;
+            }
+        }
+        if (slot == -1) {
+            for (d = 0; d < mattx_dsm_dir_cap; d++) {
+                if (!mattx_global_dsm_dir[d].in_use) {
+                    slot = d;
+                    break;
+                }
+            }
+        }
+        if (slot == -1 && grown && grown_cap > mattx_dsm_dir_cap) {
+            // No free entry: grow with the array we allocated outside the lock (the entries keep their index)
+            if (mattx_dsm_dir_cap)
+                memcpy(grown, mattx_global_dsm_dir, mattx_dsm_dir_cap * sizeof(*grown));
+            old = mattx_global_dsm_dir;
+            slot = mattx_dsm_dir_cap;
+            mattx_global_dsm_dir = grown;
+            mattx_dsm_dir_cap = grown_cap;
+            grown = NULL;
+        }
+        if (slot >= 0) {
+            struct mattx_dsm_master_dir *dir = &mattx_global_dsm_dir[slot];
+
+            mattx_dsm_dir_detach_tabs(dir, &stale);     // a reaped-later leftover of the entry
+            dir->in_use = true;
+            dir->shmid = shmid;
+            dir->home_pid = home_pid;
+            dir->npages = npages;
+            dir->sweep_pos = 0;
+            dir->page_state = mine.state;
+            dir->page_owner_pid = mine.owner;
+            dir->page_shared_mask = mine.masks;
+            memset(&mine, 0, sizeof(mine));             // the directory owns them now
+        } else if (slot == -1) {
+            need = mattx_dsm_dir_cap ? mattx_dsm_dir_cap * 2 : 8;
+        }
+        spin_unlock(&mattx_dsm_lock);
+
+        if (slot >= 0) {
+            mattx_dbg("[MESI_VM1] Dynamically registered SHMID %u in Global Directory at slot %d (%lu pages)\n", shmid, slot, npages);
+            break;
+        }
+        if (slot == -2)
+            break;
+
+        kvfree(grown);
+        grown = kvcalloc(need, sizeof(*grown), GFP_KERNEL);
+        grown_cap = need;
+        if (!grown) {
+            ret = -ENOMEM;
+            break;
+        }
+    }
+
+out:
+    kvfree(old);
+    kvfree(grown);
+    mattx_dsm_tabs_release(&stale);
+    mattx_dsm_tabs_release(&mine);      // unused if the segment was known or something failed
+    return ret;
+}
+
+// Frees the tables of the entries that are not in use any more (a destroyed segment): the garbage collector of
+// the shmctl(IPC_RMID) kprobe only clears in_use, because it must not sleep. Called by the sweeper thread.
+void mattx_dsm_dir_reap(void)
+{
+    int rounds;
+
+    for (rounds = 0; rounds < 8; rounds++) {
+        struct mattx_dsm_dir_tabs dead = { 0 };
+        int d;
+
+        spin_lock(&mattx_dsm_lock);
+        for (d = 0; d < mattx_dsm_dir_cap; d++) {
+            struct mattx_dsm_master_dir *dir = &mattx_global_dsm_dir[d];
+
+            if (!dir->in_use && dir->page_state) {
+                mattx_dsm_dir_detach_tabs(dir, &dead);
+                break;
+            }
+        }
+        spin_unlock(&mattx_dsm_lock);
+
+        if (!dead.state)
+            return;
+        mattx_dsm_tabs_release(&dead);
+    }
+}
+
+// Module unload: gives the whole directory back
+void mattx_dsm_dir_exit(void)
+{
+    struct mattx_dsm_master_dir *dirs;
+    int cap, d;
+
+    spin_lock(&mattx_dsm_lock);
+    dirs = mattx_global_dsm_dir;
+    cap = mattx_dsm_dir_cap;
+    mattx_global_dsm_dir = NULL;
+    mattx_dsm_dir_cap = 0;
+    spin_unlock(&mattx_dsm_lock);
+
+    for (d = 0; d < cap; d++) {
+        struct mattx_dsm_dir_tabs t;
+
+        mattx_dsm_dir_detach_tabs(&dirs[d], &t);
+        mattx_dsm_tabs_release(&t);
+    }
+    kvfree(dirs);
+}
 
 // --- THE HPC FAST-PATH HELPER ---
 bool is_hpc_local_lib(const char *path) {
@@ -475,69 +718,57 @@ static int mattx_fake_fsync(struct file *file, loff_t start, loff_t end, int dat
 static ssize_t mattx_fake_read(struct file *file, char __user *buf, size_t count, loff_t *pos) {
     struct mattx_fake_fd_info *fd_info = file->private_data;
     struct mattx_sys_read_req req;
-    DECLARE_WAIT_QUEUE_HEAD_ONSTACK(rpc_wq);
+    struct mattx_ticket *t;
+    struct mattx_link *link;
     pid_t my_pid = current->pid;
-    int i;
-    ssize_t ret_bytes = 0;
-    void *read_buf = NULL;
-
-    if (!fd_info || !cluster_map[fd_info->home_node]) return -EIO;
+    ssize_t ret;
 
     // Cap read size to prevent massive kmallocs on the network
     size_t to_read = min_t(size_t, count, 4096);
 
+    if (!fd_info || fd_info->home_node < 0 || fd_info->home_node >= MAX_NODES) return -EIO;
+    link = READ_ONCE(cluster_map[fd_info->home_node]);
+    if (!link) return -EIO;
+
+    // Only THIS thread waits, on its own ticket: no shared per-guest slot, no wake-up mix-ups
+    t = mattx_ticket_add(fd_info->orig_pid, fd_info->home_node, to_read);
+    if (!t) return -ENOMEM;
+
+    memset(&req, 0, sizeof(req));
     req.orig_pid = fd_info->orig_pid;
     req.fd = fd_info->remote_fd;
     req.count = to_read;
+    req.req_id = t->req_id;
 
-    // 1. Attach our wait queue to the registry
-    spin_lock(&guest_lock);
-    for (i = 0; i < guest_count; i++) {
-        if (mattx_pid_shares_tgid_with_guest(my_pid, guest_registry[i].local_pid)) {
-            guest_registry[i].rpc_wq = &rpc_wq;
-            guest_registry[i].rpc_done = false;
-            guest_registry[i].rpc_read_buf = NULL;
-            guest_registry[i].rpc_read_bytes = 0;
-            break;
-        }
+    mattx_dbg("[WORMHOLE] Surrogate %d requesting %zu bytes from FD %u (req %u). Sleeping...\n", my_pid, to_read, req.fd, req.req_id);
+
+    if (mattx_comm_send(link, MATTX_MSG_SYS_READ_REQ, &req, sizeof(req)) < 0) {
+        ret = -EIO;
+        goto out;
     }
-    spin_unlock(&guest_lock);
 
-    mattx_dbg("[WORMHOLE] Surrogate %d requesting %zu bytes from FD %u. Sleeping...\n", my_pid, to_read, req.fd);
-
-    // 2. Send the request to Node 1
-    mattx_comm_send(cluster_map[fd_info->home_node], MATTX_MSG_SYS_READ_REQ, &req, sizeof(req));
-
-    // 3. Go to sleep until Node 1 replies!
-    wait_event_interruptible(rpc_wq, check_rpc_done(my_pid));
-
-    // 4. We woke up! Collect the data from the registry
-    spin_lock(&guest_lock);
-    for (i = 0; i < guest_count; i++) {
-        if (mattx_pid_shares_tgid_with_guest(my_pid, guest_registry[i].local_pid)) {
-            read_buf = guest_registry[i].rpc_read_buf;
-            ret_bytes = guest_registry[i].rpc_read_bytes;
-            
-            guest_registry[i].rpc_wq = NULL;
-            guest_registry[i].rpc_read_buf = NULL;
-            break;
-        }
+    // Sleep until Node 1 replies. If we are interrupted (signal, freeze of a migration or recall)
+    // the wait cancels the request and still hands back the bytes if the read had already happened.
+    if (mattx_ticket_wait(t, MAX_SCHEDULE_TIMEOUT)) {
+        ret = -EINTR;
+        goto out;
     }
-    spin_unlock(&guest_lock);
 
-    // 5. Copy the data to user-space
-    if (ret_bytes > 0 && read_buf) {
-        if (copy_to_user(buf, read_buf, ret_bytes)) {
-            ret_bytes = -EFAULT;
+    ret = t->retval;
+    if (ret > 0) {
+        if (!t->data || (size_t)ret > t->data_len) {
+            ret = -EIO;
+        } else if (copy_to_user(buf, t->data, ret)) {
+            ret = -EFAULT;
         } else {
-            *pos += ret_bytes; // Advance the file position!
+            *pos += ret; // Advance the file position!
         }
     }
 
-    if (read_buf) kfree(read_buf);
-
-    mattx_dbg("[WORMHOLE] Surrogate %d woke up! Read %zd bytes.\n", my_pid, ret_bytes);
-    return ret_bytes;
+out:
+    mattx_dbg("[WORMHOLE] Surrogate %d woke up! Read %zd bytes (req %u).\n", my_pid, ret, req.req_id);
+    mattx_ticket_del(t);
+    return ret;
 }
 
 static ssize_t mattx_fake_write(struct file *file, const char __user *buf, size_t count, loff_t *pos) {
@@ -1012,14 +1243,13 @@ static void handle_sys_close_req(struct mattx_link *link, struct mattx_header *h
 /*
  * READ_REQ (the IPC Wormhole read: pipe / FIFO / socket / eventfd / proxy fds)
  *
- * This used to run kernel_read() inline in the per-link receiver kthread. kernel_read() on an
- * empty pipe, socket or eventfd BLOCKS until data arrives, and while the receiver kthread sleeps
- * nothing else from that node is dispatched, not even the forwarded write that would unblock it:
- * a classic deadlock (the receiver-thread stall). Like the other data-plane requests, a read now
- * runs in its own kworker; the receiver only copies the request and returns.
- *
- * Known limit (the thread-wait conversion fixes it): a blocked read has no cancel path yet. If the
- * Surrogate dies or is recalled meanwhile, the kworker keeps waiting and may swallow the next bytes.
+ * Runs in its own kworker (a blocking read must never run in the per-link receiver kthread, see
+ * the receiver-thread stall) and is CANCELLABLE: the Surrogate thread that asked sleeps on its own
+ * ticket (mattx_ticket_wait) and, when it is interrupted (signal, or the freeze of a migration or
+ * recall), sends MATTX_MSG_SYS_REQ_CANCEL. Every request gets exactly ONE reply:
+ *   - the real result, if the read had already happened (the bytes are never thrown away), or
+ *   - -EINTR, if the cancel came first and nothing was consumed.
+ * So a recalled Surrogate can no longer leave an orphan kworker behind that swallows the next bytes.
  */
 struct mattx_read_kworker_ctx {
     struct work_struct work;
@@ -1027,20 +1257,88 @@ struct mattx_read_kworker_ctx {
     int target_node;
 };
 
+static atomic_t mattx_cancellable_inflight = ATOMIC_INIT(0);   // cancellable kworkers (read, recvfrom, ...) that still run
+static bool mattx_cancellable_stopping;                        // set by mattx_fileio_exit()
+
+static bool mattx_req_take_cancelled(int sender, u32 orig_pid, u32 req_id);
+
+/*
+ * Reads up to count bytes from a Deputy file for a Surrogate without ever blocking where the
+ * Surrogate's CANCEL cannot reach us: wait for readiness (poll) in short sleeps, checking for a
+ * cancel / unload / lost link on every round, then do ONE plain read. Files without ->poll
+ * (regular files) and O_NONBLOCK files cannot block for long: they get the plain read at once.
+ * Returns the bytes read, 0 (EOF) or -errno; -EINTR means "cancelled, nothing was consumed".
+ * *abandoned is set when nobody is left to answer (module unloading, link gone).
+ */
+static ssize_t mattx_read_cancellable(struct file *file, struct task_struct *deputy, void *buf, size_t count,
+                                      loff_t *pos, int sender, u32 orig_pid, u32 req_id, bool *abandoned)
+{
+    const struct cred *old_cred = NULL;
+    unsigned long delay_us = 200;
+    unsigned long deadline = 0;
+    bool timed = false;
+    ssize_t ret;
+
+    if (file->f_op && file->f_op->poll && !(file->f_flags & O_NONBLOCK)) {
+        struct socket *sock = sock_from_file(file);
+
+        // SO_RCVTIMEO of a socket is honoured, like the plain read of a socket would
+        if (sock && sock->sk && READ_ONCE(sock->sk->sk_rcvtimeo) != MAX_SCHEDULE_TIMEOUT) {
+            deadline = jiffies + READ_ONCE(sock->sk->sk_rcvtimeo);
+            timed = true;
+        }
+
+        for (;;) {
+            __poll_t mask;
+
+            if (mattx_req_take_cancelled(sender, orig_pid, req_id)) {
+                mattx_dbg("[WORMHOLE] READ for PID %u req %u cancelled by the Surrogate, nothing consumed\n", orig_pid, req_id);
+                return -EINTR;
+            }
+            if (READ_ONCE(mattx_cancellable_stopping) || !READ_ONCE(cluster_map[sender])) {
+                *abandoned = true;
+                return -EINTR;
+            }
+
+            mask = vfs_poll(file, NULL);
+            if (mask & (EPOLLIN | EPOLLRDNORM | EPOLLRDHUP | EPOLLHUP | EPOLLERR))
+                break;      // data, EOF or an error is waiting: the read below returns at once
+            if (timed && time_after(jiffies, deadline))
+                return -EAGAIN;
+
+            usleep_range(delay_us, delay_us + delay_us / 2);    // 0.2 ms ... ~10 ms
+            if (delay_us < 10000)
+                delay_us *= 2;
+        }
+    }
+
+    if (deputy) {
+        if (deputy->mm) kthread_use_mm(deputy->mm);
+        old_cred = override_creds(deputy->cred);
+    }
+    ret = kernel_read(file, buf, count, pos);
+    if (deputy) {
+        revert_creds(old_cred);
+        if (deputy->mm) kthread_unuse_mm(deputy->mm);
+    }
+    return ret;
+}
+
 static void mattx_read_kworker(struct work_struct *work) {
     struct mattx_read_kworker_ctx *ctx = container_of(work, struct mattx_read_kworker_ctx, work);
     struct mattx_sys_read_req *req = &ctx->req;
-    struct mattx_sys_read_reply fail = { .orig_pid = req->orig_pid };
+    struct mattx_sys_read_reply fail = { .orig_pid = req->orig_pid, .req_id = req->req_id };
     struct mattx_sys_read_reply *reply = NULL;
     struct task_struct *deputy = NULL;
     struct file *file = NULL;
     struct mattx_link *link;
+    bool abandoned = false;
     // Both senders (mattx_fake_read and the rpc worker) cap a READ_REQ at 4096 bytes as well
     size_t count = min_t(size_t, req->count, 4096);
     ssize_t ret = -EBADF;
     int i;
 
-    mattx_dbg("[WORMHOLE] Received READ request for FD %u from Node %d. Reading from Deputy (kworker)...\n", req->fd, ctx->target_node);
+    mattx_dbg("[WORMHOLE] Received READ request for FD %u (req %u) from Node %d. Reading from Deputy (kworker)...\n", req->fd, req->req_id, ctx->target_node);
 
     if (req->fd >= 1000) {
         int slot = req->fd - 1000;
@@ -1072,8 +1370,7 @@ static void mattx_read_kworker(struct work_struct *work) {
                 }
                 spin_unlock(&files->file_lock);
             }
-            // The Deputy reference is kept until we are done with deputy->mm and deputy->cred below
-            // (the inline version dropped it right here and then kept using the pointer).
+            // The Deputy reference is kept until we are done with deputy->mm and deputy->cred
         }
     }
 
@@ -1081,21 +1378,10 @@ static void mattx_read_kworker(struct work_struct *work) {
         reply = kmalloc(sizeof(*reply) + count, GFP_KERNEL);
         if (reply) {
             loff_t pos = file->f_pos;
-            const struct cred *old_cred = NULL;
 
-            if (deputy) {
-                if (deputy->mm) kthread_use_mm(deputy->mm);
-                old_cred = override_creds(deputy->cred);
-            }
-
-            // Reads straight into the reply buffer (may block: that is why we are a kworker)
-            ret = kernel_read(file, reply->data, count, &pos);
-
-            if (deputy) {
-                revert_creds(old_cred);
-                if (deputy->mm) kthread_unuse_mm(deputy->mm);
-            }
-
+            // Reads straight into the reply buffer; may wait, but can be cancelled
+            ret = mattx_read_cancellable(file, deputy, reply->data, count, &pos,
+                                         ctx->target_node, req->orig_pid, req->req_id, &abandoned);
             if (ret >= 0) {
                 file->f_pos = pos;
             }
@@ -1107,10 +1393,11 @@ static void mattx_read_kworker(struct work_struct *work) {
     if (deputy) put_task_struct(deputy);
 
     link = READ_ONCE(cluster_map[ctx->target_node]);
-    if (!link) {
-        mattx_dbg("[WORMHOLE] READ for FD %u: link to Node %d is gone, reply dropped\n", req->fd, ctx->target_node);
+    if (abandoned || !link) {
+        mattx_dbg("[WORMHOLE] READ for FD %u (req %u): nobody left to answer, reply dropped\n", req->fd, req->req_id);
     } else if (reply) {
         reply->orig_pid = req->orig_pid;
+        reply->req_id = req->req_id;
         reply->bytes_read = ret;
         reply->error = (ret < 0) ? ret : 0;
         mattx_comm_send(link, MATTX_MSG_SYS_READ_REPLY, reply, sizeof(*reply) + (ret > 0 ? ret : 0));
@@ -1123,12 +1410,14 @@ static void mattx_read_kworker(struct work_struct *work) {
 
     if (reply) kfree(reply);
     kfree(ctx);
+    atomic_dec(&mattx_cancellable_inflight);
 }
 
 static void handle_sys_read_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
     struct mattx_read_kworker_ctx *ctx;
 
     if (!payload || hdr->length < sizeof(struct mattx_sys_read_req)) return;
+    if (hdr->sender_id >= MAX_NODES || READ_ONCE(mattx_cancellable_stopping)) return;
 
     ctx = kmalloc(sizeof(*ctx), GFP_ATOMIC);
     if (!ctx) {
@@ -1138,10 +1427,30 @@ static void handle_sys_read_req(struct mattx_link *link, struct mattx_header *hd
     INIT_WORK(&ctx->work, mattx_read_kworker);
     memcpy(&ctx->req, payload, sizeof(ctx->req));
     ctx->target_node = hdr->sender_id;
+    atomic_inc(&mattx_cancellable_inflight);
     schedule_work(&ctx->work);
 }
 
 static void handle_sys_read_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    // A reply that carries a ticket id belongs to exactly one waiting thread (mattx_ticket_*).
+    // req_id 0 is the legacy reply (pread64): it still goes through the per-guest slot below.
+    if (payload && hdr->length >= sizeof(struct mattx_sys_read_reply) &&
+        ((struct mattx_sys_read_reply *)payload)->req_id) {
+        struct mattx_sys_read_reply *reply = (struct mattx_sys_read_reply *)payload;
+        size_t datalen = hdr->length - sizeof(*reply);
+        long retval = reply->bytes_read;
+
+        if (retval > 0 && (size_t)retval > datalen)
+            retval = -EIO;      // the reply claims more bytes than it carries
+
+        mattx_dbg("[RPC] Received READ_REPLY for Orig PID %u req %u. Bytes read: %zd\n",
+                  reply->orig_pid, reply->req_id, reply->bytes_read);
+        if (!mattx_ticket_complete(hdr->sender_id, reply->orig_pid, reply->req_id, retval,
+                                   reply->data, retval > 0 ? retval : 0))
+            mattx_dbg("[RPC] READ_REPLY req %u: nobody waits for it any more, dropped\n", reply->req_id);
+        return;
+    }
+
     if (payload) {
         struct mattx_sys_read_reply *reply = (struct mattx_sys_read_reply *)payload;
         int i;
@@ -1534,85 +1843,162 @@ static void handle_sys_bind_req(struct mattx_link *link, struct mattx_header *hd
 }
 
 // --- DATA PLANE: CONNECT (Kworker Native Injector & Smart Waiter) ---
+/*
+ * CONNECT_REQ (connect() on a socket that lives on the home node)
+ *
+ * Same contract as the wormhole read, recvfrom and accept: its own kworker, CANCELLABLE, exactly ONE
+ * reply (req_id echoed): the real result, or -EINTR when the Surrogate's CANCEL came first.
+ *
+ * kernel_connect() is only ever called with O_NONBLOCK, so it never sleeps where the CANCEL cannot
+ * reach us. The waiting is done here, on the socket's own wait queue (the state change of the
+ * handshake wakes it, like sk_state_change of any socket), and the blocking semantics are the
+ * application's, like the kernel's own connect():
+ *   - an O_NONBLOCK socket returns -EINPROGRESS at once and the handshake runs on,
+ *   - SO_SNDTIMEO of the socket is honoured (-EINPROGRESS when it expires, the handshake runs on),
+ *   - a cancel returns -EINTR and does NOT abort the handshake: a repeated connect() then answers
+ *     -EALREADY / 0 / -EISCONN natively (exactly what the kernel does after a signal).
+ * The old 50 ms poll loop (no timeout, no cancel) is gone.
+ */
 struct mattx_connect_kworker_ctx {
     struct work_struct work;
     struct mattx_sys_connect_req req;
     int target_node;
 };
 
+// Connects without ever blocking in kernel_connect(). 0: connected. -EINPROGRESS: non-blocking socket /
+// SO_SNDTIMEO expired. -EINTR: cancelled, or nobody is left to answer (*abandoned: unload, link gone).
+// Other: the real error of the connect or of the handshake.
+static int mattx_connect_cancellable(struct socket *sock, struct file *file, struct sockaddr_storage *addr,
+                                     int addrlen, int sender, u32 orig_pid, u32 req_id, bool *abandoned)
+{
+    bool nonblock = file->f_flags & O_NONBLOCK;
+    long sndtimeo = nonblock ? 0 : READ_ONCE(sock->sk->sk_sndtimeo);
+    bool timed = !nonblock && sndtimeo != MAX_SCHEDULE_TIMEOUT;
+    unsigned long deadline = jiffies + sndtimeo;
+    bool connecting = false;
+    DEFINE_WAIT_FUNC(wait, woken_wake_function);
+    int err;
+
+    // On the wait queue BEFORE the first look, so that no wake-up can slip between look and sleep
+    add_wait_queue(sk_sleep(sock->sk), &wait);
+
+    for (;;) {
+        // 1. Look: never blocks
+        if (!connecting) {
+            err = kernel_connect(sock, MATTX_SA_CAST(addr), addrlen, O_NONBLOCK);
+            mattx_dbg("[KWORKER] Executed kernel_connect natively. Result: %d (NonBlock: %d)\n", err, nonblock);
+            if (err == -EINPROGRESS) {
+                // The handshake is under way: from now on we only wait for its end
+                connecting = true;
+                if (!nonblock)
+                    mattx_dbg("[CONNECT_DEBUG] Blocking connect returned -EINPROGRESS. Waiting for the handshake...\n");
+            } else if (err == -EAGAIN && !nonblock && sock->sk->sk_family == AF_UNIX) {
+                // The listener's backlog is full: a blocking connect() waits for room. Try again below.
+            } else {
+                break;                          // connected (0) or a real error
+            }
+        } else {
+            __poll_t mask = vfs_poll(file, NULL);
+
+            if (mask & (EPOLLOUT | EPOLLERR | EPOLLHUP)) {
+                mattx_dbg("[CONNECT_DEBUG] Socket handshake complete! Leaving the wait.\n");
+                // Check the final socket error state to see if the handshake succeeded!
+                err = -sock_error(sock->sk);    // sock_error() returns positive: we need negative
+                mattx_dbg("[CONNECT_DEBUG] Final handshake result: %d\n", err);
+                break;
+            }
+        }
+
+        // 2. Not connected yet
+        if (nonblock)
+            break;                              // err stays -EINPROGRESS
+        if (timed && time_after(jiffies, deadline))
+            break;                              // err stays -EINPROGRESS (-EAGAIN for a full AF_UNIX backlog)
+        if (mattx_req_take_cancelled(sender, orig_pid, req_id)) {
+            mattx_dbg("[WORMHOLE] CONNECT for PID %u req %u cancelled by the Surrogate, handshake keeps running\n", orig_pid, req_id);
+            err = -EINTR;
+            break;
+        }
+        if (READ_ONCE(mattx_cancellable_stopping) || !READ_ONCE(cluster_map[sender])) {
+            *abandoned = true;
+            err = -EINTR;
+            break;
+        }
+
+        // 3. Sleep until the socket wakes us (or 10 ms, or the SO_SNDTIMEO deadline)
+        {
+            long to = msecs_to_jiffies(10);
+
+            if (timed && (long)(deadline - jiffies) < to)
+                to = (long)(deadline - jiffies) > 0 ? (long)(deadline - jiffies) : 1;
+            wait_woken(&wait, TASK_INTERRUPTIBLE, to);
+        }
+    }
+
+    remove_wait_queue(sk_sleep(sock->sk), &wait);
+    return err;
+}
+
 static void mattx_connect_kworker(struct work_struct *work) {
     struct mattx_connect_kworker_ctx *ctx = container_of(work, struct mattx_connect_kworker_ctx, work);
     struct mattx_sys_connect_reply reply;
     struct file *file = mattx_get_remote_file(ctx->req.orig_pid, ctx->req.fd);
+    struct mattx_link *link;
+    bool abandoned = false;
     int err = -EBADF;
 
     memset(&reply, 0, sizeof(reply));
     reply.orig_pid = ctx->req.orig_pid;
+    reply.req_id = ctx->req.req_id;
+
+    mattx_dbg("[WORMHOLE] Received CONNECT request for FD %u (req %u) from Node %d (kworker)...\n", ctx->req.fd, ctx->req.req_id, ctx->target_node);
 
     if (file) {
         struct socket *sock = sock_from_file(file);
-        if (sock) {
-            bool is_nonblock = (file->f_flags & O_NONBLOCK) != 0;
-            
-            // Execute natively!
-            err = kernel_connect(sock, MATTX_SA_CAST(&ctx->req.addr), ctx->req.addrlen, file->f_flags);
-            mattx_dbg("[KWORKER] Executed kernel_connect natively. Result: %d (NonBlock: %d)\n", err, is_nonblock);
-            
-            // --- THE SMART CONNECTOR WAIT LOOP ---
-            // If it's a blocking socket and the TCP handshake is in progress, we wait right here!
-            if (err == -EINPROGRESS && !is_nonblock) {
-                mattx_dbg("[CONNECT_DEBUG] Blocking connect returned -EINPROGRESS. Entering poll loop...\n");
-                
-                while (1) {
-                    struct poll_wqueues table;
-                    poll_initwait(&table);
-                    __poll_t mask = vfs_poll(file, &table.pt);
-                    
-                    if (mask & (EPOLLOUT | EPOLLERR | EPOLLHUP)) {
-                        mattx_dbg("[CONNECT_DEBUG] Socket handshake complete! Breaking poll loop.\n");
-                        poll_freewait(&table);
-                        break;
-                    }
-                    
-                    schedule_timeout_interruptible(msecs_to_jiffies(50));
-                    poll_freewait(&table);
-                }
-                
-                // Check the final socket error state to see if the handshake succeeded!
-                if (sock->sk) {
-                    err = sock_error(sock->sk);
-                    if (err) err = -err; // sock_error returns positive, we need negative!
-                    mattx_dbg("[CONNECT_DEBUG] Final handshake result: %d\n", err);
-                } else {
-                    err = -ENOTSOCK;
-                }
-            }
-        } else {
+
+        if (!sock || !sock->sk) {
             err = -ENOTSOCK;
+        } else if (ctx->req.addrlen < 0 || (size_t)ctx->req.addrlen > sizeof(ctx->req.addr)) {
+            err = -EINVAL;
+        } else {
+            err = mattx_connect_cancellable(sock, file, &ctx->req.addr, ctx->req.addrlen,
+                                            ctx->target_node, ctx->req.orig_pid, ctx->req.req_id, &abandoned);
         }
         fput(file);
     }
 
     reply.error = err;
-    if (cluster_map[ctx->target_node]) {
-        mattx_comm_send(cluster_map[ctx->target_node], MATTX_MSG_SYS_CONNECT_REPLY, &reply, sizeof(reply));
+
+    link = READ_ONCE(cluster_map[ctx->target_node]);
+    if (abandoned || !link) {
+        mattx_dbg("[WORMHOLE] CONNECT for FD %u (req %u): nobody left to answer, reply dropped\n", ctx->req.fd, ctx->req.req_id);
+    } else {
+        mattx_comm_send(link, MATTX_MSG_SYS_CONNECT_REPLY, &reply, sizeof(reply));
     }
+
     kfree(ctx);
+    atomic_dec(&mattx_cancellable_inflight);
 }
 
 static void handle_sys_connect_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
-    if (payload) {
-        struct mattx_sys_connect_req *req = payload;
-        struct mattx_connect_kworker_ctx *ctx = kmalloc(sizeof(*ctx), GFP_ATOMIC);
-        if (ctx) {
-            INIT_WORK(&ctx->work, mattx_connect_kworker);
-            memcpy(&ctx->req, req, sizeof(*req));
-            ctx->target_node = hdr->sender_id;
-            
-            mattx_dbg("[RPC] Dispatching CONNECT_REQ to Kworker...\n");
-            schedule_work(&ctx->work);
-        }
+    struct mattx_sys_connect_req *req = payload;
+    struct mattx_connect_kworker_ctx *ctx;
+
+    if (!payload || hdr->length < sizeof(*req)) return;
+    if (hdr->sender_id >= MAX_NODES || READ_ONCE(mattx_cancellable_stopping)) return;
+
+    ctx = kmalloc(sizeof(*ctx), GFP_ATOMIC);
+    if (!ctx) {
+        printk(KERN_ERR "MattX:[WORMHOLE] CONNECT_REQ dropped: out of memory\n");
+        return;
     }
+    INIT_WORK(&ctx->work, mattx_connect_kworker);
+    memcpy(&ctx->req, req, sizeof(*req));
+    ctx->target_node = hdr->sender_id;
+
+    mattx_dbg("[RPC] Dispatching CONNECT_REQ to Kworker...\n");
+    atomic_inc(&mattx_cancellable_inflight);
+    schedule_work(&ctx->work);
 }
 
 
@@ -1740,6 +2126,19 @@ static void handle_sys_socket_reply(struct mattx_link *link, struct mattx_header
 }
 
 static void handle_sys_connect_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    // A reply that carries a ticket id belongs to exactly one waiting thread (mattx_ticket_*).
+    // req_id 0 is the legacy reply of the SIGSTOP fallback path: it goes through the slot below.
+    if (payload && hdr->length >= sizeof(struct mattx_sys_connect_reply) &&
+        ((struct mattx_sys_connect_reply *)payload)->req_id) {
+        struct mattx_sys_connect_reply *reply = (struct mattx_sys_connect_reply *)payload;
+
+        mattx_dbg("[RPC] Received CONNECT_REPLY for Orig PID %u req %u. Error: %d\n", reply->orig_pid, reply->req_id, reply->error);
+        // Nothing to clean up if the thread gave up: a connected socket simply stays connected on the home node
+        if (!mattx_ticket_complete(hdr->sender_id, reply->orig_pid, reply->req_id, reply->error, NULL, 0))
+            mattx_dbg("[RPC] CONNECT_REPLY req %u: nobody waits for it any more, dropped\n", reply->req_id);
+        return;
+    }
+
     if (payload) {
         struct mattx_sys_connect_reply *reply = (struct mattx_sys_connect_reply *)payload;
         int i;
@@ -1903,33 +2302,127 @@ static void handle_sys_send_req(struct mattx_link *link, struct mattx_header *hd
 
 
 // === DATA PLANE: RECVFROM ===
+/*
+ * RECV_REQ (recv()/recvfrom() on a socket that lives on the home node)
+ *
+ * Same contract as the wormhole read: the request runs in its own kworker, is CANCELLABLE, and gets
+ * exactly ONE reply (req_id echoed): the real result (bytes that were received are never thrown
+ * away) or -EINTR when the Surrogate's CANCEL came first and nothing was consumed.
+ *
+ * The socket is only ever read with MSG_DONTWAIT; the waiting is done here, so the blocking
+ * semantics are the application's, not the kworker's:
+ *   - MSG_DONTWAIT, or an O_NONBLOCK socket: -EAGAIN at once when nothing is queued. The kernel's own
+ *     recvfrom() adds the O_NONBLOCK of the file, kernel_recvmsg() does not: the old code BLOCKED
+ *     the kworker for a non-blocking socket.
+ *   - SO_RCVTIMEO is honoured (-EAGAIN when it expires).
+ *   - MSG_WAITALL is honoured for stream sockets (a cancel or an error after some bytes returns them).
+ * The wait sleeps on the socket's own wait queue (sk_sleep, like sk_wait_data): data, EOF and errors
+ * wake us at once, and a 10 ms ceiling looks at cancel / unload / lost link.
+ */
 struct mattx_recvfrom_kworker_ctx {
     struct work_struct work;
     u32 orig_pid;
+    u32 req_id;
     int fd;
     size_t size;
     int flags;
     int target_node;
 };
 
+// Returns the bytes received (for MSG_TRUNC on a datagram: its real length), 0 (EOF) or -errno;
+// -EINTR: cancelled, nothing consumed. *abandoned: nobody is left to answer (unload, link gone).
+static ssize_t mattx_recv_cancellable(struct socket *sock, struct file *file, void *buf, size_t size, int flags,
+                                      int sender, u32 orig_pid, u32 req_id, bool *abandoned)
+{
+    bool nonblock = (flags & MSG_DONTWAIT) || (file->f_flags & O_NONBLOCK);
+    bool waitall = (flags & MSG_WAITALL) && !(flags & MSG_PEEK) && sock->type == SOCK_STREAM;
+    long rcvtimeo = nonblock ? 0 : READ_ONCE(sock->sk->sk_rcvtimeo);
+    bool timed = !nonblock && rcvtimeo != MAX_SCHEDULE_TIMEOUT;
+    unsigned long deadline = jiffies + rcvtimeo;
+    DEFINE_WAIT_FUNC(wait, woken_wake_function);
+    size_t total = 0;
+    ssize_t result;
+    ssize_t ret;
+
+    // On the wait queue BEFORE the first look, so that no wake-up can slip between look and sleep
+    add_wait_queue(sk_sleep(sock->sk), &wait);
+
+    for (;;) {
+        struct msghdr msg = {0};
+        struct kvec iov = { .iov_base = buf + total, .iov_len = size - total };
+
+        // 1. Look: never blocks
+        ret = kernel_recvmsg(sock, &msg, &iov, 1, size - total, (flags & ~MSG_WAITALL) | MSG_DONTWAIT);
+        if (ret > 0) {
+            if ((size_t)ret > size - total) {   // MSG_TRUNC: the real length of a datagram
+                result = ret;
+                goto out;
+            }
+            total += ret;
+            if (!waitall || total >= size) {
+                result = total;
+                goto out;
+            }
+            continue;                           // MSG_WAITALL: more, right away
+        }
+        if (ret != -EAGAIN) {                   // EOF (0) or a real error: bytes in hand win
+            result = total ? (ssize_t)total : ret;
+            goto out;
+        }
+
+        // 2. Nothing (more) queued right now
+        if (nonblock || (timed && time_after(jiffies, deadline))) {
+            result = total ? (ssize_t)total : -EAGAIN;
+            goto out;
+        }
+        if (mattx_req_take_cancelled(sender, orig_pid, req_id)) {
+            mattx_dbg("[WORMHOLE] RECV for PID %u req %u cancelled by the Surrogate (%zu bytes in hand)\n", orig_pid, req_id, total);
+            result = total ? (ssize_t)total : -EINTR;
+            goto out;
+        }
+        if (READ_ONCE(mattx_cancellable_stopping) || !READ_ONCE(cluster_map[sender])) {
+            *abandoned = true;
+            result = -EINTR;
+            goto out;
+        }
+
+        // 3. Sleep until the socket wakes us (or 10 ms, or the SO_RCVTIMEO deadline)
+        {
+            long to = msecs_to_jiffies(10);
+
+            if (timed && (long)(deadline - jiffies) < to)
+                to = (long)(deadline - jiffies) > 0 ? (long)(deadline - jiffies) : 1;
+            wait_woken(&wait, TASK_INTERRUPTIBLE, to);
+        }
+    }
+
+out:
+    remove_wait_queue(sk_sleep(sock->sk), &wait);
+    return result;
+}
+
 static void mattx_recvfrom_kworker(struct work_struct *work) {
     struct mattx_recvfrom_kworker_ctx *ctx = container_of(work, struct mattx_recvfrom_kworker_ctx, work);
+    struct mattx_sys_recv_reply fail = { .orig_pid = ctx->orig_pid, .req_id = ctx->req_id };
+    struct mattx_sys_recv_reply *reply = NULL;
     struct file *file = mattx_get_remote_file(ctx->orig_pid, ctx->fd);
-    int ret = -EBADF;
-    void *recv_buf = NULL;
+    struct mattx_link *link;
+    // The Surrogate asks for at most 4096 bytes per request as well
+    size_t count = min_t(size_t, ctx->size, 4096);
+    bool abandoned = false;
+    ssize_t ret = -EBADF;
+
+    mattx_dbg("[WORMHOLE] Received RECV request for FD %d (req %u) from Node %d (kworker)...\n", ctx->fd, ctx->req_id, ctx->target_node);
 
     if (file) {
         struct socket *sock = sock_from_file(file);
-        if (sock) {
-            recv_buf = kmalloc(ctx->size, GFP_KERNEL);
-            if (recv_buf) {
-                struct msghdr msg = {0};
-                struct kvec iov;
-                iov.iov_base = recv_buf;
-                iov.iov_len = ctx->size;
-                
-                // Execute the recv natively in the Kworker!
-                ret = kernel_recvmsg(sock, &msg, &iov, 1, ctx->size, ctx->flags);
+        if (sock && sock->sk) {
+            reply = kmalloc(sizeof(*reply) + count, GFP_KERNEL);
+            if (reply) {
+                memset(reply, 0, sizeof(*reply));
+                // Receives straight into the reply buffer; may wait, but can be cancelled
+                ret = mattx_recv_cancellable(sock, file, reply->data, count, ctx->flags,
+                                             ctx->target_node, ctx->orig_pid, ctx->req_id, &abandoned);
             } else {
                 ret = -ENOMEM;
             }
@@ -1939,43 +2432,72 @@ static void mattx_recvfrom_kworker(struct work_struct *work) {
         fput(file);
     }
 
-    size_t reply_size = sizeof(struct mattx_sys_recv_reply) + (ret > 0 ? ret : 0);
-    struct mattx_sys_recv_reply *reply = kzalloc(reply_size, GFP_KERNEL);
-    if (reply) {
+    link = READ_ONCE(cluster_map[ctx->target_node]);
+    if (abandoned || !link) {
+        mattx_dbg("[WORMHOLE] RECV for FD %d (req %u): nobody left to answer, reply dropped\n", ctx->fd, ctx->req_id);
+    } else if (reply) {
+        // Only what fits travels (bytes_recv may be bigger: MSG_TRUNC)
+        size_t n = ret > 0 ? min_t(size_t, ret, count) : 0;
+
         reply->orig_pid = ctx->orig_pid;
+        reply->req_id = ctx->req_id;
         reply->bytes_recv = ret;
         reply->error = (ret < 0) ? ret : 0;
-        if (ret > 0 && recv_buf) {
-            memcpy(reply->data, recv_buf, ret);
-        }
-        if (cluster_map[ctx->target_node]) {
-            mattx_comm_send(cluster_map[ctx->target_node], MATTX_MSG_SYS_RECV_REPLY, reply, reply_size);
-        }
-        kfree(reply);
+        mattx_comm_send(link, MATTX_MSG_SYS_RECV_REPLY, reply, sizeof(*reply) + n);
+    } else {
+        // No such socket (-EBADF / -ENOTSOCK) or out of memory: still answer, the Surrogate is waiting!
+        fail.bytes_recv = ret;
+        fail.error = ret;
+        mattx_comm_send(link, MATTX_MSG_SYS_RECV_REPLY, &fail, sizeof(fail));
     }
-    if (recv_buf) kfree(recv_buf);
+
+    kfree(reply);
     kfree(ctx);
+    atomic_dec(&mattx_cancellable_inflight);
 }
 
 static void handle_sys_recv_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
-    if (payload) {
-        struct mattx_sys_recv_req *req = payload;
-        struct mattx_recvfrom_kworker_ctx *ctx = kmalloc(sizeof(*ctx), GFP_ATOMIC);
-        if (ctx) {
-            INIT_WORK(&ctx->work, mattx_recvfrom_kworker);
-            ctx->orig_pid = req->orig_pid;
-            ctx->fd = req->fd;
-            ctx->size = req->size;
-            ctx->flags = req->flags;
-            ctx->target_node = hdr->sender_id;
-            
-            schedule_work(&ctx->work); // Dispatch to the Data Plane!
-        }
+    struct mattx_sys_recv_req *req = payload;
+    struct mattx_recvfrom_kworker_ctx *ctx;
+
+    if (!payload || hdr->length < sizeof(*req)) return;
+    if (hdr->sender_id >= MAX_NODES || READ_ONCE(mattx_cancellable_stopping)) return;
+
+    ctx = kmalloc(sizeof(*ctx), GFP_ATOMIC);
+    if (!ctx) {
+        printk(KERN_ERR "MattX:[WORMHOLE] RECV_REQ dropped: out of memory\n");
+        return;
     }
+    INIT_WORK(&ctx->work, mattx_recvfrom_kworker);
+    ctx->orig_pid = req->orig_pid;
+    ctx->req_id = req->req_id;
+    ctx->fd = req->fd;
+    ctx->size = req->size;
+    ctx->flags = req->flags;
+    ctx->target_node = hdr->sender_id;
+    atomic_inc(&mattx_cancellable_inflight);
+    schedule_work(&ctx->work); // Dispatch to the Data Plane!
 }
 
 
 static void handle_sys_recv_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    // A reply that carries a ticket id belongs to exactly one waiting thread (mattx_ticket_*).
+    // req_id 0 is the legacy reply of the SIGSTOP fallback path: it goes through the slot below.
+    if (payload && hdr->length >= sizeof(struct mattx_sys_recv_reply) &&
+        ((struct mattx_sys_recv_reply *)payload)->req_id) {
+        struct mattx_sys_recv_reply *reply = (struct mattx_sys_recv_reply *)payload;
+        size_t datalen = hdr->length - sizeof(*reply);
+        long retval = reply->bytes_recv;
+        // MSG_TRUNC: retval is the real length of a datagram, only what fitted travelled with it
+        size_t n = retval > 0 ? min_t(size_t, retval, datalen) : 0;
+
+        mattx_dbg("[RPC] Received RECV_REPLY for Orig PID %u req %u. Bytes recv: %zd\n",
+                  reply->orig_pid, reply->req_id, reply->bytes_recv);
+        if (!mattx_ticket_complete(hdr->sender_id, reply->orig_pid, reply->req_id, retval, reply->data, n))
+            mattx_dbg("[RPC] RECV_REPLY req %u: nobody waits for it any more, dropped\n", reply->req_id);
+        return;
+    }
+
     if (payload) {
         struct mattx_sys_recv_reply *reply = (struct mattx_sys_recv_reply *)payload;
         int i;
@@ -2013,11 +2535,75 @@ static void handle_sys_recv_reply(struct mattx_link *link, struct mattx_header *
 
 
 // --- DATA PLANE: ACCEPT4 (Kworker Native Injector) ---
+/*
+ * ACCEPT_REQ (accept()/accept4() on a listening socket that lives on the home node)
+ *
+ * Same contract as the wormhole read and recvfrom: its own kworker, CANCELLABLE, exactly ONE reply
+ * (req_id echoed): the real result - an accepted connection is never thrown away - or -EINTR when the
+ * Surrogate's CANCEL came first and nothing was accepted.
+ *
+ * kernel_accept() is only ever called with O_NONBLOCK, the waiting is done here, on the listening
+ * socket's own wait queue (a new connection wakes it, like sk_data_ready of any socket), so the
+ * blocking semantics are the application's:
+ *   - an O_NONBLOCK listening socket returns -EAGAIN at once when no connection is pending,
+ *   - SO_RCVTIMEO of the listening socket is honoured (-EAGAIN), like the kernel's own accept().
+ * (The SOCK_NONBLOCK / SOCK_CLOEXEC of accept4() belong to the NEW socket, see below.)
+ */
 struct mattx_accept_kworker_ctx {
     struct work_struct work;
     struct mattx_sys_accept_req req;
     int target_node;
 };
+
+// Waits for a pending connection of the listening socket. 0: *newsock is the accepted socket.
+// -EAGAIN: non-blocking socket / SO_RCVTIMEO expired. -EINTR: cancelled (nothing was accepted), or
+// nobody is left to answer (*abandoned: unload, link gone). Other: a real error of kernel_accept().
+static int mattx_accept_cancellable(struct socket *sock, struct file *file, struct socket **newsock,
+                                    int sender, u32 orig_pid, u32 req_id, bool *abandoned)
+{
+    bool nonblock = file->f_flags & O_NONBLOCK;
+    long rcvtimeo = nonblock ? 0 : READ_ONCE(sock->sk->sk_rcvtimeo);
+    bool timed = !nonblock && rcvtimeo != MAX_SCHEDULE_TIMEOUT;
+    unsigned long deadline = jiffies + rcvtimeo;
+    DEFINE_WAIT_FUNC(wait, woken_wake_function);
+    int err;
+
+    // On the wait queue BEFORE the first look, so that no wake-up can slip between look and sleep
+    add_wait_queue(sk_sleep(sock->sk), &wait);
+
+    for (;;) {
+        // 1. Look: never blocks
+        err = kernel_accept(sock, newsock, O_NONBLOCK);
+        if (err != -EAGAIN)
+            break;                              // a connection (0) or a real error
+
+        // 2. No connection pending right now
+        if (nonblock || (timed && time_after(jiffies, deadline)))
+            break;                              // err stays -EAGAIN
+        if (mattx_req_take_cancelled(sender, orig_pid, req_id)) {
+            mattx_dbg("[WORMHOLE] ACCEPT for PID %u req %u cancelled by the Surrogate, nothing accepted\n", orig_pid, req_id);
+            err = -EINTR;
+            break;
+        }
+        if (READ_ONCE(mattx_cancellable_stopping) || !READ_ONCE(cluster_map[sender])) {
+            *abandoned = true;
+            err = -EINTR;
+            break;
+        }
+
+        // 3. Sleep until the listening socket wakes us (or 10 ms, or the SO_RCVTIMEO deadline)
+        {
+            long to = msecs_to_jiffies(10);
+
+            if (timed && (long)(deadline - jiffies) < to)
+                to = (long)(deadline - jiffies) > 0 ? (long)(deadline - jiffies) : 1;
+            wait_woken(&wait, TASK_INTERRUPTIBLE, to);
+        }
+    }
+
+    remove_wait_queue(sk_sleep(sock->sk), &wait);
+    return err;
+}
 
 static void mattx_accept_kworker(struct work_struct *work) {
     struct mattx_accept_kworker_ctx *ctx = container_of(work, struct mattx_accept_kworker_ctx, work);
@@ -2027,25 +2613,29 @@ static void mattx_accept_kworker(struct work_struct *work) {
     struct socket *newsock = NULL;
     struct file *newfile = NULL;
     struct task_struct *deputy = NULL;
+    struct mattx_link *link;
+    bool abandoned = false;
     int remote_fd = -1;
     int err = -EBADF;
 
     memset(&reply, 0, sizeof(reply));
     reply.orig_pid = ctx->req.orig_pid;
+    reply.req_id = ctx->req.req_id;
+
+    mattx_dbg("[WORMHOLE] Received ACCEPT request for FD %u (req %u) from Node %d (kworker)...\n", ctx->req.fd, ctx->req.req_id, ctx->target_node);
 
     if (file) {
         sock = sock_from_file(file);
-        if (sock) {
-            // 1. Use kernel_accept to do the heavy lifting!
-            // The flags passed to kernel_accept are the O_NONBLOCK from the listening socket's file
-            int accept_flags = file->f_flags & O_NONBLOCK;
-            err = kernel_accept(sock, &newsock, accept_flags);
-            
+        if (sock && sock->sk) {
+            // 1. Wait for a connection, cancellable. Never blocks inside kernel_accept().
+            err = mattx_accept_cancellable(sock, file, &newsock, ctx->target_node,
+                                           ctx->req.orig_pid, ctx->req.req_id, &abandoned);
+
             if (err == 0 && newsock) {
                 // 2. Map accept4 flags (SOCK_NONBLOCK, SOCK_CLOEXEC) to file flags
                 int file_flags = ctx->req.flags & (O_CLOEXEC | O_NONBLOCK);
                 newfile = sock_alloc_file(newsock, file_flags, NULL);
-                
+
                 if (IS_ERR(newfile)) {
                     err = PTR_ERR(newfile);
                     sock_release(newsock);
@@ -2069,14 +2659,14 @@ static void mattx_accept_kworker(struct work_struct *work) {
                         }
                         spin_unlock(&deputy->files->file_lock);
                     }
-                    
+
                     if (remote_fd == -1) {
                         fput(newfile);
                         err = -ENFILE;
                     } else {
                         err = 0;
                         mattx_dbg("[KWORKER] Successfully injected accepted socket into Deputy Native FD: %d\n", remote_fd);
-                        
+
                         // 3. Extract the peer name (client IP) natively!
                         if (newsock->ops && newsock->ops->getname) {
                             int len = newsock->ops->getname(newsock, (struct sockaddr *)&reply.addr, 2); // 2 = peer
@@ -2097,31 +2687,64 @@ static void mattx_accept_kworker(struct work_struct *work) {
     reply.remote_fd = remote_fd;
     reply.error = err;
 
-    if (cluster_map[ctx->target_node]) {
-        mattx_comm_send(cluster_map[ctx->target_node], MATTX_MSG_SYS_ACCEPT_REPLY, &reply, sizeof(reply));
+    link = READ_ONCE(cluster_map[ctx->target_node]);
+    if (abandoned || !link) {
+        mattx_dbg("[WORMHOLE] ACCEPT for FD %u (req %u): nobody left to answer, reply dropped\n", ctx->req.fd, ctx->req.req_id);
+    } else {
+        mattx_comm_send(link, MATTX_MSG_SYS_ACCEPT_REPLY, &reply, sizeof(reply));
     }
 
     kfree(ctx);
+    atomic_dec(&mattx_cancellable_inflight);
 }
 
 static void handle_sys_accept_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
-    if (payload) {
-        struct mattx_sys_accept_req *req = payload;
-        struct mattx_accept_kworker_ctx *ctx = kmalloc(sizeof(*ctx), GFP_ATOMIC);
-        
-        if (ctx) {
-            INIT_WORK(&ctx->work, mattx_accept_kworker);
-            memcpy(&ctx->req, req, sizeof(*req));
-            ctx->target_node = hdr->sender_id;
-            
-            mattx_dbg("[RPC] Dispatching ACCEPT_REQ to Kworker...\n");
-            schedule_work(&ctx->work);
-        }
+    struct mattx_sys_accept_req *req = payload;
+    struct mattx_accept_kworker_ctx *ctx;
+
+    if (!payload || hdr->length < sizeof(*req)) return;
+    if (hdr->sender_id >= MAX_NODES || READ_ONCE(mattx_cancellable_stopping)) return;
+
+    ctx = kmalloc(sizeof(*ctx), GFP_ATOMIC);
+    if (!ctx) {
+        printk(KERN_ERR "MattX:[WORMHOLE] ACCEPT_REQ dropped: out of memory\n");
+        return;
     }
+    INIT_WORK(&ctx->work, mattx_accept_kworker);
+    memcpy(&ctx->req, req, sizeof(*req));
+    ctx->target_node = hdr->sender_id;
+
+    mattx_dbg("[RPC] Dispatching ACCEPT_REQ to Kworker...\n");
+    atomic_inc(&mattx_cancellable_inflight);
+    schedule_work(&ctx->work);
 }
 
 
 static void handle_sys_accept_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    // A reply that carries a ticket id belongs to exactly one waiting thread (mattx_ticket_*).
+    // req_id 0 is the legacy reply of the SIGSTOP fallback path: it goes through the slot below.
+    if (payload && hdr->length >= sizeof(struct mattx_sys_accept_reply) &&
+        ((struct mattx_sys_accept_reply *)payload)->req_id) {
+        struct mattx_sys_accept_reply *reply = (struct mattx_sys_accept_reply *)payload;
+        // The ticket's result is the new remote FD, or -errno; the peer address travels as its data
+        long retval = reply->error ? reply->error : reply->remote_fd;
+        size_t alen = (reply->error == 0 && reply->addrlen > 0 && reply->addrlen <= sizeof(reply->addr)) ? reply->addrlen : 0;
+
+        mattx_dbg("[RPC] Received ACCEPT_REPLY for Orig PID %u req %u. New Remote FD: %d, error %d\n",
+                  reply->orig_pid, reply->req_id, reply->remote_fd, reply->error);
+        if (!mattx_ticket_complete(hdr->sender_id, reply->orig_pid, reply->req_id, retval, &reply->addr, alen)) {
+            mattx_dbg("[RPC] ACCEPT_REPLY req %u: nobody waits for it any more\n", reply->req_id);
+            // The thread gave up for good (dead link, killed) and nobody will ever claim the connection
+            // the home node accepted for it: close the orphaned FD there instead of leaking it.
+            if (reply->error == 0 && reply->remote_fd >= 0) {
+                struct mattx_sys_close_req close_req = { .orig_pid = reply->orig_pid, .remote_fd = reply->remote_fd };
+
+                mattx_comm_send(link, MATTX_MSG_SYS_CLOSE_REQ, &close_req, sizeof(close_req));
+            }
+        }
+        return;
+    }
+
     if (payload) {
         struct mattx_sys_accept_reply *reply = (struct mattx_sys_accept_reply *)payload;
         int i;
@@ -2162,168 +2785,271 @@ static void handle_sys_accept_reply(struct mattx_link *link, struct mattx_header
 
 
 // --- THE TRUE POLL WORKER (Stack Diet Edition) ---
-static void mattx_poll_worker(struct work_struct *work) {
-    struct mattx_rpc_work *rpc = container_of(work, struct mattx_rpc_work, work);
-    struct mattx_sys_poll_reply *reply;
-    struct file **poll_files;
+/*
+ * POLL_REQ (poll(), and select()/pselect6() translated to poll, on files that live on the home node)
+ *
+ * Same contract as the wormhole read, recvfrom, accept and connect: its own kworker, CANCELLABLE,
+ * exactly ONE reply (req_id echoed): the real result, or -EINTR when the Surrogate's CANCEL came first.
+ *
+ * The wait is event-driven like the kernel's own do_poll(): the files are resolved ONCE and held for the
+ * whole wait, the poll table registers this kworker on the wait queue of every file in the first round
+ * and the kworker sleeps until one of them wakes it. The sleep is capped at 10 ms so that the cancel, the
+ * unload and the lost-link checks still run. The timeout is the application's: 0 is one round, < 0 is
+ * infinite, > 0 is a deadline.
+ *
+ * Requests with a ticket (req_id != 0: poll(), select() and pselect6()) report like native poll(): POLLERR,
+ * POLLHUP (and POLLNVAL for an FD that does not exist) are always reported, whether asked for or not; the
+ * Surrogate maps them to what its syscall reports. Only the SIGSTOP fallback (req_id 0) keeps the old "only
+ * what was asked for" mask, because its events translation expects exactly that.
+ */
+struct mattx_poll_kworker_ctx {
+    struct work_struct work;
+    struct mattx_sys_poll_req req;
+    int target_node;
+};
+
+// The Deputy is alive as long as its entry exists in the export registry
+static bool mattx_poll_deputy_alive(u32 orig_pid)
+{
+    bool alive = false;
     int i;
-    unsigned long expire;
-    bool has_timeout = (rpc->timeout >= 0);
-    
-    // --- THE STACK DIET FIX ---
-    // Move large structs off the kernel stack and onto the heap!
-    reply = kzalloc(sizeof(*reply), GFP_KERNEL);
-    poll_files = kcalloc(16, sizeof(struct file *), GFP_KERNEL);
 
-    if (!reply || !poll_files) {
-        if (reply) kfree(reply);
-        if (poll_files) kfree(poll_files);
-        kfree(rpc);
-        return;
+    spin_lock(&export_lock);
+    for (i = 0; i < export_count; i++) {
+        if (export_registry[i].orig_pid == orig_pid) {
+            alive = true;
+            break;
+        }
     }
+    spin_unlock(&export_lock);
+    return alive;
+}
 
-    reply->orig_pid = rpc->orig_pid;
-    reply->nfds = rpc->nfds;
-    memcpy(reply->fds, rpc->poll_fds, sizeof(struct mattx_pollfd) * rpc->nfds);
+/*
+ * The state of one poll wait. struct poll_wqueues alone is ~0.8 KB (it carries the inline poll table
+ * entries) and the reply is ~0.3 KB: together they must not live on a kworker's stack (frame size).
+ */
+struct mattx_poll_state {
+    struct poll_wqueues table;
+    struct file *files[16];
+    struct mattx_sys_poll_reply reply;
+};
 
-    mattx_dbg("[RPC] Poll Worker started for Deputy PID %u (Timeout: %dms)\n", rpc->orig_pid, rpc->timeout);
+// Always answer: a failed allocation used to leave the Surrogate waiting forever. noinline_for_stack: the
+// reply on this function's stack is only paid for in the (rare) case that it is needed.
+static noinline_for_stack void mattx_poll_answer_nomem(struct mattx_poll_kworker_ctx *ctx)
+{
+    struct mattx_sys_poll_reply fail;
+    struct mattx_link *link;
 
-    if (has_timeout) {
-        expire = jiffies + msecs_to_jiffies(rpc->timeout);
-    }
+    memset(&fail, 0, sizeof(fail));
+    fail.orig_pid = ctx->req.orig_pid;
+    fail.req_id = ctx->req.req_id;
+    fail.error = -ENOMEM;
+    link = READ_ONCE(cluster_map[ctx->target_node]);
+    if (link)
+        mattx_comm_send(link, MATTX_MSG_SYS_POLL_REPLY, &fail, sizeof(fail));
+}
+
+// The wait: fills st->reply (revents, retval or error). *abandoned: nobody is left to answer (unload, link gone).
+static noinline_for_stack void mattx_poll_wait(struct mattx_poll_kworker_ctx *ctx, struct mattx_poll_state *st,
+                                               bool *abandoned)
+{
+    struct mattx_sys_poll_req *req = &ctx->req;
+    struct mattx_sys_poll_reply *reply = &st->reply;
+    struct poll_wqueues *table = &st->table;
+    bool timed = (req->timeout >= 0);
+    unsigned long expire = 0;
+    // A ticketed request reports like native poll(): POLLERR/POLLHUP/POLLNVAL are always reported
+    __poll_t always = req->req_id ? (EPOLLERR | EPOLLHUP | EPOLLNVAL) : 0;
+    int nfds = reply->nfds;
+    int j;
+
+    if (timed)
+        expire = jiffies + msecs_to_jiffies(req->timeout);
+
+    poll_initwait(table);
 
     // --- THE WAIT QUEUE LOOP ---
-    while (1) {
+    for (;;) {
         int ready_count = 0;
-        bool deputy_alive = false;
-        
-        // Clear the poll_files array for this iteration
-        memset(poll_files, 0, 16 * sizeof(struct file *));
 
-// 1. Check if the Deputy is still alive and grab the files!
-        spin_lock(&export_lock);
-        for (i = 0; i < export_count; i++) {
-            if (export_registry[i].orig_pid == rpc->orig_pid) {
-                deputy_alive = true;
-                
-                // Standard poll logic (No more epoll Master Watch List!)
-                for (int j = 0; j < rpc->nfds; j++) {
-                    int remote_fd = reply->fds[j].fd;
-                    if (remote_fd >= 1000) {
-                        int slot = remote_fd - 1000;
-                        if (slot < MAX_FDS && export_registry[i].remote_files[slot]) {
-                            poll_files[j] = export_registry[i].remote_files[slot];
-                            get_file(poll_files[j]); 
-                        }
-                    }
-                }
-                break;
-            }
-        }
-        spin_unlock(&export_lock);
-
-        if (!deputy_alive || READ_ONCE(mattx_unloading)) {
+        if (!mattx_poll_deputy_alive(req->orig_pid)) {
             reply->error = -ESRCH;
             break;
         }
 
-        // 2. Do the actual polling SAFELY OUTSIDE the spinlock!
-        for (int j = 0; j < rpc->nfds; j++) {
-            int remote_fd = reply->fds[j].fd;
-            struct file *f = poll_files[j];
-            struct task_struct *deputy = NULL;
+        // 1. Look: never blocks. The first round registers us on every file's wait queue.
+        for (j = 0; j < nfds; j++) {
+            struct file *f = st->files[j];
+            short events = reply->fds[j].events;
+            __poll_t mask = 0;
 
-            if (!f && remote_fd >= 0 && remote_fd < 1000) {
-                rcu_read_lock();
-                deputy = pid_task(find_vpid(rpc->orig_pid), PIDTYPE_PID);
-                if (deputy) get_task_struct(deputy);
-                rcu_read_unlock();
-
-                if (deputy) {
-                    struct files_struct *files = deputy->files;
-                    if (files) {
-                        spin_lock(&files->file_lock);
-                        struct fdtable *fdt = files_fdtable(files);
-                        if (remote_fd < fdt->max_fds) {
-                            f = rcu_dereference_raw(fdt->fd[remote_fd]);
-                            if (f) get_file(f);
-                        }
-                        spin_unlock(&files->file_lock);
-                    }
-                    put_task_struct(deputy);
-                }
-            }
+            reply->fds[j].revents = 0;
+            if (reply->fds[j].fd < 0)
+                continue;                               // a negative FD is ignored, like native poll()
 
             if (f) {
-                struct poll_wqueues table;
-                poll_initwait(&table);
-                
-                __poll_t mask = vfs_poll(f, &table.pt);
-                
-                if (rpc->is_epoll_wait) {
-                    mattx_dbg("[EPOLL_DEBUG] Polled FD %d. Mask returned: %x. Looking for: %x\n", 
-                           remote_fd, mask, reply->fds[j].events);
-                }
-                
-                reply->fds[j].revents = mask & reply->fds[j].events;
-                if (reply->fds[j].revents) {
-                    ready_count++;
-                }
-                
-                poll_freewait(&table);
-                fput(f); 
+                // What is reported: what was asked for, plus POLLERR/POLLHUP for a ticketed (native) poll()
+                __poll_t keep = (__poll_t)(u16)events | always;
+
+                table->pt._key = (__poll_t)(u16)events | EPOLLERR | EPOLLHUP;
+                mask = vfs_poll(f, &table->pt) & keep;
             } else {
-                if (rpc->is_epoll_wait) mattx_dbg("[EPOLL_DEBUG] ERROR: Could not find struct file for FD %d!\n", remote_fd);
+                mask = always & EPOLLNVAL;              // no such FD
             }
+
+            reply->fds[j].revents = mask;
+            if (mask)
+                ready_count++;
         }
+        table->pt._qproc = NULL;                        // registered: the next rounds only look
 
         if (ready_count > 0) {
             reply->retval = ready_count;
             break;
         }
-
-        if (has_timeout && time_after(jiffies, expire)) {
-            reply->retval = 0; 
+        if (table->error) {
+            reply->error = table->error;
             break;
         }
 
-        // Sleep for a tiny fraction of a second to let the CPU breathe, 
-        // but rely on the poll_table to catch the events!
-        schedule_timeout_interruptible(msecs_to_jiffies(10));
+        // 2. Nothing ready
+        if (timed && time_after_eq(jiffies, expire)) {
+            reply->retval = 0;
+            break;
+        }
+        if (mattx_req_take_cancelled(ctx->target_node, req->orig_pid, req->req_id)) {
+            mattx_dbg("[RPC] POLL for PID %u req %u cancelled by the Surrogate\n", req->orig_pid, req->req_id);
+            reply->error = -EINTR;
+            break;
+        }
+        if (READ_ONCE(mattx_cancellable_stopping) || !READ_ONCE(cluster_map[ctx->target_node])) {
+            *abandoned = true;
+            break;
+        }
+
+        // 3. Sleep until one of the files wakes us (or 10 ms, or the deadline)
+        {
+            long to = msecs_to_jiffies(10);
+
+            if (timed && (long)(expire - jiffies) < to)
+                to = (long)(expire - jiffies) > 0 ? (long)(expire - jiffies) : 1;
+
+            set_current_state(TASK_INTERRUPTIBLE);
+            if (!READ_ONCE(table->triggered))
+                schedule_timeout(to);
+            __set_current_state(TASK_RUNNING);
+            smp_store_mb(table->triggered, 0);
+        }
     }
 
-    if (cluster_map[rpc->home_node]) {
-        mattx_dbg("[RPC] Sending POLL_REPLY (Ready: %d) back to Node %u...\n", reply->retval, rpc->home_node);
+    poll_freewait(table);
+}
+
+static void mattx_poll_kworker(struct work_struct *work) {
+    struct mattx_poll_kworker_ctx *ctx = container_of(work, struct mattx_poll_kworker_ctx, work);
+    struct mattx_sys_poll_req *req = &ctx->req;
+    struct mattx_poll_state *st;
+    struct mattx_sys_poll_reply *reply;
+    struct mattx_link *link;
+    bool abandoned = false;
+    int nfds = req->nfds;
+    int j;
+
+    // --- THE STACK DIET FIX ---
+    // Move large structs off the kernel stack and onto the heap!
+    st = kzalloc(sizeof(*st), GFP_KERNEL);
+    if (!st) {
+        mattx_poll_answer_nomem(ctx);
+        goto out_ctx;
+    }
+    reply = &st->reply;
+
+    reply->orig_pid = req->orig_pid;
+    reply->req_id = req->req_id;
+
+    if (nfds < 0 || nfds > 16) {
+        reply->error = -EINVAL;
+        goto answer;
+    }
+    reply->nfds = nfds;
+    memcpy(reply->fds, req->fds, sizeof(struct mattx_pollfd) * nfds);
+
+    mattx_dbg("[RPC] Poll Worker started for Deputy PID %u (req %u, Timeout: %dms)\n", req->orig_pid, req->req_id, req->timeout);
+
+    // The files are resolved once and held for the whole wait, like the fdget() of the native poll()
+    for (j = 0; j < nfds; j++) {
+        int remote_fd = reply->fds[j].fd;
+
+        reply->fds[j].revents = 0;
+        if (remote_fd >= 0)
+            st->files[j] = mattx_get_remote_file(req->orig_pid, remote_fd);
+    }
+
+    mattx_poll_wait(ctx, st, &abandoned);
+
+    for (j = 0; j < nfds; j++) {
+        if (st->files[j])
+            fput(st->files[j]);
+    }
+
+answer:
+    link = READ_ONCE(cluster_map[ctx->target_node]);
+    if (abandoned || !link) {
+        mattx_dbg("[RPC] POLL for PID %u (req %u): nobody left to answer, reply dropped\n", req->orig_pid, req->req_id);
+    } else {
+        mattx_dbg("[RPC] Sending POLL_REPLY (Ready: %d, error %d, req %u) back to Node %d...\n", reply->retval, reply->error, req->req_id, ctx->target_node);
         // POLL_REPLY is data, not a droppable control message: mattx_comm_send_ctrl() uses mutex_trylock and
         // silently drops the message when the send mutex is busy. The Surrogate then waits forever (poll
         // with an infinite timeout). A kworker may simply wait for the mutex.
-        mattx_comm_send(cluster_map[rpc->home_node], MATTX_MSG_SYS_POLL_REPLY, reply, sizeof(*reply));
+        mattx_comm_send(link, MATTX_MSG_SYS_POLL_REPLY, reply, sizeof(*reply));
     }
-    
-    kfree(reply);
-    kfree(poll_files);
-    kfree(rpc);
+    kfree(st);
+
+out_ctx:
+    kfree(ctx);
+    atomic_dec(&mattx_cancellable_inflight);
 }
 
 
 static void handle_sys_poll_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
-    if (payload) {
-        struct mattx_sys_poll_req *req = (struct mattx_sys_poll_req *)payload;
-        
-        struct mattx_rpc_work *rpc = kmalloc(sizeof(*rpc), GFP_ATOMIC);
-        if (rpc) {
-            INIT_WORK(&rpc->work, mattx_poll_worker);
-            rpc->orig_pid = req->orig_pid;
-            rpc->home_node = hdr->sender_id;
-            rpc->nfds = req->nfds;
-            rpc->timeout = req->timeout;
-            memcpy(rpc->poll_fds, req->fds, sizeof(struct mattx_pollfd) * req->nfds);
-            mattx_queue_wait_work(&rpc->work);
-        }
+    struct mattx_sys_poll_req *req = (struct mattx_sys_poll_req *)payload;
+    struct mattx_poll_kworker_ctx *ctx;
+
+    if (!payload || hdr->length < sizeof(*req)) return;
+    if (hdr->sender_id >= MAX_NODES || READ_ONCE(mattx_cancellable_stopping)) return;
+
+    ctx = kmalloc(sizeof(*ctx), GFP_ATOMIC);
+    if (!ctx) {
+        printk(KERN_ERR "MattX:[RPC] POLL_REQ dropped: out of memory\n");
+        return;
     }
+    INIT_WORK(&ctx->work, mattx_poll_kworker);
+    memcpy(&ctx->req, req, sizeof(*req));
+    ctx->target_node = hdr->sender_id;
+
+    atomic_inc(&mattx_cancellable_inflight);
+    schedule_work(&ctx->work);
 }
 
 static void handle_sys_poll_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    // A reply that carries a ticket id belongs to exactly one waiting thread (mattx_ticket_*).
+    // req_id 0 is the legacy reply (the SIGSTOP fallback of poll, select and pselect6): it goes through the slot below.
+    if (payload && hdr->length >= sizeof(struct mattx_sys_poll_reply) &&
+        ((struct mattx_sys_poll_reply *)payload)->req_id) {
+        struct mattx_sys_poll_reply *reply = (struct mattx_sys_poll_reply *)payload;
+        // The ticket's result is the number of ready entries, or -errno; the revents travel as its data
+        long retval = reply->error ? reply->error : reply->retval;
+        size_t dlen = (reply->error == 0 && reply->nfds > 0 && reply->nfds <= 16) ? reply->nfds * sizeof(struct mattx_pollfd) : 0;
+
+        mattx_dbg("[RPC] Received POLL_REPLY for Orig PID %u req %u. Ready FDs: %d, error %d\n",
+                  reply->orig_pid, reply->req_id, reply->retval, reply->error);
+        if (!mattx_ticket_complete(hdr->sender_id, reply->orig_pid, reply->req_id, retval, reply->fds, dlen))
+            mattx_dbg("[RPC] POLL_REPLY req %u: nobody waits for it any more, dropped\n", reply->req_id);
+        return;
+    }
+
     if (payload) {
         struct mattx_sys_poll_reply *reply = (struct mattx_sys_poll_reply *)payload;
         int i;
@@ -2456,7 +3182,7 @@ static void mattx_epoll_ctl_cb(struct callback_head *cb) {
     struct pt_regs *task_regs = task_pt_regs(current); // We are the Deputy!
     struct pt_regs regs;
     int ret = -EFAULT;
-    struct mattx_sys_connect_reply reply; 
+    struct mattx_sys_bind_reply reply;  // {orig_pid, error} for handle_sys_generic_int_reply (not the connect reply: it carries a req_id now)
 
     // --- THE USER-SPACE SCRATCHPAD HACK ---
     // x86_64 has a 128-byte "red zone" below the stack pointer.
@@ -2597,9 +3323,104 @@ static bool mattx_epoll_is_cancelled(int sender, u32 orig_pid, u32 req_id)
 }
 
 
+// --- Home side: generic CANCEL registry (ticket-based requests, MATTX_MSG_SYS_REQ_CANCEL) ---
+// A Surrogate thread that gives up on a proxied request (signal, freeze for a migration or recall)
+// names it by (its node, orig_pid, req_id). The kworker serving the request polls this list.
+struct mattx_req_cancelled {
+    struct list_head node;
+    int sender;         // Surrogate node: req_id is a per-node counter
+    u32 orig_pid;
+    u32 req_id;
+    unsigned long when;
+};
+static LIST_HEAD(mattx_req_cancelled_list);
+static DEFINE_SPINLOCK(mattx_req_cancelled_lock);
+static int mattx_req_cancelled_count;
+#define MATTX_REQ_CANCELLED_MAX 256
+#define MATTX_REQ_CANCELLED_TTL (60 * HZ)
+
+// Caller holds mattx_req_cancelled_lock. The list is in arrival order: oldest entries first.
+static void mattx_req_cancelled_expire_locked(void)
+{
+    struct mattx_req_cancelled *c;
+
+    while (!list_empty(&mattx_req_cancelled_list)) {
+        c = list_first_entry(&mattx_req_cancelled_list, struct mattx_req_cancelled, node);
+        if (mattx_req_cancelled_count <= MATTX_REQ_CANCELLED_MAX &&
+            !time_after(jiffies, c->when + MATTX_REQ_CANCELLED_TTL))
+            break;
+        list_del(&c->node);
+        kfree(c);
+        mattx_req_cancelled_count--;
+    }
+}
+
+// True (and the entry is consumed) if the Surrogate cancelled this request
+static bool mattx_req_take_cancelled(int sender, u32 orig_pid, u32 req_id)
+{
+    struct mattx_req_cancelled *c, *tmp;
+    bool hit = false;
+
+    spin_lock(&mattx_req_cancelled_lock);
+    mattx_req_cancelled_expire_locked();
+    list_for_each_entry_safe(c, tmp, &mattx_req_cancelled_list, node) {
+        if (c->sender == sender && c->orig_pid == orig_pid && c->req_id == req_id) {
+            list_del(&c->node);
+            kfree(c);
+            mattx_req_cancelled_count--;
+            hit = true;
+            break;
+        }
+    }
+    spin_unlock(&mattx_req_cancelled_lock);
+    return hit;
+}
+
+static void handle_sys_req_cancel(struct mattx_link *link, struct mattx_header *hdr, void *payload)
+{
+    struct mattx_sys_req_cancel *cancel = payload;
+    struct mattx_req_cancelled *c;
+
+    if (!payload || hdr->length < sizeof(*cancel)) return;
+
+    c = kmalloc(sizeof(*c), GFP_KERNEL);
+    if (!c) {
+        printk(KERN_ERR "MattX:[RPC] CANCEL for PID %u req %u dropped: out of memory\n", cancel->orig_pid, cancel->req_id);
+        return;
+    }
+    c->sender = hdr->sender_id;
+    c->orig_pid = cancel->orig_pid;
+    c->req_id = cancel->req_id;
+    c->when = jiffies;
+
+    spin_lock(&mattx_req_cancelled_lock);
+    list_add_tail(&c->node, &mattx_req_cancelled_list);
+    mattx_req_cancelled_count++;
+    mattx_req_cancelled_expire_locked();
+    spin_unlock(&mattx_req_cancelled_lock);
+
+    mattx_dbg("[RPC] CANCEL from Node %d for PID %u req %u\n", hdr->sender_id, cancel->orig_pid, cancel->req_id);
+}
+
+static void mattx_req_cancelled_purge(void)
+{
+    struct mattx_req_cancelled *c, *tmp;
+
+    spin_lock(&mattx_req_cancelled_lock);
+    list_for_each_entry_safe(c, tmp, &mattx_req_cancelled_list, node) {
+        list_del(&c->node);
+        kfree(c);
+    }
+    mattx_req_cancelled_count = 0;
+    spin_unlock(&mattx_req_cancelled_lock);
+}
+
+
 void mattx_epoll_cancelled_purge(void)
 {
     struct mattx_epoll_cancelled *c, *tmp;
+
+    mattx_req_cancelled_purge();    // the generic CANCEL registry goes with the epoll one
 
     spin_lock(&mattx_epoll_cancelled_lock);
     list_for_each_entry_safe(c, tmp, &mattx_epoll_cancelled_list, node) {
@@ -2639,6 +3460,131 @@ void mattx_epoll_pending_del(struct mattx_epoll_pending *p)
     spin_unlock(&mattx_epoll_pending_lock);
     kfree(p->events);
     kfree(p);
+}
+
+
+/*
+ * THE TICKET (Surrogate side): one proxied request that exactly ONE thread waits for.
+ *
+ * Only the calling thread sleeps (the other threads of the process keep running, which they must:
+ * one of them is usually what makes the call return), and the reply finds its waiter by req_id
+ * instead of through a slot that is shared by the whole process. The syscall-specific parts stay
+ * flat and per syscall (own _req/_reply, task_work function, reply handler and home kworker); only
+ * this small skeleton is shared: id, list, completion, result and an optional data buffer.
+ */
+static LIST_HEAD(mattx_ticket_list);
+static DEFINE_SPINLOCK(mattx_ticket_lock);
+static atomic_t mattx_ticket_seq = ATOMIC_INIT(0);
+
+// How long an interrupted thread waits for the home node's final answer to its CANCEL. The home
+// kworkers look at their cancel flag every few ms, so this only matters if the home node is dead.
+#define MATTX_TICKET_CANCEL_WAIT (5 * HZ)
+
+struct mattx_ticket *mattx_ticket_add(u32 orig_pid, int home_node, size_t data_cap)
+{
+    struct mattx_ticket *t = kzalloc(sizeof(*t), GFP_KERNEL);
+    u32 id;
+
+    if (!t)
+        return NULL;
+    do {
+        id = (u32)atomic_inc_return(&mattx_ticket_seq);
+    } while (!id);              // 0 is reserved: "no ticket" (legacy replies)
+    t->orig_pid = orig_pid;
+    t->home_node = home_node;
+    t->req_id = id;
+    t->data_cap = data_cap;
+    init_completion(&t->done);
+    spin_lock(&mattx_ticket_lock);
+    list_add_tail(&t->node, &mattx_ticket_list);
+    spin_unlock(&mattx_ticket_lock);
+    return t;
+}
+
+void mattx_ticket_del(struct mattx_ticket *t)
+{
+    if (!t)
+        return;
+    spin_lock(&mattx_ticket_lock);
+    list_del_init(&t->node);
+    spin_unlock(&mattx_ticket_lock);
+    kfree(t->data);
+    kfree(t);
+}
+
+// Reply handler side. False if nobody waits for this reply any more (the waiter gave up).
+bool mattx_ticket_complete(int home_node, u32 orig_pid, u32 req_id, long retval, const void *data, size_t len)
+{
+    struct mattx_ticket *t;
+    void *copy = NULL;
+    bool found = false;
+
+    if (data && len) {
+        copy = kmemdup(data, len, GFP_KERNEL);
+        if (!copy)
+            retval = -ENOMEM;
+    }
+
+    spin_lock(&mattx_ticket_lock);
+    list_for_each_entry(t, &mattx_ticket_list, node) {
+        if (t->req_id == req_id && t->orig_pid == orig_pid && t->home_node == home_node) {
+            if (copy && len > t->data_cap) {    // more than the waiter asked for: protocol error
+                kfree(copy);
+                copy = NULL;
+                retval = -EIO;
+            }
+            kfree(t->data);
+            t->data = copy;
+            t->data_len = copy ? len : 0;
+            copy = NULL;                        // now owned by the ticket
+            t->retval = retval;
+            complete(&t->done);
+            found = true;
+            break;
+        }
+    }
+    spin_unlock(&mattx_ticket_lock);
+
+    kfree(copy);                                // nobody waits: drop it
+    return found;
+}
+
+/*
+ * Waits for the reply. 0: the reply is in (t->retval, t->data). The wait is interruptible so that a
+ * signal, or the freeze that precedes a migration or recall (a task_work), can always stop the
+ * thread. Then the home node is told to finish the request (MATTX_MSG_SYS_REQ_CANCEL) and we wait,
+ * bounded and killable, for its FINAL answer: either the real result (the request had already
+ * completed, e.g. the bytes a read consumed: they are never thrown away) or -EINTR (cancelled, nothing
+ * consumed). -EINTR: no reply could be obtained at all (dying task, lost link, dead home node).
+ * A timeout (MAX_SCHEDULE_TIMEOUT = none) that elapses is handled like an interruption.
+ */
+int mattx_ticket_wait(struct mattx_ticket *t, long timeout)
+{
+    struct mattx_sys_req_cancel cancel = { .orig_pid = t->orig_pid, .req_id = t->req_id };
+    struct mattx_link *link;
+    long rc;
+
+    rc = wait_for_completion_interruptible_timeout(&t->done, timeout);
+    if (rc > 0)
+        return 0;
+
+    if (t->home_node < 0 || t->home_node >= MAX_NODES)
+        return -EINTR;
+    link = READ_ONCE(cluster_map[t->home_node]);    // we may have slept for a very long time
+    if (!link) {
+        mattx_dbg("[RPC] PID %u req %u: link to node %d is gone, CANCEL not sent\n", t->orig_pid, t->req_id, t->home_node);
+        return -EINTR;
+    }
+    if (mattx_comm_send(link, MATTX_MSG_SYS_REQ_CANCEL, &cancel, sizeof(cancel)) < 0) {
+        mattx_dbg("[RPC] PID %u req %u: CANCEL send failed\n", t->orig_pid, t->req_id);
+        return -EINTR;
+    }
+
+    rc = wait_for_completion_killable_timeout(&t->done, MATTX_TICKET_CANCEL_WAIT);
+    if (rc > 0)
+        return 0;
+    mattx_dbg("[RPC] PID %u req %u: no answer to the CANCEL, giving up\n", t->orig_pid, t->req_id);
+    return -EINTR;
 }
 
 
@@ -3566,7 +4512,7 @@ static void mattx_pread64_kworker(struct work_struct *work) {
     size_t reply_size = sizeof(struct mattx_sys_read_reply) + (ret_bytes > 0 ? ret_bytes : 0);
     struct mattx_sys_read_reply *reply = kmalloc(reply_size, GFP_KERNEL);
     if (reply) {
-        reply->orig_pid = ctx->req.orig_pid; reply->bytes_read = ret_bytes; reply->error = (ret_bytes < 0) ? ret_bytes : 0;
+        reply->orig_pid = ctx->req.orig_pid; reply->req_id = 0; reply->bytes_read = ret_bytes; reply->error = (ret_bytes < 0) ? ret_bytes : 0;
         if (ret_bytes > 0) memcpy(reply->data, read_buf, ret_bytes);
         if (cluster_map[ctx->target_node]) mattx_comm_send(cluster_map[ctx->target_node], MATTX_MSG_SYS_PREAD64_REPLY, reply, reply_size);
         kfree(reply);
@@ -4001,6 +4947,16 @@ static void handle_sys_pipe2_reply(struct mattx_link *link, struct mattx_header 
 // THE DSM TRIPWIRE (VM2 PAGE FAULT HANDLER)
 // ============================================================================
 
+// VM2: is this offset inside the tables of its mapping (one entry per page of the segment)?
+static inline bool mattx_dsm_page_ok(u32 shmid, unsigned long offset, unsigned long npages)
+{
+    if (likely(offset / PAGE_SIZE < npages))
+        return true;
+    pr_err_ratelimited("MattX:[DSM] SHMID %u: offset %lu is beyond the end of the mapping (%lu pages): access refused\n",
+                       shmid, offset, npages);
+    return false;
+}
+
 static vm_fault_t mattx_dsm_fault(struct vm_fault *vmf) {
     struct vm_area_struct *vma = vmf->vma;
     unsigned long fault_addr = vmf->address & PAGE_MASK; // Align to 4KB boundary
@@ -4009,6 +4965,7 @@ static vm_fault_t mattx_dsm_fault(struct vm_fault *vmf) {
     int home_node = -1;
     u32 orig_pid = 0;
     bool found = false;
+    unsigned long npages = 0;
 
     // 1. TRANSLATION: Find the mapping in the registry
     spin_lock(&guest_lock);
@@ -4023,6 +4980,7 @@ static vm_fault_t mattx_dsm_fault(struct vm_fault *vmf) {
                     offset = fault_addr - base;
                     home_node = guest_registry[i].home_node;
                     orig_pid = guest_registry[i].orig_pid;
+                    npages = guest_registry[i].dsm_map[d].npages;
                     found = true;
                     break;
                 }
@@ -4039,6 +4997,10 @@ static vm_fault_t mattx_dsm_fault(struct vm_fault *vmf) {
 
 
     // 2. CONCURRENCY: Allocate a sterile RPC slot
+    // The tables of a mapping hold one entry per page of the segment: never index beyond them
+    if (!mattx_dsm_page_ok(shmid, offset, npages))
+        return VM_FAULT_SIGBUS;
+
     unsigned long page_idx = offset / PAGE_SIZE;
     int slot = -1;
     u64 req_id = 0;
@@ -4094,24 +5056,47 @@ static vm_fault_t mattx_dsm_fault(struct vm_fault *vmf) {
     // 5. THE INJECTION: Wire the PFN into the Surrogate's brain!
     // disabled since defined before: unsigned long page_idx = offset / PAGE_SIZE;
     void *kaddr = NULL;
+    void *newpage = NULL;   // allocated outside the spinlock: __get_free_page(GFP_KERNEL) may sleep
+    struct mattx_dsm_mapping held;  // a reference on the tables: a concurrent shmdt must not free the page under us
 
-    spin_lock(&guest_lock);
-    for (int i = 0; i < guest_count; i++) {
-        if (guest_registry[i].local_pid == current->tgid) {
-            for (int d = 0; d < guest_registry[i].dsm_count; d++) {
-                if (guest_registry[i].dsm_map[d].base_addr == (fault_addr - offset)) {
-                    // Allocate the physical page if we haven't yet!
-                    if (!guest_registry[i].dsm_map[d].pages[page_idx]) {
-                        guest_registry[i].dsm_map[d].pages[page_idx] = (void *)__get_free_page(GFP_KERNEL | __GFP_ZERO);
+    memset(&held, 0, sizeof(held));
+
+    for (;;) {
+        bool need_page = false;
+
+        spin_lock(&guest_lock);
+        for (int i = 0; i < guest_count; i++) {
+            if (guest_registry[i].local_pid == current->tgid) {
+                for (int d = 0; d < guest_registry[i].dsm_count; d++) {
+                    if (guest_registry[i].dsm_map[d].base_addr == (fault_addr - offset) && page_idx < guest_registry[i].dsm_map[d].npages) {
+                        // Allocate the physical page if we haven't yet!
+                        if (!guest_registry[i].dsm_map[d].pages[page_idx] && newpage) {
+                            guest_registry[i].dsm_map[d].pages[page_idx] = newpage;
+                            newpage = NULL;
+                        }
+                        kaddr = guest_registry[i].dsm_map[d].pages[page_idx];
+                        need_page = !kaddr;
+                        if (kaddr) {
+                            // Held until the page is in the page tables: the pages are only freed with the last reference
+                            held = guest_registry[i].dsm_map[d];
+                            mattx_dsm_map_get(&held);
+                        }
+                        break;
                     }
-                    kaddr = guest_registry[i].dsm_map[d].pages[page_idx];
-                    break;
                 }
+                break;
             }
-            break;
         }
+        spin_unlock(&guest_lock);
+
+        if (!need_page)
+            break;
+        newpage = (void *)__get_free_page(GFP_KERNEL | __GFP_ZERO);
+        if (!newpage)
+            break;          // kaddr stays NULL: VM_FAULT_OOM below
     }
-    spin_unlock(&guest_lock);
+    if (newpage)
+        free_page((unsigned long)newpage);  // somebody else filled the slot meanwhile
 
     if (!kaddr) {
         kfree(page_buf);
@@ -4138,7 +5123,7 @@ static vm_fault_t mattx_dsm_fault(struct vm_fault *vmf) {
             for (int i = 0; i < guest_count; i++) {
                 if (guest_registry[i].local_pid == current->tgid) {
                     for (int d = 0; d < guest_registry[i].dsm_count; d++) {
-                        if (guest_registry[i].dsm_map[d].base_addr == (fault_addr - offset)) {
+                        if (guest_registry[i].dsm_map[d].base_addr == (fault_addr - offset) && page_idx < guest_registry[i].dsm_map[d].npages) {
                             guest_registry[i].dsm_map[d].page_states[page_idx] = MATTX_PAGE_SHARED;
                             mattx_dbg("[MESI_VM2] Injected Read-Only Trapdoor at 0x%lx. Local State: SHARED\n", fault_addr);
                             break;
@@ -4185,17 +5170,18 @@ static vm_fault_t mattx_dsm_fault(struct vm_fault *vmf) {
     kfree(page_buf);
 
     if (ret != VM_FAULT_NOPAGE) {
+        mattx_dsm_map_put(&held);
         return ret;
     }
 
 
     // Mark the page as present so the Sweeper knows to clean it!
-    if (page_idx < MAX_DSM_PAGES) {
+    if (page_idx < npages) {
         spin_lock(&guest_lock);
         for (int i = 0; i < guest_count; i++) {
             if (guest_registry[i].local_pid == current->tgid) {
                 for (int d = 0; d < guest_registry[i].dsm_count; d++) {
-                    if (guest_registry[i].dsm_map[d].base_addr == (fault_addr - offset)) {
+                    if (guest_registry[i].dsm_map[d].base_addr == (fault_addr - offset) && page_idx < guest_registry[i].dsm_map[d].npages) {
                         set_bit(page_idx, guest_registry[i].dsm_map[d].present_pages);
                         break;
                     }
@@ -4206,6 +5192,7 @@ static vm_fault_t mattx_dsm_fault(struct vm_fault *vmf) {
         spin_unlock(&guest_lock);
     }
 
+    mattx_dsm_map_put(&held);   // the page is wired in: a shmdt may free the tables now (it unmaps the VMA first)
     mattx_dbg("[DSM] Illusion Complete! Page successfully injected at 0x%lx!\n", fault_addr);
     return VM_FAULT_NOPAGE;
 }
@@ -4222,6 +5209,7 @@ static vm_fault_t mattx_dsm_pfn_mkwrite(struct vm_fault *vmf) {
     int home_node = -1;
     u32 orig_pid = 0;
     bool found = false;
+    unsigned long npages = 0;
 
     // 1. TRANSLATION: Find the mapping in the registry
     spin_lock(&guest_lock);
@@ -4236,6 +5224,7 @@ static vm_fault_t mattx_dsm_pfn_mkwrite(struct vm_fault *vmf) {
                     offset = fault_addr - base;
                     home_node = guest_registry[i].home_node;
                     orig_pid = guest_registry[i].orig_pid;
+                    npages = guest_registry[i].dsm_map[d].npages;
                     found = true;
                     break;
                 }
@@ -4248,6 +5237,9 @@ static vm_fault_t mattx_dsm_pfn_mkwrite(struct vm_fault *vmf) {
     if (!found || home_node == -1 || !cluster_map[home_node]) {
         return VM_FAULT_SIGBUS;
     }
+
+    if (!mattx_dsm_page_ok(shmid, offset, npages))
+        return VM_FAULT_SIGBUS;
 
     if (config_dsm_mode == 2) {
         mattx_dbg("[MESI_VM2] Write-Protect Fault at 0x%lx. Requesting EXCLUSIVE lock...\n", fault_addr);
@@ -4293,7 +5285,7 @@ static vm_fault_t mattx_dsm_pfn_mkwrite(struct vm_fault *vmf) {
         for (int i = 0; i < guest_count; i++) {
             if (guest_registry[i].local_pid == current->tgid) {
                 for (int d = 0; d < guest_registry[i].dsm_count; d++) {
-                    if (guest_registry[i].dsm_map[d].base_addr == (fault_addr - offset)) {
+                    if (guest_registry[i].dsm_map[d].base_addr == (fault_addr - offset) && page_idx < guest_registry[i].dsm_map[d].npages) {
                         guest_registry[i].dsm_map[d].page_states[page_idx] = MATTX_PAGE_EXCLUSIVE;
                         break;
                     }
@@ -4550,6 +5542,7 @@ static void mattx_dsm_fault_kworker(struct work_struct *work) {
     struct task_struct *deputy = NULL;
     int ret = -EFAULT;
     unsigned long target_addr = 0;
+    unsigned long seg_npages = 0;       // size of the segment in pages: the directory of the segment is sized by it
 
     reply = kzalloc(sizeof(*reply), GFP_KERNEL);
     if (!reply) { kfree(ctx); return; }
@@ -4570,6 +5563,7 @@ static void mattx_dsm_fault_kworker(struct work_struct *work) {
             if (vma->vm_file && vma->vm_file->f_path.dentry->d_name.name) {
                 if (strncmp(vma->vm_file->f_path.dentry->d_name.name, "SYSV", 4) == 0) {
                     if (vma->vm_file->f_inode->i_ino == ctx->req.shmid) {
+                        seg_npages = DIV_ROUND_UP(i_size_read(vma->vm_file->f_inode), PAGE_SIZE);
                         if (vma->vm_start + ctx->req.offset < vma->vm_end) {
                             target_addr = vma->vm_start + ctx->req.offset;
                         }
@@ -4588,16 +5582,12 @@ static void mattx_dsm_fault_kworker(struct work_struct *work) {
             if (config_dsm_mode == 2) {
                 u32 owner_pid = 0;
                 int owner_node = -1;
+                struct mattx_dsm_master_dir *dir;
 
                 spin_lock(&mattx_dsm_lock);
-                for (int d = 0; d < MAX_DSM_SEGMENTS; d++) {
-                    if (mattx_global_dsm_dir[d].in_use && mattx_global_dsm_dir[d].shmid == ctx->req.shmid) {
-                        if (mattx_global_dsm_dir[d].page_state[page_idx] == MATTX_PAGE_EXCLUSIVE) {
-                            owner_pid = mattx_global_dsm_dir[d].page_owner_pid[page_idx];
-                        }
-                        break;
-                    }
-                }
+                dir = mattx_dsm_dir_lookup(ctx->req.shmid, page_idx);
+                if (dir && dir->page_state[page_idx] == MATTX_PAGE_EXCLUSIVE)
+                    owner_pid = dir->page_owner_pid[page_idx];
                 spin_unlock(&mattx_dsm_lock);
                 
                 if (owner_pid != 0 && owner_pid != ctx->req.orig_pid) {
@@ -4670,13 +5660,11 @@ static void mattx_dsm_fault_kworker(struct work_struct *work) {
 
                             // Update Directory: Downgrade to SHARED
                             spin_lock(&mattx_dsm_lock);
-                            for (int gd = 0; gd < MAX_DSM_SEGMENTS; gd++) {
-                                if (mattx_global_dsm_dir[gd].in_use && mattx_global_dsm_dir[gd].shmid == ctx->req.shmid) {
-                                    mattx_global_dsm_dir[gd].page_state[page_idx] = MATTX_PAGE_SHARED;
-                                    mattx_global_dsm_dir[gd].page_owner_pid[page_idx] = 0; 
-                                    memset(mattx_global_dsm_dir[gd].page_shared_mask[page_idx], 0, sizeof(u64) * (MAX_NODES / 64));
-                                    break;
-                                }
+                            dir = mattx_dsm_dir_lookup(ctx->req.shmid, page_idx);
+                            if (dir) {
+                                dir->page_state[page_idx] = MATTX_PAGE_SHARED;
+                                dir->page_owner_pid[page_idx] = 0;
+                                mattx_dsm_mask_clear(dir, page_idx);
                             }
                             spin_unlock(&mattx_dsm_lock);
                         }
@@ -4696,41 +5684,31 @@ static void mattx_dsm_fault_kworker(struct work_struct *work) {
 
                 // --- MODE 2 MASTER DIRECTORY UPDATE ---
                 if (config_dsm_mode == 2) {
+                    struct mattx_dsm_master_dir *dir;
+                    u64 *mask = NULL;
+
+                    // The directory of a segment is sized by the segment: registered once, outside the spinlock
+                    if (mattx_dsm_dir_register(ctx->req.shmid, ctx->req.orig_pid, seg_npages) != 0)
+                        mattx_dbg("[MESI_VM1] Could not register SHMID %u in the Global Directory\n", ctx->req.shmid);
+
                     spin_lock(&mattx_dsm_lock);
-                    int dir_idx = -1;
-                    for (int d = 0; d < MAX_DSM_SEGMENTS; d++) {
-                        if (mattx_global_dsm_dir[d].in_use && mattx_global_dsm_dir[d].shmid == ctx->req.shmid) {
-                            dir_idx = d; break;
+                    dir = mattx_dsm_dir_lookup(ctx->req.shmid, page_idx);
+                    if (dir) {
+                        mask = mattx_dsm_mask_get(dir, page_idx);
+                        if (mask) {
+                            if (dir->page_state[page_idx] == MATTX_PAGE_INVALID)
+                                dir->page_state[page_idx] = MATTX_PAGE_SHARED;
+                            mask[ctx->target_node / 64] |= (1ULL << (ctx->target_node % 64));
+
+                            mattx_dbg("[MESI_VM1] Page %lu of SHMID %u is now SHARED with Node %d\n", page_idx, ctx->req.shmid, ctx->target_node);
                         }
-                    }
-                    
-                    if (dir_idx == -1) {
-                        for (int d = 0; d < MAX_DSM_SEGMENTS; d++) {
-                            if (!mattx_global_dsm_dir[d].in_use) {
-                                dir_idx = d;
-                                mattx_global_dsm_dir[d].in_use = true;
-                                mattx_global_dsm_dir[d].shmid = ctx->req.shmid;
-                                mattx_global_dsm_dir[d].home_pid = ctx->req.orig_pid;
-                                memset(mattx_global_dsm_dir[d].page_state, MATTX_PAGE_INVALID, sizeof(mattx_global_dsm_dir[d].page_state));
-                                memset(mattx_global_dsm_dir[d].page_owner_pid, 0, sizeof(mattx_global_dsm_dir[d].page_owner_pid));
-                                memset(mattx_global_dsm_dir[d].page_shared_mask, 0, sizeof(mattx_global_dsm_dir[d].page_shared_mask));
-                                mattx_dbg("[MESI_VM1] Dynamically registered SHMID %u in Global Directory at slot %d\n", ctx->req.shmid, d);
-                                break;
-                            }
-                        }
-                    }
-                    
-                    if (dir_idx != -1) {
-                        if (mattx_global_dsm_dir[dir_idx].page_state[page_idx] == MATTX_PAGE_INVALID) {
-                            mattx_global_dsm_dir[dir_idx].page_state[page_idx] = MATTX_PAGE_SHARED;
-                        }
-                        int n_idx = ctx->target_node / 64;
-                        int n_bit = ctx->target_node % 64;
-                        mattx_global_dsm_dir[dir_idx].page_shared_mask[page_idx][n_idx] |= (1ULL << n_bit);
-                        
-                        mattx_dbg("[MESI_VM1] Page %lu of SHMID %u is now SHARED with Node %d\n", page_idx, ctx->req.shmid, ctx->target_node);
                     }
                     spin_unlock(&mattx_dsm_lock);
+
+                    // A sharer that cannot be recorded would never be invalidated: fail the fault instead of
+                    // handing out a page the directory does not know about
+                    if (dir && !mask)
+                        ret = -ENOMEM;
                 }
             } else {
                 mattx_dbg("[DSM_PUMP] ERROR: Failed to extract page! (Read %d bytes)\n", bytes); 
@@ -4852,19 +5830,19 @@ static void mattx_dsm_update_kworker(struct work_struct *work) {
             // --- THE FUNERAL DIRECTORY CLEANUP ---
             if (config_dsm_mode == 2) {
                 unsigned long page_idx = ctx->req.offset / PAGE_SIZE;
+                struct mattx_dsm_master_dir *dir;
+
                 spin_lock(&mattx_dsm_lock);
-                for (int d = 0; d < MAX_DSM_SEGMENTS; d++) {
-                    if (mattx_global_dsm_dir[d].in_use && mattx_global_dsm_dir[d].shmid == ctx->req.shmid) {
-                        // If the incoming data bomb is from the EXCLUSIVE owner, downgrade it to SHARED!
-                        if (mattx_global_dsm_dir[d].page_state[page_idx] == MATTX_PAGE_EXCLUSIVE &&
-                            mattx_global_dsm_dir[d].page_owner_pid[page_idx] == ctx->req.orig_pid) {
-                            
-                            mattx_global_dsm_dir[d].page_state[page_idx] = MATTX_PAGE_SHARED;
-                            mattx_global_dsm_dir[d].page_owner_pid[page_idx] = 0;
-                            memset(mattx_global_dsm_dir[d].page_shared_mask[page_idx], 0, sizeof(u64) * (MAX_NODES / 64));
-                            mattx_dbg("[MESI_VM1] Directory cleaned up! SHMID %u Offset %lu is now SHARED.\n", ctx->req.shmid, ctx->req.offset);
-                        }
-                        break;
+                dir = mattx_dsm_dir_lookup(ctx->req.shmid, page_idx);
+                if (dir) {
+                    // If the incoming data bomb is from the EXCLUSIVE owner, downgrade it to SHARED!
+                    if (dir->page_state[page_idx] == MATTX_PAGE_EXCLUSIVE &&
+                        dir->page_owner_pid[page_idx] == ctx->req.orig_pid) {
+
+                        dir->page_state[page_idx] = MATTX_PAGE_SHARED;
+                        dir->page_owner_pid[page_idx] = 0;
+                        mattx_dsm_mask_clear(dir, page_idx);
+                        mattx_dbg("[MESI_VM1] Directory cleaned up! SHMID %u Offset %lu is now SHARED.\n", ctx->req.shmid, ctx->req.offset);
                     }
                 }
                 spin_unlock(&mattx_dsm_lock);
@@ -4899,73 +5877,68 @@ int mattx_dsm_sweeper_loop(void *data) {
         
         if (config_dsm_mode == 1) {
             // --- PHASE 1: THE GUEST SWEEPER (VM2 - MODE 1 ONLY) ---
-            struct mattx_dsm_mapping *local_dsm = kmalloc_array(16, sizeof(struct mattx_dsm_mapping), GFP_KERNEL);
-            if (local_dsm) {
-                for (int i = 0; i < MAX_GUESTS; i++) {
-                    pid_t local_pid = -1; u32 orig_pid = 0; int home_node = -1; int dsm_count = 0;
+            for (int i = 0; i < MAX_GUESTS; i++) {
+                for (int d = 0; ; d++) {
+                    struct mattx_dsm_mapping m;
+                    pid_t local_pid = -1; u32 orig_pid = 0; int home_node = -1;
+                    struct task_struct *surrogate = NULL;
 
+                    // One mapping at a time: the reference keeps its tables alive while guest_lock is dropped
                     spin_lock(&guest_lock);
-                    if (i < guest_count && guest_registry[i].dsm_count > 0) {
+                    if (i < guest_count && d < guest_registry[i].dsm_count) {
                         local_pid = guest_registry[i].local_pid; orig_pid = guest_registry[i].orig_pid;
-                        home_node = guest_registry[i].home_node; dsm_count = guest_registry[i].dsm_count;
-                        memcpy(local_dsm, guest_registry[i].dsm_map, dsm_count * sizeof(struct mattx_dsm_mapping));
-                        
-                        for (int d = 0; d < dsm_count; d++) {
-                            memset(guest_registry[i].dsm_map[d].present_pages, 0, sizeof(guest_registry[i].dsm_map[d].present_pages));
-                        }
+                        home_node = guest_registry[i].home_node;
+                        m = guest_registry[i].dsm_map[d];
+                        mattx_dsm_map_get(&m);
                     }
                     spin_unlock(&guest_lock);
 
-                    if (local_pid != -1) {
-                        struct task_struct *surrogate = NULL;
-                        rcu_read_lock(); surrogate = pid_task(find_vpid(local_pid), PIDTYPE_PID); if (surrogate) get_task_struct(surrogate); rcu_read_unlock();
+                    if (local_pid == -1)
+                        break;
 
-                        // same as the deputy walk below: one pinned mm for lock and unlock (surrogate->mm
-                        // goes NULL on exit), and the task reference is dropped on every path
-                        struct mm_struct *smm = surrogate ? get_task_mm(surrogate) : NULL;
-                        if (smm) {
-                            for (int d = 0; d < dsm_count; d++) {
-                                unsigned long base = local_dsm[d].base_addr;
-                                unsigned long size = local_dsm[d].size;
-                                u32 shmid = local_dsm[d].shmid;
+                    rcu_read_lock(); surrogate = pid_task(find_vpid(local_pid), PIDTYPE_PID); if (surrogate) get_task_struct(surrogate); rcu_read_unlock();
 
-                                // 1. Sync present pages (The Data Bomb)
-                                for (int bit = 0; bit < MAX_DSM_PAGES; bit++) {
-                                    if (test_bit(bit, local_dsm[d].present_pages)) {
-                                        unsigned long offset = bit * PAGE_SIZE;
-                                        if (offset >= size) continue;
+                    if (surrogate && surrogate->mm) {
+                        unsigned long base = m.base_addr;
+                        unsigned long size = m.size;
+                        u32 shmid = m.shmid;
 
-                                        void *kaddr = local_dsm[d].pages[bit];
-                                        if (kaddr) {
-                                            size_t req_size = sizeof(struct mattx_dsm_page_update_req);
-                                            struct mattx_dsm_page_update_req *req = kmalloc(req_size, GFP_KERNEL);
-                                            if (req) {
-                                                req->orig_pid = orig_pid; req->shmid = shmid; req->offset = offset;
-                                                memcpy(req->data, kaddr, PAGE_SIZE); 
-                                                if (cluster_map[home_node]) mattx_comm_send(cluster_map[home_node], MATTX_MSG_DSM_PAGE_UPDATE, req, req_size);
-                                                kfree(req);
-                                            }
-                                        }
+                        // 1. Sync present pages (The Data Bomb)
+                        for (unsigned long bit = 0; bit < m.npages; bit++) {
+                            if (test_and_clear_bit(bit, m.present_pages)) {
+                                unsigned long offset = bit * PAGE_SIZE;
+                                if (offset >= size) continue;
+
+                                void *kaddr = m.pages[bit];
+                                if (kaddr) {
+                                    size_t req_size = sizeof(struct mattx_dsm_page_update_req);
+                                    struct mattx_dsm_page_update_req *req = kmalloc(req_size, GFP_KERNEL);
+                                    if (req) {
+                                        req->orig_pid = orig_pid; req->shmid = shmid; req->offset = offset;
+                                        memcpy(req->data, kaddr, PAGE_SIZE);
+                                        if (cluster_map[home_node]) mattx_comm_send(cluster_map[home_node], MATTX_MSG_DSM_PAGE_UPDATE, req, req_size);
+                                        kfree(req);
                                     }
-                                }
-
-                                // 2. The Zap! (Burn it all down SAFELY)
-                                if (real_zap_vma_ptes) {
-                                    mmap_read_lock(smm);
-                                    struct vm_area_struct *vma = find_vma(smm, base);
-                                    if (vma && vma->vm_start <= base) {
-                                        real_zap_vma_ptes(vma, base, size);
-                                        mattx_dbg("[DSM_SWEEPER] Zapped Hollow VMA at 0x%lx. Ready for next fault!\n", base);
-                                    }
-                                    mmap_read_unlock(smm);
                                 }
                             }
-                            mmput(smm);
+                        }
+
+                        // 2. The Zap! (Burn it all down SAFELY)
+                        if (real_zap_vma_ptes) {
+                            mmap_read_lock(surrogate->mm);
+                            struct vm_area_struct *vma = find_vma(surrogate->mm, base);
+                            if (vma && vma->vm_start <= base) {
+                                real_zap_vma_ptes(vma, base, size);
+                                mattx_dbg("[DSM_SWEEPER] Zapped Hollow VMA at 0x%lx. Ready for next fault!\n", base);
+                            }
+                            mmap_read_unlock(surrogate->mm);
                         }
                         if (surrogate) put_task_struct(surrogate);
                     }
+                    if (surrogate)
+                        put_task_struct(surrogate);
+                    mattx_dsm_map_put(&m);
                 }
-                kfree(local_dsm); 
             }
             
         } else if (config_dsm_mode == 2) {
@@ -4974,21 +5947,28 @@ int mattx_dsm_sweeper_loop(void *data) {
             int shoot_count = 0;
 
             spin_lock(&mattx_dsm_lock);
-            for (int d = 0; d < MAX_DSM_SEGMENTS; d++) {
-                if (mattx_global_dsm_dir[d].in_use) {
-                    for (int p = 0; p < MAX_DSM_PAGES; p++) {
-                        // If it's SHARED, remote nodes have copies. We must shoot down native PTEs
-                        // to force a fault and catch potential silent native writes!
-                        if (mattx_global_dsm_dir[d].page_state[p] == MATTX_PAGE_SHARED) {
-                            if (shoot_count < 16) {
-                                to_shoot[shoot_count].shmid = mattx_global_dsm_dir[d].shmid;
-                                to_shoot[shoot_count].home_pid = mattx_global_dsm_dir[d].home_pid;
-                                to_shoot[shoot_count].offset = p * PAGE_SIZE;
-                                shoot_count++;
-                            }
-                        }
+            for (int d = 0; d < mattx_dsm_dir_cap && shoot_count < 16; d++) {
+                struct mattx_dsm_master_dir *dir = &mattx_global_dsm_dir[d];
+                unsigned long scanned;
+
+                if (!dir->in_use || !dir->npages)
+                    continue;
+
+                // Only 16 shootdowns per round: continue where the last round stopped, or the first 16 shared
+                // pages would be shot down again and again and the rest never
+                for (scanned = 0; scanned < dir->npages && shoot_count < 16; scanned++) {
+                    unsigned long p = (dir->sweep_pos + scanned) % dir->npages;
+
+                    // If it's SHARED, remote nodes have copies. We must shoot down native PTEs
+                    // to force a fault and catch potential silent native writes!
+                    if (dir->page_state[p] == MATTX_PAGE_SHARED) {
+                        to_shoot[shoot_count].shmid = dir->shmid;
+                        to_shoot[shoot_count].home_pid = dir->home_pid;
+                        to_shoot[shoot_count].offset = p * PAGE_SIZE;
+                        shoot_count++;
                     }
                 }
+                dir->sweep_pos = (dir->sweep_pos + scanned) % dir->npages;
             }
             spin_unlock(&mattx_dsm_lock);
 
@@ -5033,6 +6013,9 @@ int mattx_dsm_sweeper_loop(void *data) {
 
         }
         
+        // Free the tables of the segments that were destroyed (the shmctl kprobe must not sleep: it only clears in_use)
+        mattx_dsm_dir_reap();
+
         // Sleep for 50ms regardless of mode to prevent 100% CPU spin!
         msleep(50); 
     }
@@ -5060,7 +6043,9 @@ static void mattx_dsm_cleanup_cb(struct callback_head *cb) {
     if (ctx->is_write) {
         void *kaddr = NULL;
         unsigned long offset = 0;
-        
+        struct mattx_dsm_mapping held;  // keeps the page alive while we copy it outside the spinlock
+
+        memset(&held, 0, sizeof(held));
         spin_lock(&guest_lock);
         for (int i = 0; i < guest_count; i++) {
             if (guest_registry[i].local_pid == current->tgid) {
@@ -5070,7 +6055,11 @@ static void mattx_dsm_cleanup_cb(struct callback_head *cb) {
                     if (ctx->fault_addr >= base && ctx->fault_addr < base + size) {
                         offset = ctx->fault_addr - base;
                         unsigned long page_idx = offset / PAGE_SIZE;
-                        kaddr = guest_registry[i].dsm_map[d].pages[page_idx];
+                        kaddr = (page_idx < guest_registry[i].dsm_map[d].npages) ? guest_registry[i].dsm_map[d].pages[page_idx] : NULL;
+                        if (kaddr) {
+                            held = guest_registry[i].dsm_map[d];
+                            mattx_dsm_map_get(&held);
+                        }
                         break;
                     }
                 }
@@ -5096,6 +6085,7 @@ static void mattx_dsm_cleanup_cb(struct callback_head *cb) {
                 mattx_dbg("[DSM_MODE3] Synced dirty page at 0x%lx to VM1.\n", ctx->fault_addr);
             }
         }
+        mattx_dsm_map_put(&held);
     }
 
     // 2. THE ZAP (Burn it down!)
@@ -5147,26 +6137,27 @@ static void mattx_dsm_write_acquire_kworker(struct work_struct *work) {
     u64 local_shared_mask[MAX_NODES / 64];
     memset(local_shared_mask, 0, sizeof(local_shared_mask));
     bool found = false;
+    unsigned long page_idx = ctx->req.offset / PAGE_SIZE;
+    struct mattx_dsm_master_dir *dir;
 
     // --- MODE 2 GLOBAL DIRECTORY LOOKUP (QUICK GRAB) ---
     spin_lock(&mattx_dsm_lock);
-    for (int d = 0; d < MAX_DSM_SEGMENTS; d++) {
-        if (mattx_global_dsm_dir[d].in_use && mattx_global_dsm_dir[d].shmid == ctx->req.shmid) {
-            unsigned long page_idx = ctx->req.offset / PAGE_SIZE;
+    dir = mattx_dsm_dir_lookup(ctx->req.shmid, page_idx);
+    if (dir) {
+        u64 *mask = mattx_dsm_mask(dir, page_idx);
 
-            // 1. Copy the mask locally!
-            memcpy(local_shared_mask, mattx_global_dsm_dir[d].page_shared_mask[page_idx], sizeof(local_shared_mask));
-            
-            // 2. Update Directory to EXCLUSIVE immediately
-            mattx_global_dsm_dir[d].page_state[page_idx] = MATTX_PAGE_EXCLUSIVE;
-            mattx_global_dsm_dir[d].page_owner_pid[page_idx] = ctx->req.orig_pid;
-            
-            // Clear the global mask
-            memset(mattx_global_dsm_dir[d].page_shared_mask[page_idx], 0, sizeof(local_shared_mask));
-            
-            found = true;
-            break;
-        }
+        // 1. Copy the mask locally!
+        if (mask)
+            memcpy(local_shared_mask, mask, sizeof(local_shared_mask));
+
+        // 2. Update Directory to EXCLUSIVE immediately
+        dir->page_state[page_idx] = MATTX_PAGE_EXCLUSIVE;
+        dir->page_owner_pid[page_idx] = ctx->req.orig_pid;
+
+        // Clear the global mask
+        mattx_dsm_mask_clear(dir, page_idx);
+
+        found = true;
     }
     spin_unlock(&mattx_dsm_lock); // DROP THE LOCK!
     
@@ -5241,8 +6232,23 @@ static void handle_dsm_write_acquire_req(struct mattx_link *link, struct mattx_h
 // --- VM3: INVALIDATE KWORKER ---
 struct mattx_dsm_invalidate_kworker_ctx { struct work_struct work; struct mattx_dsm_invalidate_req req; int target_node; };
 
+// A page of a Surrogate to zap: collected under guest_lock, zapped after it is dropped (mmap_read_lock() sleeps)
+struct mattx_zap_target {
+    struct task_struct *task;
+    unsigned long base;
+    unsigned long fault_addr;
+};
+
 static void mattx_dsm_invalidate_kworker(struct work_struct *work) {
     struct mattx_dsm_invalidate_kworker_ctx *ctx = container_of(work, struct mattx_dsm_invalidate_kworker_ctx, work);
+    struct mattx_zap_target *tg = kvmalloc_array(MAX_GUESTS, sizeof(*tg), GFP_KERNEL);
+    int n = 0;
+
+    if (!tg) {
+        printk(KERN_ERR "MattX:[MESI_VM2] INVALIDATE dropped: out of memory\n");
+        kfree(ctx);
+        return;
+    }
 
     spin_lock(&guest_lock);
     for (int i = 0; i < guest_count; i++) {
@@ -5253,7 +6259,7 @@ static void mattx_dsm_invalidate_kworker(struct work_struct *work) {
 
         // We must check ALL OTHER guests on this node for the SHMID!
         for (int d = 0; d < guest_registry[i].dsm_count; d++) {
-            if (guest_registry[i].dsm_map[d].shmid == ctx->req.shmid) {
+            if (guest_registry[i].dsm_map[d].shmid == ctx->req.shmid && ctx->req.offset / PAGE_SIZE < guest_registry[i].dsm_map[d].npages) {
                 unsigned long base = guest_registry[i].dsm_map[d].base_addr;
                 unsigned long fault_addr = base + ctx->req.offset;
                 unsigned long page_idx = ctx->req.offset / PAGE_SIZE;
@@ -5261,27 +6267,41 @@ static void mattx_dsm_invalidate_kworker(struct work_struct *work) {
                 // 1. Update local state to INVALID
                 guest_registry[i].dsm_map[d].page_states[page_idx] = MATTX_PAGE_INVALID;
                 
-                // 2. Zap the PTE!
-                struct task_struct *surrogate = NULL;
-                rcu_read_lock();
-                surrogate = pid_task(find_vpid(guest_registry[i].local_pid), PIDTYPE_PID);
-                if (surrogate) get_task_struct(surrogate);
-                rcu_read_unlock();
-                
-                if (surrogate && surrogate->mm && real_zap_vma_ptes) {
-                    mmap_read_lock(surrogate->mm);
-                    struct vm_area_struct *vma = find_vma(surrogate->mm, base);
-                    if (vma && vma->vm_start <= base) {
-                        real_zap_vma_ptes(vma, fault_addr, PAGE_SIZE);
-                        mattx_dbg("[MESI_VM2] Zapped invalidated page at 0x%lx for PID %d\n", fault_addr, surrogate->pid);
+                // 2. Zap the PTE! Only the task is looked up here, the zapping is done below
+                if (n < MAX_GUESTS) {
+                    struct task_struct *surrogate = NULL;
+                    rcu_read_lock();
+                    surrogate = pid_task(find_vpid(guest_registry[i].local_pid), PIDTYPE_PID);
+                    if (surrogate) get_task_struct(surrogate);
+                    rcu_read_unlock();
+
+                    if (surrogate) {
+                        tg[n].task = surrogate;
+                        tg[n].base = base;
+                        tg[n].fault_addr = fault_addr;
+                        n++;
                     }
-                    mmap_read_unlock(surrogate->mm);
-                    put_task_struct(surrogate);
                 }
             }
         }
     }
     spin_unlock(&guest_lock);
+
+    for (int k = 0; k < n; k++) {
+        struct task_struct *surrogate = tg[k].task;
+
+        if (surrogate->mm && real_zap_vma_ptes) {
+            mmap_read_lock(surrogate->mm);
+            struct vm_area_struct *vma = find_vma(surrogate->mm, tg[k].base);
+            if (vma && vma->vm_start <= tg[k].base) {
+                real_zap_vma_ptes(vma, tg[k].fault_addr, PAGE_SIZE);
+                mattx_dbg("[MESI_VM2] Zapped invalidated page at 0x%lx for PID %d\n", tg[k].fault_addr, surrogate->pid);
+            }
+            mmap_read_unlock(surrogate->mm);
+        }
+        put_task_struct(surrogate);
+    }
+    kvfree(tg);
     kfree(ctx);
 }
 
@@ -5325,11 +6345,14 @@ static void mattx_dsm_flush_kworker(struct work_struct *work) {
     reply->req_id = ctx->req.req_id;
     reply->error = -ENOENT;
 
+    struct task_struct *zap_task = NULL;    // looked up under guest_lock, zapped after it is dropped
+    unsigned long zap_base = 0, zap_addr = 0;
+
     spin_lock(&guest_lock);
     for (int i = 0; i < guest_count; i++) {
         if (guest_registry[i].orig_pid == ctx->req.orig_pid) {
             for (int d = 0; d < guest_registry[i].dsm_count; d++) {
-                if (guest_registry[i].dsm_map[d].shmid == ctx->req.shmid) {
+                if (guest_registry[i].dsm_map[d].shmid == ctx->req.shmid && ctx->req.offset / PAGE_SIZE < guest_registry[i].dsm_map[d].npages) {
                     unsigned long page_idx = ctx->req.offset / PAGE_SIZE;
                     unsigned long base = guest_registry[i].dsm_map[d].base_addr;
                     unsigned long fault_addr = base + ctx->req.offset;
@@ -5343,23 +6366,13 @@ static void mattx_dsm_flush_kworker(struct work_struct *work) {
                         // 2. Downgrade local state to INVALID
                         guest_registry[i].dsm_map[d].page_states[page_idx] = MATTX_PAGE_INVALID;
 
-                        // 3. Zap the PTE!
-                        struct task_struct *surrogate = NULL;
+                        // 3. Zap the PTE! Only the task is looked up here, the zapping is done below
                         rcu_read_lock();
-                        surrogate = pid_task(find_vpid(guest_registry[i].local_pid), PIDTYPE_PID);
-                        if (surrogate) get_task_struct(surrogate);
+                        zap_task = pid_task(find_vpid(guest_registry[i].local_pid), PIDTYPE_PID);
+                        if (zap_task) get_task_struct(zap_task);
                         rcu_read_unlock();
-
-                        if (surrogate && surrogate->mm && real_zap_vma_ptes) {
-                            mmap_read_lock(surrogate->mm);
-                            struct vm_area_struct *vma = find_vma(surrogate->mm, base);
-                            if (vma && vma->vm_start <= base) {
-                                real_zap_vma_ptes(vma, fault_addr, PAGE_SIZE);
-                                mattx_dbg("[MESI_VM2] Flushed dirty data and zapped page at 0x%lx\n", fault_addr);
-                            }
-                            mmap_read_unlock(surrogate->mm);
-                            put_task_struct(surrogate);
-                        }
+                        zap_base = base;
+                        zap_addr = fault_addr;
                     }
                     break;
                 }
@@ -5368,6 +6381,19 @@ static void mattx_dsm_flush_kworker(struct work_struct *work) {
         }
     }
     spin_unlock(&guest_lock);
+
+    if (zap_task) {
+        if (zap_task->mm && real_zap_vma_ptes) {
+            mmap_read_lock(zap_task->mm);
+            struct vm_area_struct *vma = find_vma(zap_task->mm, zap_base);
+            if (vma && vma->vm_start <= zap_base) {
+                real_zap_vma_ptes(vma, zap_addr, PAGE_SIZE);
+                mattx_dbg("[MESI_VM2] Flushed dirty data and zapped page at 0x%lx\n", zap_addr);
+            }
+            mmap_read_unlock(zap_task->mm);
+        }
+        put_task_struct(zap_task);
+    }
 
     if (cluster_map[ctx->target_node]) {
         mattx_comm_send(cluster_map[ctx->target_node], MATTX_MSG_DSM_FLUSH_REPLY, reply, sizeof(*reply));
@@ -5429,17 +6455,15 @@ static void mattx_vm1_shm_sync_kworker(struct work_struct *work) {
     
     u32 owner_pid = 0;
     int owner_node = -1;
-    int dir_idx = -1;
+    bool dir_found = false;
+    struct mattx_dsm_master_dir *dir;
     
     spin_lock(&mattx_dsm_lock);
-    for (int d = 0; d < MAX_DSM_SEGMENTS; d++) {
-        if (mattx_global_dsm_dir[d].in_use && mattx_global_dsm_dir[d].shmid == shmid) {
-            dir_idx = d;
-            if (mattx_global_dsm_dir[d].page_state[page_idx] == MATTX_PAGE_EXCLUSIVE) {
-                owner_pid = mattx_global_dsm_dir[d].page_owner_pid[page_idx];
-            }
-            break;
-        }
+    dir = mattx_dsm_dir_lookup(shmid, page_idx);
+    if (dir) {
+        dir_found = true;
+        if (dir->page_state[page_idx] == MATTX_PAGE_EXCLUSIVE)
+            owner_pid = dir->page_owner_pid[page_idx];
     }
     spin_unlock(&mattx_dsm_lock);
 
@@ -5518,10 +6542,11 @@ static void mattx_vm1_shm_sync_kworker(struct work_struct *work) {
                     }
 
                     spin_lock(&mattx_dsm_lock);
-                    if (dir_idx != -1) {
-                        mattx_global_dsm_dir[dir_idx].page_state[page_idx] = MATTX_PAGE_SHARED;
-                        mattx_global_dsm_dir[dir_idx].page_owner_pid[page_idx] = 0;
-                        memset(mattx_global_dsm_dir[dir_idx].page_shared_mask[page_idx], 0, sizeof(u64) * (MAX_NODES / 64));
+                    dir = mattx_dsm_dir_lookup(shmid, page_idx);
+                    if (dir) {
+                        dir->page_state[page_idx] = MATTX_PAGE_SHARED;
+                        dir->page_owner_pid[page_idx] = 0;
+                        mattx_dsm_mask_clear(dir, page_idx);
                     }
                     spin_unlock(&mattx_dsm_lock);
                 }
@@ -5531,11 +6556,27 @@ static void mattx_vm1_shm_sync_kworker(struct work_struct *work) {
     }
 
     // 2. INVALIDATE IF WRITE
-    if (is_write && dir_idx != -1) {
+    if (is_write && dir_found) {
+        u64 local_shared_mask[MAX_NODES / 64];
+
+        memset(local_shared_mask, 0, sizeof(local_shared_mask));
         spin_lock(&mattx_dsm_lock);
+        dir = mattx_dsm_dir_lookup(shmid, page_idx);
+        if (dir) {
+            u64 *mask = mattx_dsm_mask(dir, page_idx);
+
+            if (mask)
+                memcpy(local_shared_mask, mask, sizeof(local_shared_mask));
+            dir->page_state[page_idx] = MATTX_PAGE_EXCLUSIVE;
+            dir->page_owner_pid[page_idx] = 0; // 0 means VM1 owns it!
+            mattx_dsm_mask_clear(dir, page_idx);
+        }
+        spin_unlock(&mattx_dsm_lock);
+
+        // The Invalidates go out WITHOUT the spinlock: mattx_comm_send() sleeps on its mutex
         for (int node = 0; node < MAX_NODES; node++) {
             int n_idx = node / 64; int n_bit = node % 64;
-            if (mattx_global_dsm_dir[dir_idx].page_shared_mask[page_idx][n_idx] & (1ULL << n_bit)) {
+            if (local_shared_mask[n_idx] & (1ULL << n_bit)) {
                 if (cluster_map[node]) {
                     struct mattx_dsm_invalidate_req inv_req = {
                         .req_id = 0, .orig_pid = 0, .shmid = shmid, .offset = offset
@@ -5545,10 +6586,6 @@ static void mattx_vm1_shm_sync_kworker(struct work_struct *work) {
                 }
             }
         }
-        mattx_global_dsm_dir[dir_idx].page_state[page_idx] = MATTX_PAGE_EXCLUSIVE;
-        mattx_global_dsm_dir[dir_idx].page_owner_pid[page_idx] = 0; // 0 means VM1 owns it!
-        memset(mattx_global_dsm_dir[dir_idx].page_shared_mask[page_idx], 0, sizeof(u64) * (MAX_NODES / 64));
-        spin_unlock(&mattx_dsm_lock);
     }
 
     // Wake up the native process to retry the fault!
@@ -6806,6 +7843,7 @@ void mattx_fileio_init_handlers(void) {
     mattx_register_handler(MATTX_MSG_SYS_EPOLL_WAIT_REQ, handle_sys_epoll_wait_req);
     mattx_register_handler(MATTX_MSG_SYS_EPOLL_WAIT_REPLY, handle_sys_epoll_wait_reply);
     mattx_register_handler(MATTX_MSG_SYS_EPOLL_WAIT_CANCEL, handle_sys_epoll_wait_cancel);
+    mattx_register_handler(MATTX_MSG_SYS_REQ_CANCEL, handle_sys_req_cancel);
     mattx_register_handler(MATTX_MSG_SYS_GETSOCKNAME_REQ, handle_sys_getsockname_req);
     mattx_register_handler(MATTX_MSG_SYS_GETSOCKNAME_REPLY, handle_sys_sockname_reply);
     mattx_register_handler(MATTX_MSG_SYS_GETPEERNAME_REQ, handle_sys_getpeername_req);
@@ -6893,6 +7931,17 @@ void mattx_fileio_exit(void) {
         spin_unlock(&mattx_fwd_write_lock);
     }
 
+    // 0b. Cancellable kworkers (read, recvfrom, ...): tell them to stop and wait (bounded) until the last one is gone
+    {
+        int waited;
+
+        WRITE_ONCE(mattx_cancellable_stopping, true);
+        for (waited = 0; atomic_read(&mattx_cancellable_inflight) > 0 && waited < 500; waited++)
+            msleep(10);
+        if (atomic_read(&mattx_cancellable_inflight) > 0)
+            printk(KERN_WARNING "MattX:[FILEIO] %d cancellable kworker(s) still running at unload\n", atomic_read(&mattx_cancellable_inflight));
+    }
+
     // 1. Clean up MFS open files
     spin_lock(&mfs_file_lock);
     for (i = 0; i < MAX_FDS; i++) {
@@ -6921,6 +7970,9 @@ void mattx_fileio_exit(void) {
     }
     export_count = 0;
     spin_unlock(&export_lock);
+
+    // 3. The master directory of the DSM
+    mattx_dsm_dir_exit();
     
     mattx_dbg(" [FILEIO] File purge complete.\n");
 }

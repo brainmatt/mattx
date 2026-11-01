@@ -181,7 +181,7 @@ static int dsm_show(struct seq_file *m, void *v) {
             u32 shmid = guest_registry[i].dsm_map[d].shmid;
             
             // Extract the local MESI state for Page 0!
-            u8 p_state = guest_registry[i].dsm_map[d].page_states[0];
+            u8 p_state = guest_registry[i].dsm_map[d].npages ? guest_registry[i].dsm_map[d].page_states[0] : MATTX_PAGE_INVALID;
             char *state_str = (p_state == MATTX_PAGE_EXCLUSIVE) ? "EXCLUSIVE" : 
                               (p_state == MATTX_PAGE_SHARED) ? "SHARED" : "INVALID";
 
@@ -189,7 +189,7 @@ static int dsm_show(struct seq_file *m, void *v) {
             bytes_read = 0;
             
             // Read directly from our physical page pool!
-            if (guest_registry[i].dsm_map[d].pages[0]) {
+            if (guest_registry[i].dsm_map[d].npages && guest_registry[i].dsm_map[d].pages[0]) {
                 memcpy(hex_buf, guest_registry[i].dsm_map[d].pages[0], 16);
                 bytes_read = 16;
             }
@@ -213,24 +213,39 @@ static int dsm_show(struct seq_file *m, void *v) {
 
     // --- 2. EXPORTER VIEW (VM1 - The Physical RAM & Global Directory) ---
     
-    // Allocate a local copy of the global directory to avoid holding the spinlock!
-    struct mattx_dsm_master_dir *local_dir = kmalloc_array(MAX_DSM_SEGMENTS, sizeof(struct mattx_dsm_master_dir), GFP_KERNEL);
+    // Take a copy of what we show of the global directory to avoid holding the spinlock!
+    struct dsm_dir_sum { bool in_use; u32 shmid; u32 home_pid; u8 p_state; u32 p_owner; } *local_dir;
+    int dir_cap, local_n = 0;
+
+    spin_lock(&mattx_dsm_lock);
+    dir_cap = mattx_dsm_dir_cap;
+    spin_unlock(&mattx_dsm_lock);
+    local_dir = kmalloc_array(dir_cap ? dir_cap : 1, sizeof(*local_dir), GFP_KERNEL);
     
     if (local_dir) {
         spin_lock(&mattx_dsm_lock);
-        memcpy(local_dir, mattx_global_dsm_dir, MAX_DSM_SEGMENTS * sizeof(struct mattx_dsm_master_dir));
+        for (int d = 0; d < mattx_dsm_dir_cap && d < dir_cap; d++) {
+            struct mattx_dsm_master_dir *dir = &mattx_global_dsm_dir[d];
+
+            local_dir[d].in_use = dir->in_use;
+            local_dir[d].shmid = dir->shmid;
+            local_dir[d].home_pid = dir->home_pid;
+            local_dir[d].p_state = (dir->in_use && dir->npages) ? dir->page_state[0] : MATTX_PAGE_INVALID;
+            local_dir[d].p_owner = (dir->in_use && dir->npages) ? dir->page_owner_pid[0] : 0;
+            local_n = d + 1;
+        }
         spin_unlock(&mattx_dsm_lock);
 
-        for (int d = 0; d < MAX_DSM_SEGMENTS; d++) {
+        for (int d = 0; d < local_n; d++) {
             if (!local_dir[d].in_use) continue;
 
             u32 shmid = local_dir[d].shmid;
             u32 home_pid = local_dir[d].home_pid;
             
             char state_str[32] = "UNTRACKED";
-            u8 p_state = local_dir[d].page_state[0];
+            u8 p_state = local_dir[d].p_state;
             if (p_state == MATTX_PAGE_EXCLUSIVE) {
-                snprintf(state_str, sizeof(state_str), "EXCL(P:%u)", local_dir[d].page_owner_pid[0]);
+                snprintf(state_str, sizeof(state_str), "EXCL(P:%u)", local_dir[d].p_owner);
             } else if (p_state == MATTX_PAGE_SHARED) {
                 snprintf(state_str, sizeof(state_str), "SHARED");
             } else {
