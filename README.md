@@ -237,6 +237,8 @@ MattX embraces the UNIX philosophy. The entire cluster can be monitored and cont
 * `cat /proc/mattx/remote` - Lists all processes that have been migrated *away* from this node (`<orig_pid>:<target_node>`).
 * `cat /proc/mattx/guests` - Lists all foreign processes currently running *on* this node (`<local_surrogate_pid>:<home_node>`).
 * `cat /proc/mattx/version` - Displays the current MattX version and license information.
+* `cat /proc/mattx/stats` - Exact migration counters, monotonic since the module was loaded (`name value` per line): `migrations_out` (own processes that left), `migrations_in` (foreign processes that arrived), `migrations_return` (own processes that came back), `guests_departed` (guests that left this node again, recalled or exited), `remote_exited` (own processes that ended while running remotely) and `exports_reaped` (export entries removed because the process or the peer died). They are counted where the registries change, so nothing is lost between two reads of `remote`/`guests`.
+* `cat /proc/mattx/migrations` - `<pid>:<count>` for each recently migrated *own* process: how many times it changed place, forward and back (a process that went out and came back once shows 2). A ring of 256 slots, so counts are only reliable for recently active pids.
 
 ### Real-Time Cluster Control
 You can control the cluster dynamically by echoing commands into `/proc/mattx/admin`:
