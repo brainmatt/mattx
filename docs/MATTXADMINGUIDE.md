@@ -728,8 +728,23 @@ Now, the cluster thinks this massive server only has 1 CPU core. It will repel p
 Not every process deserves to travel through hyperspace. If MattX accidentally teleports your `sshd` daemon or your `systemd-journald` process, your node will have a very bad day. 
 
 MattX employs a strict nightclub Bouncer at the entrance to the Wormhole. 
-*   **The Blacklist (Excludes):** By default, critical system daemons are on the Exclude list. The balancer is completely blind to them. They will never be migrated.
-*   **The VIP Whitelist (Includes):** For true production stability, you can flip the Bouncer into Whitelist mode. By setting an Include list (`echo "include pvmchess-client" > /proc/mattx/admin`), the balancer ignores the entire operating system and *only* load-balances your specific HPC applications. It is the ultimate safety net for enterprise deployments. 🛑🕴️
+*   **The Blacklist (Excludes):** Critical system daemons are on the Exclude list. The balancer is completely blind to them. They will never be migrated, **even if they are also on the Include list**: the Exclude list always wins.
+*   **The VIP Whitelist (Includes):** For true production stability, you can also set an Include list. The balancer then ignores everything that is not on it and *only* load-balances your specific HPC applications (minus anything on the Exclude list). It is the ultimate safety net for enterprise deployments. 🛑🕴️
+
+**Where the lists are set.** Both lists can be set in `/etc/mattx.conf`, so that they survive a restart and can be managed with your configuration management:
+
+```bash
+# processes that must never migrate; wins over MATTX_INCLUDE and replaces the built-in list
+MATTX_EXCLUDE="cat,watch,cron,top,bash,make,pvmd,sshd,sshd-session,mattx-discd,mattx-stub,systemd,systemd-journald,systemd-journal,puppet,node_exporter"
+# only these processes are candidates for the balancer (empty = every process that is not excluded)
+MATTX_INCLUDE="pvmchess-client,mpichess-client,migtest,migtest2,migtest3,dfsatest,epolltest"
+```
+
+The init script (`init/mattx`, started by the systemd unit) writes them to `/proc/mattx/admin` when MattX starts. At runtime you can change them with the `exclude` and `include` admin commands (see below).
+*   Names are matched **exactly** against the process name (`comm`, at most 15 characters), comma-separated, no spaces.
+*   `MATTX_EXCLUDE` **replaces** the built-in default list, it does not extend it: keep the default names in it and add your own, for example configuration-management agents (`puppet`) and metrics exporters (`node_exporter`) that must stay on their node. Without the setting the built-in list is used.
+*   The admin write buffer is 256 bytes, so a list can be about 250 characters long.
+*   The lists only steer the **automatic** balancer. A manual `echo "migrate <PID> <NODE_ID>" > /proc/mattx/admin` ignores both lists.
 
 ---
 
@@ -770,14 +785,15 @@ If you have a 4-core machine, its default affinity is `4000`. If you want to tur
 *   **Reset to Auto-Calculate:** `echo "affinity 0" > /proc/mattx/admin`
 
 ### 🛡️ `exclude` (The Blacklist)
-The Bouncer's VIP list. Any process name listed here will be completely ignored by the autonomous load balancer. Use this to protect critical system daemons from being accidentally teleported.
+The Bouncer's VIP list. Any process name listed here will be completely ignored by the autonomous load balancer, **whatever the Include list says**. Use this to protect critical system daemons from being accidentally teleported.
 *   **Set Excludes:** `echo "exclude top,bash,sshd,systemd" > /proc/mattx/admin`
-*   *(Note: Comma-separated, no spaces!)*
+*   *(Note: Comma-separated, no spaces! The list you write **replaces** the current one, so repeat the names you want to keep. The same list can be set at start with `MATTX_EXCLUDE` in `/etc/mattx.conf`.)*
 
 ### 🎯 `include` (The Whitelist)
-The ultimate safety net. If this list is populated, MattX switches from Blacklist mode to strict Whitelist mode. The balancer becomes blind to the rest of the system and will **only** migrate processes that match these exact names.
+The ultimate safety net. If this list is populated, the balancer becomes blind to the rest of the system and will **only** migrate processes that match these exact names. Names on the Exclude list are still never migrated.
 *   **Set Includes:** `echo "include pvmchess-client,migtest" > /proc/mattx/admin`
-*   **Disable Whitelist (Revert to Excludes):** `echo "include " > /proc/mattx/admin`
+*   **Disable the Whitelist (every process not on the Exclude list is a candidate again):** `echo "include " > /proc/mattx/admin`
+*   *(The same list can be set at start with `MATTX_INCLUDE` in `/etc/mattx.conf`.)*
 
 ### 🚀 `migrate` (Manual Teleportation & Recall)
 Bypass the auto-pilot and manually trigger a brain transplant. You can force a local process to migrate to a specific remote node, or you can issue a Recall Order to bring an exported process back home.
@@ -785,6 +801,8 @@ Bypass the auto-pilot and manually trigger a brain transplant. You can force a l
     *(Example: `echo "migrate 1234 814" > /proc/mattx/admin`)*
 *   **Return Migration (Recall):** `echo "migrate <PID> home" > /proc/mattx/admin`
     *(Example: `echo "migrate 1234 home" > /proc/mattx/admin`)*
+
+*   **Migrations run one at a time.** The write returns as soon as the request is queued; the node then migrates its queued processes one after another (and receives incoming ones one after another), so you can fire many `migrate` commands at once, for example from a script or in parallel. A burst of 8 small processes lands in a few seconds. Watch the progress in `/proc/mattx/remote` and `/proc/mattx/guests`.
 
 ---
 
@@ -1272,12 +1290,14 @@ sequenceDiagram
 *   **Usage:** To freeze a native process and extract its DNA for a forward migration.
 *   **Detailed Description:** Sends `SIGSTOP` to the target. Extracts the Brain (`pt_regs`), the Soul (`fsbase`/`gsbase`), the Identity (UID/GID/Name), the Command Line pointers, and the open File Descriptors. It uses the modern `VMA_ITERATOR` to map the memory layout. It sends this Blueprint to the target node.
 *   **Background:** This function bridges the gap between Linux 2.4 and 6.x, utilizing modern Maple Tree iterators to safely map memory without crashing.
+*   **Queueing:** the function only enqueues the request on an ordered workqueue; a worker runs the capture and waits for the data pump to finish (or a 60 s timeout) before it takes the next one, because the migration in flight lives in single per-node slots. The same worker serves `mattx_capture_and_return_state`. Incoming blueprints are queued the same way on the target (waiting at most 120 s per migration).
 
 ### Function: mattx_capture_and_return_state
 *   **Declared in:** mattx.h
 *   **Subsystem:** Return Migration (Recall Extraction)
 *   **Usage:** To freeze a Surrogate and extract its *updated* DNA to send it back home.
 *   **Detailed Description:** Almost identical to the forward extraction, but it explicitly tags the Blueprint with the original Deputy's PID so the Home Node knows which frozen body to inject the memories back into.
+*   **Queueing:** like the forward extraction it only enqueues the request; the worker runs return and forward migrations of this node strictly one after another.
 
 ### Function: mattx_send_vma_data
 *   **Declared in:** mattx.h
