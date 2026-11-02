@@ -30,7 +30,78 @@ static int skipped_prot_none_pages = 0;
 static char *stub_argv[] = { "/usr/local/bin/mattx-stub", NULL };
 static char *stub_envp[] = { "HOME=/", "PATH=/sbin:/bin:/usr/sbin:/usr/bin", NULL };
 
-static void handle_migrate_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+// Incoming migrations are handled one at a time. pending_migration, hijacked_stub_task and
+// pending_source_node are one slot: a second blueprint used to replace the first, and the stub
+// spawned for the first then fetched the second one's blueprint (mattx#58). The blueprint
+// handlers only queue; the worker runs one, then waits until its DONE handler has cleaned up the
+// slot (or a timeout) before it takes the next. The source does not send data before it has seen
+// READY, which is only sent from a started item, so a waiting migration just waits for READY.
+#define MATTX_IN_HANDSHAKE_TIMEOUT_MS 120000
+static struct workqueue_struct *mig_in_wq;
+static DECLARE_COMPLETION(mig_in_done);
+static bool mig_in_stopping;
+
+typedef void (*mig_in_fn_t)(struct mattx_link *, struct mattx_header *, void *);
+
+struct mig_in_item {
+    struct work_struct work;
+    mig_in_fn_t fn;
+    struct mattx_link *link;
+    struct mattx_header hdr;
+    void *payload;
+};
+
+static void mig_in_work(struct work_struct *work) {
+    struct mig_in_item *it = container_of(work, struct mig_in_item, work);
+
+    if (!READ_ONCE(mig_in_stopping)) {
+        reinit_completion(&mig_in_done);
+        it->fn(it->link, &it->hdr, it->payload);
+        if (pending_migration && !READ_ONCE(mig_in_stopping) &&
+            !wait_for_completion_timeout(&mig_in_done, msecs_to_jiffies(MATTX_IN_HANDSHAKE_TIMEOUT_MS))) {
+            printk(KERN_ERR "MattX:[IMPORT] The incoming migration from Node %d did not finish within %d s, dropping it.\n",
+                   pending_source_node, MATTX_IN_HANDSHAKE_TIMEOUT_MS / 1000);
+            if (hijacked_stub_task) { put_task_struct(hijacked_stub_task); hijacked_stub_task = NULL; }
+            if (pending_migration) { kvfree(pending_migration); pending_migration = NULL; }
+            pending_source_node = -1;
+        }
+    }
+    kvfree(it->payload);
+    kfree(it);
+}
+
+static void mig_in_enqueue(mig_in_fn_t fn, struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    struct mig_in_item *it = mig_in_wq ? kzalloc(sizeof(*it), GFP_KERNEL) : NULL;
+
+    if (it && payload && hdr->length) {
+        it->payload = kvmalloc(hdr->length, GFP_KERNEL);
+        if (!it->payload) { kfree(it); it = NULL; }
+        else memcpy(it->payload, payload, hdr->length);
+    }
+    if (!it) {  // no queue (or no memory): the old, unserialised behaviour
+        fn(link, hdr, payload);
+        return;
+    }
+    it->fn = fn;
+    it->link = link;
+    it->hdr = *hdr;
+    INIT_WORK(&it->work, mig_in_work);
+    queue_work(mig_in_wq, &it->work);
+}
+
+void mattx_import_queue_stop(void) {
+    WRITE_ONCE(mig_in_stopping, true);
+    complete_all(&mig_in_done);
+}
+
+void mattx_import_queue_destroy(void) {
+    if (mig_in_wq) {
+        destroy_workqueue(mig_in_wq);
+        mig_in_wq = NULL;
+    }
+}
+
+static void do_handle_migrate_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
     if (payload) {
         struct mattx_migration_req *req = (struct mattx_migration_req *)payload;
         
@@ -54,6 +125,10 @@ static void handle_migrate_req(struct mattx_link *link, struct mattx_header *hdr
             printk(KERN_ERR "MattX:[IMPORT] Failed to spawn surrogate!\n");
         }
     }
+}
+
+static void handle_migrate_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    mig_in_enqueue(do_handle_migrate_req, link, hdr, payload);
 }
 
 static void handle_page_transfer(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
@@ -485,6 +560,7 @@ static void handle_migrate_done(struct mattx_link *link, struct mattx_header *hd
         kvfree(pending_migration);
         pending_migration = NULL;
         pending_source_node = -1;
+        complete(&mig_in_done);     // the worker may take the next queued migration
     }
 }
 
@@ -539,7 +615,7 @@ static void mattx_gang_grower_cb(struct callback_head *cb) {
 // ==============================================================================
 
 
-static void handle_return_blueprint(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+static void do_handle_return_blueprint(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
     if (payload) {
         struct mattx_migration_req *req = (struct mattx_migration_req *)payload;
         struct task_struct *deputy = NULL;
@@ -758,6 +834,10 @@ static void mattx_exorcist_cb(struct callback_head *cb) {
 // ==============================================================================
 
 
+static void handle_return_blueprint(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    mig_in_enqueue(do_handle_return_blueprint, link, hdr, payload);
+}
+
 static void handle_return_done(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
     mattx_dbg("[IMPORT] Return memory transferred successfully! Pages: %d\n", injected_pages_count);
     
@@ -940,6 +1020,7 @@ static void handle_return_done(struct mattx_link *link, struct mattx_header *hdr
         kvfree(pending_migration);
         pending_migration = NULL;
         pending_source_node = -1;
+        complete(&mig_in_done);     // the worker may take the next queued migration
     } else {
         printk(KERN_ERR "MattX: [RECALL] FATAL: Missing stub task or blueprint in return_done!\n");
     }
@@ -947,6 +1028,10 @@ static void handle_return_done(struct mattx_link *link, struct mattx_header *hdr
 
 
 void mattx_import_init_handlers(void) {
+    mig_in_stopping = false;
+    mig_in_wq = alloc_ordered_workqueue("mattx_mig_in", WQ_MEM_RECLAIM);
+    if (!mig_in_wq)
+        printk(KERN_WARNING "MattX: no workqueue for incoming migrations, they will not be serialised\n");
     mattx_register_handler(MATTX_MSG_MIGRATE_REQ, handle_migrate_req);
     mattx_register_handler(MATTX_MSG_PAGE_TRANSFER, handle_page_transfer);
     mattx_register_handler(MATTX_MSG_MIGRATE_DONE, handle_migrate_done);

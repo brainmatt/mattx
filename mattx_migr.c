@@ -434,6 +434,19 @@ static struct task_struct *migrating_task = NULL;
 static int migrating_target_node = -1;
 static bool is_returning = false; 
 
+// Outgoing migrations run one at a time. The state of the migration in flight (the four variables
+// above) is one slot, so two migrations started close together used to overwrite each other: the
+// second blueprint replaced the first, one process never moved (frozen on its home node), and two
+// data pumps could run on the same slot (NULL deref in mattx_send_vma_data, mattx#58). Requests
+// (admin write, balancer, recall) are queued on an ordered workqueue; the worker runs one capture,
+// then waits until its data pump has finished (or a timeout) before it takes the next one.
+// Nothing here blocks a receiver thread, which has to stay free to process the READY signal.
+#define MATTX_MIG_HANDSHAKE_TIMEOUT_MS 60000
+static struct workqueue_struct *mig_out_wq;
+static DECLARE_COMPLETION(mig_out_done);
+static bool mig_out_inflight;   // a blueprint was sent and its data pump has not finished yet
+static bool mig_out_stopping;
+
 // --- NEW: The Syscall Drainer ---
 
 struct mattx_drain_ctx {
@@ -517,7 +530,7 @@ static bool mattx_task_capturable(struct task_struct *task)
            READ_ONCE(task->stack);
 }
 
-void mattx_capture_and_send_state(struct task_struct *task, int target_node) {
+static void mattx_do_capture_and_send_state(struct task_struct *task, int target_node) {
     struct mm_struct *mm;
     struct vm_area_struct *vma;
     struct mattx_migration_req *req;
@@ -744,8 +757,10 @@ void mattx_capture_and_send_state(struct task_struct *task, int target_node) {
     if (cluster_map[target_node]) {
         int send_ret;
         mattx_dbg("[MIGRATE] Sending blueprint to Node %d. Waiting for READY signal...\n", target_node);
+        mig_out_inflight = true;
         send_ret = mattx_comm_send(cluster_map[target_node], MATTX_MSG_MIGRATE_REQ, req, actual_payload_size);
         if (send_ret < 0) {
+            mig_out_inflight = false;
             // mattx#17: the Mother and Gang were already frozen (SIGSTOP'd
             // at the user-space boundary) above, in anticipation of a
             // successful hand-off. If the send itself fails -- e.g.
@@ -773,7 +788,7 @@ void mattx_capture_and_send_state(struct task_struct *task, int target_node) {
     kvfree(req); // FIX: Use kvfree!
 }
 
-void mattx_capture_and_return_state(struct task_struct *task, u32 orig_pid, int target_node) {
+static void mattx_do_capture_and_return_state(struct task_struct *task, u32 orig_pid, int target_node) {
     struct mm_struct *mm;
     struct vm_area_struct *vma;
     struct mattx_migration_req *req;
@@ -969,8 +984,10 @@ void mattx_capture_and_return_state(struct task_struct *task, u32 orig_pid, int 
             mattx_dbg("[MIGRATE] RETURN Blueprint built! VMA Count: %d, Total Payload Size: %zu bytes.\n",
                     vma_count, actual_payload_size);
             mattx_dbg("[MIGRATE] Sending RETURN blueprint to Node %d. Waiting for READY signal...\n", target_node);
+            mig_out_inflight = true;
             send_ret = mattx_comm_send(cluster_map[target_node], MATTX_MSG_RETURN_BLUEPRINT, req, actual_payload_size);
             if (send_ret < 0) {
+                mig_out_inflight = false;
                 // mattx#17: same discarded-return-value hazard as the
                 // forward-migration path in mattx_capture_and_send_state()
                 // above -- the Surrogate and Gang were already frozen
@@ -1152,6 +1169,77 @@ void mattx_send_vma_data(void) {
     migrating_task = NULL;
     kvfree(local_migration_req);
     local_migration_req = NULL;
+    complete(&mig_out_done);    // the worker may start the next queued migration
+}
+
+struct mig_out_item {
+    struct work_struct work;
+    struct task_struct *task;
+    u32 orig_pid;
+    int target;
+    bool ret;
+};
+
+static void mig_out_fn(struct work_struct *work) {
+    struct mig_out_item *m = container_of(work, struct mig_out_item, work);
+
+    if (!READ_ONCE(mig_out_stopping)) {
+        reinit_completion(&mig_out_done);
+        mig_out_inflight = false;
+        if (m->ret)
+            mattx_do_capture_and_return_state(m->task, m->orig_pid, m->target);
+        else
+            mattx_do_capture_and_send_state(m->task, m->target);
+
+        if (mig_out_inflight && !READ_ONCE(mig_out_stopping) &&
+            !wait_for_completion_timeout(&mig_out_done, msecs_to_jiffies(MATTX_MIG_HANDSHAKE_TIMEOUT_MS))) {
+            printk(KERN_ERR "MattX:[MIGRATE] Node %d never answered the blueprint of PID %d (no READY within %d s), dropping this migration.\n",
+                   m->target, m->task->pid, MATTX_MIG_HANDSHAKE_TIMEOUT_MS / 1000);
+            if (migrating_task) { put_task_struct(migrating_task); migrating_task = NULL; }
+            if (local_migration_req) { kvfree(local_migration_req); local_migration_req = NULL; }
+        }
+    }
+    put_task_struct(m->task);
+    kfree(m);
+}
+
+static void mig_out_enqueue(struct task_struct *task, u32 orig_pid, int target_node, bool ret) {
+    struct mig_out_item *m = mig_out_wq ? kzalloc(sizeof(*m), GFP_KERNEL) : NULL;
+
+    if (!m) {   // no queue (or no memory): the old, unserialised behaviour
+        if (ret) mattx_do_capture_and_return_state(task, orig_pid, target_node);
+        else mattx_do_capture_and_send_state(task, target_node);
+        return;
+    }
+    get_task_struct(task);
+    m->task = task;
+    m->orig_pid = orig_pid;
+    m->target = target_node;
+    m->ret = ret;
+    INIT_WORK(&m->work, mig_out_fn);
+    queue_work(mig_out_wq, &m->work);
+}
+
+void mattx_capture_and_send_state(struct task_struct *task, int target_node) {
+    mig_out_enqueue(task, 0, target_node, false);
+}
+
+void mattx_capture_and_return_state(struct task_struct *task, u32 orig_pid, int target_node) {
+    mig_out_enqueue(task, orig_pid, target_node, true);
+}
+
+// Called first thing in mattx_exit(): the worker stops waiting and drops what is still queued.
+void mattx_migr_queue_stop(void) {
+    WRITE_ONCE(mig_out_stopping, true);
+    complete_all(&mig_out_done);
+}
+
+// Called once the receiver threads are gone: waits until no work item runs in module text any more.
+void mattx_migr_queue_destroy(void) {
+    if (mig_out_wq) {
+        destroy_workqueue(mig_out_wq);
+        mig_out_wq = NULL;
+    }
 }
 
 // --- THE NODE DRAINER (Expel) ---
@@ -1380,6 +1468,10 @@ void mattx_migr_exit(void) {
 }
 
 void mattx_migr_init_handlers(void) {
+    mig_out_stopping = false;
+    mig_out_wq = alloc_ordered_workqueue("mattx_mig_out", WQ_MEM_RECLAIM);
+    if (!mig_out_wq)
+        printk(KERN_WARNING "MattX: no workqueue for outgoing migrations, they will not be serialised\n");
     // Resolve hidden kernel 7.x symbols before we do anything else!
     mattx_resolve_hidden_symbols();
 

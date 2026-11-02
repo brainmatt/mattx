@@ -1694,6 +1694,10 @@ void mattx_hooks_exit(void);
 
 void mattx_sched_init_handlers(void);
 void mattx_import_init_handlers(void);
+void mattx_import_queue_stop(void);     // incoming-migration worker: stop waiting
+void mattx_import_queue_destroy(void);  // after the receiver threads are gone
+void mattx_migr_queue_stop(void);       // outgoing-migration worker: stop waiting
+void mattx_migr_queue_destroy(void);
 void mattx_migr_init_handlers(void);
 void mattx_migr_exit(void); // waits for a recall that is still being served
 void mattx_guest_init_handlers(void);
