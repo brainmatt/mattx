@@ -128,6 +128,50 @@ static const struct proc_ops guests_proc_ops = {
     .proc_release = single_release,
 };
 
+static int stats_show(struct seq_file *m, void *v) {
+    seq_printf(m, "migrations_out %lld\n", atomic64_read(&mattx_stat_out));
+    seq_printf(m, "migrations_in %lld\n", atomic64_read(&mattx_stat_in));
+    seq_printf(m, "migrations_return %lld\n", atomic64_read(&mattx_stat_return));
+    seq_printf(m, "guests_departed %lld\n", atomic64_read(&mattx_stat_departed));
+    seq_printf(m, "remote_exited %lld\n", atomic64_read(&mattx_stat_remote_exit));
+    seq_printf(m, "exports_reaped %lld\n", atomic64_read(&mattx_stat_reaped));
+    return 0;
+}
+
+static int stats_open(struct inode *inode, struct file *file) {
+    return single_open(file, stats_show, NULL);
+}
+
+static const struct proc_ops stats_proc_ops = {
+    .proc_open = stats_open,
+    .proc_read = seq_read,
+    .proc_lseek = seq_lseek,
+    .proc_release = single_release,
+};
+
+// pid:count for every recently migrated own process (how often it changed place, forward and back)
+static int migrations_show(struct seq_file *m, void *v) {
+    int slot, r;
+    pid_t pid;
+    u32 count;
+
+    for (slot = 0; (r = mattx_hist_get(slot, &pid, &count)) != -2; slot++) {
+        if (r == 0) seq_printf(m, "%d:%u\n", pid, count);
+    }
+    return 0;
+}
+
+static int migrations_open(struct inode *inode, struct file *file) {
+    return single_open(file, migrations_show, NULL);
+}
+
+static const struct proc_ops migrations_proc_ops = {
+    .proc_open = migrations_open,
+    .proc_read = seq_read,
+    .proc_lseek = seq_lseek,
+    .proc_release = single_release,
+};
+
 static int version_show(struct seq_file *m, void *v) {
     seq_printf(m, "MattX Version: 1.9\n");
     seq_printf(m, "MattX License: GPLv2\n");
@@ -448,6 +492,8 @@ int mattx_proc_init(void) {
     proc_create("guests", 0444, mattx_proc_dir, &guests_proc_ops); 
     proc_create("admin", 0666, mattx_proc_dir, &admin_proc_ops); 
     proc_create("dsm", 0444, mattx_proc_dir, &dsm_proc_ops);
+    proc_create("stats", 0444, mattx_proc_dir, &stats_proc_ops);
+    proc_create("migrations", 0444, mattx_proc_dir, &migrations_proc_ops);
     
     mattx_dbg(" /proc/mattx interface created successfully.\n");
     return 0;
@@ -461,6 +507,8 @@ void mattx_proc_exit(void) {
         remove_proc_entry("guests", mattx_proc_dir); 
         remove_proc_entry("admin", mattx_proc_dir);
         remove_proc_entry("dsm", mattx_proc_dir);
+        remove_proc_entry("stats", mattx_proc_dir);
+        remove_proc_entry("migrations", mattx_proc_dir);
         remove_proc_entry("mattx", NULL);
     }
 }

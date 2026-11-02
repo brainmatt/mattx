@@ -1683,6 +1683,19 @@ void remove_guest_process(int index);
 
 void add_export_process(pid_t orig_pid, int target_node);
 void remove_export_process(int index);
+
+// --- Migration counters (/proc/mattx/stats) and per-pid history (/proc/mattx/migrations) ---
+// Monotonic since module load. Counted where the registries change, so they are exact: a
+// migration that completes and finishes again between two reads of /proc/mattx/{remote,guests}
+// is still counted.
+extern atomic64_t mattx_stat_out;          // own process left for another node (export registered)
+extern atomic64_t mattx_stat_in;           // foreign process arrived here (guest registered)
+extern atomic64_t mattx_stat_return;       // own process came back home
+extern atomic64_t mattx_stat_departed;     // a guest left this node again (recalled or exited)
+extern atomic64_t mattx_stat_remote_exit;  // own process ended while running remotely (funeral)
+extern atomic64_t mattx_stat_reaped;       // export entry of a dead peer or process removed by the reaper
+void mattx_hist_bump(pid_t orig_pid);
+int mattx_hist_get(int slot, pid_t *pid, u32 *count);
 int get_export_target(pid_t orig_pid); 
 void mattx_trigger_recall(pid_t orig_pid); 
 
