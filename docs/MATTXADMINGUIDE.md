@@ -850,6 +850,47 @@ $ cat /proc/mattx/remote
 
 ---
 
+#### /proc/mattx/stats
+
+## 5. The Counters (`/proc/mattx/stats`)
+
+A read-only file with exact migration counters for monitoring. The counters are monotonic since the module was loaded (a restart of MattX resets them to 0, which a Prometheus counter handles) and are counted where the registries change, so a migration that starts and ends between two reads of `remote` and `guests` is still counted.
+
+```bash
+$ cat /proc/mattx/stats
+migrations_out 61
+migrations_in 14
+migrations_return 26
+guests_departed 14
+remote_exited 4
+exports_reaped 31
+```
+*   `migrations_out`: processes of this node that left for another node.
+*   `migrations_in`: foreign processes that arrived on this node (a guest was registered).
+*   `migrations_return`: processes of this node that came back home.
+*   `guests_departed`: guests that left this node again, recalled or exited.
+*   `remote_exited`: processes of this node that ended while running remotely (the Funeral).
+*   `exports_reaped`: export entries removed because the process or the peer node died (the Funeral Director).
+
+Over a whole cluster at rest, the sum of `migrations_out` equals the sum of `migrations_in` and of `guests_departed`, and `migrations_out` equals `migrations_return` + `remote_exited` + `exports_reaped`.
+
+---
+
+#### /proc/mattx/migrations
+
+## 6. The Travel Log (`/proc/mattx/migrations`)
+
+A read-only file that says how often each recently migrated process of this node changed place, forward and back (a process that went out and came back once shows `2`).
+
+```bash
+$ cat /proc/mattx/migrations
+53092:6
+43221:1
+```
+*   **Format:** `<ORIGINAL_PID>:<COUNT>`
+*   It is a ring of 256 slots: once more than 256 distinct pids have migrated, the oldest slot is reused, so a count is only reliable for recently active pids. Only the home node counts (the guest side has a different local pid).
+
+
 ### MattX tools
 
 While the `/proc` interface is the control deck, MattX comes bundled with a suite of custom-built tools. These aren't just utilities; they are the stress-testers, the pathfinders, and the ultimate proof that the Wormhole is stable. 
