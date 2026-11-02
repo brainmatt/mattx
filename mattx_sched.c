@@ -86,13 +86,9 @@ u32 mattx_calc_local_load(void) {
         
         // Don't count included/excluded tasks, otherwise they artificially inflate our load!
         // --- THE SMART FILTER ---
-        if (config_migration_includes[0] != '\0') {
-            // Whitelist Mode: If it's NOT on the list, ignore it!
-            if (!is_task_included(p->comm)) continue;
-        } else {
-            // Blacklist Mode: If it IS on the list, ignore it!
-            if (is_task_excluded(p->comm)) continue;
-        }        
+        // The exclude list always wins, then the whitelist (if any) narrows what is left.
+        if (is_task_excluded(p->comm)) continue;
+        if (config_migration_includes[0] != '\0' && !is_task_included(p->comm)) continue;
 
         // --- DESIGN A: The Observer Blindspot ---
         // Never count the process that is currently asking for the load!
@@ -125,11 +121,8 @@ static struct task_struct* mattx_find_candidate_task(void) {
         if (is_guest_process(p->pid)) continue;
         
         // --- THE SMART FILTER ---
-        if (config_migration_includes[0] != '\0') {
-            if (!is_task_included(p->comm)) continue;
-        } else {
-            if (is_task_excluded(p->comm)) continue;
-        }
+        if (is_task_excluded(p->comm)) continue;
+        if (config_migration_includes[0] != '\0' && !is_task_included(p->comm)) continue;
         
         if (p->pid == last_migrated_pid) continue;
 

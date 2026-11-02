@@ -126,6 +126,14 @@ start() {
         echo "MattX [WARNING]: No default included processes specified in configuration."
     fi
 
+    # 6. set the processes that must never migrate (wins over MATTX_INCLUDE)
+    if [ -n "$MATTX_EXCLUDE" ]; then
+        echo "MattX [INFO]: Setting never-migrate processes: $MATTX_EXCLUDE"
+        echo "exclude $MATTX_EXCLUDE" > $MATTX_PROC_ADMIN
+    else
+        echo "MattX [INFO]: No MATTX_EXCLUDE in configuration, keeping the built-in exclude list."
+    fi
+
     echo $DAEMON_PID > /var/run/mattx.pid
 
     echo "MattX started successfully! 🚀"

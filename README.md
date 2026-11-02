@@ -221,6 +221,9 @@ DSM_MODE=2
 
 # configure your default included processes to migrate for the cluster
 MATTX_INCLUDE="pvmchess-client,mpichess-client,migtest,migtest2,migtest3,dfsatest,epolltest"
+
+# processes that must never migrate; wins over MATTX_INCLUDE and replaces the built-in list
+MATTX_EXCLUDE="cat,watch,cron,top,bash,make,pvmd,sshd,sshd-session,mattx-discd,mattx-stub,systemd,systemd-journald,systemd-journal,puppet,node_exporter"
 ```
 
 ---
