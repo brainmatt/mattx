@@ -360,6 +360,22 @@ static void handle_migrate_done(struct mattx_link *link, struct mattx_header *hd
                         if (fsize > sizeof(pending_migration->threads[t_idx].fpu_state))
                             fsize = sizeof(pending_migration->threads[t_idx].fpu_state);
                         memcpy(&fpu->fpstate->regs, pending_migration->threads[t_idx].fpu_state, fsize);
+
+                        // The image above went into the task's fpstate in MEMORY only. If this CPU still holds the old
+                        // register file of this task (fpu->last_cpu == this CPU and the task is still the owner of the FPU
+                        // registers), the kernel skips the reload on the way back to user space and the thread runs with
+                        // STALE xmm/ymm registers (mattx#63: an all-ones ymm stored into a pointer, strlen(-1)). Same as
+                        // ptrace does after it has written a task's xstate: invalidate, so the registers ARE reloaded.
+                        {
+                            unsigned int old_last_cpu = fpu->last_cpu;
+
+                            if (pending_migration->threads[t_idx].fpu_size != fpu->fpstate->size)
+                                printk_ratelimited(KERN_WARNING "MattX:[IMPORT] WARNING: FPU image of TID %u is %u bytes, the local fpstate is %u bytes (CPU features differ, or the image was truncated)\n",
+                                                   pending_migration->threads[t_idx].tid, pending_migration->threads[t_idx].fpu_size, fpu->fpstate->size);
+                            fpu->last_cpu = -1;
+                            mattx_dbg("[IMPORT] FPU restore TID %d: last_cpu was %u, task_cpu is %u -> register reload forced\n",
+                                      t->pid, old_last_cpu, task_cpu(t));
+                        }
                     }
                 }
 
@@ -845,6 +861,37 @@ static void handle_return_done(struct mattx_link *link, struct mattx_header *hdr
         mattx_dbg("[IMPORT] %d pages skipped because the target VMA is PROT_NONE\n", skipped_prot_none_pages);
 
     if (hijacked_stub_task && pending_migration) {
+
+    // The Deputy has been frozen since the forward migration; its registers are overwritten below, which is only
+    // safe while EVERY thread is really stopped (the forward path waits for this as well). Never write pt_regs of
+    // a running task: wait a bounded time, and shout if it is not stopped (mattx#63).
+    {
+        int stop_retries = 100; // 1 s
+        struct task_struct *st;
+
+        while (stop_retries > 0) {
+            bool all_stopped = true;
+
+            rcu_read_lock();
+            for_each_thread(hijacked_stub_task, st) {
+                if (!(READ_ONCE(st->__state) & __TASK_STOPPED)) {
+                    all_stopped = false;
+                    break;
+                }
+            }
+            rcu_read_unlock();
+            if (all_stopped)
+                break;
+            msleep(10);
+            stop_retries--;
+        }
+        if (stop_retries == 0)
+            printk(KERN_WARNING "MattX:[RECALL] WARNING: Deputy PID %d is NOT fully stopped, injecting its registers anyway!\n",
+                   hijacked_stub_task->pid);
+        else
+            mattx_dbg("[RECALL] Deputy PID %d is stopped (waited %d ms), injecting its registers\n",
+                      hijacked_stub_task->pid, (100 - stop_retries) * 10);
+    }
         struct task_struct *t;
         int t_idx = 0;
         int i;
@@ -936,6 +983,22 @@ static void handle_return_done(struct mattx_link *link, struct mattx_header *hdr
                         if (fsize > sizeof(pending_migration->threads[t_idx].fpu_state))
                             fsize = sizeof(pending_migration->threads[t_idx].fpu_state);
                         memcpy(&fpu->fpstate->regs, pending_migration->threads[t_idx].fpu_state, fsize);
+
+                        // The image above went into the task's fpstate in MEMORY only. If this CPU still holds the old
+                        // register file of this task (fpu->last_cpu == this CPU and the task is still the owner of the FPU
+                        // registers), the kernel skips the reload on the way back to user space and the thread runs with
+                        // STALE xmm/ymm registers (mattx#63: an all-ones ymm stored into a pointer, strlen(-1)). Same as
+                        // ptrace does after it has written a task's xstate: invalidate, so the registers ARE reloaded.
+                        {
+                            unsigned int old_last_cpu = fpu->last_cpu;
+
+                            if (pending_migration->threads[t_idx].fpu_size != fpu->fpstate->size)
+                                printk_ratelimited(KERN_WARNING "MattX:[RECALL] WARNING: FPU image of TID %u is %u bytes, the local fpstate is %u bytes (CPU features differ, or the image was truncated)\n",
+                                                   pending_migration->threads[t_idx].tid, pending_migration->threads[t_idx].fpu_size, fpu->fpstate->size);
+                            fpu->last_cpu = -1;
+                            mattx_dbg("[RECALL] FPU restore TID %d: last_cpu was %u, task_cpu is %u -> register reload forced\n",
+                                      t->pid, old_last_cpu, task_cpu(t));
+                        }
                     }
                 }
 
