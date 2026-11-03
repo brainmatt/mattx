@@ -22,6 +22,7 @@
  */
 
 #include "mattx.h"
+#include "mattx_inotify.h"
 #include <linux/wait.h> 
 #include <linux/poll.h>
 #include <linux/eventpoll.h>
@@ -5419,6 +5420,482 @@ static int ret_handler_pipe2(struct kretprobe_instance *ri, struct pt_regs *regs
 
 
 // ============================================================================
+// THE INOTIFY WORMHOLE (VM2 side)
+// inotify_init / inotify_init1 / inotify_add_watch / inotify_rm_watch
+//
+// The real inotify instance lives in the Deputy's fd table on VM1. The
+// Surrogate only holds a mattx_vfs_proxy fake file, so these four syscalls
+// must be tunneled home (see mattx_inotify.h for the full story).
+//
+// Same ticket pattern as read(), connect() and accept(): the (sabotaged)
+// syscall returns, a task_work makes ONLY the calling thread wait on its own
+// ticket, and the reply is matched by req_id. The thread that is blocked in
+// read() on the proxy keeps sleeping undisturbed until IN_IGNORED wakes it.
+// ============================================================================
+
+mattx_sys_inotify_init1_fn real_sys_inotify_init1 = NULL;
+mattx_sys_inotify_add_watch_fn real_sys_inotify_add_watch = NULL;
+mattx_sys_inotify_rm_watch_fn real_sys_inotify_rm_watch = NULL;
+
+static void *mattx_inotify_resolve_syscall(const char *symbol) {
+    struct kprobe kp;
+    void *addr = NULL;
+
+    memset(&kp, 0, sizeof(kp));
+    kp.symbol_name = symbol;
+    if (register_kprobe(&kp) == 0) {
+        addr = (void *)kp.addr;
+        unregister_kprobe(&kp);
+    }
+    return addr;
+}
+
+// ---------------------------------------------------------------------------
+// INOTIFY_RM_WATCH
+// ---------------------------------------------------------------------------
+struct mattx_inotify_rm_watch_tw {
+    struct callback_head cb;
+    u32 orig_pid;
+    int home_node;
+    int remote_fd;
+    int wd;
+};
+
+static void mattx_inotify_rm_watch_tw_fn(struct callback_head *cb) {
+    struct mattx_inotify_rm_watch_tw *tw = container_of(cb, struct mattx_inotify_rm_watch_tw, cb);
+    struct pt_regs *regs = task_pt_regs(current);
+    struct mattx_sys_inotify_rm_watch_req req;
+    struct mattx_ticket *t;
+    struct mattx_link *link;
+    long ret = -EINTR;
+
+    if (fatal_signal_pending(current) || tw->home_node < 0 || tw->home_node >= MAX_NODES)
+        goto out;
+
+    link = READ_ONCE(cluster_map[tw->home_node]);
+    if (!link) {
+        ret = -EIO;
+        goto out;
+    }
+
+    // The reply carries no data: only the result
+    t = mattx_ticket_add(tw->orig_pid, tw->home_node, 0);
+    if (!t) {
+        ret = -ENOMEM;
+        goto out;
+    }
+
+    memset(&req, 0, sizeof(req));
+    req.orig_pid = tw->orig_pid;
+    req.fd = tw->remote_fd;
+    req.wd = tw->wd;
+    req.req_id = t->req_id;
+
+    mattx_dbg("[RPC] Thread %d: inotify_rm_watch(fd=%d, wd=%d) as req %u, sleeping on its own ticket...\n", current->pid, tw->remote_fd, tw->wd, t->req_id);
+
+    if (mattx_comm_send(link, MATTX_MSG_SYS_INOTIFY_RM_WATCH_REQ, &req, sizeof(req)) < 0) {
+        // Never sleep for a reply to a request that was never sent
+        mattx_dbg("[RPC] Thread %d: INOTIFY_RM_WATCH_REQ send failed\n", current->pid);
+        ret = -EIO;
+        goto done;
+    }
+
+    if (mattx_ticket_wait(t, MAX_SCHEDULE_TIMEOUT) == 0)
+        ret = t->retval;
+
+    mattx_dbg("[RPC] Illusion Complete! inotify_rm_watch() on Ghost FD returned %ld (thread %d)\n", ret, current->pid);
+
+done:
+    mattx_ticket_del(t);
+out:
+    regs->ax = ret;
+    kfree(tw);
+}
+
+struct inotify_rm_watch_kretprobe_data { int fd; int wd; bool is_ghost; };
+static struct kretprobe inotify_rm_watch_kprobe;
+
+static int entry_handler_inotify_rm_watch(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    struct inotify_rm_watch_kretprobe_data *data = (struct inotify_rm_watch_kretprobe_data *)ri->data;
+    data->is_ghost = false;
+
+    if (is_guest_process(current->tgid) && real_task_work_add) {
+        struct pt_regs *sys_regs = SYSCALL_REGS(regs);
+        int local_fd = (int)sys_regs->di;
+
+        data->fd = local_fd;
+        data->wd = (int)sys_regs->si;
+        if (local_fd >= 0) data->is_ghost = is_wormhole_fd(local_fd, &data->fd);
+
+        if (data->is_ghost) {
+            mattx_dbg("[HOOK] inotify_rm_watch: Intercepted Ghost FD %d (Remote: %d, wd %d). Tunneling to VM1...\n", local_fd, data->fd, data->wd);
+            sys_regs->di = -1; // Sabotage! The local syscall must fail.
+        }
+    }
+    return 0;
+}
+
+static int ret_handler_inotify_rm_watch(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    struct inotify_rm_watch_kretprobe_data *data = (struct inotify_rm_watch_kretprobe_data *)ri->data;
+    int home_node = -1;
+    u32 orig_pid = 0;
+    int i;
+
+    if (!is_guest_process(current->pid) || !data->is_ghost) return 0;
+
+    spin_lock(&guest_lock);
+    for (i = 0; i < guest_count; i++) {
+        if (guest_registry[i].local_pid == current->tgid) {
+            home_node = guest_registry[i].home_node;
+            orig_pid = guest_registry[i].orig_pid;
+            break;
+        }
+    }
+    spin_unlock(&guest_lock);
+
+    if (home_node != -1) {
+        // --- THE ATOMIC SHIELD ---
+        if (fatal_signal_pending(current) || (current->flags & PF_EXITING)) {
+            mattx_dbg("[HOOK] Surrogate %s is dying. Aborting RPC.\n", current->comm);
+            return 0;
+        }
+
+        {
+            struct mattx_inotify_rm_watch_tw *tw = kzalloc(sizeof(*tw), GFP_ATOMIC);
+            if (tw) {
+                init_task_work(&tw->cb, mattx_inotify_rm_watch_tw_fn);
+                tw->orig_pid = orig_pid;
+                tw->home_node = home_node;
+                tw->remote_fd = data->fd;
+                tw->wd = data->wd;
+
+                mattx_dbg("[HOOK] Intercepted inotify_rm_watch(fd=%d). Thread %d waits on its own ticket...\n", data->fd, current->pid);
+                // The sabotaged call returns -EBADF; the task_work overwrites it with the real result.
+                regs->ax = -EINTR;
+
+                if (real_task_work_add(current, &tw->cb, TWA_RESUME))
+                    kfree(tw);
+            }
+        }
+    }
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// INOTIFY_ADD_WATCH
+// ---------------------------------------------------------------------------
+struct mattx_inotify_add_watch_tw {
+    struct callback_head cb;
+    u32 orig_pid;
+    int home_node;
+    int remote_fd;
+    u32 mask;
+    const char __user *path;    // read by the task_work: it runs in the thread's own process context
+};
+
+static void mattx_inotify_add_watch_tw_fn(struct callback_head *cb) {
+    struct mattx_inotify_add_watch_tw *tw = container_of(cb, struct mattx_inotify_add_watch_tw, cb);
+    struct pt_regs *regs = task_pt_regs(current);
+    struct mattx_sys_inotify_add_watch_req req;
+    struct mattx_ticket *t;
+    struct mattx_link *link;
+    long ret = -EINTR;
+    long len;
+
+    if (fatal_signal_pending(current) || tw->home_node < 0 || tw->home_node >= MAX_NODES)
+        goto out;
+
+    link = READ_ONCE(cluster_map[tw->home_node]);
+    if (!link) {
+        ret = -EIO;
+        goto out;
+    }
+
+    memset(&req, 0, sizeof(req));
+
+    // The path is resolved on the Home Node (the Deputy's cwd and root): ship the string, not the pointer.
+    len = strncpy_from_user(req.path, tw->path, sizeof(req.path));
+    if (len < 0) {
+        ret = -EFAULT;
+        goto out;
+    }
+    if (len >= (long)sizeof(req.path)) {
+        ret = -ENAMETOOLONG;
+        goto out;
+    }
+
+    // The reply carries no data: only the watch descriptor (or -errno)
+    t = mattx_ticket_add(tw->orig_pid, tw->home_node, 0);
+    if (!t) {
+        ret = -ENOMEM;
+        goto out;
+    }
+
+    req.orig_pid = tw->orig_pid;
+    req.fd = tw->remote_fd;
+    req.mask = tw->mask;
+    req.req_id = t->req_id;
+
+    mattx_dbg("[RPC] Thread %d: inotify_add_watch(fd=%d, '%s', mask 0x%x) as req %u, sleeping on its own ticket...\n", current->pid, tw->remote_fd, req.path, tw->mask, t->req_id);
+
+    if (mattx_comm_send(link, MATTX_MSG_SYS_INOTIFY_ADD_WATCH_REQ, &req, sizeof(req)) < 0) {
+        mattx_dbg("[RPC] Thread %d: INOTIFY_ADD_WATCH_REQ send failed\n", current->pid);
+        ret = -EIO;
+        goto done;
+    }
+
+    if (mattx_ticket_wait(t, MAX_SCHEDULE_TIMEOUT) == 0)
+        ret = t->retval;
+
+    mattx_dbg("[RPC] Illusion Complete! inotify_add_watch() on Ghost FD returned %ld (thread %d)\n", ret, current->pid);
+
+done:
+    mattx_ticket_del(t);
+out:
+    regs->ax = ret;
+    kfree(tw);
+}
+
+struct inotify_add_watch_kretprobe_data { int fd; u32 mask; const char __user *path; bool is_ghost; };
+static struct kretprobe inotify_add_watch_kprobe;
+
+static int entry_handler_inotify_add_watch(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    struct inotify_add_watch_kretprobe_data *data = (struct inotify_add_watch_kretprobe_data *)ri->data;
+    data->is_ghost = false;
+
+    if (is_guest_process(current->tgid) && real_task_work_add) {
+        struct pt_regs *sys_regs = SYSCALL_REGS(regs);
+        int local_fd = (int)sys_regs->di;
+
+        data->fd = local_fd;
+        data->path = (const char __user *)sys_regs->si;
+        data->mask = (u32)sys_regs->dx;
+        if (local_fd >= 0) data->is_ghost = is_wormhole_fd(local_fd, &data->fd);
+
+        if (data->is_ghost) {
+            mattx_dbg("[HOOK] inotify_add_watch: Intercepted Ghost FD %d (Remote: %d, mask 0x%x). Tunneling to VM1...\n", local_fd, data->fd, data->mask);
+            sys_regs->di = -1; // Sabotage! The local syscall must fail.
+        }
+    }
+    return 0;
+}
+
+static int ret_handler_inotify_add_watch(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    struct inotify_add_watch_kretprobe_data *data = (struct inotify_add_watch_kretprobe_data *)ri->data;
+    int home_node = -1;
+    u32 orig_pid = 0;
+    int i;
+
+    if (!is_guest_process(current->pid) || !data->is_ghost) return 0;
+
+    spin_lock(&guest_lock);
+    for (i = 0; i < guest_count; i++) {
+        if (guest_registry[i].local_pid == current->tgid) {
+            home_node = guest_registry[i].home_node;
+            orig_pid = guest_registry[i].orig_pid;
+            break;
+        }
+    }
+    spin_unlock(&guest_lock);
+
+    if (home_node != -1) {
+        // --- THE ATOMIC SHIELD ---
+        if (fatal_signal_pending(current) || (current->flags & PF_EXITING)) {
+            mattx_dbg("[HOOK] Surrogate %s is dying. Aborting RPC.\n", current->comm);
+            return 0;
+        }
+
+        {
+            struct mattx_inotify_add_watch_tw *tw = kzalloc(sizeof(*tw), GFP_ATOMIC);
+            if (tw) {
+                init_task_work(&tw->cb, mattx_inotify_add_watch_tw_fn);
+                tw->orig_pid = orig_pid;
+                tw->home_node = home_node;
+                tw->remote_fd = data->fd;
+                tw->mask = data->mask;
+                tw->path = data->path;
+
+                mattx_dbg("[HOOK] Intercepted inotify_add_watch(fd=%d). Thread %d waits on its own ticket...\n", data->fd, current->pid);
+                regs->ax = -EINTR;
+
+                if (real_task_work_add(current, &tw->cb, TWA_RESUME))
+                    kfree(tw);
+            }
+        }
+    }
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// INOTIFY_INIT / INOTIFY_INIT1
+//
+// Plain inotify_init() has no argument we could sabotage, so the local syscall
+// is allowed to succeed: its fd is simply the placeholder slot that the proxy
+// file is swapped into by the task_work. That keeps the fd number and the
+// O_CLOEXEC bit the application sees. If the Home Node cannot create the
+// instance (or the thread is interrupted), the Surrogate keeps the local one:
+// graceful degradation (local watches) instead of an error that inotify_init()
+// never returns natively.
+// ---------------------------------------------------------------------------
+struct mattx_inotify_init_tw {
+    struct callback_head cb;
+    u32 orig_pid;
+    int home_node;
+    int flags;
+    int local_fd;   // the placeholder fd the local syscall just created
+};
+
+static void mattx_inotify_init_tw_fn(struct callback_head *cb) {
+    struct mattx_inotify_init_tw *tw = container_of(cb, struct mattx_inotify_init_tw, cb);
+    struct pt_regs *regs = task_pt_regs(current);
+    struct mattx_sys_inotify_init_req req;
+    struct mattx_ticket *t;
+    struct mattx_link *link;
+    long ret = tw->local_fd;    // default: keep the local instance
+
+    if (fatal_signal_pending(current) || tw->home_node < 0 || tw->home_node >= MAX_NODES)
+        goto out;
+
+    link = READ_ONCE(cluster_map[tw->home_node]);
+    if (!link)
+        goto out;
+
+    // The reply carries no data: the result is the new remote FD, or -errno
+    t = mattx_ticket_add(tw->orig_pid, tw->home_node, 0);
+    if (!t)
+        goto out;
+
+    memset(&req, 0, sizeof(req));
+    req.orig_pid = tw->orig_pid;
+    req.flags = tw->flags;
+    req.req_id = t->req_id;
+
+    mattx_dbg("[RPC] Thread %d: inotify_init(flags 0x%x) as req %u, sleeping on its own ticket...\n", current->pid, tw->flags, t->req_id);
+
+    if (mattx_comm_send(link, MATTX_MSG_SYS_INOTIFY_INIT_REQ, &req, sizeof(req)) < 0) {
+        mattx_dbg("[RPC] Thread %d: INOTIFY_INIT_REQ send failed. Keeping the local instance.\n", current->pid);
+        goto done;
+    }
+
+    if (mattx_ticket_wait(t, MAX_SCHEDULE_TIMEOUT) == 0 && t->retval >= 0) {
+        // The home node created an inotify instance in the Deputy's table as FD 'remote_fd': build the proxy FD
+        int remote_fd = (int)t->retval;
+        struct mattx_fake_fd_info *fd_info = kmalloc(sizeof(*fd_info), GFP_KERNEL);
+        struct file *fake_file = ERR_PTR(-ENOMEM);
+
+        if (fd_info) {
+            fd_info->home_node = tw->home_node;
+            fd_info->orig_pid = tw->orig_pid;
+            fd_info->remote_fd = remote_fd;
+            fake_file = anon_inode_getfile("mattx_vfs_proxy", &mattx_fops, fd_info, O_RDONLY);
+            if (IS_ERR(fake_file)) kfree(fd_info);
+        }
+
+        if (!IS_ERR(fake_file)) {
+            struct file *old_file = NULL;
+
+            // Swap the proxy into the placeholder slot the local syscall allocated for us.
+            spin_lock(&current->files->file_lock);
+            {
+                struct fdtable *fdt = files_fdtable(current->files);
+                if (tw->local_fd < fdt->max_fds) {
+                    old_file = rcu_dereference_raw(fdt->fd[tw->local_fd]);
+                    if (old_file) rcu_assign_pointer(fdt->fd[tw->local_fd], fake_file);
+                }
+            }
+            spin_unlock(&current->files->file_lock);
+
+            if (old_file) {
+                fput(old_file); // Releases the local placeholder instance
+                mattx_dbg("[RPC] Illusion Complete! Mapped Remote inotify FD %d to Local FD %d (thread %d)\n", remote_fd, tw->local_fd, current->pid);
+            } else {
+                // The slot vanished under us (closed by another thread). Drop the proxy again,
+                // its release() sends the CLOSE_REQ for the remote instance.
+                fput(fake_file);
+                ret = -EBADF;
+            }
+        } else {
+            // No proxy: do not leak the instance on the home node
+            struct mattx_sys_close_req close_req = { .orig_pid = tw->orig_pid, .remote_fd = remote_fd };
+            mattx_comm_send(link, MATTX_MSG_SYS_CLOSE_REQ, &close_req, sizeof(close_req));
+            mattx_dbg("[RPC] inotify_init: Failed to create the proxy file (%ld). Keeping the local instance.\n", PTR_ERR(fake_file));
+        }
+    } else {
+        mattx_dbg("[RPC] inotify_init: Home Node gave no instance (%ld). Keeping the local instance.\n", t->retval);
+    }
+
+done:
+    mattx_ticket_del(t);
+out:
+    regs->ax = ret;
+    kfree(tw);
+}
+
+struct inotify_init_kretprobe_data { int flags; bool is_guest; };
+static struct kretprobe inotify_init_kprobe;
+static struct kretprobe inotify_init1_kprobe;
+
+static int entry_handler_inotify_init(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    struct inotify_init_kretprobe_data *data = (struct inotify_init_kretprobe_data *)ri->data;
+    data->is_guest = is_guest_process(current->tgid) && config_migrate_file_io && real_task_work_add;
+    data->flags = 0; // plain inotify_init() has no flags
+    return 0;
+}
+
+static int entry_handler_inotify_init1(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    struct inotify_init_kretprobe_data *data = (struct inotify_init_kretprobe_data *)ri->data;
+    data->is_guest = is_guest_process(current->tgid) && config_migrate_file_io && real_task_work_add;
+    data->flags = data->is_guest ? (int)SYSCALL_REGS(regs)->di : 0;
+    return 0;
+}
+
+static int ret_handler_inotify_init(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    struct inotify_init_kretprobe_data *data = (struct inotify_init_kretprobe_data *)ri->data;
+    int local_fd = (int)regs_return_value(regs);
+    int home_node = -1;
+    u32 orig_pid = 0;
+    int i;
+
+    if (!data->is_guest || local_fd < 0) return 0; // not ours, or the local syscall failed anyway
+
+    spin_lock(&guest_lock);
+    for (i = 0; i < guest_count; i++) {
+        if (guest_registry[i].local_pid == current->tgid) {
+            home_node = guest_registry[i].home_node;
+            orig_pid = guest_registry[i].orig_pid;
+            break;
+        }
+    }
+    spin_unlock(&guest_lock);
+
+    if (home_node != -1) {
+        // --- THE ATOMIC SHIELD ---
+        if (fatal_signal_pending(current) || (current->flags & PF_EXITING)) {
+            mattx_dbg("[HOOK] Surrogate %s is dying. Aborting RPC.\n", current->comm);
+            return 0;
+        }
+
+        {
+            struct mattx_inotify_init_tw *tw = kzalloc(sizeof(*tw), GFP_ATOMIC);
+            if (tw) {
+                init_task_work(&tw->cb, mattx_inotify_init_tw_fn);
+                tw->orig_pid = orig_pid;
+                tw->home_node = home_node;
+                tw->flags = data->flags;
+                tw->local_fd = local_fd;
+
+                mattx_dbg("[HOOK] Intercepted inotify_init(flags 0x%x) for %s. Thread %d waits on its own ticket...\n", data->flags, current->comm, current->pid);
+
+                if (real_task_work_add(current, &tw->cb, TWA_RESUME))
+                    kfree(tw);
+            }
+        }
+    }
+    return 0;
+}
+
+
+// ============================================================================
 // BATCH 3.1: LOCAL MEMORY ALLOCATORS (Executes natively on VM2)
 // ============================================================================
 
@@ -6592,6 +7069,50 @@ int mattx_hooks_init(void) {
     pipe2_kprobe.maxactive = 64; 
     ret = mattx_register_kretprobe(&pipe2_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for pipe2, returned %d\n", ret);
+
+    // --- THE INOTIFY WORMHOLE ---
+    BUILD_BUG_ON((int)MATTX_MSG_SYS_REQ_CANCEL >= (int)MATTX_MSG_SYS_INOTIFY_INIT_REQ);
+    real_sys_inotify_init1 = (mattx_sys_inotify_init1_fn)mattx_inotify_resolve_syscall("__x64_sys_inotify_init1");
+    real_sys_inotify_add_watch = (mattx_sys_inotify_add_watch_fn)mattx_inotify_resolve_syscall("__x64_sys_inotify_add_watch");
+    real_sys_inotify_rm_watch = (mattx_sys_inotify_rm_watch_fn)mattx_inotify_resolve_syscall("__x64_sys_inotify_rm_watch");
+    if (!real_sys_inotify_init1 || !real_sys_inotify_add_watch || !real_sys_inotify_rm_watch)
+        printk(KERN_ERR "MattX: Could not resolve all inotify syscalls! The Home Node cannot execute them for Surrogates.\n");
+
+    memset(&inotify_init_kprobe, 0, sizeof(inotify_init_kprobe));
+    inotify_init_kprobe.kp.symbol_name = "__x64_sys_inotify_init";
+    inotify_init_kprobe.entry_handler = entry_handler_inotify_init;
+    inotify_init_kprobe.handler = ret_handler_inotify_init;
+    inotify_init_kprobe.data_size = sizeof(struct inotify_init_kretprobe_data);
+    inotify_init_kprobe.maxactive = 64;
+    ret = mattx_register_kretprobe(&inotify_init_kprobe);
+    if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for s_inotify_init, returned %d\n", ret);
+
+    memset(&inotify_init1_kprobe, 0, sizeof(inotify_init1_kprobe));
+    inotify_init1_kprobe.kp.symbol_name = "__x64_sys_inotify_init1";
+    inotify_init1_kprobe.entry_handler = entry_handler_inotify_init1;
+    inotify_init1_kprobe.handler = ret_handler_inotify_init;
+    inotify_init1_kprobe.data_size = sizeof(struct inotify_init_kretprobe_data);
+    inotify_init1_kprobe.maxactive = 64;
+    ret = mattx_register_kretprobe(&inotify_init1_kprobe);
+    if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for s_inotify_init1, returned %d\n", ret);
+
+    memset(&inotify_add_watch_kprobe, 0, sizeof(inotify_add_watch_kprobe));
+    inotify_add_watch_kprobe.kp.symbol_name = "__x64_sys_inotify_add_watch";
+    inotify_add_watch_kprobe.entry_handler = entry_handler_inotify_add_watch;
+    inotify_add_watch_kprobe.handler = ret_handler_inotify_add_watch;
+    inotify_add_watch_kprobe.data_size = sizeof(struct inotify_add_watch_kretprobe_data);
+    inotify_add_watch_kprobe.maxactive = 64;
+    ret = mattx_register_kretprobe(&inotify_add_watch_kprobe);
+    if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for s_inotify_add_watch, returned %d\n", ret);
+
+    memset(&inotify_rm_watch_kprobe, 0, sizeof(inotify_rm_watch_kprobe));
+    inotify_rm_watch_kprobe.kp.symbol_name = "__x64_sys_inotify_rm_watch";
+    inotify_rm_watch_kprobe.entry_handler = entry_handler_inotify_rm_watch;
+    inotify_rm_watch_kprobe.handler = ret_handler_inotify_rm_watch;
+    inotify_rm_watch_kprobe.data_size = sizeof(struct inotify_rm_watch_kretprobe_data);
+    inotify_rm_watch_kprobe.maxactive = 64;
+    ret = mattx_register_kretprobe(&inotify_rm_watch_kprobe);
+    if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for s_inotify_rm_watch, returned %d\n", ret);
 
     memset(&brk_kprobe, 0, sizeof(brk_kprobe));
     brk_kprobe.kp.symbol_name = "__x64_sys_brk";

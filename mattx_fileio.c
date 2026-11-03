@@ -23,6 +23,7 @@
 
 #include <linux/eventfd.h>
 #include "mattx.h"
+#include "mattx_inotify.h"
 #include <linux/wait.h>
 #include <linux/poll.h>
 #include <linux/namei.h> // For kern_path
@@ -4891,6 +4892,219 @@ static void handle_sys_getdents64_reply(struct mattx_link *link, struct mattx_he
 }
 
 
+// ============================================================================
+// THE INOTIFY WORMHOLE (VM1 side: Identity Theft, and the ticket replies on VM2)
+// inotify_init / inotify_init1 / inotify_add_watch / inotify_rm_watch
+//
+// The real inotify instance lives in the Deputy's fd table. The Kworker steals
+// the Deputy's mm/cred/fs/files and runs the native syscall on that instance,
+// without ever waking the Deputy up. inotify_rm_watch() on the real instance
+// generates IN_IGNORED, which wakes whoever is blocked in read() on it.
+// (See mattx_inotify.h. The hooks and task_works live in mattx_hooks.c.)
+// ============================================================================
+
+// --- INOTIFY_RM_WATCH ---
+struct mattx_inotify_rm_watch_kworker_ctx { struct work_struct work; struct mattx_sys_inotify_rm_watch_req req; int target_node; };
+
+static void mattx_inotify_rm_watch_kworker(struct work_struct *work) {
+    struct mattx_inotify_rm_watch_kworker_ctx *ctx = container_of(work, struct mattx_inotify_rm_watch_kworker_ctx, work);
+    struct mattx_sys_inotify_rm_watch_reply reply;
+    struct pt_regs regs; memset(&regs, 0, sizeof(regs));
+    struct task_struct *deputy = NULL;
+    struct mattx_link *link;
+    int ret = -ENOSYS;
+
+    regs.di = ctx->req.fd;
+    regs.si = ctx->req.wd;
+    rcu_read_lock(); deputy = pid_task(find_vpid(ctx->req.orig_pid), PIDTYPE_PID); if (deputy) get_task_struct(deputy); rcu_read_unlock();
+
+    mattx_dbg("[KWORKER] inotify_rm_watch(fd %d, wd %d) as Deputy %u (req %u)...\n", ctx->req.fd, ctx->req.wd, ctx->req.orig_pid, ctx->req.req_id);
+    if (real_sys_inotify_rm_watch) {
+        ret = mattx_execute_as_deputy(deputy, real_sys_inotify_rm_watch, &regs, NULL, 0, NULL, 0, 0, ctx->req.fd, 1);
+    }
+    if (deputy) put_task_struct(deputy);
+    mattx_dbg("[KWORKER] inotify_rm_watch returned %d\n", ret);
+
+    memset(&reply, 0, sizeof(reply));
+    reply.orig_pid = ctx->req.orig_pid;
+    reply.req_id = ctx->req.req_id;
+    reply.error = ret;
+    link = READ_ONCE(cluster_map[ctx->target_node]);
+    if (link) mattx_comm_send(link, MATTX_MSG_SYS_INOTIFY_RM_WATCH_REPLY, &reply, sizeof(reply));
+    kfree(ctx);
+}
+
+static void handle_sys_inotify_rm_watch_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    struct mattx_sys_inotify_rm_watch_req *req = payload;
+    struct mattx_inotify_rm_watch_kworker_ctx *ctx;
+
+    if (!payload || hdr->length < sizeof(*req)) return;
+    if (hdr->sender_id >= MAX_NODES) return;
+
+    ctx = kmalloc(sizeof(*ctx), GFP_ATOMIC);
+    if (!ctx) {
+        printk(KERN_ERR "MattX:[WORMHOLE] INOTIFY_RM_WATCH_REQ dropped: out of memory\n");
+        return;
+    }
+    INIT_WORK(&ctx->work, mattx_inotify_rm_watch_kworker);
+    memcpy(&ctx->req, req, sizeof(*req));
+    ctx->target_node = hdr->sender_id;
+
+    mattx_dbg("[RPC] Dispatching INOTIFY_RM_WATCH_REQ to Kworker...\n");
+    schedule_work(&ctx->work);
+}
+
+static void handle_sys_inotify_rm_watch_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    struct mattx_sys_inotify_rm_watch_reply *reply = payload;
+
+    if (!payload || hdr->length < sizeof(*reply) || !reply->req_id) return;
+
+    mattx_dbg("[RPC] Received INOTIFY_RM_WATCH_REPLY for Orig PID %u req %u. Error: %d\n", reply->orig_pid, reply->req_id, reply->error);
+    if (!mattx_ticket_complete(hdr->sender_id, reply->orig_pid, reply->req_id, reply->error, NULL, 0))
+        mattx_dbg("[RPC] INOTIFY_RM_WATCH_REPLY req %u: nobody waits for it any more, dropped\n", reply->req_id);
+}
+
+// --- INOTIFY_ADD_WATCH ---
+struct mattx_inotify_add_watch_kworker_ctx { struct work_struct work; struct mattx_sys_inotify_add_watch_req req; int target_node; };
+
+static void mattx_inotify_add_watch_kworker(struct work_struct *work) {
+    struct mattx_inotify_add_watch_kworker_ctx *ctx = container_of(work, struct mattx_inotify_add_watch_kworker_ctx, work);
+    struct mattx_sys_inotify_add_watch_reply reply;
+    struct pt_regs regs; memset(&regs, 0, sizeof(regs));
+    struct task_struct *deputy = NULL;
+    struct mattx_link *link;
+    int ret = -ENOSYS;
+
+    ctx->req.path[sizeof(ctx->req.path) - 1] = '\0';
+    regs.di = ctx->req.fd;
+    regs.dx = ctx->req.mask;
+    rcu_read_lock(); deputy = pid_task(find_vpid(ctx->req.orig_pid), PIDTYPE_PID); if (deputy) get_task_struct(deputy); rcu_read_unlock();
+
+    mattx_dbg("[KWORKER] inotify_add_watch(fd %d, '%s', mask 0x%x) as Deputy %u (req %u)...\n", ctx->req.fd, ctx->req.path, ctx->req.mask, ctx->req.orig_pid, ctx->req.req_id);
+    if (real_sys_inotify_add_watch) {
+        ret = mattx_execute_as_deputy(deputy, real_sys_inotify_add_watch, &regs, ctx->req.path, 2, NULL, 0, 0, ctx->req.fd, 1);
+    }
+    if (deputy) put_task_struct(deputy);
+    mattx_dbg("[KWORKER] inotify_add_watch returned %d\n", ret);
+
+    memset(&reply, 0, sizeof(reply));
+    reply.orig_pid = ctx->req.orig_pid;
+    reply.req_id = ctx->req.req_id;
+    reply.error = ret;
+    link = READ_ONCE(cluster_map[ctx->target_node]);
+    if (link) mattx_comm_send(link, MATTX_MSG_SYS_INOTIFY_ADD_WATCH_REPLY, &reply, sizeof(reply));
+    kfree(ctx);
+}
+
+static void handle_sys_inotify_add_watch_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    struct mattx_sys_inotify_add_watch_req *req = payload;
+    struct mattx_inotify_add_watch_kworker_ctx *ctx;
+
+    if (!payload || hdr->length < sizeof(*req)) return;
+    if (hdr->sender_id >= MAX_NODES) return;
+
+    ctx = kmalloc(sizeof(*ctx), GFP_ATOMIC);
+    if (!ctx) {
+        printk(KERN_ERR "MattX:[WORMHOLE] INOTIFY_ADD_WATCH_REQ dropped: out of memory\n");
+        return;
+    }
+    INIT_WORK(&ctx->work, mattx_inotify_add_watch_kworker);
+    memcpy(&ctx->req, req, sizeof(*req));
+    ctx->target_node = hdr->sender_id;
+
+    mattx_dbg("[RPC] Dispatching INOTIFY_ADD_WATCH_REQ to Kworker...\n");
+    schedule_work(&ctx->work);
+}
+
+static void handle_sys_inotify_add_watch_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    struct mattx_sys_inotify_add_watch_reply *reply = payload;
+
+    if (!payload || hdr->length < sizeof(*reply) || !reply->req_id) return;
+
+    mattx_dbg("[RPC] Received INOTIFY_ADD_WATCH_REPLY for Orig PID %u req %u. wd/error: %d\n", reply->orig_pid, reply->req_id, reply->error);
+    if (!mattx_ticket_complete(hdr->sender_id, reply->orig_pid, reply->req_id, reply->error, NULL, 0))
+        mattx_dbg("[RPC] INOTIFY_ADD_WATCH_REPLY req %u: nobody waits for it any more, dropped\n", reply->req_id);
+}
+
+// --- INOTIFY_INIT (serves inotify_init and inotify_init1) ---
+struct mattx_inotify_init_kworker_ctx { struct work_struct work; struct mattx_sys_inotify_init_req req; int target_node; };
+
+static void mattx_inotify_init_kworker(struct work_struct *work) {
+    struct mattx_inotify_init_kworker_ctx *ctx = container_of(work, struct mattx_inotify_init_kworker_ctx, work);
+    struct mattx_sys_inotify_init_reply reply;
+    struct pt_regs regs; memset(&regs, 0, sizeof(regs));
+    struct task_struct *deputy = NULL;
+    struct mattx_link *link;
+    int ret = -ENOSYS;
+
+    regs.di = ctx->req.flags;
+    rcu_read_lock(); deputy = pid_task(find_vpid(ctx->req.orig_pid), PIDTYPE_PID); if (deputy) get_task_struct(deputy); rcu_read_unlock();
+
+    mattx_dbg("[KWORKER] inotify_init1(flags 0x%x) as Deputy %u (req %u)...\n", ctx->req.flags, ctx->req.orig_pid, ctx->req.req_id);
+    if (real_sys_inotify_init1) {
+        // The new instance lands in the Deputy's own fd table (current->files is the Deputy's)
+        ret = mattx_execute_as_deputy(deputy, real_sys_inotify_init1, &regs, NULL, 0, NULL, 0, 0, -1, 0);
+    }
+    if (deputy) put_task_struct(deputy);
+    mattx_dbg("[KWORKER] inotify_init1 created Deputy FD %d\n", ret);
+
+    memset(&reply, 0, sizeof(reply));
+    reply.orig_pid = ctx->req.orig_pid;
+    reply.req_id = ctx->req.req_id;
+    reply.remote_fd = (ret >= 0) ? ret : -1;
+    reply.error = (ret < 0) ? ret : 0;
+    link = READ_ONCE(cluster_map[ctx->target_node]);
+    if (link) {
+        mattx_comm_send(link, MATTX_MSG_SYS_INOTIFY_INIT_REPLY, &reply, sizeof(reply));
+    } else if (ret >= 0) {
+        // Nobody can ever claim the instance (dead link): it dies with the Deputy
+        mattx_dbg("[KWORKER] inotify_init: link to Node %d is gone, the new FD %d is orphaned\n", ctx->target_node, ret);
+    }
+    kfree(ctx);
+}
+
+static void handle_sys_inotify_init_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    struct mattx_sys_inotify_init_req *req = payload;
+    struct mattx_inotify_init_kworker_ctx *ctx;
+
+    if (!payload || hdr->length < sizeof(*req)) return;
+    if (hdr->sender_id >= MAX_NODES) return;
+
+    ctx = kmalloc(sizeof(*ctx), GFP_ATOMIC);
+    if (!ctx) {
+        printk(KERN_ERR "MattX:[WORMHOLE] INOTIFY_INIT_REQ dropped: out of memory\n");
+        return;
+    }
+    INIT_WORK(&ctx->work, mattx_inotify_init_kworker);
+    memcpy(&ctx->req, req, sizeof(*req));
+    ctx->target_node = hdr->sender_id;
+
+    mattx_dbg("[RPC] Dispatching INOTIFY_INIT_REQ to Kworker...\n");
+    schedule_work(&ctx->work);
+}
+
+static void handle_sys_inotify_init_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    struct mattx_sys_inotify_init_reply *reply = payload;
+    long retval;
+
+    if (!payload || hdr->length < sizeof(*reply) || !reply->req_id) return;
+
+    // The ticket's result is the new remote FD, or -errno
+    retval = reply->error ? reply->error : reply->remote_fd;
+    mattx_dbg("[RPC] Received INOTIFY_INIT_REPLY for Orig PID %u req %u. New Remote FD: %d, error %d\n", reply->orig_pid, reply->req_id, reply->remote_fd, reply->error);
+    if (!mattx_ticket_complete(hdr->sender_id, reply->orig_pid, reply->req_id, retval, NULL, 0)) {
+        mattx_dbg("[RPC] INOTIFY_INIT_REPLY req %u: nobody waits for it any more\n", reply->req_id);
+        // The thread gave up for good and nobody will ever claim the instance the home node created
+        // for it: close the orphaned FD there instead of leaking it.
+        if (reply->error == 0 && reply->remote_fd >= 0) {
+            struct mattx_sys_close_req close_req = { .orig_pid = reply->orig_pid, .remote_fd = reply->remote_fd };
+
+            mattx_comm_send(link, MATTX_MSG_SYS_CLOSE_REQ, &close_req, sizeof(close_req));
+        }
+    }
+}
+
+
 // --- PIPE2 ---
 struct mattx_pipe2_kworker_ctx { struct work_struct work; struct mattx_sys_pipe2_req req; int target_node; };
 static void mattx_pipe2_kworker(struct work_struct *work) {
@@ -7884,6 +8098,14 @@ void mattx_fileio_init_handlers(void) {
     mattx_register_handler(MATTX_MSG_SYS_GETDENTS64_REPLY, handle_sys_getdents64_reply);
     mattx_register_handler(MATTX_MSG_SYS_PIPE2_REQ, handle_sys_pipe2_req);
     mattx_register_handler(MATTX_MSG_SYS_PIPE2_REPLY, handle_sys_pipe2_reply);
+
+    // --- THE INOTIFY WORMHOLE (VM1 requests, VM2 ticket replies) ---
+    mattx_register_handler(MATTX_MSG_SYS_INOTIFY_INIT_REQ, handle_sys_inotify_init_req);
+    mattx_register_handler(MATTX_MSG_SYS_INOTIFY_INIT_REPLY, handle_sys_inotify_init_reply);
+    mattx_register_handler(MATTX_MSG_SYS_INOTIFY_ADD_WATCH_REQ, handle_sys_inotify_add_watch_req);
+    mattx_register_handler(MATTX_MSG_SYS_INOTIFY_ADD_WATCH_REPLY, handle_sys_inotify_add_watch_reply);
+    mattx_register_handler(MATTX_MSG_SYS_INOTIFY_RM_WATCH_REQ, handle_sys_inotify_rm_watch_req);
+    mattx_register_handler(MATTX_MSG_SYS_INOTIFY_RM_WATCH_REPLY, handle_sys_inotify_rm_watch_reply);
     mattx_register_handler(MATTX_MSG_SYS_SHMGET_REQ, handle_sys_shmget_req);
     mattx_register_handler(MATTX_MSG_SYS_SHMGET_REPLY, handle_sys_shmget_reply);
     mattx_register_handler(MATTX_MSG_SYS_SHMCTL_REQ, handle_sys_shmctl_req);
