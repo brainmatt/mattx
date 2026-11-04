@@ -52,8 +52,6 @@ char config_dfsa_dir[256] = {0}; // Default empty
 EXPORT_SYMBOL(config_dfsa_dir);
 bool config_debug_mode = true; // Default to ON so we see everything!
 EXPORT_SYMBOL(config_debug_mode);
-bool config_mpi_support = false; // Default to false
-EXPORT_SYMBOL(config_mpi_support);
 bool config_hpc_local_libs = true; // Default to ON for maximum performance!
 EXPORT_SYMBOL(config_hpc_local_libs);
 
@@ -65,7 +63,7 @@ static struct task_struct *dsm_sweeper_thread;
 
 
 
-enum { MATTX_ATTR_UNSPEC, MATTX_ATTR_NODE_ID, MATTX_ATTR_IPV4_ADDR, MATTX_ATTR_STUB_PID, MATTX_ATTR_BLUEPRINT, MATTX_ATTR_MY_NODE_ID, MATTX_ATTR_LOCAL_IP, MATTX_ATTR_CONFIG_FILE_IO, MATTX_ATTR_CONFIG_NET_IO, MATTX_ATTR_MATTXFS_ENABLED, MATTX_ATTR_DFSA_DIR, MATTX_ATTR_MPI_SUPPORT, MATTX_ATTR_ACCEPT_GUESTS, MATTX_ATTR_CONFIG_LOCAL_LIBS, MATTX_ATTR_DSM_MODE, __MATTX_ATTR_MAX };
+enum { MATTX_ATTR_UNSPEC, MATTX_ATTR_NODE_ID, MATTX_ATTR_IPV4_ADDR, MATTX_ATTR_STUB_PID, MATTX_ATTR_BLUEPRINT, MATTX_ATTR_MY_NODE_ID, MATTX_ATTR_LOCAL_IP, MATTX_ATTR_CONFIG_FILE_IO, MATTX_ATTR_CONFIG_NET_IO, MATTX_ATTR_MATTXFS_ENABLED, MATTX_ATTR_DFSA_DIR, MATTX_ATTR_ACCEPT_GUESTS, MATTX_ATTR_CONFIG_LOCAL_LIBS, MATTX_ATTR_DSM_MODE, __MATTX_ATTR_MAX };
 #define MATTX_ATTR_MAX (__MATTX_ATTR_MAX - 1)
 
 enum { MATTX_CMD_UNSPEC, MATTX_CMD_NODE_JOIN, MATTX_CMD_NODE_LEAVE, MATTX_CMD_HIJACK_ME, MATTX_CMD_GET_BLUEPRINT, MATTX_CMD_SET_LOCAL_IP, MATTX_CMD_SET_CONFIG, __MATTX_CMD_MAX };
@@ -80,7 +78,6 @@ static const struct nla_policy mattx_genl_policy[MATTX_ATTR_MAX + 1] = {[MATTX_A
     [MATTX_ATTR_CONFIG_NET_IO] = { .type = NLA_U8 },
     [MATTX_ATTR_MATTXFS_ENABLED] = { .type = NLA_U8 },
     [MATTX_ATTR_DFSA_DIR] = { .type = NLA_STRING, .len = 255 },
-    [MATTX_ATTR_MPI_SUPPORT] = { .type = NLA_U8 },
     [MATTX_ATTR_ACCEPT_GUESTS] = { .type = NLA_U8 },
     [MATTX_ATTR_CONFIG_LOCAL_LIBS] = { .type = NLA_U8 },
     [MATTX_ATTR_DSM_MODE] = { .type = NLA_U8 },        
@@ -226,10 +223,6 @@ static int mattx_nl_cmd_set_config(struct sk_buff *skb, struct genl_info *info) 
         nla_strscpy(config_dfsa_dir, info->attrs[MATTX_ATTR_DFSA_DIR], sizeof(config_dfsa_dir));
         mattx_dbg("[NL] DFSA Directory set to: '%s'\n", config_dfsa_dir);
     }
-    if (info->attrs[MATTX_ATTR_MPI_SUPPORT]) {
-        config_mpi_support = nla_get_u8(info->attrs[MATTX_ATTR_MPI_SUPPORT]) ? true : false;
-        mattx_dbg("[NL] MPI Support Enabled: %s\n", config_mpi_support ? "TRUE" : "FALSE");
-    }
     if (info->attrs[MATTX_ATTR_ACCEPT_GUESTS]) {
         config_accept_guests = nla_get_u8(info->attrs[MATTX_ATTR_ACCEPT_GUESTS]) ? true : false;
         mattx_dbg("[NL] Accept Guests Enabled: %s\n", config_accept_guests ? "TRUE" : "FALSE");
@@ -243,11 +236,10 @@ static int mattx_nl_cmd_set_config(struct sk_buff *skb, struct genl_info *info) 
         mattx_dbg("[NL] DSM Mode set to: %d\n", config_dsm_mode);
     }
 
-    mattx_dbg(" Configuration Updated - FileIO: %s, NetworkIO: %s, MattXFS: %s, MPI: %s, Accept: %s, HPC Local Libs: %s, DSM Mode: %d\n",    
+    mattx_dbg(" Configuration Updated - FileIO: %s, NetworkIO: %s, MattXFS: %s, Accept: %s, HPC Local Libs: %s, DSM Mode: %d\n",
            config_migrate_file_io ? "TRUE" : "FALSE",
            config_migrate_network_io ? "TRUE" : "FALSE",
            config_mattxfs_enabled ? "TRUE" : "FALSE",
-           config_mpi_support ? "TRUE" : "FALSE",
            config_accept_guests ? "TRUE" : "FALSE",
            config_hpc_local_libs ? "TRUE" : "FALSE",
            config_dsm_mode);

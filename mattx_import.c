@@ -740,45 +740,29 @@ static void do_handle_return_blueprint(struct mattx_link *link, struct mattx_hea
                     
 
 
-                    // here we check for MPI_SUPPORT and if it's enabled it needs to check if the entire VMA exists, 
-                    // not just the start address. This is because MPI applications may have large contiguous memory
-                    // regions that need to be preserved during migration. If the entire VMA does not exist, we will
-                    // carve it out to ensure the Deputy has the necessary memory mapped before we inject data.
                     // --- THE DYNAMIC BRAIN CARVER (The Hole Carver Edition) ---
                     bool needs_mapping = false;
                     unsigned long carve_start = start;
                     unsigned long carve_size = size;
 
-                    if (config_mpi_support) {
-                        // MPI apps might need the whole block checked
-                        mmap_read_lock(deputy->mm);
-                        struct vm_area_struct *vma = find_vma(deputy->mm, start);
-                        if (vma && vma->vm_start <= start && vma->vm_end >= start + size) {
-                            needs_mapping = false; 
-                        } else {
-                            needs_mapping = true;
-                        }
-                        mmap_read_unlock(deputy->mm);
-                    } else {
-                        // The Hole Carver: Only carve exactly what is missing!
-                        mmap_read_lock(deputy->mm);
-                        struct vm_area_struct *vma = find_vma(deputy->mm, start);
-                        
-                        if (!vma || vma->vm_start >= start + size) {
-                            // Completely missing (e.g., new thread stack from VM2)
-                            needs_mapping = true;
-                        } else if (vma->vm_start > start) {
-                            // Missing at the beginning (e.g., stack grew down)
-                            needs_mapping = true;
-                            carve_size = vma->vm_start - start;
-                        } else if (vma->vm_end < start + size) {
-                            // Missing at the end (e.g., heap grew up)
-                            needs_mapping = true;
-                            carve_start = vma->vm_end;
-                            carve_size = (start + size) - vma->vm_end;
-                        }
-                        mmap_read_unlock(deputy->mm);
+                    // The Hole Carver: Only carve exactly what is missing!
+                    mmap_read_lock(deputy->mm);
+                    struct vm_area_struct *vma = find_vma(deputy->mm, start);
+
+                    if (!vma || vma->vm_start >= start + size) {
+                        // Completely missing (e.g., new thread stack from VM2)
+                        needs_mapping = true;
+                    } else if (vma->vm_start > start) {
+                        // Missing at the beginning (e.g., stack grew down)
+                        needs_mapping = true;
+                        carve_size = vma->vm_start - start;
+                    } else if (vma->vm_end < start + size) {
+                        // Missing at the end (e.g., heap grew up)
+                        needs_mapping = true;
+                        carve_start = vma->vm_end;
+                        carve_size = (start + size) - vma->vm_end;
                     }
+                    mmap_read_unlock(deputy->mm);
 
                     if (needs_mapping) {
                         mattx_dbg("[RECALL] Carving missing memory hole: 0x%lx (Size: %lu)\n", carve_start, carve_size);

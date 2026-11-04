@@ -1642,7 +1642,6 @@ extern mattx_unmap_mapping_range_fn real_unmap_mapping_range;
 // Configuration Toggles
 extern bool config_migrate_file_io;
 extern bool config_migrate_network_io;
-extern bool config_mpi_support;
 extern bool config_accept_guests;
 extern bool config_hpc_local_libs; // The HPC Fast-Path Toggle!
 

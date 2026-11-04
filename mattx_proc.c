@@ -59,7 +59,6 @@ static int nodes_show(struct seq_file *m, void *v) {
     
     seq_printf(m, "\nBalancer Enabled: %s\n", balancer_enabled ? "YES" : "NO");
     seq_printf(m, "MattXFS Enabled: %s\n", config_mattxfs_enabled ? "YES" : "NO");
-    seq_printf(m, "MPI Support: %s\n", config_mpi_support ? "YES" : "NO");
     seq_printf(m, "Accept Guests: %s\n", config_accept_guests ? "YES" : "NO");
     seq_printf(m, "HPC Local Libs: %s\n", config_hpc_local_libs ? "ON" : "OFF");
     seq_printf(m, "DSM Mode: %d\n", config_dsm_mode);
@@ -415,10 +414,6 @@ static ssize_t admin_write(struct file *file, const char __user *ubuf, size_t co
             config_mattxfs_enabled = (arg1 != 0);
             mattx_dbg(" [ADMIN] MattXFS Mode set to: %s\n", config_mattxfs_enabled ? "ON" : "OFF");
         }        
-        else if (strcmp(cmd, "mpi") == 0 && arg1 != -1) {
-            config_mpi_support = (arg1 != 0);
-            mattx_dbg(" [ADMIN] MPI Support set to: %s\n", config_mpi_support ? "ON" : "OFF");
-        }
         else if (strcmp(cmd, "accept") == 0 && arg1 != -1) {
             config_accept_guests = (arg1 != 0);
             mattx_dbg(" [ADMIN] Accept Guests set to: %s\n", config_accept_guests ? "YES" : "NO");
