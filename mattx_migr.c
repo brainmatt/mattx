@@ -65,6 +65,7 @@ mattx_sys_readlinkat_fn real_sys_readlinkat = NULL;
 mattx_sys_getdents64_fn real_sys_getdents64 = NULL;
 mattx_sys_pipe2_fn real_sys_pipe2 = NULL;
 mattx_sys_exit_fn real_sys_exit = NULL;
+mattx_do_group_exit_fn real_do_group_exit = NULL;
 mattx_sys_clone_fn real_sys_clone = NULL;
 mattx_sys_mremap_fn real_sys_mremap = NULL;
 mattx_x86_fsbase_write_task_fn real_x86_fsbase_write_task = NULL;
@@ -321,6 +322,17 @@ static void mattx_resolve_hidden_symbols(void) {
     if (register_kprobe(&kp) == 0) { 
         real_sys_exit = (mattx_sys_exit_fn)kp.addr; 
         unregister_kprobe(&kp); 
+    }
+
+    // --- THE NATIVE FUNERAL ---
+    // do_group_exit(): the Deputy dies with the raw wait status of its Surrogate (see mattx_deputy_funeral())
+    memset(&kp, 0, sizeof(kp));
+    kp.symbol_name = "do_group_exit";
+    if (register_kprobe(&kp) == 0) {
+        real_do_group_exit = (mattx_do_group_exit_fn)kp.addr;
+        unregister_kprobe(&kp);
+    } else {
+        printk(KERN_ERR "MattX: Could not resolve do_group_exit! A Deputy will get SIGKILL instead of the exit status of its Surrogate.\n");
     }
 
     // --- THE GANG GROWER ---

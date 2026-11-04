@@ -205,9 +205,27 @@ static void mattx_evaluate_and_balance(u32 local_load, u32 local_affinity) {
     }
 }
 
+// --- THE FUNERAL BELL ---
+// The do_group_exit kprobe (mattx_hooks.c) rings it when a Surrogate starts to die: the Guest Watcher then looks at
+// the guests every MATTX_FUNERAL_FAST_MS for MATTX_FUNERAL_FAST_POLLS rounds, instead of sleeping the full
+// BALANCER_INTERVAL_MS, so the funeral (and the waitpid() of the parent of the Deputy, e.g. mpirun) does not lag
+// by up to 2 seconds. The funeral itself is still done by the Guest Watcher: Funeral Flush first, PROCESS_EXIT second.
+#define MATTX_FUNERAL_FAST_MS 10
+#define MATTX_FUNERAL_FAST_POLLS 50
+
+static DECLARE_WAIT_QUEUE_HEAD(mattx_watcher_wq);
+static atomic_t mattx_funeral_kick = ATOMIC_INIT(0);
+
+// Safe in atomic context (it is called from a kprobe handler)
+void mattx_watcher_kick(void) {
+    atomic_set(&mattx_funeral_kick, 1);
+    wake_up(&mattx_watcher_wq);
+}
+
 int mattx_balancer_loop(void *data) {
     struct mattx_load_info local_load;
     int i;
+    int fast_polls = 0;
 
     mattx_dbg(" Balancer thread started\n");
 
@@ -246,6 +264,12 @@ restart_guest_loop:
             rcu_read_unlock();
             
             if (!task || task->exit_state != 0) is_dead = true;
+
+            // The real wait status, straight from the zombie if it is still around: it is authoritative once the
+            // group exit has started (the do_group_exit kprobe may have seen an argument that lost a race)
+            int zombie_status = -1;
+            if (task && is_dead && (READ_ONCE(task->signal->flags) & SIGNAL_GROUP_EXIT))
+                zombie_status = READ_ONCE(task->signal->group_exit_code);
             if (task) put_task_struct(task);
 
 
@@ -253,6 +277,9 @@ restart_guest_loop:
             if (is_dead) {
                 u32 dead_orig_pid = guest_registry[i].orig_pid;
                 int dead_home_node = guest_registry[i].home_node;
+                // -1: unknown (the kprobe saw nothing and the zombie is gone): the Deputy then gets SIGKILL
+                int dead_status = guest_registry[i].exit_status_valid ? guest_registry[i].exit_status : -1;
+                if (zombie_status != -1) dead_status = zombie_status;
                 void *buf1 = guest_registry[i].rpc_read_buf;
                 void *buf2 = guest_registry[i].rpc_statx_buf;
                 bool is_migrating = guest_registry[i].is_migrating; 
@@ -284,7 +311,8 @@ restart_guest_loop:
                 if (!is_migrating) {
                     struct mattx_process_exit exit_msg;
                     exit_msg.orig_pid = dead_orig_pid;
-                    exit_msg.exit_code = 0; 
+                    exit_msg.exit_code = dead_status;   // the raw wait status: the Deputy dies the same way
+                    mattx_dbg(" [WATCHER] Guest of Deputy PID %u is gone (wait status 0x%x), sending the exit notice\n", dead_orig_pid, dead_status);
                     if (cluster_map[dead_home_node]) {
                         mattx_comm_send(cluster_map[dead_home_node], MATTX_MSG_PROCESS_EXIT, &exit_msg, sizeof(exit_msg));
                     }
@@ -345,7 +373,19 @@ restart_export_loop:
         }
         spin_unlock(&export_lock);
 
-        msleep(BALANCER_INTERVAL_MS);
+        // --- THE FUNERAL BELL ---
+        // A guest announced its death: (re)arm a short fast-polling window. Otherwise sleep the normal interval,
+        // but wake up at once when the bell rings.
+        if (atomic_xchg(&mattx_funeral_kick, 0))
+            fast_polls = MATTX_FUNERAL_FAST_POLLS;
+        if (fast_polls > 0) {
+            fast_polls--;
+            msleep(MATTX_FUNERAL_FAST_MS);
+        } else {
+            wait_event_idle_timeout(mattx_watcher_wq,
+                                    kthread_should_stop() || atomic_read(&mattx_funeral_kick),
+                                    msecs_to_jiffies(BALANCER_INTERVAL_MS));
+        }
     }
     return 0;
 }

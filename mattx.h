@@ -1135,6 +1135,12 @@ struct mattx_guest_info {
     int rpc_fsync_res;
     bool is_migrating; // The Migration Lock!
 
+    // The real wait status of the Surrogate: the raw status word do_group_exit() takes ((code & 0xff) << 8 for
+    // exit_group(), the signal number (| 0x80: core) for a death by signal), recorded by the do_group_exit kprobe
+    // (mattx_hooks.c). The Guest Watcher sends it home as mattx_process_exit.exit_code; -1 means "unknown".
+    bool exit_status_valid;
+    int exit_status;
+
     // The TID Translation Map ---
     int thread_count;
     u32 orig_tids[MAX_GANG_THREADS];
@@ -1602,6 +1608,11 @@ extern mattx_x86_task_fpu_fn real_x86_task_fpu;
 typedef long (*mattx_sys_exit_fn)(const struct pt_regs *regs);
 extern mattx_sys_exit_fn real_sys_exit;
 
+// --- THE NATIVE FUNERAL RESOLVER ---
+// do_group_exit() takes the raw wait status: the Deputy dies with exactly the status its Surrogate died with.
+typedef void (*mattx_do_group_exit_fn)(int exit_code);
+extern mattx_do_group_exit_fn real_do_group_exit;
+
 // --- THE GANG GROWER RESOLVER ---
 typedef long (*mattx_sys_clone_fn)(const struct pt_regs *regs);
 extern mattx_sys_clone_fn real_sys_clone;
@@ -1649,6 +1660,7 @@ struct mattx_link* mattx_comm_connect(__be32 ip_addr, int node_id);
 void mattx_comm_disconnect(int node_id);
 int mattx_listener_loop(void *data);
 int mattx_balancer_loop(void *data);
+void mattx_watcher_kick(void); // The Funeral Bell: a guest is about to die, the Guest Watcher looks at once
 void mattx_capture_and_send_state(struct task_struct *task, int target_node);
 void mattx_capture_and_return_state(struct task_struct *task, u32 orig_pid, int target_node); 
 void mattx_send_vma_data(void); 

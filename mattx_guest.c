@@ -354,6 +354,8 @@ void add_guest_process(pid_t local_pid, u32 orig_pid, int home_node) {
 
         //Exorcise the ghosts! Clean up dirty memory from previous guests ---
         guest_registry[guest_count].is_migrating = false;
+        guest_registry[guest_count].exit_status_valid = false;
+        guest_registry[guest_count].exit_status = 0;
         guest_registry[guest_count].rpc_wq = NULL;
         guest_registry[guest_count].rpc_done = false;
         guest_registry[guest_count].rpc_read_buf = NULL;
@@ -477,6 +479,82 @@ int get_export_target(pid_t orig_pid) {
     return target;
 }
 
+// ============================================================================
+// THE NATIVE FUNERAL (VM1): the Deputy dies the way its Surrogate died
+// ============================================================================
+// A Surrogate that exit(3)s or crashes on the remote node must look to the parent of the Deputy exactly like the
+// process had never moved: waitpid() sees WIFEXITED/WEXITSTATUS, or WIFSIGNALED/WTERMSIG. The wait status the
+// Surrogate left with arrives as mattx_process_exit.exit_code (the raw word do_group_exit() takes, -1: unknown).
+//
+// The Deputy is frozen (group-stopped) at the user-space boundary. Every thread of it gets a task_work, then the
+// group is woken: each thread runs its work before it can return to user space, so not one stale user instruction
+// executes on this node, and the work simply calls do_group_exit(status) (the Ghost Exorcist pattern).
+struct mattx_funeral_ctx {
+    struct callback_head cb;
+    int status;
+};
+
+static void mattx_funeral_cb(struct callback_head *cb) {
+    struct mattx_funeral_ctx *ctx = container_of(cb, struct mattx_funeral_ctx, cb);
+    int status = ctx->status;
+
+    kfree(ctx);
+
+    // A thread that is already on its way out runs its leftover task_works from do_exit(): never call do_exit() again
+    if (current->flags & PF_EXITING)
+        return;
+
+    mattx_dbg("[FUNERAL] Deputy TID %d dies natively with wait status 0x%x\n", current->pid, status);
+
+    // This thread already died on the remote node: do not let the kernel write its TID word / wake futexes
+    // in a memory image that is stale by now (same as the Ghost Exorcist)
+    current->clear_child_tid = NULL;
+    current->set_child_tid = NULL;
+
+    real_do_group_exit(status);         // never returns
+    send_sig(SIGKILL, current, 0);      // (cannot happen: the resolver was checked before the work was queued)
+}
+
+// Returns true if every thread of the Deputy has its funeral queued and the group was woken. False means: nothing
+// to rely on (unknown status, no resolver, no memory), the caller falls back to SIGKILL.
+static bool mattx_deputy_funeral(struct task_struct *deputy, int status) {
+    struct task_struct *t;
+    int threads = 0, queued = 0;
+    int sig = status & 0x7f;
+
+    if (!real_task_work_add || !real_do_group_exit)
+        return false;
+    if (status < 0 || status > 0xffff || sig == 0x7f || sig > _NSIG)    // unknown, or not a way to die
+        return false;
+
+    rcu_read_lock();
+    for_each_thread(deputy, t) {
+        struct mattx_funeral_ctx *ctx = kmalloc(sizeof(*ctx), GFP_ATOMIC);
+
+        threads++;
+        if (!ctx)
+            continue;
+        ctx->status = status;
+        init_task_work(&ctx->cb, mattx_funeral_cb);
+        if (real_task_work_add(t, &ctx->cb, TWA_SIGNAL))
+            kfree(ctx);
+        else
+            queued++;
+    }
+    rcu_read_unlock();
+
+    if (queued != threads) {
+        // A thread without its work would run stale user code once it is woken: the caller must SIGKILL the
+        // group (SIGKILL also kills the threads that got their work, whose work then reports the SIGKILL status)
+        printk(KERN_WARNING "MattX: [FUNERAL] Only %d of %d threads of Deputy PID %d could be queued, falling back to SIGKILL\n",
+               queued, threads, deputy->pid);
+        return false;
+    }
+
+    send_sig(SIGCONT, deputy, 0);       // wakes the whole group-stopped Deputy
+    return true;
+}
+
 // --- Network Handlers for Lifecycle Management ---
 static void handle_process_exit(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
     if (payload) {
@@ -486,8 +564,8 @@ static void handle_process_exit(struct mattx_link *link, struct mattx_header *hd
         struct file **files_to_close = NULL;
         bool found = false;
 
-        mattx_dbg(" [FUNERAL] Received exit notice for Deputy PID %u from Node %u\n", 
-               exit_msg->orig_pid, hdr->sender_id);
+        mattx_dbg(" [FUNERAL] Received exit notice for Deputy PID %u from Node %u (wait status 0x%x)\n",
+               exit_msg->orig_pid, hdr->sender_id, exit_msg->exit_code);
 
         rcu_read_lock();
         deputy = pid_task(find_vpid(exit_msg->orig_pid), PIDTYPE_PID);
@@ -495,8 +573,12 @@ static void handle_process_exit(struct mattx_link *link, struct mattx_header *hd
         rcu_read_unlock();
 
         if (deputy) {
-            mattx_dbg(" [FUNERAL] Laying Deputy PID %u to rest (Sending SIGKILL)...\n", deputy->pid);
-            send_sig(SIGKILL, deputy, 0);
+            if (mattx_deputy_funeral(deputy, exit_msg->exit_code)) {
+                mattx_dbg(" [FUNERAL] Deputy PID %u was woken for its native funeral\n", deputy->pid);
+            } else {
+                mattx_dbg(" [FUNERAL] Laying Deputy PID %u to rest (Sending SIGKILL)...\n", deputy->pid);
+                send_sig(SIGKILL, deputy, 0);
+            }
             put_task_struct(deputy);
         }
         

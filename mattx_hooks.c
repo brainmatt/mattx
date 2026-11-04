@@ -4744,6 +4744,55 @@ static int pre_handler_send_signal(struct kprobe *p, struct pt_regs *regs) {
     return 0;
 }
 
+/*
+ * THE FUNERAL RECORDER (VM2): the real fate of a Surrogate.
+ *
+ * Every way a thread group dies ends in do_group_exit(): exit_group() calls it with the exit code already shifted
+ * into the wait-status position ((code & 0xff) << 8), and get_signal() calls it with the number of the fatal signal
+ * (the core-dump bit is already in group_exit_code when it dumped). Both are the raw wait status the parent would
+ * see. It is recorded in the registry entry of the guest, so the Guest Watcher can send it home instead of a blind 0
+ * (the Deputy then dies the same way: mattx_deputy_funeral() in mattx_guest.c).
+ *
+ * This runs in the dying thread in atomic context: it must not sleep, so it only records the status and rings the
+ * bell (mattx_watcher_kick()). The funeral itself stays with the Guest Watcher: Funeral Flush first, PROCESS_EXIT
+ * second, so the parent of the Deputy can never wake up before the dirty DSM pages are home.
+ *
+ * If another thread of the group already started the exit, do_group_exit() takes ITS status and ignores the
+ * argument, and so do we. The first status that is recorded wins.
+ */
+static struct kprobe do_group_exit_kprobe;
+
+static int pre_handler_do_group_exit(struct kprobe *p, struct pt_regs *regs) {
+    struct signal_struct *sig = current->signal;
+    int status = (int)regs->di;
+    bool recorded = false;
+    int i;
+
+    if (!READ_ONCE(guest_count))                   /* a node without guests: nothing to record */
+        return 0;
+    if (READ_ONCE(sig->flags) & SIGNAL_GROUP_EXIT) /* somebody else was first: that is the status */
+        status = READ_ONCE(sig->group_exit_code);
+
+    spin_lock(&guest_lock);
+    for (i = 0; i < guest_count; i++) {
+        if (guest_registry[i].local_pid == current->tgid) {
+            if (!guest_registry[i].exit_status_valid) {
+                guest_registry[i].exit_status = status;
+                guest_registry[i].exit_status_valid = true;
+                recorded = true;
+            }
+            break;
+        }
+    }
+    spin_unlock(&guest_lock);
+
+    if (recorded) {
+        mattx_dbg("[FUNERAL] Surrogate TGID %d leaves with wait status 0x%x (recorded, ringing the bell)\n", current->tgid, status);
+        mattx_watcher_kick();
+    }
+    return 0;
+}
+
 // --- BATCH 1: WORMHOLE TUNNELERS ---
 struct uname_kretprobe_data { void __user *buf; };
 static struct kretprobe uname_kprobe;
@@ -7218,6 +7267,13 @@ int mattx_hooks_init(void) {
     ret = register_kprobe(&send_signal_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kprobe failed for __send_signal_locked, returned %d (pthread_cancel() in a migrated process will not work)\n", ret);
 
+    // --- THE FUNERAL RECORDER ---
+    memset(&do_group_exit_kprobe, 0, sizeof(do_group_exit_kprobe));
+    do_group_exit_kprobe.symbol_name = "do_group_exit";
+    do_group_exit_kprobe.pre_handler = pre_handler_do_group_exit;
+    ret = register_kprobe(&do_group_exit_kprobe);
+    if (ret < 0) printk(KERN_ERR "MattX: register_kprobe failed for do_group_exit, returned %d (the exit status of a Surrogate is only found if its zombie is still around, else its Deputy gets SIGKILL)\n", ret);
+
     // DSM - shared memory syscalls
     memset(&shmget_kprobe, 0, sizeof(shmget_kprobe)); shmget_kprobe.kp.symbol_name = "__x64_sys_shmget";
     shmget_kprobe.entry_handler = entry_handler_shmget; shmget_kprobe.handler = ret_handler_shmget;
@@ -7299,6 +7355,7 @@ void mattx_hooks_exit(void) {
         unregister_kretprobe(mattx_registered_krp[--mattx_nregistered_krp]);
     unregister_kprobe(&wake_up_new_task_kprobe);
     unregister_kprobe(&send_signal_kprobe);
+    unregister_kprobe(&do_group_exit_kprobe);
 
     unregister_die_notifier(&mattx_die_notifier);
 
