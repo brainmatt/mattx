@@ -1141,6 +1141,10 @@ struct mattx_guest_info {
     bool exit_status_valid;
     int exit_status;
 
+    // The Guest Watcher: when the LEADER of the Surrogate was first seen as a zombie while other threads of the
+    // group were still inside do_exit() (in jiffies, 0: not seen). Bounds how long the funeral waits for them.
+    unsigned long zombie_since;
+
     // The TID Translation Map ---
     int thread_count;
     u32 orig_tids[MAX_GANG_THREADS];

@@ -212,6 +212,9 @@ static void mattx_evaluate_and_balance(u32 local_load, u32 local_affinity) {
 // by up to 2 seconds. The funeral itself is still done by the Guest Watcher: Funeral Flush first, PROCESS_EXIT second.
 #define MATTX_FUNERAL_FAST_MS 10
 #define MATTX_FUNERAL_FAST_POLLS 50
+// A leader that is a zombie while other threads of its group are still inside do_exit() gets this long (in ms)
+// before its funeral is held anyway: a thread that is stuck for good must not stall the Deputy forever.
+#define MATTX_FUNERAL_GRACE_MS 10000
 
 static DECLARE_WAIT_QUEUE_HEAD(mattx_watcher_wq);
 static atomic_t mattx_funeral_kick = ATOMIC_INIT(0);
@@ -226,6 +229,7 @@ int mattx_balancer_loop(void *data) {
     struct mattx_load_info local_load;
     int i;
     int fast_polls = 0;
+    bool funeral_waiting = false;
 
     mattx_dbg(" Balancer thread started\n");
 
@@ -253,6 +257,7 @@ int mattx_balancer_loop(void *data) {
 
         // --- THE SAFE GUEST WATCHER (Node 2) ---
 restart_guest_loop:
+        funeral_waiting = false;
         spin_lock(&guest_lock);
         for (i = 0; i < guest_count; i++) {
             struct task_struct *task = NULL;
@@ -264,6 +269,27 @@ restart_guest_loop:
             rcu_read_unlock();
             
             if (!task || task->exit_state != 0) is_dead = true;
+
+            // --- THE LAST THREAD OUT ---
+            // The leader is a zombie as soon as IT has passed exit_notify(), but with exit_group() the other threads
+            // of the Surrogate may still be inside do_exit(): sending their last RPCs (write, close, ...) and dropping
+            // their files. thread_group_empty() is true only when the last of them is completely gone, so the exit
+            // notice can never overtake the late RPCs of a sibling thread (they would hit a Deputy that is already
+            // dead and an export entry that is already gone: stdout never closes, the parent never returns).
+            // A thread that is stuck for good must not stall the funeral forever: after MATTX_FUNERAL_GRACE_MS go on.
+            if (task && is_dead && !thread_group_empty(task)) {
+                if (!guest_registry[i].zombie_since) {
+                    guest_registry[i].zombie_since = jiffies ? jiffies : 1;
+                    mattx_dbg(" [WATCHER] Leader of Guest PID %d is a zombie, other threads are still exiting: waiting for the last thread out\n", guest_registry[i].local_pid);
+                }
+                if (time_before(jiffies, guest_registry[i].zombie_since + msecs_to_jiffies(MATTX_FUNERAL_GRACE_MS))) {
+                    is_dead = false;
+                    funeral_waiting = true;
+                } else {
+                    printk(KERN_WARNING "MattX: [WATCHER] Guest PID %d: threads still exiting after %d ms, not waiting for them any longer\n",
+                           guest_registry[i].local_pid, MATTX_FUNERAL_GRACE_MS);
+                }
+            }
 
             // The real wait status, straight from the zombie if it is still around: it is authoritative once the
             // group exit has started (the do_group_exit kprobe may have seen an argument that lost a race)
@@ -374,13 +400,14 @@ restart_export_loop:
         spin_unlock(&export_lock);
 
         // --- THE FUNERAL BELL ---
-        // A guest announced its death: (re)arm a short fast-polling window. Otherwise sleep the normal interval,
-        // but wake up at once when the bell rings.
-        if (atomic_xchg(&mattx_funeral_kick, 0))
+        // A guest announced its death, or its funeral waits for the last thread out: (re)arm a short fast-polling
+        // window. Otherwise sleep the normal interval, but wake up at once when the bell rings. All sleeps are idle
+        // sleeps: the Watcher is not a D-state task and does not show up in the load average.
+        if (atomic_xchg(&mattx_funeral_kick, 0) || funeral_waiting)
             fast_polls = MATTX_FUNERAL_FAST_POLLS;
         if (fast_polls > 0) {
             fast_polls--;
-            msleep(MATTX_FUNERAL_FAST_MS);
+            schedule_timeout_idle(msecs_to_jiffies(MATTX_FUNERAL_FAST_MS));
         } else {
             wait_event_idle_timeout(mattx_watcher_wq,
                                     kthread_should_stop() || atomic_read(&mattx_funeral_kick),

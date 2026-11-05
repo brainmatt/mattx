@@ -356,6 +356,7 @@ void add_guest_process(pid_t local_pid, u32 orig_pid, int home_node) {
         guest_registry[guest_count].is_migrating = false;
         guest_registry[guest_count].exit_status_valid = false;
         guest_registry[guest_count].exit_status = 0;
+        guest_registry[guest_count].zombie_since = 0;
         guest_registry[guest_count].rpc_wq = NULL;
         guest_registry[guest_count].rpc_done = false;
         guest_registry[guest_count].rpc_read_buf = NULL;

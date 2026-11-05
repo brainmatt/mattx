@@ -6231,7 +6231,10 @@ int mattx_dsm_sweeper_loop(void *data) {
         mattx_dsm_dir_reap();
 
         // Sleep for 50ms regardless of mode to prevent 100% CPU spin!
-        msleep(50); 
+        // An IDLE sleep (TASK_IDLE): msleep() is uninterruptible, so the Sweeper showed up as a D-state task in
+        // "echo w > /proc/sysrq-trigger" and added a permanent 1.0 to the load average. kthread_stop() also
+        // wakes an idle sleeper at once, so the thread leaves immediately at module unload.
+        schedule_timeout_idle(msecs_to_jiffies(50));
     }
     return 0;
 }
