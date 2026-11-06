@@ -568,6 +568,11 @@ static void handle_process_exit(struct mattx_link *link, struct mattx_header *hd
         mattx_dbg(" [FUNERAL] Received exit notice for Deputy PID %u from Node %u (wait status 0x%x)\n",
                exit_msg->orig_pid, hdr->sender_id, exit_msg->exit_code);
 
+        // THE BARRIER: the Data Bombs of the Funeral Flush were sent just before this notice, but they are
+        // applied by an ordered workqueue. Wait until every one of them is in the RAM of its segment before
+        // the Deputy is woken for its funeral and its export entry is dropped.
+        mattx_dsm_update_barrier();
+
         rcu_read_lock();
         deputy = pid_task(find_vpid(exit_msg->orig_pid), PIDTYPE_PID);
         if (deputy) get_task_struct(deputy);

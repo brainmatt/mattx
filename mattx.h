@@ -1730,6 +1730,7 @@ void mattx_migr_init_handlers(void);
 void mattx_migr_exit(void); // waits for a recall that is still being served
 void mattx_guest_init_handlers(void);
 void mattx_fileio_init_handlers(void);
+void mattx_dsm_update_barrier(void);     // VM1: returns when every Data Bomb received so far is applied (may sleep)
 void mattx_fileio_exit(void); // The Cleanup function!
 void mattx_fileio_waiters_stop(void);    // rmmod: tell the poll/epoll waiter kworkers to leave
 void mattx_fileio_waiters_destroy(void); // rmmod: wait until they are gone (after the receivers are)

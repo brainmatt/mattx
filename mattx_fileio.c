@@ -342,6 +342,149 @@ void mattx_dsm_dir_exit(void)
     kvfree(dirs);
 }
 
+/*
+ * THE SEGMENT PINS (VM1)
+ *
+ * The Eternal Owner of the RAM of a SYSV segment is the SEGMENT, not the mapping of one Deputy. The Data
+ * Bombs of the Funeral Flush used to find the segment through the VMAs of the Deputy, but the shmdt() of the
+ * Surrogate is executed natively inside the Deputy BEFORE the bombs are sent: the VMA was gone by the time
+ * they arrived and every bomb was dropped without a word (and the directory kept the dead owner EXCLUSIVE).
+ * So the first fault of a Surrogate pins the SYSV file here, and the bombs write through the pin.
+ *
+ * A pin lives as long as its owner (the Deputy that has the segment attached) is exported to another node:
+ * the sweeper thread lets go of the pins whose owner has no export entry any more. Without a pin (modes
+ * 0/1, or the owner came home) the bombs fall back to the VMAs of the Deputy, as before.
+ */
+struct mattx_dsm_pin {
+    struct list_head node;
+    u32 shmid;
+    u32 owner_pid;          // the Deputy that gave us the file
+    struct file *file;      // the SYSV file of its VMA (we hold a reference)
+};
+static LIST_HEAD(mattx_dsm_pins);
+static DEFINE_SPINLOCK(mattx_dsm_pin_lock);
+
+// Pins @file for @shmid unless it is pinned already. The caller keeps its own reference. May sleep.
+static void mattx_dsm_pin_file(u32 shmid, u32 owner_pid, struct file *file)
+{
+    struct mattx_dsm_pin *p, *n;
+
+    n = kzalloc(sizeof(*n), GFP_KERNEL);
+    if (!n) {
+        mattx_dbg("[DSM_SYNC] No memory to pin SHMID %u: its Data Bombs depend on the Deputy's mapping\n", shmid);
+        return;
+    }
+
+    spin_lock(&mattx_dsm_pin_lock);
+    list_for_each_entry(p, &mattx_dsm_pins, node) {
+        if (p->shmid == shmid) {
+            p->owner_pid = owner_pid;       // the latest Deputy that faulted keeps it alive
+            spin_unlock(&mattx_dsm_pin_lock);
+            kfree(n);
+            return;
+        }
+    }
+    n->shmid = shmid;
+    n->owner_pid = owner_pid;
+    n->file = get_file(file);
+    list_add(&n->node, &mattx_dsm_pins);
+    spin_unlock(&mattx_dsm_pin_lock);
+
+    mattx_dbg("[DSM_SYNC] Pinned the SYSV file of SHMID %u (owner Deputy PID %u)\n", shmid, owner_pid);
+}
+
+// The pinned file of @shmid with a reference for the caller (fput it), or NULL
+static struct file *mattx_dsm_pin_get(u32 shmid)
+{
+    struct mattx_dsm_pin *p;
+    struct file *f = NULL;
+
+    spin_lock(&mattx_dsm_pin_lock);
+    list_for_each_entry(p, &mattx_dsm_pins, node) {
+        if (p->shmid == shmid) {
+            f = get_file(p->file);
+            break;
+        }
+    }
+    spin_unlock(&mattx_dsm_pin_lock);
+    return f;
+}
+
+// Is @pid exported to another node right now?
+static bool mattx_dsm_pin_owner_exported(u32 pid)
+{
+    bool found = false;
+    int i;
+
+    spin_lock(&export_lock);
+    for (i = 0; i < export_count; i++) {
+        if (export_registry[i].orig_pid == pid) {
+            found = true;
+            break;
+        }
+    }
+    spin_unlock(&export_lock);
+    return found;
+}
+
+// Lets go of the pins whose owner is not exported any more. Called by the sweeper thread; may sleep.
+static void mattx_dsm_pin_reap(void)
+{
+    struct mattx_dsm_pin *p, *tmp;
+    LIST_HEAD(dead);
+
+    spin_lock(&mattx_dsm_pin_lock);
+    list_for_each_entry_safe(p, tmp, &mattx_dsm_pins, node) {
+        // lock order: mattx_dsm_pin_lock, then export_lock (nobody takes them the other way round)
+        if (!mattx_dsm_pin_owner_exported(p->owner_pid))
+            list_move(&p->node, &dead);
+    }
+    spin_unlock(&mattx_dsm_pin_lock);
+
+    list_for_each_entry_safe(p, tmp, &dead, node) {
+        mattx_dbg("[DSM_SYNC] Unpinned SHMID %u: its owner Deputy PID %u is not exported any more\n", p->shmid, p->owner_pid);
+        list_del(&p->node);
+        fput(p->file);
+        kfree(p);
+    }
+}
+
+// Module unload: lets go of all pins
+static void mattx_dsm_pin_exit(void)
+{
+    struct mattx_dsm_pin *p, *tmp;
+    LIST_HEAD(dead);
+
+    spin_lock(&mattx_dsm_pin_lock);
+    list_splice_init(&mattx_dsm_pins, &dead);
+    spin_unlock(&mattx_dsm_pin_lock);
+
+    list_for_each_entry_safe(p, tmp, &dead, node) {
+        list_del(&p->node);
+        fput(p->file);
+        kfree(p);
+    }
+}
+
+/*
+ * THE ORDERED WORKQUEUE OF THE DATA BOMBS (VM1)
+ *
+ * The bombs of a dying Surrogate are applied by kworkers, but its PROCESS_EXIT notice is handled inline by
+ * the receiver thread: the Deputy could be woken for its funeral (and the export entry dropped) while bombs
+ * were still queued. The bombs go through one ordered workqueue instead, and mattx_dsm_update_barrier()
+ * (called by the exit handler before it touches anything) waits until every bomb received so far is applied.
+ */
+static struct workqueue_struct *mattx_dsm_wq;
+
+// Returns when every Data Bomb received before the call has been applied. May sleep: process context only.
+void mattx_dsm_update_barrier(void)
+{
+    if (mattx_dsm_wq) {
+        mattx_dbg("[DSM_SYNC] Barrier: waiting for the queued Data Bombs...\n");
+        flush_workqueue(mattx_dsm_wq);
+    }
+}
+
 // --- THE HPC FAST-PATH HELPER ---
 bool is_hpc_local_lib(const char *path) {
     if (!path) return false;
@@ -936,6 +1079,10 @@ void mattx_fileio_waiters_stop(void) {
 
 // Called once nothing can queue a waiter any more (the receiver threads are gone).
 void mattx_fileio_waiters_destroy(void) {
+    if (mattx_dsm_wq) {
+        destroy_workqueue(mattx_dsm_wq);    // drains the Data Bombs that are still queued
+        mattx_dsm_wq = NULL;
+    }
     if (mattx_wait_wq) {
         destroy_workqueue(mattx_wait_wq);
         mattx_wait_wq = NULL;
@@ -5757,6 +5904,7 @@ static void mattx_dsm_fault_kworker(struct work_struct *work) {
     int ret = -EFAULT;
     unsigned long target_addr = 0;
     unsigned long seg_npages = 0;       // size of the segment in pages: the directory of the segment is sized by it
+    struct file *seg_file = NULL;       // the SYSV file of the segment (referenced): pinned for the Data Bombs
 
     reply = kzalloc(sizeof(*reply), GFP_KERNEL);
     if (!reply) { kfree(ctx); return; }
@@ -5778,6 +5926,8 @@ static void mattx_dsm_fault_kworker(struct work_struct *work) {
                 if (strncmp(vma->vm_file->f_path.dentry->d_name.name, "SYSV", 4) == 0) {
                     if (vma->vm_file->f_inode->i_ino == ctx->req.shmid) {
                         seg_npages = DIV_ROUND_UP(i_size_read(vma->vm_file->f_inode), PAGE_SIZE);
+                        if (config_dsm_mode == 2)
+                            seg_file = get_file(vma->vm_file);      // for the pin below
                         if (vma->vm_start + ctx->req.offset < vma->vm_end) {
                             target_addr = vma->vm_start + ctx->req.offset;
                         }
@@ -5787,6 +5937,13 @@ static void mattx_dsm_fault_kworker(struct work_struct *work) {
             }
         }
         mmap_read_unlock(deputy->mm); // DROP THE LOCK IMMEDIATELY!
+
+        // THE PIN: the Data Bombs of the Funeral Flush must not depend on the mapping of the Deputy (see above)
+        if (seg_file) {
+            mattx_dsm_pin_file(ctx->req.shmid, ctx->req.orig_pid, seg_file);
+            fput(seg_file);
+            seg_file = NULL;
+        }
 
         // 2. THE MESI SYNC & PUMP (Completely Lock-Free!)
         if (target_addr != 0) {
@@ -5989,95 +6146,119 @@ static void mattx_dsm_update_kworker(struct work_struct *work) {
     struct task_struct *deputy = NULL;
     struct file *shm_file = NULL;
 
-    rcu_read_lock();
-    deputy = pid_task(find_vpid(ctx->req.orig_pid), PIDTYPE_PID);
-    if (deputy) get_task_struct(deputy);
-    rcu_read_unlock();
+    // 1. THE PIN (MODE 2): the segment is found without the Deputy. Its shmdt() has most likely run already
+    //    (it is executed natively before the Funeral Flush is sent) and took the VMA with it.
+    if (config_dsm_mode == 2)
+        shm_file = mattx_dsm_pin_get(ctx->req.shmid);
 
-    if (deputy && deputy->mm) {
-        // 1. QUICK GRAB: Find the SYSV file and pin it!
-        mmap_read_lock(deputy->mm);
-        struct vm_area_struct *vma;
-        VMA_ITERATOR(vmi, deputy->mm, 0);
-        for_each_vma(vmi, vma) {
-            if (vma->vm_file && vma->vm_file->f_path.dentry->d_name.name) {
-                if (strncmp(vma->vm_file->f_path.dentry->d_name.name, "SYSV", 4) == 0) {
-                    if (vma->vm_file->f_inode->i_ino == ctx->req.shmid) {
-                        unsigned long target_addr = vma->vm_start + ctx->req.offset;
-                        if (target_addr < vma->vm_end) {
-                            shm_file = vma->vm_file;
-                            get_file(shm_file); // Safely pin the file so it doesn't vanish!
+    // 2. THE FALLBACK (modes 0/1, or no pin): the SYSV file of the VMA of the Deputy
+    if (!shm_file) {
+        rcu_read_lock();
+        deputy = pid_task(find_vpid(ctx->req.orig_pid), PIDTYPE_PID);
+        if (deputy) get_task_struct(deputy);
+        rcu_read_unlock();
+
+        if (deputy && deputy->mm) {
+            // QUICK GRAB: Find the SYSV file and pin it!
+            mmap_read_lock(deputy->mm);
+            struct vm_area_struct *vma;
+            VMA_ITERATOR(vmi, deputy->mm, 0);
+            for_each_vma(vmi, vma) {
+                if (vma->vm_file && vma->vm_file->f_path.dentry->d_name.name) {
+                    if (strncmp(vma->vm_file->f_path.dentry->d_name.name, "SYSV", 4) == 0) {
+                        if (vma->vm_file->f_inode->i_ino == ctx->req.shmid) {
+                            unsigned long target_addr = vma->vm_start + ctx->req.offset;
+                            if (target_addr < vma->vm_end) {
+                                shm_file = vma->vm_file;
+                                get_file(shm_file); // Safely pin the file so it doesn't vanish!
+                            }
+                            break;
                         }
-                        break;
                     }
                 }
             }
+            mmap_read_unlock(deputy->mm); // DROP THE LOCK IMMEDIATELY!
         }
-        mmap_read_unlock(deputy->mm); // DROP THE LOCK IMMEDIATELY!
-
-        // 2. HEAVY LIFTING: Write directly to physical RAM lock-free!
-        if (shm_file) {
-            // --- THE SAFE BOMB TRICK ---
-            // Use filemap_get_folio instead of read_mapping_page!
-            // read_mapping_page blocks if the page is locked (e.g., during IPC_RMID destruction).
-            // filemap_get_folio is a non-blocking lookup. If the memory is being destroyed,
-            // it just returns an error and we safely drop the bomb!
-            struct folio *folio = filemap_get_folio(shm_file->f_mapping, ctx->req.offset / PAGE_SIZE);
-            
-            if (!IS_ERR(folio)) {
-                struct page *page = folio_page(folio, 0);
-                void *kaddr = kmap_local_page(page);
-                memcpy(kaddr, ctx->req.data, PAGE_SIZE);
-                kunmap_local(kaddr);
-                
-                folio_mark_dirty(folio); // Tell the kernel we modified it!
-                folio_put(folio);        // Release our reference
-                
-                mattx_dbg("[DSM_SYNC] VM1 updated physical RAM for SHMID %u at offset %lu\n", ctx->req.shmid, ctx->req.offset);
-            } else {
-                mattx_dbg("[DSM_SYNC] SHM segment is gone or locked. Dropping Data Bomb safely.\n");
-            }
-            // ---------------------------------------
-            
-            fput(shm_file); // Release the file
-
-            // --- THE FUNERAL DIRECTORY CLEANUP ---
-            if (config_dsm_mode == 2) {
-                unsigned long page_idx = ctx->req.offset / PAGE_SIZE;
-                struct mattx_dsm_master_dir *dir;
-
-                spin_lock(&mattx_dsm_lock);
-                dir = mattx_dsm_dir_lookup(ctx->req.shmid, page_idx);
-                if (dir) {
-                    // If the incoming data bomb is from the EXCLUSIVE owner, downgrade it to SHARED!
-                    if (dir->page_state[page_idx] == MATTX_PAGE_EXCLUSIVE &&
-                        dir->page_owner_pid[page_idx] == ctx->req.orig_pid) {
-
-                        dir->page_state[page_idx] = MATTX_PAGE_SHARED;
-                        dir->page_owner_pid[page_idx] = 0;
-                        mattx_dsm_mask_clear(dir, page_idx);
-                        mattx_dbg("[MESI_VM1] Directory cleaned up! SHMID %u Offset %lu is now SHARED.\n", ctx->req.shmid, ctx->req.offset);
-                    }
-                }
-                spin_unlock(&mattx_dsm_lock);
-            }
-            // ------------------------------------------
-        }
-
-        put_task_struct(deputy);
+        if (deputy)
+            put_task_struct(deputy);
     }
+
+    // 3. HEAVY LIFTING: Write directly to physical RAM lock-free!
+    if (shm_file && ctx->req.offset >= i_size_read(file_inode(shm_file))) {
+        mattx_dbg("[DSM_SYNC] Offset %lu is beyond the end of SHMID %u. Dropping Data Bomb.\n", ctx->req.offset, ctx->req.shmid);
+        fput(shm_file);
+        shm_file = NULL;
+    } else if (shm_file) {
+        // --- THE SAFE BOMB TRICK ---
+        // Use filemap_get_folio instead of read_mapping_page!
+        // read_mapping_page blocks if the page is locked (e.g., during IPC_RMID destruction).
+        // filemap_get_folio is a non-blocking lookup. If the memory is being destroyed,
+        // it just returns an error and we safely drop the bomb!
+        struct folio *folio = filemap_get_folio(shm_file->f_mapping, ctx->req.offset / PAGE_SIZE);
+
+        if (!IS_ERR(folio)) {
+            struct page *page = folio_page(folio, 0);
+            void *kaddr = kmap_local_page(page);
+            memcpy(kaddr, ctx->req.data, PAGE_SIZE);
+            kunmap_local(kaddr);
+
+            folio_mark_dirty(folio); // Tell the kernel we modified it!
+            folio_put(folio);        // Release our reference
+
+            mattx_dbg("[DSM_SYNC] VM1 updated physical RAM for SHMID %u at offset %lu\n", ctx->req.shmid, ctx->req.offset);
+        } else {
+            mattx_dbg("[DSM_SYNC] SHM segment is gone or locked. Dropping Data Bomb safely.\n");
+        }
+        // ---------------------------------------
+
+        fput(shm_file); // Release the file
+    } else {
+        // Never drop a bomb silently again: this is the line the missing [DSM_SYNC] lines were hiding
+        mattx_dbg("[DSM_SYNC] No SYSV file for SHMID %u (no pin, Deputy PID %u gone or detached). Dropping Data Bomb for offset %lu.\n",
+                  ctx->req.shmid, ctx->req.orig_pid, ctx->req.offset);
+    }
+
+    // --- THE FUNERAL DIRECTORY CLEANUP ---
+    // Whatever became of the data, the owner is gone for good: it must not stay EXCLUSIVE (a FLUSH
+    // to a dead owner would never be answered)
+    if (config_dsm_mode == 2) {
+        unsigned long page_idx = ctx->req.offset / PAGE_SIZE;
+        struct mattx_dsm_master_dir *dir;
+
+        spin_lock(&mattx_dsm_lock);
+        dir = mattx_dsm_dir_lookup(ctx->req.shmid, page_idx);
+        if (dir) {
+            // If the incoming data bomb is from the EXCLUSIVE owner, downgrade it to SHARED!
+            if (dir->page_state[page_idx] == MATTX_PAGE_EXCLUSIVE &&
+                dir->page_owner_pid[page_idx] == ctx->req.orig_pid) {
+
+                dir->page_state[page_idx] = MATTX_PAGE_SHARED;
+                dir->page_owner_pid[page_idx] = 0;
+                mattx_dsm_mask_clear(dir, page_idx);
+                mattx_dbg("[MESI_VM1] Directory cleaned up! SHMID %u Offset %lu is now SHARED.\n", ctx->req.shmid, ctx->req.offset);
+            }
+        }
+        spin_unlock(&mattx_dsm_lock);
+    }
+    // ------------------------------------------
+
     kfree(ctx);
 }
 
 
 static void handle_dsm_page_update(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
     struct mattx_dsm_page_update_req *req = payload;
-    struct mattx_dsm_update_kworker_ctx *ctx = kmalloc(sizeof(*ctx), GFP_ATOMIC);
-    if (ctx) {
-        INIT_WORK(&ctx->work, mattx_dsm_update_kworker);
-        memcpy(&ctx->req, req, sizeof(*req));
-        schedule_work(&ctx->work);
+    // The receiver thread may sleep: GFP_KERNEL, not GFP_ATOMIC (a failed atomic allocation lost the bomb)
+    struct mattx_dsm_update_kworker_ctx *ctx = kmalloc(sizeof(*ctx), GFP_KERNEL);
+
+    if (!ctx) {
+        printk_ratelimited(KERN_ERR "MattX:[DSM_SYNC] OUT OF MEMORY: Data Bomb for SHMID %u offset %lu from PID %u is LOST\n",
+                           req->shmid, req->offset, req->orig_pid);
+        return;
     }
+    INIT_WORK(&ctx->work, mattx_dsm_update_kworker);
+    memcpy(&ctx->req, req, sizeof(*req));
+    queue_work(mattx_dsm_wq ? mattx_dsm_wq : system_wq, &ctx->work);
 }
 
 
@@ -6229,6 +6410,9 @@ int mattx_dsm_sweeper_loop(void *data) {
         
         // Free the tables of the segments that were destroyed (the shmctl kprobe must not sleep: it only clears in_use)
         mattx_dsm_dir_reap();
+
+        // Let go of the segment pins whose owner came home or died
+        mattx_dsm_pin_reap();
 
         // Sleep for 50ms regardless of mode to prevent 100% CPU spin!
         // An IDLE sleep (TASK_IDLE): msleep() is uninterruptible, so the Sweeper showed up as a D-state task in
@@ -8003,6 +8187,9 @@ static void handle_vfs_close_req(struct mattx_link *link, struct mattx_header *h
 
 void mattx_fileio_init_handlers(void) {
     mattx_unloading = false;
+    mattx_dsm_wq = alloc_ordered_workqueue("mattx_dsm", WQ_MEM_RECLAIM);
+    if (!mattx_dsm_wq)
+        printk(KERN_WARNING "MattX: no ordered workqueue for the DSM Data Bombs, using the system one (no ordering)\n");
     mattx_wait_wq = alloc_workqueue("mattx_wait", WQ_UNBOUND | WQ_MEM_RECLAIM, 0);
     if (!mattx_wait_wq)
         printk(KERN_WARNING "MattX: no private workqueue for poll/epoll waiters, using the system one\n");
@@ -8196,7 +8383,8 @@ void mattx_fileio_exit(void) {
     export_count = 0;
     spin_unlock(&export_lock);
 
-    // 3. The master directory of the DSM
+    // 3. The master directory of the DSM and the pins of its segments
+    mattx_dsm_pin_exit();
     mattx_dsm_dir_exit();
     
     mattx_dbg(" [FILEIO] File purge complete.\n");
