@@ -17,15 +17,18 @@
 #include <time.h>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <stdbool.h>
 
 #define CHUNK_SIZE 4096
-#define SHM_KEY 0x4D415456 // Hex for "MATV" (Different key to avoid collisions)
+#define SHM_KEY 0x4D415456 // Hex for "MATV"
 #define MAX_CHUNKS 250000  // Supports up to ~1GB images
+#define MAX_WORKERS 64
 
-// The Control Header sits at the very beginning of the Shared Memory
+// The Control Header sits at the very beginning of the Shared Memory (Page 0)
 struct dsm_ctrl {
     volatile int total_chunks;
     volatile int chunks_written;
+    volatile int heartbeat[MAX_WORKERS]; // The Coherence Forcer!
     volatile int chunk_status[MAX_CHUNKS]; // 0 = unwritten, 1 = written
 };
 
@@ -78,8 +81,8 @@ int main(int argc, char *argv[]) {
     float action_delay = atof(argv[3]);    
     const char *bmp_path = argv[4];
 
-    if (num_workers <= 0 || max_ops <= 0 || action_delay < 0.0) {
-        printf("Arguments must be > 0 (action_delay can be >= 0)\n");
+    if (num_workers <= 0 || num_workers > MAX_WORKERS || max_ops <= 0 || action_delay < 0.0) {
+        printf("Invalid arguments. (Max workers: %d)\n", MAX_WORKERS);
         exit(1);
     }
 
@@ -132,10 +135,10 @@ int main(int argc, char *argv[]) {
     struct dsm_ctrl *ctrl = (struct dsm_ctrl *)shm_data;
     ctrl->total_chunks = total_chunks;
     ctrl->chunks_written = 0;
+    memset((void *)ctrl->heartbeat, 0, sizeof(ctrl->heartbeat));
     memset((void *)ctrl->chunk_status, 0, sizeof(ctrl->chunk_status));
 
     // Initialize the Canvas with a glaring pattern (0x55 = striped gray)
-    // If the DSM drops a page, it will show up as a highly visible glitch block!
     char *canvas = (char *)shm_data + sizeof(struct dsm_ctrl);
     memset(canvas, 0x55, file_size);
 
@@ -155,66 +158,83 @@ int main(int argc, char *argv[]) {
 
         if (pid == 0) {
             // --- CHILD PROCESS (The Worker) ---
+            int my_worker_id = i;
             srand(time(NULL) ^ getpid()); 
             
-            printf("[Worker PID %d] Started. Waiting 10 seconds for migration...\n", getpid());
+            printf("[Worker %d | PID %d] Started. Waiting 10 seconds for migration...\n", my_worker_id, getpid());
             sleep(10);
 
-            printf("[Worker PID %d] Waking up! Starting to paint...\n", getpid());
+            printf("[Worker %d | PID %d] Waking up! Starting to paint...\n", my_worker_id, getpid());
             
-            int op_counter = 0;
+            bool image_done = false;
 
             // Loop until the entire image is painted!
-            while (ctrl->chunks_written < ctrl->total_chunks) {
+            while (ctrl->chunks_written < ctrl->total_chunks && !image_done) {
                 int current_node = get_local_node_id();
                 int ops = (rand() % max_ops) + 1;
                 
+                // THE COHERENCE FORCER: Write to Page 0 to steal the EXCLUSIVE lock!
+                // This guarantees we fetch the absolute latest 'chunks_written' value from VM1.
+                __sync_fetch_and_add(&ctrl->heartbeat[my_worker_id], 1);
+
                 for (int o = 1; o <= ops && ctrl->chunks_written < ctrl->total_chunks; o++) {
-                    op_counter++;
                     
-                    // --- THE CHAOS OVERWRITE (Every 10th Op) ---
-                    if (op_counter % 10 == 0 && ctrl->chunks_written > 0) {
+                    int action = rand() % 100;
+
+                    // --- 5% CHANCE: THE CHAOS OVERWRITE (Steal EXCLUSIVE) ---
+                    if (action < 5 && ctrl->chunks_written > 0) {
                         int c = rand() % ctrl->total_chunks;
                         if (ctrl->chunk_status[c] == 1) {
-                            // 1. READ: Forces VM1 to FLUSH the original writer and downgrade to SHARED
-                            volatile char dummy = canvas[c * CHUNK_SIZE];
-                            
-                            // 2. WRITE: Triggers Write-Protect fault, forces INVALIDATE, upgrades to EXCLUSIVE
                             int copy_size = CHUNK_SIZE;
                             if ((c + 1) * CHUNK_SIZE > file_size) copy_size = file_size - c * CHUNK_SIZE;
                             
                             memcpy(canvas + c * CHUNK_SIZE, local_bmp + c * CHUNK_SIZE, copy_size);
-                            printf("  -> [PID %d | Node %d] Chaos Overwrite on chunk %d (MESI Torture!)\n", getpid(), current_node, c);
+                            printf("  -> [PID %d | Node %d] Chaos Overwrite on chunk %d (Steal EXCLUSIVE)\n", getpid(), current_node, c);
                         }
                     } 
-                    // --- THE NORMAL WRITE ---
+                    // --- 15% CHANCE: THE READ TORTURE (Downgrade to SHARED) ---
+                    else if (action < 20 && ctrl->chunks_written > 0) {
+                        int c = rand() % ctrl->total_chunks;
+                        if (ctrl->chunk_status[c] == 1) {
+                            volatile char dummy = canvas[c * CHUNK_SIZE];
+                            (void)dummy; // Prevent compiler optimization
+                            printf("  -> [PID %d | Node %d] Read Torture on chunk %d (Downgrade to SHARED)\n", getpid(), current_node, c);
+                        }
+                    }
+                    // --- 80% CHANCE: THE NORMAL PAINT ---
                     else {
                         int c = rand() % ctrl->total_chunks;
                         int start_c = c;
                         
                         // Find an unwritten chunk
                         while (1) {
-                            // Lock-free atomic claim!
-                            if (__sync_bool_compare_and_swap(&ctrl->chunk_status[c], 0, 1)) {
-                                int copy_size = CHUNK_SIZE;
-                                if ((c + 1) * CHUNK_SIZE > file_size) copy_size = file_size - c * CHUNK_SIZE;
-                                
-                                memcpy(canvas + c * CHUNK_SIZE, local_bmp + c * CHUNK_SIZE, copy_size);
-                                __sync_fetch_and_add(&ctrl->chunks_written, 1);
-                                
-                                printf("  -> [PID %d | Node %d] Painted chunk %d (%d/%d)\n", 
-                                       getpid(), current_node, c, ctrl->chunks_written, ctrl->total_chunks);
-                                break;
+                            if (ctrl->chunk_status[c] == 0) {
+                                // Lock-free atomic claim!
+                                if (__sync_bool_compare_and_swap(&ctrl->chunk_status[c], 0, 1)) {
+                                    int copy_size = CHUNK_SIZE;
+                                    if ((c + 1) * CHUNK_SIZE > file_size) copy_size = file_size - c * CHUNK_SIZE;
+                                    
+                                    memcpy(canvas + c * CHUNK_SIZE, local_bmp + c * CHUNK_SIZE, copy_size);
+                                    __sync_fetch_and_add(&ctrl->chunks_written, 1);
+                                    
+                                    printf("  -> [PID %d | Node %d] Painted chunk %d (%d/%d)\n", 
+                                           getpid(), current_node, c, ctrl->chunks_written, ctrl->total_chunks);
+                                    break;
+                                }
                             }
                             c = (c + 1) % ctrl->total_chunks;
-                            if (c == start_c) break; // All chunks claimed
+                            if (c == start_c) {
+                                // We scanned the whole image and found no empty chunks!
+                                image_done = true;
+                                break; 
+                            }
                         }
                     }
                     usleep((useconds_t)(action_delay * 1000000.0)); 
                 }
             }
 
-            printf("[Worker PID %d] Image complete! Exiting cleanly (Triggering Funeral Flush).\n", getpid());
+            printf("[Worker %d | PID %d] Image complete! Exiting cleanly (Triggering Funeral Flush).\n", my_worker_id, getpid());
             exit(0);
         } else {
             child_pids[i] = pid;
@@ -232,6 +252,7 @@ int main(int argc, char *argv[]) {
 
     printf("[Manager] All workers finished! Extracting the final image from DSM...\n");
     
+    char *canvas = (char *)shm_data + sizeof(struct dsm_ctrl);
     FILE *out = fopen("output_dsm_test.bmp", "wb");
     if (out) {
         fwrite(canvas, 1, file_size, out);
@@ -251,4 +272,3 @@ int main(int argc, char *argv[]) {
     printf("[Manager] Clean exit. Goodbye!\n");
     return 0;
 }
-
