@@ -252,7 +252,7 @@ int main(int argc, char *argv[]) {
 
     printf("[Manager] All workers finished! Extracting the final image from DSM...\n");
     
-    char *canvas = (char *)shm_data + sizeof(struct dsm_ctrl);
+    //char *canvas = (char *)shm_data + sizeof(struct dsm_ctrl);
     FILE *out = fopen("output_dsm_test.bmp", "wb");
     if (out) {
         fwrite(canvas, 1, file_size, out);
