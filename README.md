@@ -268,6 +268,26 @@ echo "migrate 1234 home" > /proc/mattx/admin
 
 **MattX** is developed and tested on Debian Trixie for Kernel 6.x and Ubuntu 26.04 for Kernel 7.x. It is also fully supported on Alma Linux (Kernel 6.x) with SELinux enforcing!
 
+### MPI and the UCX version
+
+Migrating a running MPI job (tested with `mpirun -np 1` and an `MPI_Comm_spawn`ed client, see `bin/mpich/`) depends on the UCX library MPICH is built against:
+
+| MPICH | UCX | Result of migrating the client mid-run |
+|---|---|---|
+| 4.3.2 `ch4:ucx` | **1.20.0** (Ubuntu 26.04 package, or built from source on AlmaLinux 10) | runs to the end, `mpirun` exits 0 (Ubuntu: 45 of 46 runs, Alma: 8 of 8) |
+| 4.3.2 `ch4:ucx` | 1.19.1 (AlmaLinux 10 package) | fails often: home node oops in `fdget` (#64), or a hang (#15) |
+| 4.1.2 `ch4:ofi` (AlmaLinux 10 / Fedora distro MPICH) | - | hangs, see #15 |
+
+UCX 1.19.1 is the likely cause, not a proven one. `UCX_HANDLE_ERRORS=none` and `UCX_VFS_ENABLE=n` do not work around it. Use **UCX 1.20.0 or newer**; on a distribution that ships an older UCX, build it from the release tarball and point MPICH at it:
+
+```bash
+./configure --prefix=$HOME/ucx-1.20 && make -j && make install            # UCX 1.20.0 release tarball
+./configure --prefix=$HOME/mpich --with-device=ch4:ucx --with-ucx=$HOME/ucx-1.20 \
+            --disable-fortran --disable-cxx --disable-doc && make -j && make install   # MPICH 4.3.2
+```
+
+The numbers come from the MattX test suite (`scripts/test-mpi.sh`, Test 4) on 2.0-dev `bbb74f0`, with both nodes rebooted before every Alma run.
+
 ---
 
 ## 📜 License
