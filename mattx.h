@@ -745,13 +745,29 @@ struct mattx_sys_recvmsg_req {
     int flags;
     int addrlen;
     size_t datalen;
+    u32 req_id; // ticket id: matches the reply to the one thread that waits for it (0 = legacy SIGSTOP path)
+};
+
+// The flags a Ghost recvmsg() forwards to the home node. MSG_ERRQUEUE is not one of them: it needs ancillary data.
+#define MATTX_RECVMSG_FLAGS (MSG_PEEK | MSG_WAITALL | MSG_TRUNC | MSG_DONTWAIT | MSG_OOB)
+
+// What a ticket-based RECVMSG_REPLY hands to the waiting thread: the reply from addrlen on. Keep the
+// layout in sync with the tail of struct mattx_sys_recvmsg_reply (BUILD_BUG_ONs in mattx_recvmsg_tw_fn()).
+struct mattx_recvmsg_blob {
+    int addrlen;                    // length of the source address (0: none)
+    int msg_flags;                  // MSG_TRUNC, MSG_EOR, MSG_OOB, MSG_CTRUNC
+    struct sockaddr_storage addr;
+    char data[];
 };
 
 struct mattx_sys_recvmsg_reply {
     u32 orig_pid;
     ssize_t bytes_recv;
     int error;
+    u32 req_id; // echo of the request's ticket id (0 = legacy reply)
+    // From here on this is what the ticket carries (see struct mattx_recvmsg_blob)
     int addrlen;
+    int msg_flags;
     struct sockaddr_storage addr;
     char data[]; // Flexible array for the flattened data!
 };

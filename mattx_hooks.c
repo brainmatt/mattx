@@ -4596,7 +4596,6 @@ static int ret_handler_sockopt(struct kretprobe_instance *ri, struct pt_regs *re
 
 // --- THE NETWORK HIJACKERS: Sendmsg & Recvmsg ---
 static struct kretprobe sendmsg_kprobe;
-static struct kretprobe recvmsg_kprobe;
 
 struct msg_kretprobe_data { int fd; struct msghdr __user *msg; int flags; bool is_ghost; int remote_fd; };
 
@@ -4649,6 +4648,314 @@ static int ret_handler_msg(struct kretprobe_instance *ri, struct pt_regs *regs) 
             mattx_dbg("[HOOK] Intercepted %s(fd=%d). Freezing Surrogate %d...\n", 
                    rpc->is_sendmsg ? "sendmsg" : "recvmsg", data->fd, current->pid);
 
+            regs->ax = -EINTR;
+            send_sig(SIGSTOP, current, 0);
+            schedule_work(&rpc->work);
+        }
+    }
+    return 0;
+}
+
+
+// --- RECVMSG HOOK ---
+/*
+ * recvmsg() on a socket that lives on the home node: the thread that called it waits for the reply on
+ * its own ticket, in a task_work that runs when the (sabotaged) syscall returns to user mode. Same
+ * pattern as the wormhole read() and recvfrom(): only this thread sleeps, the other threads of the
+ * process keep running, and the reply is matched by req_id, not through a slot shared by the process.
+ *
+ * Carried: the data (msg_iov is flattened, scattered back into the iovecs here), the source address
+ * (msg_name / msg_namelen) and msg_flags. NOT carried (yet): ancillary data (msg_control, SCM_RIGHTS):
+ * msg_controllen is reset to 0 and the home node reports MSG_CTRUNC if a control message was queued.
+ */
+struct recvmsg_kretprobe_data {
+    int fd;
+    struct user_msghdr __user *msg;
+    int flags;
+    bool is_ghost;
+    int remote_fd;
+};
+
+static struct kretprobe recvmsg_kprobe;
+
+static int entry_handler_recvmsg(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    struct recvmsg_kretprobe_data *data = (struct recvmsg_kretprobe_data *)ri->data;
+    struct pt_regs *sys_regs = SYSCALL_REGS(regs);
+
+    data->is_ghost = false;
+    if (is_guest_process(current->tgid)) {
+        data->fd = (int)sys_regs->di;
+        if (is_wormhole_fd(data->fd, &data->remote_fd)) {
+            data->is_ghost = true;
+            data->msg = (struct user_msghdr __user *)sys_regs->si;
+            data->flags = (int)sys_regs->dx;
+            sys_regs->di = -1; // Sabotage!
+        }
+    }
+    return 0;
+}
+
+struct mattx_recvmsg_tw {
+    struct callback_head cb;
+    u32 orig_pid;
+    int home_node;
+    int remote_fd;
+    struct user_msghdr __user *msg;
+    int flags;
+};
+
+// Scatters n bytes to the user iovecs, starting off bytes into them
+static int mattx_recvmsg_scatter(const struct iovec *iovs, size_t iovlen, size_t off, const char *src, size_t n)
+{
+    size_t i;
+
+    for (i = 0; i < iovlen && n; i++) {
+        size_t len = iovs[i].iov_len;
+        size_t c;
+
+        if (off >= len) {
+            off -= len;
+            continue;
+        }
+        c = min_t(size_t, len - off, n);
+        if (copy_to_user((char __user *)iovs[i].iov_base + off, src, c))
+            return -EFAULT;
+        src += c;
+        n -= c;
+        off = 0;
+    }
+    return 0;
+}
+
+// One request of at most 4096 bytes: the bytes (or -errno) the home node received, already scattered into
+// the user iovecs at off. *meta gets the source address and msg_flags. -EINTR when interrupted before
+// anything arrived.
+static long mattx_recvmsg_one(struct mattx_recvmsg_tw *tw, const struct iovec *iovs, size_t iovlen,
+                              size_t chunk, size_t off, int flags, bool want_addr, size_t namelen,
+                              struct mattx_recvmsg_blob *meta)
+{
+    struct mattx_sys_recvmsg_req req;
+    struct mattx_ticket *t;
+    struct mattx_link *link;
+    long ret = -EINTR;
+
+    link = READ_ONCE(cluster_map[tw->home_node]);
+    if (!link)
+        return -EIO;
+
+    // The ticket carries [addrlen][msg_flags][sockaddr][data]: a bigger reply is a protocol error
+    t = mattx_ticket_add(tw->orig_pid, tw->home_node, sizeof(*meta) + chunk);
+    if (!t)
+        return -ENOMEM;
+
+    memset(&req, 0, sizeof(req));
+    req.orig_pid = tw->orig_pid;
+    req.fd = tw->remote_fd;
+    req.flags = flags;
+    req.addrlen = want_addr ? (int)namelen : 0;
+    req.datalen = chunk;
+    req.req_id = t->req_id;
+
+    mattx_dbg("[RPC] Thread %d: recvmsg(fd=%d, %zu) as req %u, sleeping on its own ticket...\n", current->pid, tw->remote_fd, chunk, t->req_id);
+
+    if (mattx_comm_send(link, MATTX_MSG_SYS_RECVMSG_REQ, &req, sizeof(req)) < 0) {
+        // Never sleep for a reply to a request that was never sent
+        mattx_dbg("[RPC] Thread %d: RECVMSG_REQ send failed\n", current->pid);
+        ret = -EIO;
+        goto done;
+    }
+
+    // Interrupted (signal, freeze of a migration or recall)? The wait cancels the request and still
+    // hands back the bytes if the home node had already received them; otherwise we return -EINTR.
+    if (mattx_ticket_wait(t, MAX_SCHEDULE_TIMEOUT) == 0) {
+        ret = t->retval;
+        if (ret >= 0) {
+            if (!t->data || t->data_len < sizeof(*meta)) {
+                ret = -EIO;
+            } else {
+                size_t n = ret > 0 ? min_t(size_t, ret, t->data_len - sizeof(*meta)) : 0;   // MSG_TRUNC: ret can be the real datagram length
+
+                memcpy(meta, t->data, sizeof(*meta));
+                if (n && mattx_recvmsg_scatter(iovs, iovlen, off, (const char *)t->data + sizeof(*meta), n))
+                    ret = -EFAULT;
+            }
+        }
+    }
+
+done:
+    mattx_ticket_del(t);
+    return ret;
+}
+
+static void mattx_recvmsg_tw_fn(struct callback_head *cb) {
+    struct mattx_recvmsg_tw *tw = container_of(cb, struct mattx_recvmsg_tw, cb);
+    struct pt_regs *regs = task_pt_regs(current);
+    struct mattx_recvmsg_blob meta;
+    struct user_msghdr umsg;
+    struct iovec *iovs = NULL;
+    int flags = tw->flags & MATTX_RECVMSG_FLAGS;
+    // MSG_WAITALL may ask for more than one request carries (4096 bytes): ask chunk by chunk
+    bool waitall = (flags & MSG_WAITALL) && !(flags & MSG_PEEK);
+    bool want_addr;
+    size_t total_len = 0;
+    size_t total = 0;
+    long ret = -EINTR;
+    size_t i;
+
+    // The ticket data is [addrlen][msg_flags][sockaddr][data]: that is the reply from addrlen on
+    BUILD_BUG_ON(offsetof(struct mattx_sys_recvmsg_reply, data) - offsetof(struct mattx_sys_recvmsg_reply, addrlen)
+                 != offsetof(struct mattx_recvmsg_blob, data));
+    BUILD_BUG_ON(offsetof(struct mattx_sys_recvmsg_reply, msg_flags) - offsetof(struct mattx_sys_recvmsg_reply, addrlen)
+                 != offsetof(struct mattx_recvmsg_blob, msg_flags));
+    BUILD_BUG_ON(offsetof(struct mattx_sys_recvmsg_reply, addr) - offsetof(struct mattx_sys_recvmsg_reply, addrlen)
+                 != offsetof(struct mattx_recvmsg_blob, addr));
+
+    memset(&meta, 0, sizeof(meta));
+
+    if (fatal_signal_pending(current) || tw->home_node < 0 || tw->home_node >= MAX_NODES)
+        goto out;
+
+    if (tw->flags & MSG_ERRQUEUE) {     // needs ancillary data: not carried
+        mattx_dbg("[RPC] Thread %d: recvmsg(MSG_ERRQUEUE) is not supported on a Ghost FD\n", current->pid);
+        ret = -EOPNOTSUPP;
+        goto out;
+    }
+
+    if (copy_from_user(&umsg, tw->msg, sizeof(umsg))) {
+        ret = -EFAULT;
+        goto out;
+    }
+    if (umsg.msg_iovlen > UIO_MAXIOV) {
+        ret = -EMSGSIZE;
+        goto out;
+    }
+    if (umsg.msg_iovlen) {
+        iovs = kmalloc_array(umsg.msg_iovlen, sizeof(*iovs), GFP_KERNEL);
+        if (!iovs) {
+            ret = -ENOMEM;
+            goto out;
+        }
+        if (copy_from_user(iovs, umsg.msg_iov, umsg.msg_iovlen * sizeof(*iovs))) {
+            ret = -EFAULT;
+            goto out;
+        }
+    }
+    for (i = 0; i < umsg.msg_iovlen; i++) {
+        if (check_add_overflow(total_len, iovs[i].iov_len, &total_len)) {
+            ret = -EINVAL;
+            goto out;
+        }
+    }
+    total_len = min_t(size_t, total_len, MAX_RW_COUNT);
+    want_addr = umsg.msg_name && umsg.msg_namelen > 0;
+
+    mattx_dbg("[RPC] Thread %d: recvmsg(fd=%d) wants up to %zu bytes across %zu iovecs (name %d, control %zu)\n",
+              current->pid, tw->remote_fd, total_len, (size_t)umsg.msg_iovlen, want_addr ? umsg.msg_namelen : 0,
+              umsg.msg_control ? (size_t)umsg.msg_controllen : 0);
+    if (umsg.msg_control && umsg.msg_controllen)
+        mattx_dbg("[RPC] Thread %d: recvmsg control buffer ignored (ancillary data / SCM_RIGHTS are not carried)\n", current->pid);
+
+    do {
+        size_t chunk = min_t(size_t, total_len - total, 4096);
+        long r = mattx_recvmsg_one(tw, iovs, umsg.msg_iovlen, chunk, total, flags, want_addr, umsg.msg_namelen, &meta);
+
+        if (r < 0) {
+            ret = total ? (long)total : r;      // bytes already in the user buffer win over the error
+            break;
+        }
+        total += r;
+        ret = total;
+        if ((size_t)r < chunk)
+            break;                              // EOF, a datagram, a non-blocking socket: short is final
+    } while (waitall && total < total_len);
+
+    // The rest of the msghdr, like the kernel's own recvmsg(): only after a successful receive
+    if (ret >= 0) {
+        if (want_addr) {
+            int alen = min_t(int, max_t(int, meta.addrlen, 0), (int)sizeof(meta.addr));
+            size_t clen = min_t(size_t, alen, umsg.msg_namelen);
+
+            if ((clen && copy_to_user(umsg.msg_name, &meta.addr, clen)) ||
+                put_user(alen, &tw->msg->msg_namelen))
+                ret = -EFAULT;
+        }
+        if (ret >= 0 && umsg.msg_control && umsg.msg_controllen && put_user(0, &tw->msg->msg_controllen))
+            ret = -EFAULT;
+        if (ret >= 0 && put_user((unsigned int)meta.msg_flags, &tw->msg->msg_flags))
+            ret = -EFAULT;
+    }
+    mattx_dbg("[RPC] Illusion Complete! recvmsg on Ghost FD returned %ld (thread %d)\n", ret, current->pid);
+
+out:
+    kfree(iovs);
+    regs->ax = ret;
+    kfree(tw);
+}
+
+static int ret_handler_recvmsg(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    struct recvmsg_kretprobe_data *data = (struct recvmsg_kretprobe_data *)ri->data;
+    int home_node = -1;
+    u32 orig_pid = 0;
+    int i;
+
+    if (!data->is_ghost) return 0;
+    if (fatal_signal_pending(current) || (current->flags & PF_EXITING)) return 0;
+
+    spin_lock(&guest_lock);
+    for (i = 0; i < guest_count; i++) {
+        if (guest_registry[i].local_pid == current->tgid) {
+            home_node = guest_registry[i].home_node;
+            orig_pid = guest_registry[i].orig_pid;
+            break;
+        }
+    }
+    spin_unlock(&guest_lock);
+
+    if (home_node != -1) {
+        if (real_task_work_add) {
+            struct mattx_recvmsg_tw *tw = kzalloc(sizeof(*tw), GFP_ATOMIC);
+            if (tw) {
+                init_task_work(&tw->cb, mattx_recvmsg_tw_fn);
+                tw->orig_pid = orig_pid;
+                tw->home_node = home_node;
+                tw->remote_fd = data->remote_fd;
+                tw->msg = data->msg;
+                tw->flags = data->flags;
+
+                mattx_dbg("[HOOK] Intercepted recvmsg(fd=%d). Thread %d waits on its own ticket...\n", data->fd, current->pid);
+                // The sabotaged call returns -EBADF; the task_work overwrites it with the real result.
+                regs->ax = -EINTR;
+
+                if (real_task_work_add(current, &tw->cb, TWA_RESUME))
+                    kfree(tw);
+            }
+            return 0;
+        }
+
+        // Fallback if the task_work resolver is missing: the old way (freeze the whole group, the
+        // rpc worker polls the per-guest slot). The home node answers with req_id 0 then.
+        struct mattx_rpc_work *rpc = kzalloc(sizeof(*rpc), GFP_ATOMIC);
+        if (rpc) {
+            spin_lock(&guest_lock);
+            for (i = 0; i < guest_count; i++) {
+                if (guest_registry[i].local_pid == current->tgid) {
+                    guest_registry[i].rpc_done = false;
+                    break;
+                }
+            }
+            spin_unlock(&guest_lock);
+
+            INIT_WORK(&rpc->work, mattx_rpc_worker);
+            rpc->local_pid = current->pid;
+            rpc->orig_pid = orig_pid;
+            rpc->home_node = home_node;
+
+            rpc->is_recvmsg = true;
+            rpc->remote_fd = data->remote_fd;
+            rpc->msg_ptr = (struct msghdr __user *)data->msg;
+            rpc->flags = data->flags;
+
+            mattx_dbg("[HOOK] Intercepted recvmsg(fd=%d). Freezing Surrogate %d (fallback)...\n", data->fd, current->pid);
             regs->ax = -EINTR;
             send_sig(SIGSTOP, current, 0);
             schedule_work(&rpc->work);
@@ -6977,9 +7284,9 @@ int mattx_hooks_init(void) {
 
     memset(&recvmsg_kprobe, 0, sizeof(recvmsg_kprobe));
     recvmsg_kprobe.kp.symbol_name = "__x64_sys_recvmsg";
-    recvmsg_kprobe.entry_handler = entry_handler_msg; // Shared!
-    recvmsg_kprobe.handler = ret_handler_msg;         // Shared!
-    recvmsg_kprobe.data_size = sizeof(struct msg_kretprobe_data);
+    recvmsg_kprobe.entry_handler = entry_handler_recvmsg; // Flat: its own ticket-based handlers
+    recvmsg_kprobe.handler = ret_handler_recvmsg;
+    recvmsg_kprobe.data_size = sizeof(struct recvmsg_kretprobe_data);
     recvmsg_kprobe.maxactive = 64;
     ret = mattx_register_kretprobe(&recvmsg_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for recvmsg, returned %d\n", ret);
