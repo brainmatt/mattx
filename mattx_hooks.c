@@ -4352,6 +4352,13 @@ static void mattx_epoll_wait_tw_fn(struct callback_head *cb) {
     long rc = 0;
     int ret = -EINTR;
 
+    // Same guard as the other Surrogate task_works (connect, read, poll, ...): a thread that is on its way out
+    // must not start a proxied wait. The call returns EINTR, nothing is sent and nothing is left pending.
+    if (fatal_signal_pending(current) || (current->flags & PF_EXITING)) {
+        mattx_dbg("[GUARD] Surrogate TID %d is exiting: the epoll_wait of PID %u is not sent\n", current->pid, tw->orig_pid);
+        goto out;
+    }
+
     p = mattx_epoll_pending_add(tw->orig_pid, tw->home_node);
     if (!p)
         goto out;

@@ -3236,9 +3236,51 @@ struct mattx_epoll_hijack_ctx {
     int target_node;
 };
 
+/*
+ * THE DEPUTY GUARD (VM1)
+ *
+ * The Deputy-side callbacks below (mattx_*_cb) are task_work that the RPC handlers queue onto a Deputy thread.
+ * They run a native syscall as that thread, so they need a live thread with a files table. They can run at the
+ * worst moment: the Native Funeral (mattx_guest.c) makes one Deputy thread call do_group_exit() and SIGKILLs
+ * its siblings, and do_exit() runs exit_files() BEFORE exit_task_work(): a callback that is still pending then
+ * runs with current->files == NULL (NULL deref in fdget() inside the native epoll_wait, seen on AlmaLinux 10).
+ * The thread that called do_group_exit() has no SIGKILL pending itself, so fatal_signal_pending() alone does
+ * not catch it, PF_EXITING does.
+ *
+ * A callback that finds its Deputy thread dying runs NO native syscall, touches no user memory, does not stop
+ * the thread, and only answers its Surrogate with -ESRCH (the flat, per syscall mattx_*_fail() helpers) so a
+ * Surrogate that is still alive is not left waiting. The same helpers answer when the work could not be
+ * queued (the Deputy is exiting, or task_work_add() failed): no more leaked ctx, no more silent drop.
+ */
+static inline bool mattx_deputy_dying(void)
+{
+    return (READ_ONCE(current->flags) & PF_EXITING) ||
+           (READ_ONCE(current->signal->flags) & SIGNAL_GROUP_EXIT) ||
+           fatal_signal_pending(current) ||
+           !READ_ONCE(current->files);
+}
+
+// The Deputy cannot execute the epoll_create1 (it is exiting, or the work was not queued): tell the Surrogate
+static void mattx_epoll_hijack_fail(struct mattx_epoll_hijack_ctx *ctx, int err) {
+    struct mattx_sys_epoll_create_reply reply;
+
+    memset(&reply, 0, sizeof(reply));
+    reply.orig_pid = ctx->orig_pid;
+    reply.remote_fd = err;
+    reply.error = err;
+    mattx_dbg("[GUARD] epoll_create1 of PID %u not executed (Deputy exiting or not reachable), answering %d\n", ctx->orig_pid, err);
+    if (cluster_map[ctx->target_node])
+        mattx_comm_send(cluster_map[ctx->target_node], MATTX_MSG_SYS_EPOLL_CREATE_REPLY, &reply, sizeof(reply));
+}
+
 // This runs INSIDE the Deputy on VM1!
 static void mattx_epoll_hijack_cb(struct callback_head *cb) {
     struct mattx_epoll_hijack_ctx *ctx = container_of(cb, struct mattx_epoll_hijack_ctx, cb);
+    if (mattx_deputy_dying()) {
+        mattx_epoll_hijack_fail(ctx, -ESRCH);
+        kfree(ctx);
+        return;                 // no SIGSTOP: this thread is on its way out
+    }
     struct pt_regs regs;
     int fd = -ENOSYS;
     struct mattx_sys_epoll_create_reply reply;
@@ -3284,11 +3326,12 @@ static void handle_sys_epoll_create_req(struct mattx_link *link, struct mattx_he
                 ctx->target_node = hdr->sender_id;
                 
                 init_task_work(&ctx->cb, mattx_epoll_hijack_cb);
-                if (real_task_work_add) {
-                    real_task_work_add(deputy, &ctx->cb, TWA_SIGNAL);
+                if (!(READ_ONCE(deputy->flags) & PF_EXITING) && real_task_work_add &&
+                    !real_task_work_add(deputy, &ctx->cb, TWA_SIGNAL)) {
                     // Nudge the Deputy to wake up and execute our injected code!
                     send_sig(SIGCONT, deputy, 0);
                 } else {
+                    mattx_epoll_hijack_fail(ctx, -ESRCH);
                     kfree(ctx);
                 }
             }
@@ -3325,8 +3368,24 @@ struct mattx_epoll_ctl_ctx {
 };
 
 
+static void mattx_epoll_ctl_fail(struct mattx_epoll_ctl_ctx *ctx, int err) {
+    struct mattx_sys_bind_reply reply;  // {orig_pid, error}, the layout the callback answers with
+
+    memset(&reply, 0, sizeof(reply));
+    reply.orig_pid = ctx->req.orig_pid;
+    reply.error = err;
+    mattx_dbg("[GUARD] epoll_ctl of PID %u not executed (Deputy exiting or not reachable), answering %d\n", ctx->req.orig_pid, err);
+    if (cluster_map[ctx->target_node])
+        mattx_comm_send(cluster_map[ctx->target_node], MATTX_MSG_SYS_EPOLL_CTL_REPLY, &reply, sizeof(reply));
+}
+
 static void mattx_epoll_ctl_cb(struct callback_head *cb) {
     struct mattx_epoll_ctl_ctx *ctx = container_of(cb, struct mattx_epoll_ctl_ctx, cb);
+    if (mattx_deputy_dying()) {
+        mattx_epoll_ctl_fail(ctx, -ESRCH);
+        kfree(ctx);
+        return;                 // no SIGSTOP: this thread is on its way out
+    }
     struct pt_regs *task_regs = task_pt_regs(current); // We are the Deputy!
     struct pt_regs regs;
     int ret = -EFAULT;
@@ -3380,10 +3439,11 @@ static void handle_sys_epoll_ctl_req(struct mattx_link *link, struct mattx_heade
                 ctx->target_node = hdr->sender_id;
                 
                 init_task_work(&ctx->cb, mattx_epoll_ctl_cb);
-                if (real_task_work_add) {
-                    real_task_work_add(deputy, &ctx->cb, TWA_SIGNAL);
+                if (!(READ_ONCE(deputy->flags) & PF_EXITING) && real_task_work_add &&
+                    !real_task_work_add(deputy, &ctx->cb, TWA_SIGNAL)) {
                     send_sig(SIGCONT, deputy, 0);
                 } else {
+                    mattx_epoll_ctl_fail(ctx, -ESRCH);
                     kfree(ctx);
                 }
             }
@@ -3736,8 +3796,25 @@ int mattx_ticket_wait(struct mattx_ticket *t, long timeout)
 }
 
 
+static void mattx_epoll_wait_fail(struct mattx_epoll_wait_ctx *ctx, int err) {
+    struct mattx_sys_epoll_wait_reply reply;    // no events: the flexible array stays empty
+
+    memset(&reply, 0, sizeof(reply));
+    reply.orig_pid = ctx->req.orig_pid;
+    reply.req_id = ctx->req.req_id;
+    reply.retval = err;
+    mattx_dbg("[GUARD] epoll_wait %u of PID %u not executed (Deputy exiting or not reachable), answering %d\n", ctx->req.req_id, ctx->req.orig_pid, err);
+    if (cluster_map[ctx->target_node])
+        mattx_comm_send(cluster_map[ctx->target_node], MATTX_MSG_SYS_EPOLL_WAIT_REPLY, &reply, sizeof(reply));
+}
+
 static void mattx_epoll_wait_cb(struct callback_head *cb) {
     struct mattx_epoll_wait_ctx *ctx = container_of(cb, struct mattx_epoll_wait_ctx, cb);
+    if (mattx_deputy_dying()) {
+        mattx_epoll_wait_fail(ctx, -ESRCH);
+        kfree(ctx);
+        return;                 // no SIGSTOP: this thread is on its way out
+    }
     struct pt_regs *task_regs = task_pt_regs(current);
     struct pt_regs regs;
     int ret = -EFAULT;
@@ -3899,10 +3976,12 @@ static void mattx_epoll_wait_kworker(struct work_struct *work) {
             ctx->target_node = rpc->home_node; 
             
             init_task_work(&ctx->cb, mattx_epoll_wait_cb);
-            if (real_task_work_add) {
-                real_task_work_add(deputy, &ctx->cb, TWA_SIGNAL);
+            if (!(READ_ONCE(deputy->flags) & PF_EXITING) && real_task_work_add &&
+                !real_task_work_add(deputy, &ctx->cb, TWA_SIGNAL)) {
                 send_sig(SIGCONT, deputy, 0);
             } else {
+                // The Deputy is on its way out (the Funeral): nobody can execute this wait any more
+                mattx_epoll_wait_fail(ctx, -ESRCH);
                 kfree(ctx);
             }
         }
@@ -4014,8 +4093,27 @@ struct mattx_sockname_ctx {
     bool is_peer;
 };
 
+static void mattx_sockname_fail(struct mattx_sockname_ctx *ctx, int err) {
+    struct mattx_sys_getsockname_reply reply;   // the same layout for getsockname and getpeername
+
+    memset(&reply, 0, sizeof(reply));
+    reply.orig_pid = ctx->orig_pid;
+    reply.error = err;
+    mattx_dbg("[GUARD] %s of PID %u not executed (Deputy exiting or not reachable), answering %d\n",
+              ctx->is_peer ? "getpeername" : "getsockname", ctx->orig_pid, err);
+    if (cluster_map[ctx->target_node])
+        mattx_comm_send(cluster_map[ctx->target_node],
+                        ctx->is_peer ? MATTX_MSG_SYS_GETPEERNAME_REPLY : MATTX_MSG_SYS_GETSOCKNAME_REPLY,
+                        &reply, sizeof(reply));
+}
+
 static void mattx_sockname_cb(struct callback_head *cb) {
     struct mattx_sockname_ctx *ctx = container_of(cb, struct mattx_sockname_ctx, cb);
+    if (mattx_deputy_dying()) {
+        mattx_sockname_fail(ctx, -ESRCH);
+        kfree(ctx);
+        return;                 // no SIGSTOP: this thread is on its way out
+    }
     struct pt_regs *task_regs = task_pt_regs(current);
     struct pt_regs regs;
     int ret = -EFAULT;
@@ -4071,7 +4169,7 @@ static void handle_sys_getsockname_req(struct mattx_link *link, struct mattx_hea
         if (ctx) {
             ctx->orig_pid = req->orig_pid; ctx->fd = req->fd; ctx->target_node = hdr->sender_id; ctx->is_peer = false;
             init_task_work(&ctx->cb, mattx_sockname_cb);
-            if (real_task_work_add) { real_task_work_add(deputy, &ctx->cb, TWA_SIGNAL); send_sig(SIGCONT, deputy, 0); } else { kfree(ctx); }
+            if (!(READ_ONCE(deputy->flags) & PF_EXITING) && real_task_work_add && !real_task_work_add(deputy, &ctx->cb, TWA_SIGNAL)) { send_sig(SIGCONT, deputy, 0); } else { mattx_sockname_fail(ctx, -ESRCH); kfree(ctx); }
         }
         put_task_struct(deputy);
     }
@@ -4086,7 +4184,7 @@ static void handle_sys_getpeername_req(struct mattx_link *link, struct mattx_hea
         if (ctx) {
             ctx->orig_pid = req->orig_pid; ctx->fd = req->fd; ctx->target_node = hdr->sender_id; ctx->is_peer = true;
             init_task_work(&ctx->cb, mattx_sockname_cb);
-            if (real_task_work_add) { real_task_work_add(deputy, &ctx->cb, TWA_SIGNAL); send_sig(SIGCONT, deputy, 0); } else { kfree(ctx); }
+            if (!(READ_ONCE(deputy->flags) & PF_EXITING) && real_task_work_add && !real_task_work_add(deputy, &ctx->cb, TWA_SIGNAL)) { send_sig(SIGCONT, deputy, 0); } else { mattx_sockname_fail(ctx, -ESRCH); kfree(ctx); }
         }
         put_task_struct(deputy);
     }
@@ -4128,8 +4226,24 @@ struct mattx_setsockopt_ctx {
     char optval[];
 };
 
+static void mattx_setsockopt_fail(struct mattx_setsockopt_ctx *ctx, int err) {
+    struct mattx_sys_setsockopt_reply reply;
+
+    memset(&reply, 0, sizeof(reply));
+    reply.orig_pid = ctx->orig_pid;
+    reply.error = err;
+    mattx_dbg("[GUARD] setsockopt of PID %u not executed (Deputy exiting or not reachable), answering %d\n", ctx->orig_pid, err);
+    if (cluster_map[ctx->target_node])
+        mattx_comm_send(cluster_map[ctx->target_node], MATTX_MSG_SYS_SETSOCKOPT_REPLY, &reply, sizeof(reply));
+}
+
 static void mattx_setsockopt_cb(struct callback_head *cb) {
     struct mattx_setsockopt_ctx *ctx = container_of(cb, struct mattx_setsockopt_ctx, cb);
+    if (mattx_deputy_dying()) {
+        mattx_setsockopt_fail(ctx, -ESRCH);
+        kfree(ctx);
+        return;                 // no SIGSTOP: this thread is on its way out
+    }
     struct pt_regs *task_regs = task_pt_regs(current);
     struct pt_regs regs;
     int ret = -EFAULT;
@@ -4166,7 +4280,7 @@ static void handle_sys_setsockopt_req(struct mattx_link *link, struct mattx_head
             ctx->orig_pid = req->orig_pid; ctx->fd = req->fd; ctx->level = req->level; ctx->optname = req->optname;
             ctx->optlen = req->optlen; ctx->target_node = hdr->sender_id; memcpy(ctx->optval, req->optval, req->optlen);
             init_task_work(&ctx->cb, mattx_setsockopt_cb);
-            if (real_task_work_add) { real_task_work_add(deputy, &ctx->cb, TWA_SIGNAL); send_sig(SIGCONT, deputy, 0); } else { kfree(ctx); }
+            if (!(READ_ONCE(deputy->flags) & PF_EXITING) && real_task_work_add && !real_task_work_add(deputy, &ctx->cb, TWA_SIGNAL)) { send_sig(SIGCONT, deputy, 0); } else { mattx_setsockopt_fail(ctx, -ESRCH); kfree(ctx); }
         }
         put_task_struct(deputy);
     }
@@ -4183,8 +4297,24 @@ struct mattx_getsockopt_ctx {
     int target_node;
 };
 
+static void mattx_getsockopt_fail(struct mattx_getsockopt_ctx *ctx, int err) {
+    struct mattx_sys_getsockopt_reply reply;    // no option value: the flexible array stays empty
+
+    memset(&reply, 0, sizeof(reply));
+    reply.orig_pid = ctx->orig_pid;
+    reply.error = err;
+    mattx_dbg("[GUARD] getsockopt of PID %u not executed (Deputy exiting or not reachable), answering %d\n", ctx->orig_pid, err);
+    if (cluster_map[ctx->target_node])
+        mattx_comm_send(cluster_map[ctx->target_node], MATTX_MSG_SYS_GETSOCKOPT_REPLY, &reply, sizeof(reply));
+}
+
 static void mattx_getsockopt_cb(struct callback_head *cb) {
     struct mattx_getsockopt_ctx *ctx = container_of(cb, struct mattx_getsockopt_ctx, cb);
+    if (mattx_deputy_dying()) {
+        mattx_getsockopt_fail(ctx, -ESRCH);
+        kfree(ctx);
+        return;                 // no SIGSTOP: this thread is on its way out
+    }
     struct pt_regs *task_regs = task_pt_regs(current);
     struct pt_regs regs;
     int ret = -EFAULT;
@@ -4241,7 +4371,7 @@ static void handle_sys_getsockopt_req(struct mattx_link *link, struct mattx_head
             ctx->orig_pid = req->orig_pid; ctx->fd = req->fd; ctx->level = req->level; ctx->optname = req->optname;
             ctx->optlen = req->optlen; ctx->target_node = hdr->sender_id;
             init_task_work(&ctx->cb, mattx_getsockopt_cb);
-            if (real_task_work_add) { real_task_work_add(deputy, &ctx->cb, TWA_SIGNAL); send_sig(SIGCONT, deputy, 0); } else { kfree(ctx); }
+            if (!(READ_ONCE(deputy->flags) & PF_EXITING) && real_task_work_add && !real_task_work_add(deputy, &ctx->cb, TWA_SIGNAL)) { send_sig(SIGCONT, deputy, 0); } else { mattx_getsockopt_fail(ctx, -ESRCH); kfree(ctx); }
         }
         put_task_struct(deputy);
     }
@@ -4540,8 +4670,24 @@ static void handle_sys_uname_reply(struct mattx_link *link, struct mattx_header 
 
 // The prlimit64 Deputy Hijack
 struct mattx_prlimit_ctx { struct callback_head cb; struct mattx_sys_prlimit64_req req; int target_node; };
+static void mattx_prlimit_fail(struct mattx_prlimit_ctx *ctx, int err) {
+    struct mattx_sys_prlimit64_reply reply;
+
+    memset(&reply, 0, sizeof(reply));
+    reply.orig_pid = ctx->req.orig_pid;
+    reply.error = err;
+    mattx_dbg("[GUARD] prlimit64 of PID %u not executed (Deputy exiting or not reachable), answering %d\n", ctx->req.orig_pid, err);
+    if (cluster_map[ctx->target_node])
+        mattx_comm_send(cluster_map[ctx->target_node], MATTX_MSG_SYS_PRLIMIT64_REPLY, &reply, sizeof(reply));
+}
+
 static void mattx_prlimit_cb(struct callback_head *cb) {
     struct mattx_prlimit_ctx *ctx = container_of(cb, struct mattx_prlimit_ctx, cb);
+    if (mattx_deputy_dying()) {
+        mattx_prlimit_fail(ctx, -ESRCH);
+        kfree(ctx);
+        return;                 // no SIGSTOP: this thread is on its way out
+    }
     struct pt_regs *task_regs = task_pt_regs(current);
     struct pt_regs regs; int ret = -EFAULT;
     struct mattx_sys_prlimit64_reply reply;
@@ -4572,8 +4718,24 @@ static void mattx_prlimit_cb(struct callback_head *cb) {
 
 // The prctl Deputy Hijack
 struct mattx_prctl_ctx { struct callback_head cb; struct mattx_sys_prctl_req req; int target_node; };
+static void mattx_prctl_fail(struct mattx_prctl_ctx *ctx, int err) {
+    struct mattx_sys_prctl_reply reply;
+
+    memset(&reply, 0, sizeof(reply));
+    reply.orig_pid = ctx->req.orig_pid;
+    reply.error = err;
+    mattx_dbg("[GUARD] prctl of PID %u not executed (Deputy exiting or not reachable), answering %d\n", ctx->req.orig_pid, err);
+    if (cluster_map[ctx->target_node])
+        mattx_comm_send(cluster_map[ctx->target_node], MATTX_MSG_SYS_PRCTL_REPLY, &reply, sizeof(reply));
+}
+
 static void mattx_prctl_cb(struct callback_head *cb) {
     struct mattx_prctl_ctx *ctx = container_of(cb, struct mattx_prctl_ctx, cb);
+    if (mattx_deputy_dying()) {
+        mattx_prctl_fail(ctx, -ESRCH);
+        kfree(ctx);
+        return;                 // no SIGSTOP: this thread is on its way out
+    }
     struct pt_regs regs; int ret = -ENOSYS;
     struct mattx_sys_prctl_reply reply;
 
@@ -4599,7 +4761,7 @@ static void handle_sys_prlimit64_req(struct mattx_link *link, struct mattx_heade
         if (ctx) {
             memcpy(&ctx->req, req, sizeof(*req)); ctx->target_node = hdr->sender_id;
             init_task_work(&ctx->cb, mattx_prlimit_cb);
-            if (real_task_work_add) { real_task_work_add(deputy, &ctx->cb, TWA_SIGNAL); send_sig(SIGCONT, deputy, 0); } else { kfree(ctx); }
+            if (!(READ_ONCE(deputy->flags) & PF_EXITING) && real_task_work_add && !real_task_work_add(deputy, &ctx->cb, TWA_SIGNAL)) { send_sig(SIGCONT, deputy, 0); } else { mattx_prlimit_fail(ctx, -ESRCH); kfree(ctx); }
         }
         put_task_struct(deputy);
     }
@@ -4614,7 +4776,7 @@ static void handle_sys_prctl_req(struct mattx_link *link, struct mattx_header *h
         if (ctx) {
             memcpy(&ctx->req, req, sizeof(*req)); ctx->target_node = hdr->sender_id;
             init_task_work(&ctx->cb, mattx_prctl_cb);
-            if (real_task_work_add) { real_task_work_add(deputy, &ctx->cb, TWA_SIGNAL); send_sig(SIGCONT, deputy, 0); } else { kfree(ctx); }
+            if (!(READ_ONCE(deputy->flags) & PF_EXITING) && real_task_work_add && !real_task_work_add(deputy, &ctx->cb, TWA_SIGNAL)) { send_sig(SIGCONT, deputy, 0); } else { mattx_prctl_fail(ctx, -ESRCH); kfree(ctx); }
         }
         put_task_struct(deputy);
     }
@@ -4682,8 +4844,27 @@ static void handle_sys_pread64_req(struct mattx_link *link, struct mattx_header 
 
 // The fcntl & ioctl Deputy Hijack:
 struct mattx_fio_ctx { struct callback_head cb; u32 orig_pid; int fd; int cmd; unsigned long arg; u8 has_ptr; char data[256]; int target_node; bool is_ioctl; };
+static void mattx_fio_fail(struct mattx_fio_ctx *ctx, int err) {
+    struct mattx_sys_fcntl_reply reply;     // reused for ioctl
+
+    memset(&reply, 0, sizeof(reply));
+    reply.orig_pid = ctx->orig_pid;
+    reply.error = err;
+    mattx_dbg("[GUARD] %s of PID %u not executed (Deputy exiting or not reachable), answering %d\n",
+              ctx->is_ioctl ? "ioctl" : "fcntl", ctx->orig_pid, err);
+    if (cluster_map[ctx->target_node])
+        mattx_comm_send(cluster_map[ctx->target_node],
+                        ctx->is_ioctl ? MATTX_MSG_SYS_IOCTL_REPLY : MATTX_MSG_SYS_FCNTL_REPLY,
+                        &reply, sizeof(reply));
+}
+
 static void mattx_fio_cb(struct callback_head *cb) {
     struct mattx_fio_ctx *ctx = container_of(cb, struct mattx_fio_ctx, cb);
+    if (mattx_deputy_dying()) {
+        mattx_fio_fail(ctx, -ESRCH);
+        kfree(ctx);
+        return;                 // no SIGSTOP: this thread is on its way out
+    }
     struct pt_regs *task_regs = task_pt_regs(current);
     struct pt_regs regs; int ret = -EFAULT;
     struct mattx_sys_fcntl_reply reply; // Reused for ioctl
@@ -4720,7 +4901,7 @@ static void handle_sys_fcntl_req(struct mattx_link *link, struct mattx_header *h
         if (ctx) {
             ctx->orig_pid = req->orig_pid; ctx->fd = req->fd; ctx->cmd = req->cmd; ctx->arg = req->arg; ctx->has_ptr = req->has_ptr; memcpy(ctx->data, req->data, 256); ctx->target_node = hdr->sender_id; ctx->is_ioctl = false;
             init_task_work(&ctx->cb, mattx_fio_cb);
-            if (real_task_work_add) { real_task_work_add(deputy, &ctx->cb, TWA_SIGNAL); send_sig(SIGCONT, deputy, 0); } else { kfree(ctx); }
+            if (!(READ_ONCE(deputy->flags) & PF_EXITING) && real_task_work_add && !real_task_work_add(deputy, &ctx->cb, TWA_SIGNAL)) { send_sig(SIGCONT, deputy, 0); } else { mattx_fio_fail(ctx, -ESRCH); kfree(ctx); }
         }
         put_task_struct(deputy);
     }
@@ -4734,7 +4915,7 @@ static void handle_sys_ioctl_req(struct mattx_link *link, struct mattx_header *h
         if (ctx) {
             ctx->orig_pid = req->orig_pid; ctx->fd = req->fd; ctx->cmd = req->cmd; ctx->arg = req->arg; ctx->has_ptr = req->has_ptr; memcpy(ctx->data, req->data, 256); ctx->target_node = hdr->sender_id; ctx->is_ioctl = true;
             init_task_work(&ctx->cb, mattx_fio_cb);
-            if (real_task_work_add) { real_task_work_add(deputy, &ctx->cb, TWA_SIGNAL); send_sig(SIGCONT, deputy, 0); } else { kfree(ctx); }
+            if (!(READ_ONCE(deputy->flags) & PF_EXITING) && real_task_work_add && !real_task_work_add(deputy, &ctx->cb, TWA_SIGNAL)) { send_sig(SIGCONT, deputy, 0); } else { mattx_fio_fail(ctx, -ESRCH); kfree(ctx); }
         }
         put_task_struct(deputy);
     }
