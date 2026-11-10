@@ -18,7 +18,9 @@
  * The VM1 write patterns differ in HOW the native PTE got (re)mapped before
  * the write, because that is exactly what hides the write from the DSM:
  *
- *   ctl       control group: VM2 writes, VM1 polls (must always PASS)
+ *   ctl       control group: VM2 writes, VM1 polls. It must PASS LIVE: VM1 has to see the updates
+ *             while the worker is writing (DSMRW_CTL_MIN_PCT), not only the final value that the
+ *             Funeral Flush delivers at exit
  *   atomic    lock xadd on the page, no prior load      (issue #66 scenario)
  *   store     plain store, no prior load                (write-first)
  *   rw        load the word, then store it              (read fault maps the
@@ -51,10 +53,17 @@
  *   DSMRW_STALE_MS      ack timeout before a round counts as STALE (default 2000)
  *   DSMRW_SLOW_MS       ack latency that counts as WARN             (default 40)
  *   DSMRW_POLL_US       poll interval in microseconds               (default 200)
+ *   DSMRW_CTL_MIN_PCT   ctl: % of the worker's updates that VM1 must see while the worker
+ *                       is still writing (default 50; only checked with action_delay >= 0.05)
  *   DSMRW_VERBOSE=1     print every round
  *   DSMRW_ALLOW_LOCAL=1 accept a run without migration (harness self-test only)
  *   DSMRW_FAULT_INJECT=N  self-test: Workers pretend to see no update after
- *                       round N (proves the FAIL path and the no-hang timeouts)
+ *                       round N (proves the FAIL path and the no-hang timeouts); in ctl
+ *                       VM1 pretends to see no LIVE update after round N (proves the live check)
+ *
+ * The ctl live check assumes that the Manager already polls when the Worker starts to write. That is
+ * true for a migrated Worker (it waits for the migration first); without migration (DSMRW_ALLOW_LOCAL
+ * self-tests) the Workers start during the spawn gap and VM1 misses the first rounds.
  *
  * EXIT CODE: 0 = all PASS (WARN counts as pass), 1 = FAIL, 2 = INCONCLUSIVE
  */
@@ -132,6 +141,8 @@ struct sc_result {
     unsigned long long lat_sum_us, lat_max_us;
     int hist[NHIST];
     unsigned long long torn, order, regress;
+    unsigned long long live_seen_min;    /* ctl: updates VM1 saw while the worker was still writing */
+    int live_checked, live_fail;
     int not_migrated;
     int verdict;
     char note[200];
@@ -145,7 +156,7 @@ static int shmid = -1;
 static uint8_t *shm_base = (uint8_t *)-1;
 static int home_node = -1;
 static long stale_ms = 2000, slow_ms = 40, poll_us = 200, verbose = 0;
-static long allow_local = 0, inject_round = 0;
+static long allow_local = 0, inject_round = 0, ctl_min_pct = 50;
 
 /* ---- layout helpers ---- */
 static struct payload *payload_page(int sc)
@@ -448,11 +459,13 @@ collect:
 static void run_ctl_scenario(int sc, struct sc_result *res)
 {
     uint64_t last[MAX_WORKERS];
+    uint64_t live[MAX_WORKERS];          /* distinct updates seen while the worker was still writing */
     long total_s = (long)(rounds * (action_delay + 0.05)) + migrate_wait + 60;
     uint64_t deadline = now_us() + (uint64_t)total_s * 1000000ULL;
     int all_done = 0;
 
     memset(last, 0, sizeof(last));
+    memset(live, 0, sizeof(live));
 
     while (!all_done) {
         all_done = 1;
@@ -462,6 +475,9 @@ static void run_ctl_scenario(int sc, struct sc_result *res)
             int finished = r->done ? 1 : 0;      /* sample BEFORE the final read */
             uint64_t s = p->seq;
 
+            /* self-test: VM1 pretends that no update arrives while the worker is still writing */
+            if (inject_round > 0 && !finished && last[w] >= (uint64_t)inject_round) s = last[w];
+
             if (s < last[w]) res->regress++;     /* VM1 must never see time go backwards */
             if (s > last[w]) {
                 uint64_t d[NDATA];
@@ -470,6 +486,7 @@ static void run_ctl_scenario(int sc, struct sc_result *res)
                 for (int i = 1; i < NDATA; i++)
                     if (d[i] != d[0]) { res->torn++; break; }
                 last[w] = s;
+                if (!finished) live[w]++;
             }
             if (!finished) all_done = 0;
         }
@@ -479,6 +496,26 @@ static void run_ctl_scenario(int sc, struct sc_result *res)
             break;
         }
         usleep((useconds_t)poll_us);
+    }
+
+    /* LIVE VISIBILITY: a page that only shows its final value after the Worker has exited (the Funeral
+     * Flush) is eventually consistent at best. ctl used to PASS exactly like that (issue #66). */
+    {
+        int min_w = 0;
+
+        res->live_seen_min = live[0];
+        for (int w = 1; w < num_workers; w++)
+            if (live[w] < res->live_seen_min) { res->live_seen_min = live[w]; min_w = w; }
+
+        if (!res->done_timeout && action_delay >= 0.05) {
+            res->live_checked = 1;
+            if (res->live_seen_min * 100ULL < (unsigned long long)rounds * (unsigned long long)ctl_min_pct) {
+                res->live_fail = 1;
+                snprintf(res->note, sizeof(res->note),
+                         "NOT LIVE: VM1 saw only %llu of %d updates of worker %d while it was writing (eventual consistency only)",
+                         res->live_seen_min, rounds, min_w);
+            }
+        }
     }
 
     /* After the Worker is done, VM1 must see the final value (within the stale timeout) */
@@ -502,7 +539,7 @@ static void run_ctl_scenario(int sc, struct sc_result *res)
 static void judge(struct sc_result *res)
 {
     if (res->ready_timeout || res->done_timeout)            res->verdict = V_FAIL;
-    else if (res->stale_round || res->torn || res->order || res->regress) res->verdict = V_FAIL;
+    else if (res->stale_round || res->torn || res->order || res->regress || res->live_fail) res->verdict = V_FAIL;
     else if (res->not_migrated && !allow_local)             res->verdict = V_INCONC;
     else if (res->lat_max_us >= (unsigned long long)slow_ms * 1000ULL) res->verdict = V_WARN;
     else                                                    res->verdict = V_PASS;
@@ -514,6 +551,9 @@ static void print_result(int sc, struct sc_result *res)
     if (res->note[0]) printf("   note   : %s\n", res->note);
     if (res->not_migrated && !allow_local)
         printf("   note   : a worker never left the home node (or node unknown) -> the DSM was not exercised!\n");
+    if (sc == SC_CTL)
+        printf("   live   : VM1 saw %llu of %d updates while the worker was writing (worst worker)%s\n",
+               res->live_seen_min, rounds, res->live_checked ? "" : "  [not enforced: needs a done run and action_delay >= 0.05]");
     printf("   rounds : %d/%d acked", res->rounds_ok, rounds);
     if (sc != SC_CTL && res->rounds_ok)
         printf(" | latency avg %.2f ms, max %.2f ms",
@@ -594,6 +634,7 @@ int main(int argc, char *argv[])
         verbose      = env_long("DSMRW_VERBOSE", 0);
         allow_local  = env_long("DSMRW_ALLOW_LOCAL", 0);
         inject_round = env_long("DSMRW_FAULT_INJECT", 0);
+        ctl_min_pct  = env_long("DSMRW_CTL_MIN_PCT", 50);
 
         home_node = get_local_node_id();
         child_pids = calloc(num_workers, sizeof(pid_t));
@@ -680,5 +721,8 @@ int main(int argc, char *argv[])
 
         return any_fail ? 1 : (any_inconc ? 2 : 0);
     }
-    waitpid(outter_pid, NULL, 0);
+    // hand the verdict of the inner Manager (0 = PASS, 1 = FAIL, 2 = INCONCLUSIVE) on to the shell
+    int status = 0;
+    waitpid(outter_pid, &status, 0);
+    return WIFEXITED(status) ? WEXITSTATUS(status) : 1;
 }

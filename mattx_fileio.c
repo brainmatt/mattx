@@ -5949,6 +5949,51 @@ static vm_fault_t mattx_dsm_fault(struct vm_fault *vmf) {
 
 
 
+/*
+ * THE MESI TRANSIENT STATE (VM2), issue #66: "SHARED, EXCLUSIVE requested, grant not yet processed here"
+ *
+ * VM1 turns the directory EXCLUSIVE the moment it handles the WRITE_ACQUIRE, but this node flips its local state
+ * only after the faulting task has been woken by the reply and scheduled again (steps 4 and 5 of the trapdoor
+ * below: 3-5 ms on a busy VM). A native VM1 reader that polls the page sends its FLUSH inside that window: the
+ * FLUSH kworker found no EXCLUSIVE page and answered -ENOENT, VM1 downgraded the directory to SHARED with an
+ * empty mask, and this node then wrote into a page the directory no longer knew about, so VM1 read stale RAM
+ * forever (dsmreadwritetest store / atomic: the ack page was lost after 3 to 8 rounds).
+ *
+ * Between the request and the upgrade the page is UPGRADING, and the FLUSH kworker waits for it (bounded).
+ * The value only ever lives in page_states[] of this node, and every other reader of that array compares
+ * against MATTX_PAGE_EXCLUSIVE (the Funeral Flush) or falls back to INVALID (/proc/mattx/dsm), so it needs no
+ * mattx.h change. Move it into enum mattx_dsm_page_state when mattx.h is touched anyway.
+ *
+ * MESI_MODE=0 (lazy) never enters it. Set MESI_MODE identically on all nodes.
+ */
+#define MATTX_PAGE_UPGRADING    (MATTX_PAGE_EXCLUSIVE + 1)
+#define MATTX_UPGRADE_WAIT_MS   1000    // a grant that has not arrived within a second is not coming
+
+// Moves one page of the calling Surrogate from @from to @to. false: the page was not in @from
+static bool mattx_dsm_vm2_page_cas(unsigned long fault_addr, unsigned long offset, u8 from, u8 to)
+{
+    unsigned long page_idx = offset / PAGE_SIZE;
+    bool done = false;
+
+    spin_lock(&guest_lock);
+    for (int i = 0; i < guest_count; i++) {
+        if (guest_registry[i].local_pid == current->tgid) {
+            for (int d = 0; d < guest_registry[i].dsm_count; d++) {
+                if (guest_registry[i].dsm_map[d].base_addr == (fault_addr - offset) && page_idx < guest_registry[i].dsm_map[d].npages) {
+                    if (guest_registry[i].dsm_map[d].page_states[page_idx] == from) {
+                        guest_registry[i].dsm_map[d].page_states[page_idx] = to;
+                        done = true;
+                    }
+                    break;
+                }
+            }
+            break;
+        }
+    }
+    spin_unlock(&guest_lock);
+    return done;
+}
+
 // ============================================================================
 // THE MESI WRITE-PROTECT TRAPDOOR (VM2)
 // ============================================================================
@@ -6009,6 +6054,12 @@ static vm_fault_t mattx_dsm_pfn_mkwrite(struct vm_fault *vmf) {
         
         if (slot == -1) return VM_FAULT_SIGBUS;
 
+        // MESI_MODE=1: the page is UPGRADING until the grant has been processed here (MATTX_PAGE_UPGRADING)
+        bool upgrading = mattx_mesi_atomic() &&
+                         mattx_dsm_vm2_page_cas(fault_addr, offset, MATTX_PAGE_SHARED, MATTX_PAGE_UPGRADING);
+        if (upgrading)
+            mattx_dbg("[MESI_VM2] Page at 0x%lx is UPGRADING (EXCLUSIVE grant requested)\n", fault_addr);
+
         // 3. THE REQUEST: Ask VM1 for the EXCLUSIVE lock!
         struct mattx_dsm_write_acquire_req acq_req = { 
             .req_id = req_id, .orig_pid = orig_pid, .shmid = shmid, .offset = offset 
@@ -6023,11 +6074,15 @@ static vm_fault_t mattx_dsm_pfn_mkwrite(struct vm_fault *vmf) {
 
         // If we were interrupted by a signal (like migration SIGSTOP/SIGKILL), abort!
         if (wait_ret == -ERESTARTSYS) {
+            if (upgrading) mattx_dsm_vm2_page_cas(fault_addr, offset, MATTX_PAGE_UPGRADING, MATTX_PAGE_SHARED);
             mattx_dbg("[MESI_VM2] Write-Acquire interrupted by signal! Aborting upgrade.\n");
             return VM_FAULT_RETRY; // Tell the kernel to retry the fault later!
         }
 
-        if (err != 0) return VM_FAULT_SIGBUS;
+        if (err != 0) {
+            if (upgrading) mattx_dsm_vm2_page_cas(fault_addr, offset, MATTX_PAGE_UPGRADING, MATTX_PAGE_SHARED);
+            return VM_FAULT_SIGBUS;
+        }
 
         // 5. THE UPGRADE: Mark local state as EXCLUSIVE
         unsigned long page_idx = offset / PAGE_SIZE;
@@ -7197,7 +7252,11 @@ static void mattx_dsm_flush_kworker(struct work_struct *work) {
 
     struct task_struct *zap_task = NULL;    // looked up under guest_lock, zapped after it is dropped
     unsigned long zap_base = 0, zap_addr = 0;
+    bool upgrading;                         // the page is UPGRADING: its EXCLUSIVE grant is still in flight
+    int waited = 0;
 
+again:
+    upgrading = false;
     spin_lock(&guest_lock);
     for (int i = 0; i < guest_count; i++) {
         if (guest_registry[i].orig_pid == ctx->req.orig_pid) {
@@ -7223,6 +7282,8 @@ static void mattx_dsm_flush_kworker(struct work_struct *work) {
                         rcu_read_unlock();
                         zap_base = base;
                         zap_addr = fault_addr;
+                    } else if (guest_registry[i].dsm_map[d].page_states[page_idx] == MATTX_PAGE_UPGRADING) {
+                        upgrading = true;
                     }
                     break;
                 }
@@ -7231,6 +7292,24 @@ static void mattx_dsm_flush_kworker(struct work_struct *work) {
         }
     }
     spin_unlock(&guest_lock);
+
+    // MESI_MODE=1: the EXCLUSIVE grant of this page is still on its way to the faulting task (issue #66).
+    // Answering -ENOENT now would make VM1 downgrade the directory while this node is about to write: wait for it.
+    if (upgrading && reply->error == -ENOENT) {
+        if (waited == 0)
+            mattx_dbg("[MESI_VM2] FLUSH for SHMID %u Offset %lu arrived while the EXCLUSIVE grant is in flight. Waiting for it...\n",
+                      ctx->req.shmid, ctx->req.offset);
+        if (waited < MATTX_UPGRADE_WAIT_MS) {
+            waited++;
+            msleep(1);
+            goto again;
+        }
+        mattx_dbg("[MESI_VM2] FLUSH for SHMID %u Offset %lu: the grant did not arrive within %d ms, answering -ENOENT\n",
+                  ctx->req.shmid, ctx->req.offset, MATTX_UPGRADE_WAIT_MS);
+    } else if (waited) {
+        mattx_dbg("[MESI_VM2] FLUSH for SHMID %u Offset %lu: the grant arrived after %d ms, flushing now\n",
+                  ctx->req.shmid, ctx->req.offset, waited);
+    }
 
     if (zap_task) {
         if (zap_task->mm && real_zap_vma_ptes) {
