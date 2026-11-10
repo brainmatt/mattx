@@ -529,127 +529,156 @@ static void print_result(int sc, struct sc_result *res)
         printf("   likely : %s\n", sc_hint[sc]);
 }
 
+
+
+
+
+
+// The Parent catches Ctrl-C and kills all children cleanly
+void handle_sigint(int sig) {
+    printf("\n[Manager] Caught Ctrl-C! Sending kill signals to workers...\n");
+    for (int i = 0; i < num_workers; i++) {
+        if (child_pids[i] > 0) {
+            kill(child_pids[i], SIGKILL); 
+        }
+    }
+    exit(0);
+}
+
+
 int main(int argc, char *argv[])
 {
-    struct sc_result results[SC_COUNT];
-    size_t shm_size;
-    struct payload *op;
-    int any_fail = 0, any_inconc = 0;
-
-    setvbuf(stdout, NULL, _IOLBF, 0);
-
-    if (argc < 4 || argc > 6) {
-        printf("Usage: %s <num_workers> <rounds> <action_delay> [scenario|all] [migrate_wait_secs]\n", argv[0]);
-        printf("  scenario: ctl | atomic | store | rw | rwfield | all (default)\n");
-        exit(1);
+    // for first to keep the stdout console when migrating
+    pid_t outter_pid = fork();
+    
+    if (outter_pid < 0) {
+        perror("Fork failed");
+        handle_sigint(SIGINT);
     }
 
-    num_workers = atoi(argv[1]);
-    rounds = atoi(argv[2]);
-    action_delay = atof(argv[3]);
-    if (argc >= 5 && strcasecmp(argv[4], "all") != 0) {
-        sel_sc = -1;
-        for (int sc = 0; sc < SC_COUNT; sc++)
-            if (strcasecmp(argv[4], sc_name[sc]) == 0) sel_sc = sc;
-        if (sel_sc < 0) { printf("Unknown scenario '%s'\n", argv[4]); exit(1); }
+    if (outter_pid == 0) {
+
+        struct sc_result results[SC_COUNT];
+        size_t shm_size;
+        struct payload *op;
+        int any_fail = 0, any_inconc = 0;
+
+        setvbuf(stdout, NULL, _IOLBF, 0);
+
+        if (argc < 4 || argc > 6) {
+            printf("Usage: %s <num_workers> <rounds> <action_delay> [scenario|all] [migrate_wait_secs]\n", argv[0]);
+            printf("  scenario: ctl | atomic | store | rw | rwfield | all (default)\n");
+            exit(1);
+        }
+
+        num_workers = atoi(argv[1]);
+        rounds = atoi(argv[2]);
+        action_delay = atof(argv[3]);
+        if (argc >= 5 && strcasecmp(argv[4], "all") != 0) {
+            sel_sc = -1;
+            for (int sc = 0; sc < SC_COUNT; sc++)
+                if (strcasecmp(argv[4], sc_name[sc]) == 0) sel_sc = sc;
+            if (sel_sc < 0) { printf("Unknown scenario '%s'\n", argv[4]); exit(1); }
+        }
+        if (argc == 6) migrate_wait = atoi(argv[5]);
+
+        if (num_workers <= 0 || num_workers > MAX_WORKERS || rounds <= 0 ||
+            action_delay < 0.0 || migrate_wait < 0) {
+            printf("Invalid arguments. (Max workers: %d, rounds > 0, action_delay >= 0)\n", MAX_WORKERS);
+            exit(1);
+        }
+
+        stale_ms     = env_long("DSMRW_STALE_MS", 2000);
+        slow_ms      = env_long("DSMRW_SLOW_MS", 40);
+        poll_us      = env_long("DSMRW_POLL_US", 200);
+        verbose      = env_long("DSMRW_VERBOSE", 0);
+        allow_local  = env_long("DSMRW_ALLOW_LOCAL", 0);
+        inject_round = env_long("DSMRW_FAULT_INJECT", 0);
+
+        home_node = get_local_node_id();
+        child_pids = calloc(num_workers, sizeof(pid_t));
+
+        printf("==================================================\n");
+        printf("[Manager] MattX DSM Read-Then-Write Test Initializing...\n");
+        printf("[Manager] Workers: %d | Rounds: %d | Action Delay: %.3fs | Home node: %d\n",
+            num_workers, rounds, action_delay, home_node);
+        printf("[Manager] Stale timeout: %ldms | Slow (WARN) threshold: %ldms\n", stale_ms, slow_ms);
+        if (home_node < 0)
+            printf("[Manager] WARNING: /proc/mattx/nodes not readable (module not loaded?) -> run is INCONCLUSIVE\n");
+        if (inject_round > 0)
+            printf("[Manager] SELF-TEST: fault injection after round %ld (expect FAIL)\n", inject_round);
+
+        /* 1. MASTER CREATES THE SHARED MEMORY */
+        shm_size = total_pages() * PAGE_SZ;
+        shmid = shmget(SHM_KEY, shm_size, IPC_CREAT | 0666);
+        if (shmid < 0) { perror("shmget failed"); exit(1); }
+        shm_base = (uint8_t *)shmat(shmid, NULL, 0);
+        if (shm_base == (uint8_t *)-1) { perror("shmat failed"); shmctl(shmid, IPC_RMID, NULL); exit(1); }
+
+        memset(shm_base, 0, shm_size);
+        for (int sc = 1; sc < SC_COUNT; sc++) {
+            op = payload_page(sc);
+            op->other = 0xC0FFEE;
+        }
+        printf("[Manager] SHM created and attached at %p (SHMID: %d, %zu pages, one page per role)\n",
+            (void *)shm_base, shmid, total_pages());
+        printf("==================================================\n");
+
+        signal(SIGINT, cleanup_and_exit);
+        signal(SIGALRM, cleanup_and_exit);
+        {   /* the watchdog: this tool must never hang, whatever the DSM does */
+            int nsc = sel_sc < 0 ? SC_COUNT : 1;
+            long wd = migrate_wait + 120 +
+                    (long)nsc * ((long)(rounds * (action_delay + 0.5)) + (stale_ms * 8) / 1000 + 60);
+            alarm((unsigned)wd);
+        }
+
+        /* 2. FORK THE WORKERS */
+        for (int i = 0; i < num_workers; i++) {
+            pid_t pid = fork();
+            if (pid < 0) { perror("Fork failed"); cleanup_and_exit(SIGINT); }
+            if (pid == 0) worker_main(i);
+            child_pids[i] = pid;
+            printf("[Manager] Spawned worker %d/%d (PID %d). Migrate it to the remote node now!\n",
+                i + 1, num_workers, pid);
+            usleep(500000);
+        }
+
+        /* 3. RUN THE SCENARIOS (this process must stay on the Home Node!) */
+        memset(results, 0, sizeof(results));
+        for (int sc = 0; sc < SC_COUNT; sc++) {
+            if (!scenario_selected(sc)) continue;
+
+            printf("\n[Manager] === Scenario '%s': %s ===\n", sc_name[sc], sc_desc[sc]);
+            results[sc].ran = 1;
+            if (sc == SC_CTL) run_ctl_scenario(sc, &results[sc]);
+            else              run_poll_scenario(sc, &results[sc]);
+            judge(&results[sc]);
+            print_result(sc, &results[sc]);
+        }
+
+        for (int i = 0; i < num_workers; i++) waitpid(child_pids[i], NULL, 0);
+        alarm(0);
+
+        /* 4. THE VERDICT */
+        printf("\n==================================================\n");
+        printf("[Manager] SUMMARY (workers: %d, rounds: %d)\n", num_workers, rounds);
+        for (int sc = 0; sc < SC_COUNT; sc++) {
+            if (!results[sc].ran) continue;
+            printf("  %-8s %-13s %s\n", sc_name[sc], v_name[results[sc].verdict], sc_desc[sc]);
+            if (results[sc].verdict == V_FAIL) any_fail = 1;
+            if (results[sc].verdict == V_INCONC) any_inconc = 1;
+        }
+        if (results[SC_CTL].ran && results[SC_CTL].verdict == V_FAIL)
+            printf("  NOTE: the control group failed -> the remaining results are suspect.\n");
+        printf("==================================================\n");
+
+        shmdt((void *)shm_base);
+        shmctl(shmid, IPC_RMID, NULL);
+        free(child_pids);
+        printf("[Manager] Clean exit. Goodbye!\n");
+
+        return any_fail ? 1 : (any_inconc ? 2 : 0);
     }
-    if (argc == 6) migrate_wait = atoi(argv[5]);
-
-    if (num_workers <= 0 || num_workers > MAX_WORKERS || rounds <= 0 ||
-        action_delay < 0.0 || migrate_wait < 0) {
-        printf("Invalid arguments. (Max workers: %d, rounds > 0, action_delay >= 0)\n", MAX_WORKERS);
-        exit(1);
-    }
-
-    stale_ms     = env_long("DSMRW_STALE_MS", 2000);
-    slow_ms      = env_long("DSMRW_SLOW_MS", 40);
-    poll_us      = env_long("DSMRW_POLL_US", 200);
-    verbose      = env_long("DSMRW_VERBOSE", 0);
-    allow_local  = env_long("DSMRW_ALLOW_LOCAL", 0);
-    inject_round = env_long("DSMRW_FAULT_INJECT", 0);
-
-    home_node = get_local_node_id();
-    child_pids = calloc(num_workers, sizeof(pid_t));
-
-    printf("==================================================\n");
-    printf("[Manager] MattX DSM Read-Then-Write Test Initializing...\n");
-    printf("[Manager] Workers: %d | Rounds: %d | Action Delay: %.3fs | Home node: %d\n",
-           num_workers, rounds, action_delay, home_node);
-    printf("[Manager] Stale timeout: %ldms | Slow (WARN) threshold: %ldms\n", stale_ms, slow_ms);
-    if (home_node < 0)
-        printf("[Manager] WARNING: /proc/mattx/nodes not readable (module not loaded?) -> run is INCONCLUSIVE\n");
-    if (inject_round > 0)
-        printf("[Manager] SELF-TEST: fault injection after round %ld (expect FAIL)\n", inject_round);
-
-    /* 1. MASTER CREATES THE SHARED MEMORY */
-    shm_size = total_pages() * PAGE_SZ;
-    shmid = shmget(SHM_KEY, shm_size, IPC_CREAT | 0666);
-    if (shmid < 0) { perror("shmget failed"); exit(1); }
-    shm_base = (uint8_t *)shmat(shmid, NULL, 0);
-    if (shm_base == (uint8_t *)-1) { perror("shmat failed"); shmctl(shmid, IPC_RMID, NULL); exit(1); }
-
-    memset(shm_base, 0, shm_size);
-    for (int sc = 1; sc < SC_COUNT; sc++) {
-        op = payload_page(sc);
-        op->other = 0xC0FFEE;
-    }
-    printf("[Manager] SHM created and attached at %p (SHMID: %d, %zu pages, one page per role)\n",
-           (void *)shm_base, shmid, total_pages());
-    printf("==================================================\n");
-
-    signal(SIGINT, cleanup_and_exit);
-    signal(SIGALRM, cleanup_and_exit);
-    {   /* the watchdog: this tool must never hang, whatever the DSM does */
-        int nsc = sel_sc < 0 ? SC_COUNT : 1;
-        long wd = migrate_wait + 120 +
-                  (long)nsc * ((long)(rounds * (action_delay + 0.5)) + (stale_ms * 8) / 1000 + 60);
-        alarm((unsigned)wd);
-    }
-
-    /* 2. FORK THE WORKERS */
-    for (int i = 0; i < num_workers; i++) {
-        pid_t pid = fork();
-        if (pid < 0) { perror("Fork failed"); cleanup_and_exit(SIGINT); }
-        if (pid == 0) worker_main(i);
-        child_pids[i] = pid;
-        printf("[Manager] Spawned worker %d/%d (PID %d). Migrate it to the remote node now!\n",
-               i + 1, num_workers, pid);
-        usleep(500000);
-    }
-
-    /* 3. RUN THE SCENARIOS (this process must stay on the Home Node!) */
-    memset(results, 0, sizeof(results));
-    for (int sc = 0; sc < SC_COUNT; sc++) {
-        if (!scenario_selected(sc)) continue;
-
-        printf("\n[Manager] === Scenario '%s': %s ===\n", sc_name[sc], sc_desc[sc]);
-        results[sc].ran = 1;
-        if (sc == SC_CTL) run_ctl_scenario(sc, &results[sc]);
-        else              run_poll_scenario(sc, &results[sc]);
-        judge(&results[sc]);
-        print_result(sc, &results[sc]);
-    }
-
-    for (int i = 0; i < num_workers; i++) waitpid(child_pids[i], NULL, 0);
-    alarm(0);
-
-    /* 4. THE VERDICT */
-    printf("\n==================================================\n");
-    printf("[Manager] SUMMARY (workers: %d, rounds: %d)\n", num_workers, rounds);
-    for (int sc = 0; sc < SC_COUNT; sc++) {
-        if (!results[sc].ran) continue;
-        printf("  %-8s %-13s %s\n", sc_name[sc], v_name[results[sc].verdict], sc_desc[sc]);
-        if (results[sc].verdict == V_FAIL) any_fail = 1;
-        if (results[sc].verdict == V_INCONC) any_inconc = 1;
-    }
-    if (results[SC_CTL].ran && results[SC_CTL].verdict == V_FAIL)
-        printf("  NOTE: the control group failed -> the remaining results are suspect.\n");
-    printf("==================================================\n");
-
-    shmdt((void *)shm_base);
-    shmctl(shmid, IPC_RMID, NULL);
-    free(child_pids);
-    printf("[Manager] Clean exit. Goodbye!\n");
-
-    return any_fail ? 1 : (any_inconc ? 2 : 0);
+    waitpid(outter_pid, NULL, 0);
 }
