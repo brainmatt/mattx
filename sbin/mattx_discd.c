@@ -40,7 +40,7 @@
 #define DEFAULT_PORT 7225
 #define DEFAULT_IFACE "eth0"
 
-enum { MATTX_ATTR_UNSPEC, MATTX_ATTR_NODE_ID, MATTX_ATTR_IPV4_ADDR, MATTX_ATTR_STUB_PID, MATTX_ATTR_BLUEPRINT, MATTX_ATTR_MY_NODE_ID, MATTX_ATTR_LOCAL_IP, MATTX_ATTR_CONFIG_FILE_IO, MATTX_ATTR_CONFIG_NET_IO, MATTX_ATTR_MATTXFS_ENABLED, MATTX_ATTR_DFSA_DIR, MATTX_ATTR_ACCEPT_GUESTS, MATTX_ATTR_CONFIG_LOCAL_LIBS, MATTX_ATTR_DSM_MODE, __MATTX_ATTR_MAX };
+enum { MATTX_ATTR_UNSPEC, MATTX_ATTR_NODE_ID, MATTX_ATTR_IPV4_ADDR, MATTX_ATTR_STUB_PID, MATTX_ATTR_BLUEPRINT, MATTX_ATTR_MY_NODE_ID, MATTX_ATTR_LOCAL_IP, MATTX_ATTR_CONFIG_FILE_IO, MATTX_ATTR_CONFIG_NET_IO, MATTX_ATTR_MATTXFS_ENABLED, MATTX_ATTR_DFSA_DIR, MATTX_ATTR_ACCEPT_GUESTS, MATTX_ATTR_CONFIG_LOCAL_LIBS, MATTX_ATTR_DSM_MODE, MATTX_ATTR_MESI_MODE, __MATTX_ATTR_MAX };
 #define MATTX_ATTR_MAX (__MATTX_ATTR_MAX - 1)
 
 enum { MATTX_CMD_UNSPEC, MATTX_CMD_NODE_JOIN, MATTX_CMD_NODE_LEAVE, MATTX_CMD_HIJACK_ME, MATTX_CMD_GET_BLUEPRINT, MATTX_CMD_SET_LOCAL_IP, MATTX_CMD_SET_CONFIG, __MATTX_CMD_MAX };
@@ -58,6 +58,7 @@ struct mattx_config {
     uint8_t accept_guests;
     uint8_t local_libs; // local libs
     uint8_t dsm_mode; // DSM config
+    uint8_t mesi_mode; // MESI engine of DSM mode 2: 0 = Lazy, 1 = Atomic
     char autodiscovery[32]; // Discovery Mode ---
 };
 
@@ -130,6 +131,7 @@ void register_config_to_kernel() {
     nla_put_u8(msg, MATTX_ATTR_ACCEPT_GUESTS, config.accept_guests);
     nla_put_u8(msg, MATTX_ATTR_CONFIG_LOCAL_LIBS, config.local_libs);
     nla_put_u8(msg, MATTX_ATTR_DSM_MODE, config.dsm_mode);
+    nla_put_u8(msg, MATTX_ATTR_MESI_MODE, config.mesi_mode);
 
     if (nl_send_auto(nl_sock, msg) < 0) {
         printf("ERROR: Failed to push configuration to kernel.\n");
@@ -218,6 +220,7 @@ void load_config() {
     config.accept_guests = 1; // Default to true
     config.local_libs = 1; // use local libs
     config.dsm_mode = 1; // Default to Dirty Sweeper
+    config.mesi_mode = 0; // Default to Lazy MESI (the Sweeper)
 
     FILE *fp = fopen(CONFIG_FILE, "r");
     if (!fp) {
@@ -260,6 +263,12 @@ void load_config() {
         int temp_dsm;
         if (sscanf(line, "DSM_MODE=%d", &temp_dsm) == 1) {
             config.dsm_mode = (uint8_t)temp_dsm;
+            continue;
+        }
+
+        int temp_mesi;
+        if (sscanf(line, "MESI_MODE=%d", &temp_mesi) == 1) {
+            config.mesi_mode = temp_mesi ? 1 : 0;
             continue;
         }
     }

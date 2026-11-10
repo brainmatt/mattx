@@ -467,6 +467,78 @@ static void mattx_dsm_pin_exit(void)
 }
 
 /*
+ * ATOMIC MESI (MESI_MODE=1) - VM1 SIDE (issue #66)
+ *
+ * The invariant of the atomic engine: as long as a remote node holds a copy of a page, VM1 must not own a
+ * writable PTE of it. Whenever the directory hands a page to a remote node (first share, a VM1-owned page
+ * that gets a sharer, write-acquire) the native PTEs are ripped out of EVERY process of this node that maps
+ * the segment: unmap_mapping_range() on the pinned SYSV file works on the address_space, so no Deputy, no
+ * task lookup and no mmap lock are needed. The next native access faults and meets the directory (the
+ * shmem_fault kretprobe), instead of writing silently like the Sweeper allowed for up to 50ms.
+ *
+ * MESI_MODE=0 (lazy) keeps the Sweeper exactly as it was, none of this runs.
+ *
+ * Known limit of this step: a native READ fault maps the page writable again (shm_vm_ops has no
+ * page_mkwrite), so a native read-then-write stays invisible until the next transition. The Sweeper that
+ * used to re-arm the trap is switched off in atomic mode, so this hole is deterministic (dsmreadwritetest
+ * rw / rwfield) until the write-notify step.
+ */
+extern int config_mesi_mode;    // 0 = lazy, 1 = atomic (mattx_main.c)
+
+// The atomic engine only exists inside Mode 2
+static inline bool mattx_mesi_atomic(void)
+{
+    return config_dsm_mode == 2 && config_mesi_mode == 1;
+}
+
+// Rips the native PTEs of one page of @shmid out of all processes of this node. false: nothing was done
+static bool mattx_dsm_vm1_shootdown(u32 shmid, unsigned long offset, const char *why)
+{
+    struct file *f;
+
+    if (!real_unmap_mapping_range)
+        return false;
+
+    f = mattx_dsm_pin_get(shmid);
+    if (!f) {
+        mattx_dbg("[MESI_VM1] Atomic shootdown (%s): SHMID %u has no pin, Offset %lu was NOT shot down\n", why, shmid, offset);
+        return false;
+    }
+    real_unmap_mapping_range(f->f_mapping, offset, PAGE_SIZE, 1);
+    fput(f);
+    mattx_dbg("[MESI_VM1] Atomic shootdown (%s): ripped the native PTEs of SHMID %u Offset %lu\n", why, shmid, offset);
+    return true;
+}
+
+// Copies one page of @shmid out of the page cache of its SYSV file without ever creating a PTE (the old pump,
+// access_process_vm(), faulted the page into the Deputy's mm writable again, right after the shootdown).
+// PAGE_SIZE: copied. -ENOENT: no pin, or the page is not in the page cache (never touched or swapped out):
+// a zero page must not be invented, the caller falls back to the pump
+static int mattx_dsm_vm1_copy_page(u32 shmid, unsigned long offset, void *dst)
+{
+    struct file *f = mattx_dsm_pin_get(shmid);
+    struct folio *folio;
+    int ret = -ENOENT;
+
+    if (!f)
+        return -ENOENT;
+
+    folio = filemap_get_folio(f->f_mapping, offset / PAGE_SIZE);
+    if (!IS_ERR(folio)) {
+        if (folio_test_uptodate(folio)) {
+            void *kaddr = kmap_local_page(folio_file_page(folio, offset / PAGE_SIZE));
+
+            memcpy(dst, kaddr, PAGE_SIZE);
+            kunmap_local(kaddr);
+            ret = PAGE_SIZE;
+        }
+        folio_put(folio);
+    }
+    fput(f);
+    return ret;
+}
+
+/*
  * THE ORDERED WORKQUEUE OF THE DATA BOMBS (VM1)
  *
  * The bombs of a dying Surrogate are applied by kworkers, but its PROCESS_EXIT notice is handled inline by
@@ -6364,14 +6436,70 @@ static void mattx_dsm_fault_kworker(struct work_struct *work) {
 
             mattx_dbg("[DSM_PUMP] Found SYSV segment! Sucking 4096 bytes from physical addr 0x%lx...\n", target_addr); 
             
-            // THE PUMP: Safely extract the data because we dropped the mmap_read_lock!
-            int bytes = access_process_vm(deputy, target_addr, reply->data, 4096, FOLL_FORCE);
+            // --- ATOMIC MESI (MESI_MODE=1): directory first, then shootdown, then copy (issue #66) ---
+            // The requester becomes a sharer BEFORE the data leaves, so a native writer that faults from now
+            // on already finds it in the mask. The native PTEs are gone before the copy, so nobody writes
+            // through them while the page is copied, and the copy does not create one again.
+            bool mesi_atomic = mattx_mesi_atomic();
+            bool atomic_nomask = false;
+
+            if (mesi_atomic) {
+                struct mattx_dsm_master_dir *adir;
+                u64 *amask = NULL;
+
+                if (mattx_dsm_dir_register(ctx->req.shmid, ctx->req.orig_pid, seg_npages) != 0)
+                    mattx_dbg("[MESI_VM1] Could not register SHMID %u in the Global Directory\n", ctx->req.shmid);
+
+                spin_lock(&mattx_dsm_lock);
+                adir = mattx_dsm_dir_lookup(ctx->req.shmid, page_idx);
+                if (adir) {
+                    amask = mattx_dsm_mask_get(adir, page_idx);
+                    if (amask) {
+                        u8 old_state = adir->page_state[page_idx];
+
+                        // INVALID and the VM1-owned EXCLUSIVE (owner 0) both become SHARED: from now on VM1 is
+                        // a sharer like the others (the old EXCLUSIVE(0) + sharer bit hybrid is what let the
+                        // Sweeper and the native fault intercept ignore the page)
+                        if (old_state == MATTX_PAGE_INVALID ||
+                            (old_state == MATTX_PAGE_EXCLUSIVE && adir->page_owner_pid[page_idx] == 0)) {
+                            adir->page_state[page_idx] = MATTX_PAGE_SHARED;
+                            adir->page_owner_pid[page_idx] = 0;
+                        }
+                        amask[ctx->target_node / 64] |= (1ULL << (ctx->target_node % 64));
+                        mattx_dbg("[MESI_VM1] Atomic: Page %lu of SHMID %u state %u -> %u, Node %d is a sharer now\n",
+                                  page_idx, ctx->req.shmid, old_state, adir->page_state[page_idx], ctx->target_node);
+                    }
+                }
+                spin_unlock(&mattx_dsm_lock);
+
+                if (adir && !amask) {
+                    // A sharer that cannot be recorded would never be invalidated: it must not get the page
+                    atomic_nomask = true;
+                    ret = -ENOMEM;
+                } else {
+                    mattx_dsm_vm1_shootdown(ctx->req.shmid, ctx->req.offset, "fetch");
+                }
+            }
+
+            int bytes = -ENOMEM;    // stays so only when the atomic directory could not record the sharer
+            if (!atomic_nomask) {
+                bytes = -ENOENT;
+                if (mesi_atomic)
+                    bytes = mattx_dsm_vm1_copy_page(ctx->req.shmid, ctx->req.offset, reply->data);
+                if (bytes != 4096) {
+                    // THE PUMP: Safely extract the data because we dropped the mmap_read_lock!
+                    bytes = access_process_vm(deputy, target_addr, reply->data, 4096, FOLL_FORCE);
+                    // the pump faults the page into the Deputy's mm writable again: take it out once more
+                    if (mesi_atomic && bytes == 4096)
+                        mattx_dsm_vm1_shootdown(ctx->req.shmid, ctx->req.offset, "fetch/pump");
+                }
+            }
             if (bytes == 4096) {
                 ret = 0;
                 mattx_dbg("[DSM_PUMP] Successfully extracted 4KB page. Sending to Node %d...\n", ctx->target_node); 
 
-                // --- MODE 2 MASTER DIRECTORY UPDATE ---
-                if (config_dsm_mode == 2) {
+                // --- MODE 2 MASTER DIRECTORY UPDATE (MESI_MODE=1 did it above, before the copy) ---
+                if (config_dsm_mode == 2 && !mesi_atomic) {
                     struct mattx_dsm_master_dir *dir;
                     u64 *mask = NULL;
 
@@ -6653,8 +6781,9 @@ int mattx_dsm_sweeper_loop(void *data) {
                 }
             }
             
-        } else if (config_dsm_mode == 2) {
-            // --- PHASE 2: THE NATIVE SWEEPER (VM1 - MODE 2 ONLY) ---
+        } else if (config_dsm_mode == 2 && !mattx_mesi_atomic()) {
+            // --- PHASE 2: THE NATIVE SWEEPER (VM1 - MODE 2, MESI_MODE=0 ONLY) ---
+            // (MESI_MODE=1 shoots the native PTEs down synchronously at every transition instead)
             struct { u32 shmid; u32 home_pid; unsigned long offset; } to_shoot[16];
             int shoot_count = 0;
 
@@ -6901,7 +7030,10 @@ static void mattx_dsm_write_acquire_kworker(struct work_struct *work) {
         }
         
         // 2. THE PTE SHOOTDOWN (VM1)
-        if (real_unmap_mapping_range) {
+        // MESI_MODE=1: through the pinned file, so every process of this node is hit and no Deputy is needed.
+        // Without a pin (or in lazy mode) the VMA of the Deputy is used, as before.
+        if (real_unmap_mapping_range &&
+            !(mattx_mesi_atomic() && mattx_dsm_vm1_shootdown(ctx->req.shmid, ctx->req.offset, "write-acquire"))) {
             struct task_struct *deputy = NULL;
             rcu_read_lock();
             deputy = pid_task(find_vpid(ctx->req.orig_pid), PIDTYPE_PID);
@@ -7257,6 +7389,11 @@ static void mattx_vm1_shm_sync_kworker(struct work_struct *work) {
                             put_task_struct(deputy);
                         }
                         mattx_dbg("[MESI_VM1] Native Fault: Successfully flushed dirty data from PID %u.\n", owner_pid);
+                    } else {
+                        // VM2 answers an error when it holds nothing dirty (RAM is current) - or when this races with
+                        // its own write-acquire: the directory is downgraded below either way. Never silent again.
+                        mattx_dbg("[MESI_VM1] Native Fault: FLUSH from PID %u failed (err %d). Page %lu is downgraded anyway\n",
+                                  owner_pid, flush_err, page_idx);
                     }
 
                     spin_lock(&mattx_dsm_lock);
@@ -7290,6 +7427,9 @@ static void mattx_vm1_shm_sync_kworker(struct work_struct *work) {
             mattx_dsm_mask_clear(dir, page_idx);
         }
         spin_unlock(&mattx_dsm_lock);
+        if (mattx_mesi_atomic())
+            mattx_dbg("[MESI_VM1] Atomic: Native write on Page %lu of SHMID %u -> EXCLUSIVE(VM1), invalidating the sharers\n",
+                      page_idx, shmid);
 
         // The Invalidates go out WITHOUT the spinlock: mattx_comm_send() sleeps on its mutex
         for (int node = 0; node < MAX_NODES; node++) {
