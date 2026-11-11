@@ -539,6 +539,56 @@ static int mattx_dsm_vm1_copy_page(u32 shmid, unsigned long offset, void *dst)
 }
 
 /*
+ * THE PAGE TRANSACTION (VM1), issue #66
+ *
+ * The directory is changed by three kworkers: the fetch (VM2 read), the write-acquire (VM2 write) and the native
+ * sync worker (VM1 fault). Each of them reads the directory, talks to a remote node (the FLUSH round trip alone
+ * takes 0.5 to 11 ms) and writes the directory again - with nothing around it. A newer fetch and write-acquire
+ * overtook a FLUSH round trip, and when its reply arrived the sync worker wrote SHARED / owner 0 / empty mask over
+ * the fresh EXCLUSIVE grant: VM2 went on writing, VM1 read stale RAM from then on (2 of 138 FLUSH round trips of
+ * the dsmreadwritetest run, ctl froze at seq 61).
+ *
+ * Every transaction of one page now holds the mutex of its stripe from the first read of the directory until the
+ * reply (or the INVALIDATEs) have left. The stripes are hashed from (shmid, page): different pages mostly run
+ * in parallel, the same page is serialized. The native fault intercept (a kretprobe) cannot sleep and takes no
+ * lock: it only schedules the sync worker, which re-reads the directory after it got the mutex.
+ *
+ * MESI_MODE=0 (lazy) takes no lock.
+ */
+#define MATTX_DSM_TXN_STRIPES   64
+static struct mutex mattx_dsm_txn_locks[MATTX_DSM_TXN_STRIPES];
+
+static void mattx_dsm_txn_init(void)
+{
+    for (int i = 0; i < MATTX_DSM_TXN_STRIPES; i++)
+        mutex_init(&mattx_dsm_txn_locks[i]);
+}
+
+// Starts the transaction of one page: the held stripe, NULL when nothing is locked (MESI_MODE is not atomic)
+static struct mutex *mattx_dsm_txn_begin(u32 shmid, unsigned long page_idx, const char *who)
+{
+    struct mutex *m;
+    unsigned int h;
+
+    if (!mattx_mesi_atomic())
+        return NULL;
+
+    h = shmid * 2654435761u + (unsigned int)page_idx * 40503u;
+    m = &mattx_dsm_txn_locks[(h ^ (h >> 16)) % MATTX_DSM_TXN_STRIPES];
+    if (!mutex_trylock(m)) {
+        mattx_dbg("[MESI_VM1] Atomic: %s of Page %lu of SHMID %u waits for the transaction in flight\n", who, page_idx, shmid);
+        mutex_lock(m);
+    }
+    return m;
+}
+
+static void mattx_dsm_txn_end(struct mutex *m)
+{
+    if (m)
+        mutex_unlock(m);
+}
+
+/*
  * THE ORDERED WORKQUEUE OF THE DATA BOMBS (VM1)
  *
  * The bombs of a dying Surrogate are applied by kworkers, but its PROCESS_EXIT notice is handled inline by
@@ -5707,6 +5757,68 @@ static inline bool mattx_dsm_page_ok(u32 shmid, unsigned long offset, unsigned l
     return false;
 }
 
+/*
+ * THE MESI TRANSIENT STATES (VM2), issue #66
+ *
+ * Messages of one page overtake each other on this node: the replies wake a task that is scheduled again only
+ * milliseconds later (3-5 ms on a busy VM), while the INVALIDATE and FLUSH kworkers run at once. Two windows
+ * followed from that, and both are closed with a transient state in page_states[]:
+ *
+ * UPGRADING (SHARED, EXCLUSIVE requested, grant not yet processed here): VM1 turns the directory EXCLUSIVE when it
+ * handles the WRITE_ACQUIRE, but this node flips its local state only after the faulting task has run again. A
+ * native VM1 reader that polls the page sends its FLUSH inside that window: the FLUSH kworker found no EXCLUSIVE
+ * page, answered -ENOENT, VM1 downgraded the directory to SHARED with an empty mask, and this node then wrote
+ * into a page the directory no longer knew about. The FLUSH kworker waits for the grant instead (bounded).
+ *
+ * FETCHING (INVALID, page requested, reply not yet injected) and FETCHING_STALE (an INVALIDATE arrived meanwhile):
+ * the INVALIDATE of a VM1 write overtook the reply of an older fetch, which was injected afterwards: VM2 kept a
+ * stale copy that VM1 no longer knew about (dsmreadwritetest store / atomic: 5 and 9 microseconds between the zap
+ * and the injection). The INVALIDATE kworker marks a FETCHING page stale, and the fault handler drops the reply
+ * of a stale fetch: it takes the PTE out again and the access faults anew.
+ *
+ * The values only ever live in page_states[] of this node, and every other reader of that array compares against
+ * MATTX_PAGE_EXCLUSIVE (the Funeral Flush) or falls back to INVALID (/proc/mattx/dsm), so they need no mattx.h
+ * change. Move them into enum mattx_dsm_page_state when mattx.h is touched anyway.
+ *
+ * MESI_MODE=0 (lazy) never enters them. Set MESI_MODE identically on all nodes.
+ */
+#define MATTX_PAGE_UPGRADING        (MATTX_PAGE_EXCLUSIVE + 1)
+#define MATTX_PAGE_FETCHING         (MATTX_PAGE_EXCLUSIVE + 2)
+#define MATTX_PAGE_FETCHING_STALE   (MATTX_PAGE_EXCLUSIVE + 3)
+#define MATTX_UPGRADE_WAIT_MS       1000    // a grant that has not arrived within a second is not coming
+
+// Moves one page of the calling Surrogate from @from to @to. false: the page was not in @from
+static bool mattx_dsm_vm2_page_cas(unsigned long fault_addr, unsigned long offset, u8 from, u8 to)
+{
+    unsigned long page_idx = offset / PAGE_SIZE;
+    bool done = false;
+
+    spin_lock(&guest_lock);
+    for (int i = 0; i < guest_count; i++) {
+        if (guest_registry[i].local_pid == current->tgid) {
+            for (int d = 0; d < guest_registry[i].dsm_count; d++) {
+                if (guest_registry[i].dsm_map[d].base_addr == (fault_addr - offset) && page_idx < guest_registry[i].dsm_map[d].npages) {
+                    if (guest_registry[i].dsm_map[d].page_states[page_idx] == from) {
+                        guest_registry[i].dsm_map[d].page_states[page_idx] = to;
+                        done = true;
+                    }
+                    break;
+                }
+            }
+            break;
+        }
+    }
+    spin_unlock(&guest_lock);
+    return done;
+}
+
+// A fetch that ends without an injection gives the page back to INVALID, stale or not
+static void mattx_dsm_vm2_fetch_abort(unsigned long fault_addr, unsigned long offset)
+{
+    if (!mattx_dsm_vm2_page_cas(fault_addr, offset, MATTX_PAGE_FETCHING, MATTX_PAGE_INVALID))
+        mattx_dsm_vm2_page_cas(fault_addr, offset, MATTX_PAGE_FETCHING_STALE, MATTX_PAGE_INVALID);
+}
+
 static vm_fault_t mattx_dsm_fault(struct vm_fault *vmf) {
     struct vm_area_struct *vma = vmf->vma;
     unsigned long fault_addr = vmf->address & PAGE_MASK; // Align to 4KB boundary
@@ -5777,6 +5889,11 @@ static vm_fault_t mattx_dsm_fault(struct vm_fault *vmf) {
         return VM_FAULT_SIGSEGV; 
     }
 
+    // MESI_MODE=1: the page is FETCHING until the reply is injected; an INVALIDATE that overtakes the reply
+    // marks it stale (MATTX_PAGE_FETCHING_STALE) and the reply is dropped below
+    bool fetching = mattx_mesi_atomic() &&
+                    mattx_dsm_vm2_page_cas(fault_addr, offset, MATTX_PAGE_INVALID, MATTX_PAGE_FETCHING);
+
     // 3. THE REQUEST: Ask VM1 for the page
     struct mattx_dsm_page_fault_req req = {
         .req_id = req_id,
@@ -5798,6 +5915,7 @@ static vm_fault_t mattx_dsm_fault(struct vm_fault *vmf) {
     spin_unlock(&vfs_rpc_lock);
 
     if (err != 0) {
+        if (fetching) mattx_dsm_vm2_fetch_abort(fault_addr, offset);
         kfree(page_buf);
         return VM_FAULT_SIGSEGV;
     }
@@ -5849,6 +5967,7 @@ static vm_fault_t mattx_dsm_fault(struct vm_fault *vmf) {
         free_page((unsigned long)newpage);  // somebody else filled the slot meanwhile
 
     if (!kaddr) {
+        if (fetching) mattx_dsm_vm2_fetch_abort(fault_addr, offset);
         kfree(page_buf);
         return VM_FAULT_OOM;
     }
@@ -5860,6 +5979,7 @@ static vm_fault_t mattx_dsm_fault(struct vm_fault *vmf) {
     // Surgically insert the Page Frame Number (PFN) into the application's page tables!
     unsigned long pfn = __pa(kaddr) >> PAGE_SHIFT;
     vm_fault_t ret;
+    bool stale = false;     // an INVALIDATE overtook the reply of this fetch (MESI_MODE=1)
 
     if (config_dsm_mode == 2 && real_vmf_insert_pfn_prot) {
         // --- MODE 2: THE READ-ONLY TRAPDOOR ---
@@ -5874,8 +5994,16 @@ static vm_fault_t mattx_dsm_fault(struct vm_fault *vmf) {
                 if (guest_registry[i].local_pid == current->tgid) {
                     for (int d = 0; d < guest_registry[i].dsm_count; d++) {
                         if (guest_registry[i].dsm_map[d].base_addr == (fault_addr - offset) && page_idx < guest_registry[i].dsm_map[d].npages) {
-                            guest_registry[i].dsm_map[d].page_states[page_idx] = MATTX_PAGE_SHARED;
-                            mattx_dbg("[MESI_VM2] Injected Read-Only Trapdoor at 0x%lx. Local State: SHARED\n", fault_addr);
+                            u8 *pst = &guest_registry[i].dsm_map[d].page_states[page_idx];
+
+                            if (fetching && *pst == MATTX_PAGE_FETCHING_STALE) {
+                                // the INVALIDATE of a newer write overtook this reply: the copy just injected is older
+                                *pst = MATTX_PAGE_INVALID;
+                                stale = true;
+                            } else {
+                                *pst = MATTX_PAGE_SHARED;
+                                mattx_dbg("[MESI_VM2] Injected Read-Only Trapdoor at 0x%lx. Local State: SHARED\n", fault_addr);
+                            }
                             break;
                         }
                     }
@@ -5883,10 +6011,19 @@ static vm_fault_t mattx_dsm_fault(struct vm_fault *vmf) {
                 }
             }
             spin_unlock(&guest_lock);
+
+            if (stale) {
+                // take the stale copy out again: nobody tracks it any more
+                if (real_zap_vma_ptes)
+                    real_zap_vma_ptes(vma, fault_addr, PAGE_SIZE);
+                mattx_dbg("[MESI_VM2] INVALIDATE overtook the fetch of 0x%lx: stale copy dropped, fetching again\n", fault_addr);
+            }
         }
     } else {
         // Mode 1 or Mode 3: Standard RW injection
         ret = vmf_insert_pfn(vma, fault_addr, pfn);
+        // (MESI_MODE=1 without the trapdoor resolver: the page never becomes SHARED, so give it back)
+        if (fetching) mattx_dsm_vm2_fetch_abort(fault_addr, offset);
     }
 
 
@@ -5920,8 +6057,14 @@ static vm_fault_t mattx_dsm_fault(struct vm_fault *vmf) {
     kfree(page_buf);
 
     if (ret != VM_FAULT_NOPAGE) {
+        if (fetching) mattx_dsm_vm2_fetch_abort(fault_addr, offset);
         mattx_dsm_map_put(&held);
         return ret;
+    }
+
+    if (stale) {
+        mattx_dsm_map_put(&held);
+        return VM_FAULT_NOPAGE;     // no PTE left: the access faults again and fetches the page anew
     }
 
 
@@ -5948,51 +6091,6 @@ static vm_fault_t mattx_dsm_fault(struct vm_fault *vmf) {
 }
 
 
-
-/*
- * THE MESI TRANSIENT STATE (VM2), issue #66: "SHARED, EXCLUSIVE requested, grant not yet processed here"
- *
- * VM1 turns the directory EXCLUSIVE the moment it handles the WRITE_ACQUIRE, but this node flips its local state
- * only after the faulting task has been woken by the reply and scheduled again (steps 4 and 5 of the trapdoor
- * below: 3-5 ms on a busy VM). A native VM1 reader that polls the page sends its FLUSH inside that window: the
- * FLUSH kworker found no EXCLUSIVE page and answered -ENOENT, VM1 downgraded the directory to SHARED with an
- * empty mask, and this node then wrote into a page the directory no longer knew about, so VM1 read stale RAM
- * forever (dsmreadwritetest store / atomic: the ack page was lost after 3 to 8 rounds).
- *
- * Between the request and the upgrade the page is UPGRADING, and the FLUSH kworker waits for it (bounded).
- * The value only ever lives in page_states[] of this node, and every other reader of that array compares
- * against MATTX_PAGE_EXCLUSIVE (the Funeral Flush) or falls back to INVALID (/proc/mattx/dsm), so it needs no
- * mattx.h change. Move it into enum mattx_dsm_page_state when mattx.h is touched anyway.
- *
- * MESI_MODE=0 (lazy) never enters it. Set MESI_MODE identically on all nodes.
- */
-#define MATTX_PAGE_UPGRADING    (MATTX_PAGE_EXCLUSIVE + 1)
-#define MATTX_UPGRADE_WAIT_MS   1000    // a grant that has not arrived within a second is not coming
-
-// Moves one page of the calling Surrogate from @from to @to. false: the page was not in @from
-static bool mattx_dsm_vm2_page_cas(unsigned long fault_addr, unsigned long offset, u8 from, u8 to)
-{
-    unsigned long page_idx = offset / PAGE_SIZE;
-    bool done = false;
-
-    spin_lock(&guest_lock);
-    for (int i = 0; i < guest_count; i++) {
-        if (guest_registry[i].local_pid == current->tgid) {
-            for (int d = 0; d < guest_registry[i].dsm_count; d++) {
-                if (guest_registry[i].dsm_map[d].base_addr == (fault_addr - offset) && page_idx < guest_registry[i].dsm_map[d].npages) {
-                    if (guest_registry[i].dsm_map[d].page_states[page_idx] == from) {
-                        guest_registry[i].dsm_map[d].page_states[page_idx] = to;
-                        done = true;
-                    }
-                    break;
-                }
-            }
-            break;
-        }
-    }
-    spin_unlock(&guest_lock);
-    return done;
-}
 
 // ============================================================================
 // THE MESI WRITE-PROTECT TRAPDOOR (VM2)
@@ -6355,6 +6453,9 @@ static void mattx_dsm_fault_kworker(struct work_struct *work) {
 
     reply->req_id = ctx->req.req_id;
 
+    // MESI_MODE=1: the whole fetch is one transaction of this page, from the first look at the directory to the reply
+    struct mutex *txn = mattx_dsm_txn_begin(ctx->req.shmid, ctx->req.offset / PAGE_SIZE, "Fetch");
+
     rcu_read_lock();
     deputy = pid_task(find_vpid(ctx->req.orig_pid), PIDTYPE_PID);
     if (deputy) get_task_struct(deputy);
@@ -6592,6 +6693,7 @@ static void mattx_dsm_fault_kworker(struct work_struct *work) {
     if (cluster_map[ctx->target_node]) {
         mattx_comm_send(cluster_map[ctx->target_node], MATTX_MSG_DSM_PAGE_FAULT_REPLY, reply, sizeof(*reply));
     }
+    mattx_dsm_txn_end(txn);
     kfree(reply);
     kfree(ctx);
 }
@@ -7042,6 +7144,9 @@ static void mattx_dsm_write_acquire_kworker(struct work_struct *work) {
     unsigned long page_idx = ctx->req.offset / PAGE_SIZE;
     struct mattx_dsm_master_dir *dir;
 
+    // MESI_MODE=1: grant, INVALIDATEs, shootdown and reply are one transaction of this page
+    struct mutex *txn = mattx_dsm_txn_begin(ctx->req.shmid, page_idx, "Write-acquire");
+
     // --- MODE 2 GLOBAL DIRECTORY LOOKUP (QUICK GRAB) ---
     spin_lock(&mattx_dsm_lock);
     dir = mattx_dsm_dir_lookup(ctx->req.shmid, page_idx);
@@ -7119,6 +7224,7 @@ static void mattx_dsm_write_acquire_kworker(struct work_struct *work) {
     if (cluster_map[ctx->target_node]) {
         mattx_comm_send(cluster_map[ctx->target_node], MATTX_MSG_DSM_WRITE_ACQUIRE_REPLY, &reply, sizeof(reply));
     }
+    mattx_dsm_txn_end(txn);
     kfree(ctx);
 }
 
@@ -7169,8 +7275,16 @@ static void mattx_dsm_invalidate_kworker(struct work_struct *work) {
                 unsigned long fault_addr = base + ctx->req.offset;
                 unsigned long page_idx = ctx->req.offset / PAGE_SIZE;
                 
-                // 1. Update local state to INVALID
-                guest_registry[i].dsm_map[d].page_states[page_idx] = MATTX_PAGE_INVALID;
+                // 1. Update local state to INVALID. A FETCHING page has no copy yet, but the reply of its fetch may be
+                //    older than this INVALIDATE: it is marked stale and the fault handler drops it (issue #66)
+                u8 *pst = &guest_registry[i].dsm_map[d].page_states[page_idx];
+
+                if (*pst == MATTX_PAGE_FETCHING || *pst == MATTX_PAGE_FETCHING_STALE) {
+                    *pst = MATTX_PAGE_FETCHING_STALE;
+                    mattx_dbg("[MESI_VM2] INVALIDATE for 0x%lx arrived while its fetch is in flight: the reply will be dropped\n", fault_addr);
+                } else {
+                    *pst = MATTX_PAGE_INVALID;
+                }
                 
                 // 2. Zap the PTE! Only the task is looked up here, the zapping is done below
                 if (n < MAX_GUESTS) {
@@ -7381,7 +7495,11 @@ static void mattx_vm1_shm_sync_kworker(struct work_struct *work) {
     unsigned long offset = rpc->offset;
     bool is_write = rpc->is_write;
     unsigned long page_idx = offset / PAGE_SIZE;
-    
+
+    // MESI_MODE=1: FLUSH, downgrade and INVALIDATEs are one transaction of this page. The directory is read only
+    // after the mutex is held: what the fault intercept saw may be out of date by now (issue #66)
+    struct mutex *txn = mattx_dsm_txn_begin(shmid, page_idx, "Native fault");
+
     u32 owner_pid = 0;
     int owner_node = -1;
     bool dir_found = false;
@@ -7524,6 +7642,8 @@ static void mattx_vm1_shm_sync_kworker(struct work_struct *work) {
             }
         }
     }
+
+    mattx_dsm_txn_end(txn);
 
     // Wake up the native process to retry the fault!
     struct task_struct *native_task = NULL;
@@ -8723,6 +8843,7 @@ static void handle_vfs_close_req(struct mattx_link *link, struct mattx_header *h
 
 void mattx_fileio_init_handlers(void) {
     mattx_unloading = false;
+    mattx_dsm_txn_init();
     mattx_dsm_wq = alloc_ordered_workqueue("mattx_dsm", WQ_MEM_RECLAIM);
     if (!mattx_dsm_wq)
         printk(KERN_WARNING "MattX: no ordered workqueue for the DSM Data Bombs, using the system one (no ordering)\n");
