@@ -7366,8 +7366,226 @@ static void handle_dsm_write_acquire_reply(struct mattx_link *link, struct mattx
 // MESI --- VM2: FLUSH KWORKER ---
 struct mattx_dsm_flush_kworker_ctx { struct work_struct work; struct mattx_dsm_flush_req req; int target_node; };
 
+/*
+ * MESI_MODE=1 (issue #66, dsmreadwritetest 'atomic'): THE FLUSH OF AN EXCLUSIVE PAGE.
+ *
+ * Two races of the old order (copy the page, then zap the PTE), seen as "VM1 never gets the ack":
+ *
+ *  1. The grant is announced too early. mattx_dsm_pfn_mkwrite() sets EXCLUSIVE and returns; only then does
+ *     the kernel turn the PTE writable and only then can the faulting store retire. A FLUSH in that gap (27 and
+ *     32 microseconds after "Lock acquired" in the failing run) copied a page without the store.
+ *  2. The page stays writable between the copy and the zap. A store that retires in that gap (the woken
+ *     worker on a 1-vCPU node) is zapped away together with the PTE: a lost update, never repeated.
+ *
+ * The fix is "revoke first, then read": the state goes to INVALID, the PTE is zapped (the TLB flush is part
+ * of it) and ONLY THEN the page is copied. After the zap nobody can write the page any more, so the copy is
+ * final, and a store that is still on its way simply faults again and fetches the page anew from VM1.
+ *
+ * Before that the FLUSH holds back while the grant has not become a writable PTE yet, so a fresh grant is not
+ * taken away before the faulting store had a chance to run (progress, no ping-pong livelock). The PTE is only
+ * looked at (page table walk under mmap_read_lock, no exported symbol). A writable PTE proves that the
+ * kernel finished the upgrade, NOT that the store retired (the kernel marks the PTE dirty itself when it
+ * makes it writable): the short yield after it gives the faulting task the CPU, and the order above is what
+ * keeps the data right even if it does not run.
+ *
+ * MESI_MODE=0 (lazy) keeps the old function below, untouched.
+ */
+#define MATTX_STORE_HOLD_US     20000   // longest wait for the faulting task to get its writable PTE
+#define MATTX_STORE_YIELD_MIN   100     // microseconds the faulting task gets after that (usleep_range)
+#define MATTX_STORE_YIELD_MAX   300
+
+// 1: the PTE of @addr is present and writable, 0: present but read-only, -1: not present (or not a 4K PTE).
+// The caller holds mmap_read_lock(): the page tables of the VMA cannot go away under the walk.
+static int mattx_dsm_pte_writable(struct mm_struct *mm, unsigned long addr)
+{
+    pgd_t *pgd;
+    p4d_t *p4d;
+    pud_t *pud;
+    pmd_t *pmd;
+    pte_t *ptep, pte;
+
+    pgd = pgd_offset(mm, addr);
+    if (pgd_none(*pgd) || pgd_bad(*pgd))
+        return -1;
+    p4d = p4d_offset(pgd, addr);
+    if (p4d_none(*p4d) || p4d_bad(*p4d))
+        return -1;
+    pud = pud_offset(p4d, addr);
+    if (pud_none(*pud) || pud_leaf(*pud) || pud_bad(*pud))
+        return -1;
+    pmd = pmd_offset(pud, addr);
+    if (pmd_none(*pmd) || pmd_leaf(*pmd) || pmd_bad(*pmd))
+        return -1;
+    ptep = pte_offset_kernel(pmd, addr);
+    pte = ptep_get_lockless(ptep);
+    if (!pte_present(pte))
+        return -1;
+    return pte_write(pte) ? 1 : 0;
+}
+
+// Takes @ctx over (frees it) and answers the FLUSH request
+static void mattx_dsm_flush_atomic(struct mattx_dsm_flush_kworker_ctx *ctx)
+{
+    struct mattx_dsm_flush_reply *reply = kzalloc(sizeof(*reply), GFP_KERNEL);
+    struct task_struct *zap_task = NULL;    // looked up under guest_lock, used after it is dropped
+    struct mattx_dsm_mapping held;          // a reference on the tables: the page is read outside guest_lock
+    unsigned long zap_base = 0, zap_addr = 0;
+    void *kaddr_held = NULL;
+    bool upgrading, excl, revoked = false, hold_done = false;
+    int waited = 0;
+
+    if (!reply) { kfree(ctx); return; }
+    reply->req_id = ctx->req.req_id;
+    reply->error = -ENOENT;
+    memset(&held, 0, sizeof(held));
+
+again:
+    upgrading = false;
+    excl = false;
+    spin_lock(&guest_lock);
+    for (int i = 0; i < guest_count; i++) {
+        if (guest_registry[i].orig_pid == ctx->req.orig_pid) {
+            for (int d = 0; d < guest_registry[i].dsm_count; d++) {
+                if (guest_registry[i].dsm_map[d].shmid == ctx->req.shmid && ctx->req.offset / PAGE_SIZE < guest_registry[i].dsm_map[d].npages) {
+                    unsigned long page_idx = ctx->req.offset / PAGE_SIZE;
+                    unsigned long base = guest_registry[i].dsm_map[d].base_addr;
+                    void *kaddr = guest_registry[i].dsm_map[d].pages[page_idx];
+                    u8 st = guest_registry[i].dsm_map[d].page_states[page_idx];
+
+                    if (kaddr && st == MATTX_PAGE_EXCLUSIVE) {
+                        excl = true;
+                        zap_base = base;
+                        zap_addr = base + ctx->req.offset;
+                        if (!zap_task) {
+                            rcu_read_lock();
+                            zap_task = pid_task(find_vpid(guest_registry[i].local_pid), PIDTYPE_PID);
+                            if (zap_task) get_task_struct(zap_task);
+                            rcu_read_unlock();
+                        }
+                        if (hold_done) {
+                            // REVOKE: from here on this node does not own the page. The tables stay alive
+                            // (reference) until the page has been read, whatever happens to the Surrogate.
+                            guest_registry[i].dsm_map[d].page_states[page_idx] = MATTX_PAGE_INVALID;
+                            held = guest_registry[i].dsm_map[d];
+                            mattx_dsm_map_get(&held);
+                            kaddr_held = kaddr;
+                            revoked = true;
+                        }
+                    } else if (st == MATTX_PAGE_UPGRADING) {
+                        upgrading = true;
+                    }
+                    break;
+                }
+            }
+            break;
+        }
+    }
+    spin_unlock(&guest_lock);
+
+    // The EXCLUSIVE grant of this page is still on its way to the faulting task: wait for it (unchanged)
+    if (upgrading) {
+        if (waited == 0)
+            mattx_dbg("[MESI_VM2] FLUSH for SHMID %u Offset %lu arrived while the EXCLUSIVE grant is in flight. Waiting for it...\n",
+                      ctx->req.shmid, ctx->req.offset);
+        if (waited < MATTX_UPGRADE_WAIT_MS) {
+            waited++;
+            msleep(1);
+            goto again;
+        }
+        mattx_dbg("[MESI_VM2] FLUSH for SHMID %u Offset %lu: the grant did not arrive within %d ms, answering -ENOENT\n",
+                  ctx->req.shmid, ctx->req.offset, MATTX_UPGRADE_WAIT_MS);
+    } else if (waited) {
+        mattx_dbg("[MESI_VM2] FLUSH for SHMID %u Offset %lu: the grant arrived after %d ms, flushing now\n",
+                  ctx->req.shmid, ctx->req.offset, waited);
+        waited = 0;
+    }
+
+    // The grant is in, but has the kernel made the PTE writable yet? Give the faulting task its chance (once)
+    if (excl && !hold_done) {
+        struct mm_struct *mm = zap_task ? get_task_mm(zap_task) : NULL;
+        ktime_t t0 = ktime_get();
+        bool announced = false;
+
+        while (mm) {
+            int pw;
+
+            mmap_read_lock(mm);
+            pw = mattx_dsm_pte_writable(mm, zap_addr);
+            mmap_read_unlock(mm);
+            if (pw != 0)                    // writable (1), or nothing mapped (-1): nothing to wait for
+                break;
+            if (ktime_to_us(ktime_sub(ktime_get(), t0)) >= MATTX_STORE_HOLD_US) {
+                mattx_dbg("[MESI_VM2] FLUSH for SHMID %u Offset %lu: the PTE did not become writable within %d us, flushing anyway\n",
+                          ctx->req.shmid, ctx->req.offset, MATTX_STORE_HOLD_US);
+                break;
+            }
+            if (!announced) {
+                mattx_dbg("[MESI_VM2] FLUSH for SHMID %u Offset %lu: EXCLUSIVE, but the PTE is not writable yet (the store has not run). Waiting for it...\n",
+                          ctx->req.shmid, ctx->req.offset);
+                announced = true;
+            }
+            usleep_range(50, 150);
+        }
+        if (mm) mmput(mm);
+        if (announced)
+            mattx_dbg("[MESI_VM2] FLUSH for SHMID %u Offset %lu: the PTE became writable after %lld us, flushing now\n",
+                      ctx->req.shmid, ctx->req.offset, ktime_to_us(ktime_sub(ktime_get(), t0)));
+        usleep_range(MATTX_STORE_YIELD_MIN, MATTX_STORE_YIELD_MAX);   // the faulting task gets the CPU (1 vCPU)
+        hold_done = true;
+        goto again;                         // the page may have changed meanwhile: look again, then revoke
+    }
+
+    if (revoked) {
+        bool zapped = false;
+
+        // 1. REVOKE: zap the PTE (includes the TLB flush). Nobody can write the page after this.
+        if (zap_task) {
+            struct mm_struct *mm = get_task_mm(zap_task);
+
+            if (mm && real_zap_vma_ptes) {
+                mmap_read_lock(mm);
+                struct vm_area_struct *vma = find_vma(mm, zap_base);
+                if (vma && vma->vm_start <= zap_base) {
+                    real_zap_vma_ptes(vma, zap_addr, PAGE_SIZE);
+                    zapped = true;
+                    mattx_dbg("[MESI_VM2] Flushed dirty data and zapped page at 0x%lx\n", zap_addr);
+                }
+                mmap_read_unlock(mm);
+            }
+            if (mm) mmput(mm);
+            if (!zapped)
+                mattx_dbg("[MESI_VM2] FLUSH-REVOKE-FAILED: could not zap page at 0x%lx, the copy may miss a store\n", zap_addr);
+        }
+
+        // 2. READ: the page is final now
+        memcpy(reply->data, kaddr_held, PAGE_SIZE);
+        reply->error = 0;
+
+        // 3. Safety net (issue #66): after the zap the page must not change any more. Silent unless it did.
+        if (zapped && memcmp(reply->data, kaddr_held, PAGE_SIZE)) {
+            mattx_dbg("[MESI_VM2] FLUSH-LOST-STORE: page at 0x%lx changed after it was zapped, copying again\n", zap_addr);
+            memcpy(reply->data, kaddr_held, PAGE_SIZE);
+        }
+        mattx_dsm_map_put(&held);
+    }
+    if (zap_task) put_task_struct(zap_task);
+
+    if (cluster_map[ctx->target_node]) {
+        mattx_comm_send(cluster_map[ctx->target_node], MATTX_MSG_DSM_FLUSH_REPLY, reply, sizeof(*reply));
+    }
+    kfree(reply);
+    kfree(ctx);
+}
+
 static void mattx_dsm_flush_kworker(struct work_struct *work) {
     struct mattx_dsm_flush_kworker_ctx *ctx = container_of(work, struct mattx_dsm_flush_kworker_ctx, work);
+
+    // MESI_MODE=1: revoke first, then read (see mattx_dsm_flush_atomic())
+    if (mattx_mesi_atomic()) {
+        mattx_dsm_flush_atomic(ctx);
+        return;
+    }
+
     struct mattx_dsm_flush_reply *reply = kzalloc(sizeof(*reply), GFP_KERNEL);
     
     if (!reply) { kfree(ctx); return; }
