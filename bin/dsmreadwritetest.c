@@ -126,8 +126,10 @@ struct wres {
     volatile uint64_t torn;          /* data words of one snapshot disagree  */
     volatile uint64_t order;         /* data older than seq                  */
     volatile uint64_t timed_out;
+    volatile uint64_t seen_us;       /* step A: worker clock, when it saw the last new seq */
+    volatile uint64_t exit_us;       /* step A: worker clock, when it left its poll loop   */
     volatile int32_t  node;
-    char pad[PAGE_SZ - 8 * sizeof(uint64_t) - sizeof(int32_t)];
+    char pad[PAGE_SZ - 10 * sizeof(uint64_t) - sizeof(int32_t)];
 };
 
 _Static_assert(sizeof(struct payload) == PAGE_SZ, "payload must be exactly one page");
@@ -300,6 +302,7 @@ static void worker_poll(int w, int sc)
             last = s;
             r->ack = s;                       /* the working direction: VM2 write */
             t_idle = now_us();
+            r->seen_us = t_idle;              /* step A: same VM2 clock as exit_us below */
         } else if (now_us() - t_idle > (last == 0 ? first_us : idle_us)) {
             timed_out = 1;
             break;
@@ -309,6 +312,7 @@ static void worker_poll(int w, int sc)
 
     r->last_seen = last; r->polls = polls; r->torn = torn;
     r->order = order; r->timed_out = timed_out;
+    r->exit_us = now_us();
     __sync_synchronize();
     r->done = 1;
 }
@@ -392,6 +396,9 @@ static void collect_worker_stats(int sc, struct sc_result *res)
                    w, (int)r->node, (unsigned long long)r->last_seen,
                    (unsigned long long)r->polls, (unsigned long long)r->torn,
                    (unsigned long long)r->order, r->timed_out ? "  <- gave up (STALE)" : "");
+        if (sc != SC_CTL && r->seen_us && r->exit_us >= r->seen_us)
+            printf("      worker %d: last acked seq=%llu, seen %.1f ms before it left its poll loop\n",
+                   w, (unsigned long long)r->ack, (r->exit_us - r->seen_us) / 1000.0);
     }
 }
 

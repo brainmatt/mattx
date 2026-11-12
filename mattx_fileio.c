@@ -6437,7 +6437,7 @@ static void handle_sys_shmat_reply(struct mattx_link *link, struct mattx_header 
 
 
 // --- DSM PAGE FAULT KWORKER (VM1) ---
-struct mattx_dsm_fault_kworker_ctx { struct work_struct work; struct mattx_dsm_page_fault_req req; int target_node; };
+struct mattx_dsm_fault_kworker_ctx { struct work_struct work; struct mattx_dsm_page_fault_req req; int target_node; unsigned long queued_at; };
 
 static void mattx_dsm_fault_kworker(struct work_struct *work) {
     struct mattx_dsm_fault_kworker_ctx *ctx = container_of(work, struct mattx_dsm_fault_kworker_ctx, work);
@@ -6455,6 +6455,15 @@ static void mattx_dsm_fault_kworker(struct work_struct *work) {
 
     // MESI_MODE=1: the whole fetch is one transaction of this page, from the first look at the directory to the reply
     struct mutex *txn = mattx_dsm_txn_begin(ctx->req.shmid, ctx->req.offset / PAGE_SIZE, "Fetch");
+
+    // STEP A (debug only): a fetch that sat in the queue or behind another transaction. Silent below 20 ms
+    if (mattx_mesi_atomic()) {
+        unsigned int stall_ms = jiffies_to_msecs(jiffies - ctx->queued_at);
+
+        if (stall_ms >= 20)
+            mattx_dbg("[MESI_VM1] Atomic: fetch of Page %lu of SHMID %u from Node %d started %u ms after its request arrived\n",
+                      ctx->req.offset / PAGE_SIZE, ctx->req.shmid, ctx->target_node, stall_ms);
+    }
 
     rcu_read_lock();
     deputy = pid_task(find_vpid(ctx->req.orig_pid), PIDTYPE_PID);
@@ -6708,6 +6717,7 @@ static void handle_dsm_page_fault_req(struct mattx_link *link, struct mattx_head
     struct mattx_dsm_fault_kworker_ctx *ctx = kmalloc(sizeof(*ctx), GFP_ATOMIC);
     if (ctx) {
         INIT_WORK(&ctx->work, mattx_dsm_fault_kworker);
+        ctx->queued_at = jiffies;
         memcpy(&ctx->req, req, sizeof(*req));
         ctx->target_node = hdr->sender_id;
         schedule_work(&ctx->work);
