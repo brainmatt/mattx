@@ -1,0 +1,567 @@
+#!/usr/bin/env bash
+#
+# dsmrw-loop - run dsmreadwritetest in a loop and COUNT (MattX DSM, issue #66)
+#
+# Runs on the home node (VM1), next to the manager. For every run it
+#   - starts dsmreadwritetest in the background,
+#   - migrates the spawned worker(s) with "mattx-admin migrate <pid> <node>",
+#   - follows the kernel log of both nodes ("dmesg -W", VM2 over ssh),
+#   - parses the verdict per scenario, counts the microscope lines,
+#   - keeps a fail-*/warn-* folder with the full evidence of every bad run,
+# and prints a table with pass rates and a 95% Wilson interval at the end.
+#
+# Exit code: 0 = all PASS, 1 = at least one FAIL / HANG / ERROR, 2 = inconclusive, invalid or infrastructure
+# problem (the exit codes of dsmreadwritetest: 0 = PASS, 1 = FAIL, 2 = INCONCLUSIVE).
+#
+# Examples:
+#   dsmrw-loop --remote mattx@ubunode2 -n 5 -r 1000 -d "0 0.1" -s all
+#   dsmrw-loop --remote mattx@ubunode2 -T 1h -r 2000 -d "0 0.1 0.2" -s "atomic rw rwfield" --shuffle
+#   dsmrw-loop --remote mattx@ubunode2 --plan -n 10 -r 10000 -d 0 -s atomic
+#
+set -u
+export LC_ALL=C
+
+ORIG_ARGS="$*"
+PROG=${0##*/}
+BIN=dsmreadwritetest
+PASSES=10            # -n: repetitions of every (delay, scenario) combination
+DURATION=""          # -T: run until this much time has passed (overrides -n)
+ROUNDS=1000
+DELAYS="0 0.1"
+SCENS="all"
+WORKERS=1
+NODE=946             # node id of the remote node (VM2)
+MIGRATE_CMD='mattx-admin migrate {pid} {node}'
+REMOTE=""
+NO_REMOTE=0
+LOCAL_LOG=1
+OUT=""
+SHUFFLE=0
+STOP_ON_FAIL=0
+KEEP_ALL=0
+TMO=""
+SETTLE=2
+PLAN=0
+ALL_COUNT=5          # ctl atomic store rw rwfield: only used for the watchdog estimate
+GC_WAIT=1
+
+INTERRUPTED=0
+CUR_MPID=""
+F_PIDS=""
+
+# ---------------------------------------------------------------------------------------------------------
+usage() {
+    cat <<EOF
+usage: $PROG [options]
+
+  -n RUNS            repetitions of every (delay, scenario) combination (default $PASSES)
+  -T DURATION        loop until DURATION has passed instead (e.g. 90s, 30m, 1h)
+  -r ROUNDS          rounds per scenario (default $ROUNDS)
+  -d "LIST"          action delays in seconds, e.g. "0 0.1 0.2" (default "$DELAYS")
+  -s "LIST"          scenarios: ctl atomic store rw rwfield all (default "$SCENS")
+  -w WORKERS         workers (default $WORKERS)
+  --node ID          node id the workers are migrated to (default $NODE)
+  --migrate-cmd CMD  migrate command, {pid} and {node} are replaced
+                     (default '$MIGRATE_CMD')
+  --remote USER@HOST VM2, for its kernel log (ssh key + passwordless sudo needed)
+  --no-remote        do not follow the kernel log of VM2
+  --no-local-log     do not follow the kernel log of this node (needs no sudo then)
+  --bin PATH         the harness (default $BIN from PATH)
+  --outdir DIR       where everything goes (default ./dsmrw-loop-DATE-TIME)
+  --shuffle          shuffle the combinations in every pass
+  --stop-on-fail     stop at the first FAIL / HANG / ERROR
+  --keep-all         keep the logs of clean runs as well (big: hundreds of thousands of lines)
+  --timeout SEC      watchdog per run (default: estimated from rounds and delay)
+  --settle SEC       pause after every run (default $SETTLE)
+  --plan             print what would run and exit
+  -h, --help         this text
+EOF
+}
+
+die()  { echo "$PROG: $*" >&2; exit 2; }
+warn() { echo "$PROG: warning: $*" >&2; }
+
+dur_to_s() {
+    local s=$1 n
+    case $s in
+        *h) n=${s%h}; [[ $n =~ ^[0-9]+$ ]] && echo $((n * 3600)) ;;
+        *m) n=${s%m}; [[ $n =~ ^[0-9]+$ ]] && echo $((n * 60)) ;;
+        *s) n=${s%s}; [[ $n =~ ^[0-9]+$ ]] && echo "$n" ;;
+        *)  [[ $s =~ ^[0-9]+$ ]] && echo "$s" ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------------------------------------
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -n) PASSES=${2:?}; shift 2 ;;
+        -T) DURATION=${2:?}; shift 2 ;;
+        -r) ROUNDS=${2:?}; shift 2 ;;
+        -d) DELAYS=${2:?}; shift 2 ;;
+        -s) SCENS=${2:?}; shift 2 ;;
+        -w) WORKERS=${2:?}; shift 2 ;;
+        --node) NODE=${2:?}; shift 2 ;;
+        --migrate-cmd) MIGRATE_CMD=${2:?}; shift 2 ;;
+        --remote) REMOTE=${2:?}; shift 2 ;;
+        --no-remote) NO_REMOTE=1; shift ;;
+        --no-local-log) LOCAL_LOG=0; shift ;;
+        --bin) BIN=${2:?}; shift 2 ;;
+        --outdir) OUT=${2:?}; shift 2 ;;
+        --shuffle) SHUFFLE=1; shift ;;
+        --stop-on-fail) STOP_ON_FAIL=1; shift ;;
+        --keep-all) KEEP_ALL=1; shift ;;
+        --timeout) TMO=${2:?}; shift 2 ;;
+        --settle) SETTLE=${2:?}; shift 2 ;;
+        --plan) PLAN=1; shift ;;
+        -h|--help) usage; exit 0 ;;
+        *) usage >&2; die "unknown option: $1" ;;
+    esac
+done
+
+[[ $PASSES =~ ^[0-9]+$ && $PASSES -ge 1 ]] || die "-n needs a number >= 1"
+[[ $ROUNDS =~ ^[0-9]+$ && $ROUNDS -ge 1 ]] || die "-r needs a number >= 1"
+[[ $WORKERS =~ ^[0-9]+$ && $WORKERS -ge 1 ]] || die "-w needs a number >= 1"
+DUR_S=""
+if [[ -n $DURATION ]]; then
+    DUR_S=$(dur_to_s "$DURATION")
+    [[ -n $DUR_S && $DUR_S -ge 1 ]] || die "-T: cannot read the duration '$DURATION' (try 90s, 30m, 1h)"
+fi
+for d in $DELAYS; do
+    [[ $d =~ ^[0-9]+(\.[0-9]+)?$ ]] || die "-d: '$d' is not a number of seconds"
+done
+if [[ -z $REMOTE && $NO_REMOTE -eq 0 ]]; then
+    die "give --remote USER@HOST (kernel log of VM2) or --no-remote"
+fi
+(( NO_REMOTE )) && REMOTE=""
+[[ -n $OUT ]] || OUT=./dsmrw-loop-$(date +%Y%m%d-%H%M%S)
+
+if [[ $EUID -eq 0 ]]; then LSUDO=""; else LSUDO="sudo -n"; fi
+SSH="ssh -o BatchMode=yes -o ConnectTimeout=5 -o ServerAliveInterval=5"
+
+# ---------------------------------------------------------------------------------------------------------
+# watchdog estimate: every scenario needs rounds * (delay + ~30 ms) plus slack, plus the migration and the exit
+calc_timeout() {      # delay spec
+    local nsc=1
+    [[ $2 == all ]] && nsc=$ALL_COUNT
+    awk -v r="$ROUNDS" -v d="$1" -v n="$nsc" 'BEGIN { printf "%d", n * (r * (d + 0.03) + 20) + 90 }'
+}
+
+est_run_s() {         # delay spec: a typical run (about 12 ms per round and scenario), only for --plan
+    local nsc=1
+    [[ $2 == all ]] && nsc=$ALL_COUNT
+    awk -v r="$ROUNDS" -v d="$1" -v n="$nsc" 'BEGIN { printf "%d", n * (r * (d + 0.012) + 3) + 10 }'
+}
+
+combos=()
+for d in $DELAYS; do for s in $SCENS; do combos+=("$d $s"); done; done
+
+if (( PLAN )); then
+    total=0
+    echo "plan: ${#combos[@]} combination(s) per pass, rounds=$ROUNDS workers=$WORKERS node=$NODE"
+    for c in "${combos[@]}"; do
+        set -- $c
+        e=$(est_run_s "$1" "$2"); total=$((total + e))
+        printf '  delay %-5s scenario %-8s ~%ss (watchdog %ss)\n' "$1" "$2" "$e" "${TMO:-$(calc_timeout "$1" "$2")}"
+    done
+    if [[ -n $DUR_S ]]; then echo "duration: $DURATION (passes until the time is up)"
+    else echo "passes: $PASSES -> about $((total * PASSES / 60)) min"; fi
+    echo "migrate: $MIGRATE_CMD"
+    echo "logs: local=$([[ $LOCAL_LOG -eq 1 ]] && echo yes || echo no) remote=${REMOTE:-no}"
+    echo "outdir: $OUT"
+    exit 0
+fi
+
+# ---------------------------------------------------------------------------------------------------------
+# parser of the harness output. One TSV line per scenario: name verdict acked total avg_ms max_ms stuck_seq
+# ("-" = unknown), and "@shmid <n>" for the segment. mawk-safe (no gawk extensions).
+read -r -d '' AWK_PARSE <<'EOF'
+function dash(x) { return (x == "" ? "-" : x) }
+function setcur(name) {
+    cur = name
+    if (!(name in seen)) { seen[name] = 1; order[++n] = name; v[name] = "-" }
+}
+/=== Scenario '/ {
+    s = $0; sub(/.*=== Scenario '/, "", s); sub(/'.*/, "", s); setcur(s); next
+}
+/SHMID: [0-9]+/ {
+    if (shmid == "" && match($0, /SHMID: [0-9]+/)) { t = substr($0, RSTART, RLENGTH); sub(/[^0-9]*/, "", t); shmid = t }
+}
+cur != "" && /^[ \t]+result[ \t]*:/ {
+    s = $0; sub(/^[ \t]+result[ \t]*:[ \t]*/, "", s); sub(/[ \t].*/, "", s); v[cur] = toupper(s); next
+}
+cur != "" && /^[ \t]+rounds[ \t]*:/ {
+    if (match($0, /[0-9]+\/[0-9]+/)) { split(substr($0, RSTART, RLENGTH), a, "/"); acked[cur] = a[1]; total[cur] = a[2] }
+    if (match($0, /avg [0-9.]+/)) { t = substr($0, RSTART, RLENGTH); sub(/[^0-9.]*/, "", t); avg[cur] = t }
+    if (match($0, /max [0-9.]+/)) { t = substr($0, RSTART, RLENGTH); sub(/[^0-9.]*/, "", t); mx[cur] = t }
+    next
+}
+cur != "" && /^[ \t]+note[ \t]*:/ {
+    if (match($0, /stuck at seq=[0-9]+/)) { t = substr($0, RSTART, RLENGTH); sub(/[^0-9]*/, "", t); stuck[cur] = t }
+    next
+}
+/SUMMARY \(workers/ { insum = 1; next }
+insum && /^=+[ \t]*$/ { insum = 0; next }
+insum && NF >= 2 && ($1 in seen) && $2 ~ /^[A-Z]+$/ { if (v[$1] == "-") v[$1] = $2 }
+END {
+    for (i = 1; i <= n; i++) {
+        k = order[i]
+        printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", k, v[k], dash(acked[k]), dash(total[k]), dash(avg[k]), dash(mx[k]), dash(stuck[k])
+    }
+    printf "@shmid\t%s\n", dash(shmid)
+}
+EOF
+
+# summary table from runs.csv. Columns: 1 run,2 time,3 delay,4 rounds,5 workers,6 scenario,7 verdict,8 acked,
+# 9 total,10 avg_ms,11 max_ms,12 stuck,13 wall_s,14 run_verdict,15 fault_race,16 wnotify,17 warn,18 dir
+read -r -d '' AWK_SUMMARY <<'EOF'
+BEGIN { FS = ","; z = 1.96 }
+NR == 1 { next }
+{
+    key = $6 "\t" $3
+    keys[key] = 1
+    cnt[key, $7]++
+    runs[key]++
+    if ($8 != "-") ack[key] += $8
+    if ($10 != "-") { asum[key] += $10; an[key]++ }
+    if ($11 != "-" && $11 + 0 > mx[key]) mx[key] = $11 + 0
+    if ($17 != "-") warned[key]++
+}
+END {
+    for (key in keys) {
+        p = cnt[key, "PASS"] + 0; f = cnt[key, "FAIL"] + 0; h = cnt[key, "HANG"] + 0; e = cnt[key, "ERROR"] + 0
+        c = cnt[key, "INCONCL"] + 0; iv = cnt[key, "INVALID"] + 0
+        bad = f + h + e; n = p + bad
+        if (n > 0) {
+            ph = p / n
+            den = 1 + z * z / n
+            ctr = (ph + z * z / (2 * n)) / den
+            half = z * sqrt(ph * (1 - ph) / n + z * z / (4 * n * n)) / den
+            lo = ctr - half; hi = ctr + half
+            if (lo < 0) lo = 0
+            if (hi > 1) hi = 1
+            pr = sprintf("%5.1f%%", 100 * ph); ci = sprintf("%5.1f-%5.1f%%", 100 * lo, 100 * hi)
+        } else { pr = "    -"; ci = "     -" }
+        fm = (ack[key] > 0 ? sprintf("%.1f", bad * 1000000 / ack[key]) : "-")
+        av = (an[key] > 0 ? sprintf("%.2f", asum[key] / an[key]) : "-")
+        printf "%s\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%s\t%s\t%s\t%s\t%s\t%d\n", key, runs[key], p, f, h, e, c, iv, pr, ci, fm, av, (mx[key] > 0 ? mx[key] : "-"), warned[key] + 0
+    }
+}
+EOF
+
+# ---------------------------------------------------------------------------------------------------------
+# kernel log followers (one file per node and run). dmesg -W only prints NEW messages.
+start_followers() {   # dir ttl
+    F_PIDS=""
+    if (( LOCAL_LOG )); then
+        timeout "$2" $LSUDO dmesg -W > "$1/vm1.dmesg" 2>"$1/vm1.dmesg.err" &
+        F_PIDS="$F_PIDS $!"
+    fi
+    if [[ -n $REMOTE ]]; then
+        timeout "$2" $SSH "$REMOTE" "timeout $2 sudo -n dmesg -W" > "$1/vm2.dmesg" 2>"$1/vm2.dmesg.err" &
+        F_PIDS="$F_PIDS $!"
+    fi
+    sleep 0.5
+}
+
+stop_followers() {
+    local p
+    for p in $F_PIDS; do kill "$p" 2>/dev/null; done
+    for p in $F_PIDS; do wait "$p" 2>/dev/null; done
+    F_PIDS=""
+}
+
+# auto-migration: runs next to the harness, picks up "Spawned worker i/n (PID p)" and calls the migrate command
+migrator() {          # dir manager_pid
+    local rdir=$1 mpid=$2 pid cmd rc n
+    : > "$rdir/migrated.list"
+    while :; do
+        for pid in $(sed -n 's/.*Spawned worker [0-9]*\/[0-9]* (PID \([0-9][0-9]*\)).*/\1/p' "$rdir/manager.out" 2>/dev/null); do
+            grep -qx "$pid" "$rdir/migrated.list" && continue
+            echo "$pid" >> "$rdir/migrated.list"
+            cmd=${MIGRATE_CMD//\{pid\}/$pid}
+            cmd=${cmd//\{node\}/$NODE}
+            echo "$(date +%T) migrate: $cmd" >> "$rdir/migrate.log"
+            rc=1
+            for n in 1 2 3; do
+                if eval "$cmd" >> "$rdir/migrate.log" 2>&1; then rc=0; break; fi
+                sleep 1
+            done
+            if (( rc )); then
+                echo "migration of PID $pid failed" >> "$rdir/migrate.fail"
+                kill -TERM "$mpid" 2>/dev/null
+                return
+            fi
+        done
+        sleep 0.2
+    done
+}
+
+wait_clean_slate() {  # no harness process of an earlier run may be left
+    local name=${BIN##*/} i
+    name=${name:0:15}                        # comm is cut at 15 characters
+    for ((i = 0; i < 150; i++)); do
+        pgrep -x "$name" >/dev/null 2>&1 || return 0
+        sleep 0.2
+    done
+    warn "$name is still running: $(pgrep -x "$name" | tr '\n' ' ')"
+    return 1
+}
+
+# after the harness is gone: wait for the garbage collector of VM1 to free the segment, so runs do not overlap
+settle() {            # dir shmid gc: "gc" when the harness left normally and VM1 will free the segment
+    local i
+    if (( GC_WAIT )) && (( LOCAL_LOG )) && [[ $2 != "-" && $3 == gc ]]; then
+        for ((i = 0; i < 50; i++)); do
+            if grep -q "Garbage Collector: SHMID $2 destroyed" "$1/vm1.dmesg" 2>/dev/null; then sleep 1; return; fi
+            sleep 0.2
+        done
+        warn "no 'Garbage Collector: SHMID $2 destroyed' on this node, falling back to --settle $SETTLE"
+        GC_WAIT=0
+    fi
+    sleep "$SETTLE"
+}
+
+cnt() {               # regex file
+    local n
+    n=$(grep -c -E -- "$1" "$2" 2>/dev/null)
+    echo "${n:-0}"
+}
+
+HEALTH='BUG:|WARNING: |Oops:|soft lockup|hung task|blocked for more than|rcu: .*stall|Call Trace:'
+
+colorize() {          # verdict
+    if [[ -t 1 ]]; then
+        case $1 in
+            PASS) printf '\033[32m%s\033[0m' "$1" ;;
+            FAIL|HANG|ERROR) printf '\033[31m%s\033[0m' "$1" ;;
+            *) printf '\033[33m%s\033[0m' "$1" ;;
+        esac
+    else printf '%s' "$1"; fi
+}
+
+make_paste() {        # dir tag verdict
+    local d=$1
+    {
+        echo "# dsmrw-loop evidence: $2  verdict=$3"
+        echo "# cmd: $BIN $WORKERS $ROUNDS $RUN_DELAY $RUN_SPEC   migrate: $MIGRATE_CMD   node: $NODE"
+        echo "# VM1: $(uname -r)   VM2: ${REMOTE:-n/a}"
+        echo
+        echo "== harness =="
+        grep -E "=== Scenario|^[[:space:]]+(result|note|rounds|likely)[[:space:]]*:" "$d/manager.clean" | tail -30
+        echo
+        echo "== kernel health, microscope =="
+        for f in vm1 vm2; do
+            [[ -f $d/$f.dmesg ]] || continue
+            echo "-- $f: $(cnt 'FLUSH-LOST-STORE' "$d/$f.dmesg") FLUSH-LOST-STORE, $(cnt 'FLUSH-REVOKE-FAILED' "$d/$f.dmesg") FLUSH-REVOKE-FAILED, $(cnt 'FAULT-RACE' "$d/$f.dmesg") FAULT-RACE, $(cnt "$HEALTH" "$d/$f.dmesg") kernel health lines"
+            grep -E "$HEALTH|FLUSH-LOST-STORE|FLUSH-REVOKE-FAILED" "$d/$f.dmesg" | head -10
+        done
+        echo
+        echo "== VM1: dmesg | grep MESI_VM1 | tail -40 =="
+        grep MESI_VM1 "$d/vm1.dmesg" 2>/dev/null | tail -40
+        echo
+        echo "== VM2: dmesg | grep MESI_VM2 | tail -15 =="
+        grep MESI_VM2 "$d/vm2.dmesg" 2>/dev/null | tail -15
+    } > "$d/paste.txt"
+}
+
+# ---------------------------------------------------------------------------------------------------------
+# one run. Result: 0 = counted, 3 = interrupted (not counted), 2 = infrastructure problem
+run_one() {           # delay spec idx
+    local delay=$1 spec=$2 idx=$3
+    local tag rdir tmo mpid mg ec t0 wall nmig nrun rv shmid warn_s fr wn l r k final
+    RUN_DELAY=$delay; RUN_SPEC=$spec
+    tag=$(printf 'run-%03d-%s-d%s' "$idx" "$spec" "$delay")
+    rdir=$OUT/$tag
+    mkdir -p "$rdir"
+    tmo=${TMO:-$(calc_timeout "$delay" "$spec")}
+
+    wait_clean_slate || { warn "an earlier harness process does not go away"; return 2; }
+    start_followers "$rdir" $((tmo + 120))
+
+    t0=$(date +%s)
+    timeout -k 5 "$tmo" stdbuf -oL "$BIN" "$WORKERS" "$ROUNDS" "$delay" "$spec" > "$rdir/manager.out" 2>&1 &
+    mpid=$!
+    CUR_MPID=$mpid
+    migrator "$rdir" "$mpid" &
+    mg=$!
+    wait "$mpid"; ec=$?
+    kill "$mg" 2>/dev/null; wait "$mg" 2>/dev/null
+    if (( INTERRUPTED )); then
+        wait "$mpid" 2>/dev/null
+        CUR_MPID=""; stop_followers
+        return 3
+    fi
+    CUR_MPID=""
+    wall=$(( $(date +%s) - t0 ))
+
+    sed -e 's/\x1b\[[0-9;]*[A-Za-z]//g' "$rdir/manager.out" > "$rdir/manager.clean"
+    awk "$AWK_PARSE" "$rdir/manager.clean" > "$rdir/parsed.tsv"
+    shmid=$(awk -F'\t' '$1 == "@shmid" { print $2 }' "$rdir/parsed.tsv")
+    if (( ec == 0 || ec == 1 || ec == 2 )) && [[ ! -e $rdir/migrate.fail ]]; then
+        settle "$rdir" "${shmid:--}" gc
+    else
+        settle "$rdir" "${shmid:--}" nogc      # killed or crashed: nobody frees the segment on time
+    fi
+    stop_followers
+
+    nmig=$(wc -l < "$rdir/migrated.list" 2>/dev/null || echo 0)
+    nrun=$(grep -c "Running on node $NODE" "$rdir/manager.clean")
+
+    # the verdict of the whole run
+    if [[ -e $rdir/migrate.fail ]]; then rv=INVALID
+    elif (( ec == 124 || ec == 137 )); then rv=HANG
+    elif (( ec != 0 && nmig > 0 && nrun < nmig )); then rv=INVALID      # a worker never reached the node
+    elif (( ec == 0 )); then rv=PASS
+    elif (( ec == 1 )); then rv=FAIL
+    elif (( ec == 2 )); then rv=INCONCL
+    else rv=ERROR
+    fi
+
+    # the microscope: counted per run
+    l=$(( $(cnt 'FLUSH-LOST-STORE' "$rdir/vm2.dmesg") + $(cnt 'FLUSH-LOST-STORE' "$rdir/vm1.dmesg") ))
+    r=$(( $(cnt 'FLUSH-REVOKE-FAILED' "$rdir/vm2.dmesg") + $(cnt 'FLUSH-REVOKE-FAILED' "$rdir/vm1.dmesg") ))
+    k=$(( $(cnt "$HEALTH" "$rdir/vm1.dmesg") + $(cnt "$HEALTH" "$rdir/vm2.dmesg") ))
+    fr=$(cnt 'FAULT-RACE' "$rdir/vm1.dmesg")
+    wn=$(cnt 'Write-notify: ' "$rdir/vm1.dmesg")
+    warn_s=""
+    (( l )) && warn_s="${warn_s}LOSTSTORE=$l;"
+    (( r )) && warn_s="${warn_s}REVOKEFAIL=$r;"
+    (( k )) && warn_s="${warn_s}KERNEL=$k;"
+    (( ec == 0 && nmig > 0 && nrun < nmig )) && warn_s="${warn_s}NOMIGRATE-LINE;"
+    [[ -n $warn_s ]] || warn_s="-"
+    warn_s=${warn_s%;}
+
+    # rows: one per scenario (the parser knows them); a scenario without result gets the verdict of the run
+    local sc ver ack tot avg mx st nrows=0 bad=0 rowbad=0
+    while IFS=$'\t' read -r sc ver ack tot avg mx st; do
+        [[ $sc == "@shmid" ]] && continue
+        if [[ $ver == "-" ]]; then ver=$rv; [[ $rv == PASS ]] && ver=ERROR; fi
+        [[ $ver == INCONCLUSIVE ]] && ver=INCONCL
+        # a run that did not PASS must not hide behind scenario lines that did
+        nrows=$((nrows + 1))
+        printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+            "$idx" "$(date +%H:%M:%S)" "$delay" "$ROUNDS" "$WORKERS" "$sc" "$ver" "$ack" "$tot" "$avg" "$mx" "$st" "$wall" "$rv" "$fr" "$wn" "$warn_s" "$tag" >> "$OUT/runs.csv"
+        case $ver in FAIL|HANG|ERROR) bad=1; rowbad=1 ;; esac
+        printf '[%s] run %-3s d=%-4s %-8s ' "$(date +%H:%M:%S)" "$idx" "$delay" "$sc"
+        colorize "$ver"
+        printf ' %s/%s acked, avg %s ms max %s ms%s\n' "$ack" "$tot" "$avg" "$mx" "$([[ $st != - ]] && echo ", stuck at seq=$st")"
+    done < "$rdir/parsed.tsv"
+    if (( nrows == 0 )); then
+        printf '%s,%s,%s,%s,%s,%s,%s,-,-,-,-,-,%s,%s,%s,%s,%s,%s\n' \
+            "$idx" "$(date +%H:%M:%S)" "$delay" "$ROUNDS" "$WORKERS" "$spec" "$rv" "$wall" "$rv" "$fr" "$wn" "$warn_s" "$tag" >> "$OUT/runs.csv"
+        printf '[%s] run %-3s d=%-4s %-8s ' "$(date +%H:%M:%S)" "$idx" "$delay" "$spec"; colorize "$rv"; printf ' (no scenario result parsed, exit code %s)\n' "$ec"
+        case $rv in FAIL|HANG|ERROR) bad=1 ;; esac
+    fi
+    # the exit code of the harness is the judge when the text says PASS and the code does not
+    case $rv in
+        FAIL|HANG|ERROR)
+            bad=1
+            if (( nrows > 0 && !rowbad )); then
+                printf '%s,%s,%s,%s,%s,%s,%s,-,-,-,-,-,%s,%s,%s,%s,%s,%s\n' \
+                    "$idx" "$(date +%H:%M:%S)" "$delay" "$ROUNDS" "$WORKERS" "exit$ec" "$rv" "$wall" "$rv" "$fr" "$wn" "$warn_s" "$tag" >> "$OUT/runs.csv"
+                printf '           ^ the harness exited with %s (%s) although no scenario line says so\n' "$ec" "$rv"
+            fi ;;
+    esac
+    [[ $warn_s != "-" ]] && printf '           ^ warning flags: %s  (fault-race rerouted: %s, write-notify routed: %s)\n' "$warn_s" "$fr" "$wn"
+
+    # evidence
+    if (( bad )); then final=$OUT/fail-$tag
+    elif [[ $warn_s != "-" ]]; then final=$OUT/warn-$tag
+    elif [[ $rv == INVALID || $rv == INCONCL ]]; then final=$OUT/inv-$tag
+    else final=""
+    fi
+    if [[ -n $final ]]; then
+        make_paste "$rdir" "$tag" "$rv"
+        mv "$rdir" "$final"
+        sed -i "s|,$tag\$|,${final##*/}|" "$OUT/runs.csv"      # the csv points at the folder that is left
+        printf '           ^ evidence: %s/paste.txt\n' "$final"
+    elif (( KEEP_ALL )); then
+        :
+    else
+        rm -rf "$rdir"
+        sed -i "s|,$tag\$|,-|" "$OUT/runs.csv"                 # clean run: nothing is kept
+    fi
+    LAST_BAD=$bad
+    return 0
+}
+
+# ---------------------------------------------------------------------------------------------------------
+summary() {
+    [[ -s $OUT/runs.csv ]] || { echo "no result."; return 0; }
+    local total
+    echo
+    echo "======================================= dsmrw-loop summary ======================================="
+    printf '%-9s %-6s %5s %5s %5s %5s %5s %5s %5s  %-7s %-14s %-12s %-8s %-8s %s\n' \
+        scenario delay runs PASS FAIL HANG ERR INCON INVAL pass% "95%-CI(pass)" fail/Mround avg-ms max-ms warned
+    awk "$AWK_SUMMARY" "$OUT/runs.csv" | sort -t$'\t' -k1,1 -k2,2n | \
+        awk -F'\t' '{ printf "%-9s %-6s %5d %5d %5d %5d %5d %5d %5d  %-7s %-14s %-12s %-8s %-8s %d\n", $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15 }'
+    total=$(awk -F, 'NR > 1 { n++; if ($7 == "PASS") p++; if ($7 == "FAIL" || $7 == "HANG" || $7 == "ERROR") f++; if ($8 != "-") a += $8 } END { printf "%d results, %d PASS, %d FAIL/HANG/ERROR, %d rounds acked", n, p, f, a }' "$OUT/runs.csv")
+    echo "-------------------------------------------------------------------------------------------------"
+    echo "$total"
+    echo "csv: $OUT/runs.csv"
+    ls -d "$OUT"/fail-* "$OUT"/warn-* "$OUT"/inv-* 2>/dev/null | sed 's/^/evidence: /'
+}
+
+final_rc() {
+    awk -F, 'NR > 1 { if ($7 == "FAIL" || $7 == "HANG" || $7 == "ERROR") f = 1; if ($7 == "INCONCL" || $7 == "INVALID") i = 1 }
+             END { exit (f ? 1 : (i ? 2 : 0)) }' "$OUT/runs.csv" 2>/dev/null
+}
+
+# ---------------------------------------------------------------------------------------------------------
+# preflight
+need() { command -v "$1" >/dev/null 2>&1 || die "'$1' not found in PATH"; }
+need awk; need timeout; need stdbuf; need pgrep; need sed; need shuf; need ssh
+need "$BIN"
+need "${MIGRATE_CMD%% *}"
+if (( LOCAL_LOG )) && [[ -n $LSUDO ]]; then
+    $LSUDO true 2>/dev/null || die "passwordless sudo is needed for 'dmesg -W' on this node (or use --no-local-log)"
+fi
+if [[ -n $REMOTE ]]; then
+    $SSH "$REMOTE" "sudo -n true" 2>/dev/null || die "ssh $REMOTE with passwordless sudo does not work (or use --no-remote)"
+fi
+mkdir -p "$OUT" || die "cannot create $OUT"
+echo "run,time,delay,rounds,workers,scenario,verdict,acked,total,avg_ms,max_ms,stuck,wall_s,run_verdict,fault_race,wnotify,warn,dir" > "$OUT/runs.csv"
+{
+    echo "started: $(date -Is)"
+    echo "cmdline: $PROG $ORIG_ARGS"
+    echo "bin: $(command -v "$BIN")   migrate: $MIGRATE_CMD   node: $NODE"
+    echo "VM1: $(uname -srv)"
+    [[ -n $REMOTE ]] && echo "VM2: $($SSH "$REMOTE" 'uname -srv' 2>/dev/null)"
+} > "$OUT/meta.txt"
+
+trap 'INTERRUPTED=1; [[ -n $CUR_MPID ]] && kill -TERM "$CUR_MPID" 2>/dev/null' INT TERM
+trap 'stop_followers' EXIT
+
+echo "dsmrw-loop: rounds=$ROUNDS workers=$WORKERS delays=[$DELAYS] scenarios=[$SCENS] node=$NODE"
+echo "dsmrw-loop: logs -> $OUT   (VM1 log: $([[ $LOCAL_LOG -eq 1 ]] && echo yes || echo no), VM2 log: ${REMOTE:-no})"
+
+LAST_BAD=0
+idx=0
+pass=0
+start=$(date +%s)
+stop=0
+while (( !stop && !INTERRUPTED )); do
+    pass=$((pass + 1))
+    if [[ -n $DUR_S ]]; then
+        (( $(date +%s) - start >= DUR_S )) && break
+    elif (( pass > PASSES )); then
+        break
+    fi
+    if (( SHUFFLE )); then mapfile -t order < <(printf '%s\n' "${combos[@]}" | shuf); else order=("${combos[@]}"); fi
+    for c in "${order[@]}"; do
+        if [[ -n $DUR_S ]] && (( $(date +%s) - start >= DUR_S )); then stop=1; break; fi
+        (( INTERRUPTED )) && break
+        set -- $c
+        idx=$((idx + 1))
+        run_one "$1" "$2" "$idx"; rc=$?
+        if (( rc == 2 )); then echo "dsmrw-loop: infrastructure problem, stopping." >&2; stop=1; INFRA=1; break; fi
+        if (( rc == 0 && LAST_BAD && STOP_ON_FAIL )); then echo "dsmrw-loop: --stop-on-fail"; stop=1; break; fi
+    done
+done
+
+(( INTERRUPTED )) && echo "dsmrw-loop: interrupted, the run in flight is not counted."
+summary
+final_rc; rc=$?
+if [[ ${INFRA:-0} -eq 1 && $rc -eq 0 ]]; then rc=2; fi
+if (( INTERRUPTED )) && [[ $rc -eq 0 ]]; then rc=130; fi
+exit $rc
