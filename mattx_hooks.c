@@ -6782,12 +6782,14 @@ static int entry_handler_shmem_fault(struct kretprobe_instance *ri, struct pt_re
 }
 
 
-// STEP A (debug only, issue #66). The entry handler above decides from the directory as it was BEFORE
-// shmem_fault() ran; the PTE is installed only AFTER it returned. A fetch (state change + shootdown) in between
-// is invisible to it. This asks the same question again, when shmem_fault() is done (the folio is locked).
+// STEP E (issue #66). The entry handler above decides from the directory as it was BEFORE shmem_fault() ran;
+// the PTE is installed only AFTER it returned. A fetch or write-acquire (state change + shootdown) in between
+// is invisible to it. This asks the same question again, when shmem_fault() is done and the folio is locked:
+// the pump changes the directory under the same folio lock (the folio fence in mattx_fileio.c), so the answer
+// is final until the PTE is installed.
 extern int config_mesi_mode;    // 0 = lazy, 1 = atomic (mattx_main.c)
 
-static bool mattx_dbg_fault_sync_now(u32 shmid, unsigned long page_idx, bool is_write, u8 *state, int *nsharers)
+static bool mattx_fault_sync_now(u32 shmid, unsigned long page_idx, bool is_write, u8 *state, int *nsharers)
 {
     struct mattx_dsm_master_dir *dir;
     bool need = false;
@@ -6815,7 +6817,24 @@ static bool mattx_dbg_fault_sync_now(u32 shmid, unsigned long page_idx, bool is_
 
 static int ret_handler_shmem_fault(struct kretprobe_instance *ri, struct pt_regs *regs) {
     struct shmem_fault_kretprobe_data *data = (struct shmem_fault_kretprobe_data *)ri->data;
-    
+
+    // STEP E (MESI_MODE=1): the directory as it is NOW, with the folio locked. A fault that was let through at
+    // entry, but meanwhile met a fetch / write-acquire, takes the sync way instead of installing a PTE past the
+    // directory (it would stay writable for good: the FAULT-RACE of dsmreadwritetest atomic)
+    if (!data->needs_sync && data->sysv && (regs->ax & VM_FAULT_LOCKED) && config_dsm_mode == 2 && config_mesi_mode == 1) {
+        u8 st;
+        int ns;
+
+        if (mattx_fault_sync_now(data->shmid, data->offset / PAGE_SIZE, data->is_write, &st, &ns)) {
+            mattx_dbg("[MESI_VM1] FAULT-RACE: PID %d Page %lu of SHMID %u (%s): no sync at entry, but state=%u sharers=%d NOW -> routed to the sync worker\n",
+                      current->pid, data->offset / PAGE_SIZE, data->shmid, data->is_write ? "write" : "read", st, ns);
+            data->needs_sync = true;
+        } else if (ns > 0) {
+            mattx_dbg("[MESI_VM1] Fault passed: PID %d Page %lu of SHMID %u (%s), state=%u sharers=%d -> shmem_fault maps it, no write-notify\n",
+                      current->pid, data->offset / PAGE_SIZE, data->shmid, data->is_write ? "write" : "read", st, ns);
+        }
+    }
+
     if (data->needs_sync) {
         // --- THE LOCK PICK ---
         // shmem_fault locked the physical page. Because we are aborting the fault,
@@ -6842,18 +6861,6 @@ static int ret_handler_shmem_fault(struct kretprobe_instance *ri, struct pt_regs
         
         // Call the dedicated VM1 sync scheduler! (Clean cross-file API!)
         mattx_schedule_vm1_sync(current->pid, data->shmid, data->offset, data->is_write);
-    } else if (data->sysv && (regs->ax & VM_FAULT_LOCKED) && config_dsm_mode == 2 && config_mesi_mode == 1) {
-        // STEP A (debug only): a fault that is let through while a remote node holds the page. Silent otherwise.
-        u8 st;
-        int ns;
-        bool late = mattx_dbg_fault_sync_now(data->shmid, data->offset / PAGE_SIZE, data->is_write, &st, &ns);
-
-        if (late)
-            mattx_dbg("[MESI_VM1] FAULT-RACE: PID %d Page %lu of SHMID %u (%s): no sync at entry, but state=%u sharers=%d NOW -> the PTE is installed past the directory\n",
-                      current->pid, data->offset / PAGE_SIZE, data->shmid, data->is_write ? "write" : "read", st, ns);
-        else if (ns > 0)
-            mattx_dbg("[MESI_VM1] Fault passed: PID %d Page %lu of SHMID %u (%s), state=%u sharers=%d -> shmem_fault maps it, no write-notify\n",
-                      current->pid, data->offset / PAGE_SIZE, data->shmid, data->is_write ? "write" : "read", st, ns);
     }
     return 0;
 }

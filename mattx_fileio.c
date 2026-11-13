@@ -510,6 +510,65 @@ static bool mattx_dsm_vm1_shootdown(u32 shmid, unsigned long offset, const char 
     return true;
 }
 
+/*
+ * THE FOLIO FENCE (VM1), issue #66
+ *
+ * A native fault is not atomic: shmem_fault() returns the page LOCKED, and the kernel installs the PTE only
+ * afterwards, still under that folio lock. The directory decision of the shmem_fault kretprobe (entry) can
+ * therefore be overtaken by a fetch or a write-acquire, which changes the directory and rips the PTEs out
+ * BEFORE the faulting task has installed its own: the task then owns a (writable) PTE of a page a remote node
+ * holds, and its stores are invisible from now on (FAULT-RACE: dsmreadwritetest atomic froze at seq 237: the
+ * fetch of page 0 passed between the entry check of the manager's write fault and its PTE install).
+ *
+ * The fence closes that window from both sides:
+ *   - the pump (fetch, write-acquire) holds the folio lock around "directory change + shootdown": it waits until
+ *     an in-flight fault has installed its PTE (which the shootdown then rips out), and a fault that starts later
+ *     waits in shmem_fault() until the shootdown is done
+ *   - the ret handler of the shmem_fault kretprobe asks the directory once more while it holds the folio lock
+ *     (mattx_fault_sync_now): a fault that waited, or that raced, sees the NEW state and goes the sync way
+ * Lock order: txn stripe -> folio lock -> mattx_dsm_lock (spinlock) -> i_mmap_rwsem (inside the shootdown); the
+ * same order as the rmap walk (folio lock, then i_mmap_rwsem). The ret handler only takes folio -> spinlock.
+ * Nothing that faults a page (access_process_vm, the pump) may run inside the fence: it would lock the folio again.
+ * A page that is not in the page cache has no PTE, there is nothing to fence (the first touch is not covered).
+ *
+ * MESI_MODE=0 (lazy): no fence.
+ */
+struct mattx_dsm_fence {
+    struct file *file;
+    struct folio *folio;
+};
+
+static void mattx_dsm_vm1_fence_begin(struct mattx_dsm_fence *fc, u32 shmid, unsigned long offset)
+{
+    fc->file = NULL;
+    fc->folio = NULL;
+    if (!mattx_mesi_atomic())
+        return;
+
+    fc->file = mattx_dsm_pin_get(shmid);
+    if (!fc->file)
+        return;
+    fc->folio = filemap_get_folio(fc->file->f_mapping, offset / PAGE_SIZE);
+    if (IS_ERR(fc->folio)) {
+        fc->folio = NULL;
+        return;
+    }
+    folio_lock(fc->folio);
+}
+
+static void mattx_dsm_vm1_fence_end(struct mattx_dsm_fence *fc)
+{
+    if (fc->folio) {
+        folio_unlock(fc->folio);
+        folio_put(fc->folio);
+        fc->folio = NULL;
+    }
+    if (fc->file) {
+        fput(fc->file);
+        fc->file = NULL;
+    }
+}
+
 // Copies one page of @shmid out of the page cache of its SYSV file without ever creating a PTE (the old pump,
 // access_process_vm(), faulted the page into the Deputy's mm writable again, right after the shootdown).
 // PAGE_SIZE: copied. -ENOENT: no pin, or the page is not in the page cache (never touched or swapped out):
@@ -6607,6 +6666,10 @@ static void mattx_dsm_fault_kworker(struct work_struct *work) {
             // through them while the page is copied, and the copy does not create one again.
             bool mesi_atomic = mattx_mesi_atomic();
             bool atomic_nomask = false;
+            struct mattx_dsm_fence fence = { NULL, NULL };  // folio fence: directory change + shootdown + copy
+
+            if (mesi_atomic)
+                mattx_dsm_vm1_fence_begin(&fence, ctx->req.shmid, ctx->req.offset);
 
             if (mesi_atomic) {
                 struct mattx_dsm_master_dir *adir;
@@ -6651,6 +6714,10 @@ static void mattx_dsm_fault_kworker(struct work_struct *work) {
                 bytes = -ENOENT;
                 if (mesi_atomic)
                     bytes = mattx_dsm_vm1_copy_page(ctx->req.shmid, ctx->req.offset, reply->data);
+            }
+            // The fence ends here: the pump below faults the page itself and would lock the folio again
+            mattx_dsm_vm1_fence_end(&fence);
+            if (!atomic_nomask) {
                 if (bytes != 4096) {
                     // THE PUMP: Safely extract the data because we dropped the mmap_read_lock!
                     bytes = access_process_vm(deputy, target_addr, reply->data, 4096, FOLL_FORCE);
@@ -7156,6 +7223,10 @@ static void mattx_dsm_write_acquire_kworker(struct work_struct *work) {
 
     // MESI_MODE=1: grant, INVALIDATEs, shootdown and reply are one transaction of this page
     struct mutex *txn = mattx_dsm_txn_begin(ctx->req.shmid, page_idx, "Write-acquire");
+    // MESI_MODE=1: the directory change and the shootdown are also fenced against an in-flight native fault
+    struct mattx_dsm_fence fence;
+
+    mattx_dsm_vm1_fence_begin(&fence, ctx->req.shmid, ctx->req.offset);
 
     // --- MODE 2 GLOBAL DIRECTORY LOOKUP (QUICK GRAB) ---
     spin_lock(&mattx_dsm_lock);
@@ -7231,6 +7302,8 @@ static void mattx_dsm_write_acquire_kworker(struct work_struct *work) {
         }
     }
     
+    mattx_dsm_vm1_fence_end(&fence);
+
     if (cluster_map[ctx->target_node]) {
         mattx_comm_send(cluster_map[ctx->target_node], MATTX_MSG_DSM_WRITE_ACQUIRE_REPLY, &reply, sizeof(reply));
     }
@@ -7541,20 +7614,33 @@ again:
         // 1. REVOKE: zap the PTE (includes the TLB flush). Nobody can write the page after this.
         if (zap_task) {
             struct mm_struct *mm = get_task_mm(zap_task);
+            const char *why = NULL;
 
-            if (mm && real_zap_vma_ptes) {
+            if (!mm) {
+                why = "the Surrogate has no mm (it is exiting)";
+            } else if (!real_zap_vma_ptes) {
+                why = "zap_vma_ptes is not resolved";
+            } else {
                 mmap_read_lock(mm);
                 struct vm_area_struct *vma = find_vma(mm, zap_base);
                 if (vma && vma->vm_start <= zap_base) {
                     real_zap_vma_ptes(vma, zap_addr, PAGE_SIZE);
                     zapped = true;
                     mattx_dbg("[MESI_VM2] Flushed dirty data and zapped page at 0x%lx\n", zap_addr);
+                } else {
+                    why = "the segment is not mapped any more";
                 }
                 mmap_read_unlock(mm);
             }
             if (mm) mmput(mm);
-            if (!zapped)
-                mattx_dbg("[MESI_VM2] FLUSH-REVOKE-FAILED: could not zap page at 0x%lx, the copy may miss a store\n", zap_addr);
+            if (!zapped) {
+                // Without an mm or a VMA nobody can store to the page any more: the copy is final, harmless.
+                // Only a missing resolver is a real failure.
+                if (!mm || real_zap_vma_ptes)
+                    mattx_dbg("[MESI_VM2] FLUSH: nothing to zap at 0x%lx (%s), the copy is final\n", zap_addr, why);
+                else
+                    mattx_dbg("[MESI_VM2] FLUSH-REVOKE-FAILED: could not zap page at 0x%lx (%s), the copy may miss a store\n", zap_addr, why);
+            }
         }
 
         // 2. READ: the page is final now
