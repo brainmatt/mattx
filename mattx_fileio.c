@@ -30,8 +30,30 @@
 #include <linux/nsproxy.h>
 #include <linux/highmem.h> // Required for kmap_local_page
 #include <linux/pagemap.h> // Required for read_mapping_page
+#include <linux/moduleparam.h>
+#include <linux/random.h>
 
 #define MAX_VFS_RPC 64
+
+// --- DSM chaos knobs (QA only, both default 0 = off) ---
+// A random delay of 0..N ms stretches the race windows of the MESI protocol (issue #66, P3):
+//   dsm_chaos_inv_ms   VM2: the INVALIDATE kworker sleeps before it works (a late INVALIDATE)
+//   dsm_chaos_fetch_ms VM1: the page-fault (fetch) reply is held back (a late page)
+static unsigned int dsm_chaos_inv_ms;
+static unsigned int dsm_chaos_fetch_ms;
+module_param_named(dsm_chaos_inv_ms, dsm_chaos_inv_ms, uint, 0644);
+module_param_named(dsm_chaos_fetch_ms, dsm_chaos_fetch_ms, uint, 0644);
+MODULE_PARM_DESC(dsm_chaos_inv_ms, "QA: random delay (0..N ms) in the VM2 INVALIDATE kworker, 0 = off");
+MODULE_PARM_DESC(dsm_chaos_fetch_ms, "QA: random delay (0..N ms) before the VM1 page-fault reply, 0 = off");
+
+static void mattx_dsm_chaos_delay(unsigned int max_ms)
+{
+    unsigned int ms;
+
+    if (!max_ms) return;
+    ms = get_random_u32_below(max_ms + 1);
+    if (ms) msleep(ms);
+}
 
 
 // --- VFS RPC Registry ---
@@ -90,6 +112,34 @@ static int mattx_vfs_rpc_wait(int slot)
     vfs_rpc_registry[slot].data_buf = NULL;
     spin_unlock(&vfs_rpc_lock);
     return rc;
+}
+
+/*
+ * Wait for the reply of a DSM FLUSH_REQ in @slot (VM1, kworker context), at most MATTX_FLUSH_TIMEOUT_MS. The
+ * waits used to be unbounded: a VM2 that died between the FLUSH_REQ and its reply hung the transaction of the
+ * page (and with it every fault in its stripe) for ever. Returns the error of the reply, or -ETIMEDOUT. The slot
+ * is released in every case: a reply that arrives later finds no in-use slot with its req_id and is dropped, and
+ * data_buf is cleared under the lock, so a late reply can never write into the buffer of the caller.
+ */
+#define MATTX_FLUSH_TIMEOUT_MS 5000
+
+static int mattx_flush_wait(int slot, u32 shmid, unsigned long offset)
+{
+    int err;
+
+    wait_event_timeout(vfs_rpc_registry[slot].wq, READ_ONCE(vfs_rpc_registry[slot].done),
+                       msecs_to_jiffies(MATTX_FLUSH_TIMEOUT_MS));
+
+    spin_lock(&vfs_rpc_lock);
+    err = vfs_rpc_registry[slot].done ? vfs_rpc_registry[slot].error : -ETIMEDOUT;
+    vfs_rpc_registry[slot].in_use = false;
+    vfs_rpc_registry[slot].data_buf = NULL;
+    spin_unlock(&vfs_rpc_lock);
+
+    if (err == -ETIMEDOUT)
+        printk(KERN_WARNING "MattX:[MESI_VM1] FLUSH-TIMEOUT: no answer for SHMID %u Offset %lu within %d ms, going on without the dirty page\n",
+               shmid, offset, MATTX_FLUSH_TIMEOUT_MS);
+    return err;
 }
 
 
@@ -6611,10 +6661,7 @@ static void mattx_dsm_fault_kworker(struct work_struct *work) {
                             };
                             
                             mattx_comm_send(cluster_map[owner_node], MATTX_MSG_DSM_FLUSH_REQ, &flush_req, sizeof(flush_req));
-                            wait_event_interruptible(vfs_rpc_registry[slot].wq, vfs_rpc_registry[slot].done);
-                            
-                            int flush_err = vfs_rpc_registry[slot].error;
-                            spin_lock(&vfs_rpc_lock); vfs_rpc_registry[slot].in_use = false; spin_unlock(&vfs_rpc_lock);
+                            int flush_err = mattx_flush_wait(slot, ctx->req.shmid, ctx->req.offset);
 
                             if (flush_err == 0) {
                                 // Write directly to physical RAM bypassing the frozen process's page tables!
@@ -6766,6 +6813,7 @@ static void mattx_dsm_fault_kworker(struct work_struct *work) {
     }
 
     reply->error = ret;
+    mattx_dsm_chaos_delay(dsm_chaos_fetch_ms);
     if (cluster_map[ctx->target_node]) {
         mattx_comm_send(cluster_map[ctx->target_node], MATTX_MSG_DSM_PAGE_FAULT_REPLY, reply, sizeof(*reply));
     }
@@ -7208,12 +7256,141 @@ EXPORT_SYMBOL(mattx_inject_dsm_cleanup);
 // MESI PROTOCOL: WRITE ACQUIRE & INVALIDATE (MODE 2)
 // ============================================================================
 
+// --- INVALIDATE ACKS (issue #66, P3) ---
+// An INVALIDATE used to be fire-and-forget: VM1 sent it and granted the write (or resumed the native writer) at once,
+// so a sharer could still read its old copy AFTER the writer had written (message passing across two pages breaks).
+// Now every INVALIDATE carries a req_id, the VM2 kworker answers with an INVALIDATE_REPLY once the copy is invalid
+// and zapped, and VM1 grants / resumes only when all sharers have answered (or after MATTX_INV_ACK_TIMEOUT_MS:
+// then it proceeds exactly like before and logs INV-ACK-TIMEOUT). dsm_inv_ack=0 switches back to fire-and-forget.
+#define MATTX_INV_ACK_SLOTS      64     // >= the 64 transaction stripes: at most one waiting transaction per stripe
+#define MATTX_INV_ACK_TIMEOUT_MS 1000
+
+static bool dsm_inv_ack = true;
+module_param_named(dsm_inv_ack, dsm_inv_ack, bool, 0644);
+MODULE_PARM_DESC(dsm_inv_ack, "DSM MESI: wait for the INVALIDATE acknowledgements before a write is granted (default 1)");
+
+struct mattx_inv_ack_slot {
+    bool in_use;
+    u64 req_id;
+    int pending;                // sharers that did not answer yet
+    int error;                  // the first error a sharer reported
+    wait_queue_head_t wq;
+};
+static struct mattx_inv_ack_slot mattx_inv_acks[MATTX_INV_ACK_SLOTS];
+static DEFINE_SPINLOCK(mattx_inv_ack_lock);
+static u64 mattx_inv_ack_next_id = 1;   // never 0: 0 means "no ack wanted"
+
+// What a transaction holds between mattx_inv_send() and mattx_inv_wait()
+struct mattx_inv_ack { int slot; u64 req_id; int sent; ktime_t t0; };   // slot -1: nobody to wait for
+
+// One sharer answered (or could not be asked): under the lock, by slot and id
+static void mattx_inv_ack_dec(int slot, u64 req_id, int err) {
+    spin_lock(&mattx_inv_ack_lock);
+    if (mattx_inv_acks[slot].in_use && mattx_inv_acks[slot].req_id == req_id) {
+        if (err && !mattx_inv_acks[slot].error) mattx_inv_acks[slot].error = err;
+        if (--mattx_inv_acks[slot].pending <= 0) wake_up(&mattx_inv_acks[slot].wq);
+    }
+    spin_unlock(&mattx_inv_ack_lock);
+}
+
+// VM1: send the INVALIDATE to every node of the sharer mask. Registers an ack slot first (the answer may be quicker than
+// the loop). Call it with the directory already changed; no spinlock held (mattx_comm_send() sleeps).
+static void mattx_inv_send(const u64 *mask, u32 orig_pid, u32 shmid, unsigned long offset, struct mattx_inv_ack *ack, const char *tag) {
+    int nodes = 0;
+
+    ack->slot = -1; ack->req_id = 0; ack->sent = 0; ack->t0 = ktime_get();
+
+    for (int node = 0; node < MAX_NODES; node++)
+        if ((mask[node / 64] & (1ULL << (node % 64))) && cluster_map[node]) nodes++;
+    if (!nodes) return;
+
+    if (READ_ONCE(dsm_inv_ack)) {
+        spin_lock(&mattx_inv_ack_lock);
+        for (int i = 0; i < MATTX_INV_ACK_SLOTS; i++) {
+            if (!mattx_inv_acks[i].in_use) {
+                mattx_inv_acks[i].in_use = true;
+                mattx_inv_acks[i].req_id = mattx_inv_ack_next_id++;
+                mattx_inv_acks[i].pending = nodes;
+                mattx_inv_acks[i].error = 0;
+                init_waitqueue_head(&mattx_inv_acks[i].wq);
+                ack->slot = i;
+                ack->req_id = mattx_inv_acks[i].req_id;
+                break;
+            }
+        }
+        spin_unlock(&mattx_inv_ack_lock);
+        if (ack->slot < 0)
+            mattx_dbg("[MESI_VM1] %sno free INVALIDATE ack slot: SHMID %u Offset %lu is invalidated without an ack\n", tag, shmid, offset);
+    }
+
+    for (int node = 0; node < MAX_NODES; node++) {
+        struct mattx_link *l;
+
+        if (!(mask[node / 64] & (1ULL << (node % 64)))) continue;
+        l = cluster_map[node];
+        if (l) {
+            struct mattx_dsm_invalidate_req inv_req = {
+                .req_id = ack->req_id, .orig_pid = orig_pid, .shmid = shmid, .offset = offset
+            };
+            if (mattx_comm_send(l, MATTX_MSG_DSM_INVALIDATE_REQ, &inv_req, sizeof(inv_req)) >= 0) {
+                ack->sent++;
+                mattx_dbg("[MESI_VM1] %sSent INVALIDATE to Node %d for SHMID %u Offset %lu\n", tag, node, shmid, offset);
+                continue;
+            }
+        }
+        // not sent (link gone / send failed): nobody will answer for this node
+        if (ack->slot >= 0) mattx_inv_ack_dec(ack->slot, ack->req_id, 0);
+    }
+}
+
+// VM1: wait until every sharer has answered. Call it AFTER the folio fence is gone (the answer needs a VM2 kworker, never
+// a VM1 lock), still inside the transaction of the page, and BEFORE the grant / the SIGCONT.
+static void mattx_inv_wait(struct mattx_inv_ack *ack, u32 shmid, unsigned long offset) {
+    struct mattx_inv_ack_slot *sl;
+    int pending, error;
+
+    if (ack->slot < 0) return;
+    sl = &mattx_inv_acks[ack->slot];
+
+    wait_event_timeout(sl->wq, READ_ONCE(sl->pending) <= 0, msecs_to_jiffies(MATTX_INV_ACK_TIMEOUT_MS));
+
+    spin_lock(&mattx_inv_ack_lock);
+    pending = sl->pending;
+    error = sl->error;
+    sl->in_use = false;                 // a late answer finds no matching req_id and is ignored
+    spin_unlock(&mattx_inv_ack_lock);
+
+    // only the slow ones are logged: the normal case is a few hundred microseconds
+    if (pending <= 0 && ktime_to_ms(ktime_sub(ktime_get(), ack->t0)) > 10)
+        mattx_dbg("[MESI_VM1] INV-ACK-SLOW: %d sharers took %lld ms to acknowledge the INVALIDATE for SHMID %u Offset %lu\n",
+                  ack->sent, ktime_to_ms(ktime_sub(ktime_get(), ack->t0)), shmid, offset);
+    if (pending > 0)
+        printk(KERN_WARNING "MattX:[MESI_VM1] INV-ACK-TIMEOUT: %d of %d sharers did not acknowledge the INVALIDATE for SHMID %u Offset %lu within %d ms, going on\n",
+               pending, ack->sent, shmid, offset, MATTX_INV_ACK_TIMEOUT_MS);
+    else if (error)
+        mattx_dbg("[MESI_VM1] INVALIDATE for SHMID %u Offset %lu acknowledged with error %d\n", shmid, offset, error);
+}
+
+// VM1 receiver thread: a sharer says that its copy is gone
+static void handle_dsm_invalidate_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    struct mattx_dsm_invalidate_reply *rep = payload;
+    int slot = -1;
+
+    spin_lock(&mattx_inv_ack_lock);
+    for (int i = 0; i < MATTX_INV_ACK_SLOTS; i++) {
+        if (mattx_inv_acks[i].in_use && mattx_inv_acks[i].req_id == rep->req_id) { slot = i; break; }
+    }
+    spin_unlock(&mattx_inv_ack_lock);
+    if (slot >= 0) mattx_inv_ack_dec(slot, rep->req_id, rep->error);
+}
+
 // --- VM1: WRITE ACQUIRE KWORKER ---
 struct mattx_dsm_write_acquire_kworker_ctx { struct work_struct work; struct mattx_dsm_write_acquire_req req; int target_node; };
 
 static void mattx_dsm_write_acquire_kworker(struct work_struct *work) {
     struct mattx_dsm_write_acquire_kworker_ctx *ctx = container_of(work, struct mattx_dsm_write_acquire_kworker_ctx, work);
     struct mattx_dsm_write_acquire_reply reply = { .req_id = ctx->req.req_id, .error = 0 };
+    struct mattx_inv_ack ack = { .slot = -1 };
     
     u64 local_shared_mask[MAX_NODES / 64];
     memset(local_shared_mask, 0, sizeof(local_shared_mask));
@@ -7253,22 +7430,8 @@ static void mattx_dsm_write_acquire_kworker(struct work_struct *work) {
     if (found) {
         mattx_dbg("[MESI_VM1] PID %u granted EXCLUSIVE lock for SHMID %u Offset %lu\n", ctx->req.orig_pid, ctx->req.shmid, ctx->req.offset);
 
-        // 1. Send Invalidates to EVERYONE in the local mask!
-        for (int node = 0; node < MAX_NODES; node++) {
-            int n_idx = node / 64;
-            int n_bit = node % 64;
-            
-            if (local_shared_mask[n_idx] & (1ULL << n_bit)) {
-                if (cluster_map[node]) {
-                    struct mattx_dsm_invalidate_req inv_req = {
-                        .req_id = 0, .orig_pid = ctx->req.orig_pid,
-                        .shmid = ctx->req.shmid, .offset = ctx->req.offset
-                    };
-                    mattx_comm_send(cluster_map[node], MATTX_MSG_DSM_INVALIDATE_REQ, &inv_req, sizeof(inv_req));
-                    mattx_dbg("[MESI_VM1] Sent INVALIDATE to Node %d for SHMID %u Offset %lu\n", node, ctx->req.shmid, ctx->req.offset);
-                }
-            }
-        }
+        // 1. Send Invalidates to EVERYONE in the local mask! The answers are collected after the fence (P3)
+        mattx_inv_send(local_shared_mask, ctx->req.orig_pid, ctx->req.shmid, ctx->req.offset, &ack, "");
         
         // 2. THE PTE SHOOTDOWN (VM1)
         // MESI_MODE=1: through the pinned file, so every process of this node is hit and no Deputy is needed.
@@ -7304,6 +7467,9 @@ static void mattx_dsm_write_acquire_kworker(struct work_struct *work) {
     
     mattx_dsm_vm1_fence_end(&fence);
 
+    // P3: the write is granted only when no sharer can read its old copy any more
+    mattx_inv_wait(&ack, ctx->req.shmid, ctx->req.offset);
+
     if (cluster_map[ctx->target_node]) {
         mattx_comm_send(cluster_map[ctx->target_node], MATTX_MSG_DSM_WRITE_ACQUIRE_REPLY, &reply, sizeof(reply));
     }
@@ -7333,13 +7499,24 @@ struct mattx_zap_target {
     unsigned long fault_addr;
 };
 
+// VM2: tell VM1 that the copy is gone (req_id 0: the INVALIDATE was fire-and-forget, nobody waits)
+static void mattx_dsm_inv_ack_send(struct mattx_dsm_invalidate_kworker_ctx *ctx, int err) {
+    struct mattx_dsm_invalidate_reply rep = { .req_id = ctx->req.req_id, .error = err };
+
+    if (!ctx->req.req_id) return;
+    if (cluster_map[ctx->target_node])
+        mattx_comm_send(cluster_map[ctx->target_node], MATTX_MSG_DSM_INVALIDATE_REPLY, &rep, sizeof(rep));
+}
+
 static void mattx_dsm_invalidate_kworker(struct work_struct *work) {
     struct mattx_dsm_invalidate_kworker_ctx *ctx = container_of(work, struct mattx_dsm_invalidate_kworker_ctx, work);
     struct mattx_zap_target *tg = kvmalloc_array(MAX_GUESTS, sizeof(*tg), GFP_KERNEL);
     int n = 0;
 
+    mattx_dsm_chaos_delay(dsm_chaos_inv_ms);
     if (!tg) {
         printk(KERN_ERR "MattX:[MESI_VM2] INVALIDATE dropped: out of memory\n");
+        mattx_dsm_inv_ack_send(ctx, -ENOMEM);
         kfree(ctx);
         return;
     }
@@ -7403,6 +7580,7 @@ static void mattx_dsm_invalidate_kworker(struct work_struct *work) {
         }
         put_task_struct(surrogate);
     }
+    mattx_dsm_inv_ack_send(ctx, 0);     // the page is INVALID and zapped: VM1 may let the writer go
     kvfree(tg);
     kfree(ctx);
 }
@@ -7817,6 +7995,7 @@ static void mattx_vm1_shm_sync_kworker(struct work_struct *work) {
     u32 owner_pid = 0;
     int owner_node = -1;
     bool dir_found = false;
+    struct mattx_inv_ack ack = { .slot = -1 };
     struct mattx_dsm_master_dir *dir;
     
     spin_lock(&mattx_dsm_lock);
@@ -7862,10 +8041,7 @@ static void mattx_vm1_shm_sync_kworker(struct work_struct *work) {
                         .req_id = req_id, .orig_pid = owner_pid, .shmid = shmid, .offset = offset
                     };
                     mattx_comm_send(cluster_map[owner_node], MATTX_MSG_DSM_FLUSH_REQ, &flush_req, sizeof(flush_req));
-                    wait_event_interruptible(vfs_rpc_registry[slot].wq, vfs_rpc_registry[slot].done);
-                    
-                    int flush_err = vfs_rpc_registry[slot].error;
-                    spin_lock(&vfs_rpc_lock); vfs_rpc_registry[slot].in_use = false; spin_unlock(&vfs_rpc_lock);
+                    int flush_err = mattx_flush_wait(slot, shmid, offset);
 
                     if (flush_err == 0) {
                         // Write directly to physical RAM bypassing the frozen process's page tables!
@@ -7943,19 +8119,11 @@ static void mattx_vm1_shm_sync_kworker(struct work_struct *work) {
                       page_idx, shmid);
 
         // The Invalidates go out WITHOUT the spinlock: mattx_comm_send() sleeps on its mutex
-        for (int node = 0; node < MAX_NODES; node++) {
-            int n_idx = node / 64; int n_bit = node % 64;
-            if (local_shared_mask[n_idx] & (1ULL << n_bit)) {
-                if (cluster_map[node]) {
-                    struct mattx_dsm_invalidate_req inv_req = {
-                        .req_id = 0, .orig_pid = 0, .shmid = shmid, .offset = offset
-                    };
-                    mattx_comm_send(cluster_map[node], MATTX_MSG_DSM_INVALIDATE_REQ, &inv_req, sizeof(inv_req));
-                    mattx_dbg("[MESI_VM1] Native Fault: Sent INVALIDATE to Node %d\n", node);
-                }
-            }
-        }
+        mattx_inv_send(local_shared_mask, 0, shmid, offset, &ack, "Native Fault: ");
     }
+
+    // P3: the native writer is resumed only when no sharer can read its old copy any more
+    mattx_inv_wait(&ack, shmid, offset);
 
     mattx_dsm_txn_end(txn);
 
@@ -9281,6 +9449,7 @@ void mattx_fileio_init_handlers(void) {
     mattx_register_handler(MATTX_MSG_DSM_WRITE_ACQUIRE_REQ, handle_dsm_write_acquire_req);
     mattx_register_handler(MATTX_MSG_DSM_WRITE_ACQUIRE_REPLY, handle_dsm_write_acquire_reply);
     mattx_register_handler(MATTX_MSG_DSM_INVALIDATE_REQ, handle_dsm_invalidate_req);
+    mattx_register_handler(MATTX_MSG_DSM_INVALIDATE_REPLY, handle_dsm_invalidate_reply);
     mattx_register_handler(MATTX_MSG_DSM_FLUSH_REQ, handle_dsm_flush_req);
     mattx_register_handler(MATTX_MSG_DSM_FLUSH_REPLY, handle_dsm_flush_reply);
 

@@ -67,7 +67,7 @@ KEEP_ALL=0
 TMO=""
 SETTLE=2
 PLAN=0
-ALL_COUNT=5          # ctl atomic store rw rwfield: only used for the watchdog estimate
+ALL_COUNT=6          # ctl atomic store rw rwfield mp: only used for the watchdog estimate
 GC_WAIT=1
 
 INTERRUPTED=0
@@ -83,7 +83,7 @@ usage: $PROG [options]
   -T DURATION        loop until DURATION has passed instead (e.g. 90s, 30m, 1h)
   -r ROUNDS          rounds per scenario (default $ROUNDS)
   -d "LIST"          action delays in seconds, e.g. "0 0.1 0.2" (default "$DELAYS")
-  -s "LIST"          scenarios: ctl atomic store rw rwfield all (default "$SCENS")
+  -s "LIST"          scenarios: ctl atomic store rw rwfield mp all (default "$SCENS")
   -w WORKERS         workers (default $WORKERS)
   --node ID          node id the workers are migrated to (default $NODE)
   --migrate-cmd CMD  migrate command, {pid} and {node} are replaced
@@ -352,7 +352,15 @@ cnt() {               # regex file
     echo "${n:-0}"
 }
 
-HEALTH='BUG:|WARNING: |Oops:|soft lockup|hung task|blocked for more than|rcu: .*stall|Call Trace:'
+hcnt() {              # file: kernel health lines, MattX's own lines excluded
+    local n
+    n=$(grep -E -- "$HEALTH" "$1" 2>/dev/null | grep -vc 'MattX:')
+    echo "${n:-0}"
+}
+
+# Kernel health lines. MattX's own printk lines ("MattX:...", e.g. "MattX:[IMPORT] WARNING: FPU image ...") are
+# information, not a kernel warning: they never count. A kernel WARN looks like "WARNING: CPU: 0 PID: ...".
+HEALTH='BUG:|WARNING: CPU:|Oops:|soft lockup|hung task|blocked for more than|rcu: .*stall|Call Trace:'
 
 colorize() {          # verdict
     if [[ -t 1 ]]; then
@@ -377,8 +385,8 @@ make_paste() {        # dir tag verdict
         echo "== kernel health, microscope =="
         for f in vm1 vm2; do
             [[ -f $d/$f.dmesg ]] || continue
-            echo "-- $f: $(cnt 'FLUSH-LOST-STORE' "$d/$f.dmesg") FLUSH-LOST-STORE, $(cnt 'FLUSH-REVOKE-FAILED' "$d/$f.dmesg") FLUSH-REVOKE-FAILED, $(cnt 'FAULT-RACE' "$d/$f.dmesg") FAULT-RACE, $(cnt "$HEALTH" "$d/$f.dmesg") kernel health lines"
-            grep -E "$HEALTH|FLUSH-LOST-STORE|FLUSH-REVOKE-FAILED" "$d/$f.dmesg" | head -10
+            echo "-- $f: $(cnt 'FLUSH-LOST-STORE' "$d/$f.dmesg") FLUSH-LOST-STORE, $(cnt 'FLUSH-REVOKE-FAILED' "$d/$f.dmesg") FLUSH-REVOKE-FAILED, $(cnt 'FAULT-RACE' "$d/$f.dmesg") FAULT-RACE, $(cnt 'INV-ACK-TIMEOUT|FLUSH-TIMEOUT' "$d/$f.dmesg") ACK/FLUSH-TIMEOUT, $(hcnt "$d/$f.dmesg") kernel health lines"
+            grep -E "$HEALTH|FLUSH-LOST-STORE|FLUSH-REVOKE-FAILED|INV-ACK-TIMEOUT|FLUSH-TIMEOUT" "$d/$f.dmesg" | grep -v 'MattX:\[IMPORT\]' | head -10
         done
         echo
         echo "== VM1: dmesg | grep MESI_VM1 | tail -40 =="
@@ -445,13 +453,15 @@ run_one() {           # delay spec idx
     # the microscope: counted per run
     l=$(( $(cnt 'FLUSH-LOST-STORE' "$rdir/vm2.dmesg") + $(cnt 'FLUSH-LOST-STORE' "$rdir/vm1.dmesg") ))
     r=$(( $(cnt 'FLUSH-REVOKE-FAILED' "$rdir/vm2.dmesg") + $(cnt 'FLUSH-REVOKE-FAILED' "$rdir/vm1.dmesg") ))
-    k=$(( $(cnt "$HEALTH" "$rdir/vm1.dmesg") + $(cnt "$HEALTH" "$rdir/vm2.dmesg") ))
+    k=$(( $(hcnt "$rdir/vm1.dmesg") + $(hcnt "$rdir/vm2.dmesg") ))
+    t=$(cnt 'INV-ACK-TIMEOUT|FLUSH-TIMEOUT' "$rdir/vm1.dmesg")     # P3: a sharer / owner that did not answer in time
     fr=$(cnt 'FAULT-RACE' "$rdir/vm1.dmesg")
     wn=$(cnt 'Write-notify: ' "$rdir/vm1.dmesg")
     warn_s=""
     (( l )) && warn_s="${warn_s}LOSTSTORE=$l;"
     (( r )) && warn_s="${warn_s}REVOKEFAIL=$r;"
     (( k )) && warn_s="${warn_s}KERNEL=$k;"
+    (( t )) && warn_s="${warn_s}ACKTIMEOUT=$t;"
     (( ec == 0 && nmig > 0 && nrun < nmig )) && warn_s="${warn_s}NOMIGRATE-LINE;"
     [[ -n $warn_s ]] || warn_s="-"
     warn_s=${warn_s%;}

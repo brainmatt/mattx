@@ -44,6 +44,9 @@
  *                                                        silent write)
  *   rwfield   load ANOTHER field of the same 4K page,   (page granularity:
  *             then store                                 the header-page case)
+ *   mp        message passing across TWO pages: VM1 writes X, then Y (release). Once a Worker
+ *             sees the new Y it MUST see the new X too (P3: an INVALIDATE of X that is still in
+ *             flight when the grant for Y is sent makes the Worker read the old X -> ORDER)
  *
  * Every Worker also validates the page snapshot it sees (data words must be
  * consistent and never older than seq) -> TORN / ORDER counters.
@@ -59,7 +62,7 @@
  *   num_workers        readers that get migrated to the remote node(s) (1..16)
  *   rounds             write rounds per scenario
  *   action_delay       seconds between rounds (float, 0 = hammer)
- *   scenario           ctl | atomic | store | rw | rwfield | all   (default: all)
+ *   scenario           ctl | atomic | store | rw | rwfield | mp | all   (default: all)
  *   migrate_wait_secs  how long a Worker waits to be migrated (default: 60)
  *
  *   The Manager (this process) MUST stay on the Home Node. Migrate the workers
@@ -104,23 +107,25 @@
 #define NDATA        8
 #define NHIST        5
 
-enum { SC_CTL = 0, SC_ATOMIC, SC_STORE, SC_RW, SC_RWFIELD, SC_COUNT };
+enum { SC_CTL = 0, SC_ATOMIC, SC_STORE, SC_RW, SC_RWFIELD, SC_MP, SC_COUNT };
 enum { V_PASS = 0, V_WARN, V_FAIL, V_INCONC };
 
-static const char *sc_name[SC_COUNT] = { "ctl", "atomic", "store", "rw", "rwfield" };
+static const char *sc_name[SC_COUNT] = { "ctl", "atomic", "store", "rw", "rwfield", "mp" };
 static const char *sc_desc[SC_COUNT] = {
     "control: VM2 writes, VM1 polls",
     "VM1 atomic add, no prior load (issue #66)",
     "VM1 plain store, no prior load",
     "VM1 load word, then store it",
-    "VM1 load other field of same page, then store"
+    "VM1 load other field of same page, then store",
+    "VM1 writes X then Y, VM2 must see X new once Y is new"
 };
 static const char *sc_hint[SC_COUNT] = {
     "baseline of the harness itself",
     "stale PTE after downgrade / first share",
     "stale PTE after downgrade / first share",
     "no write-notify on VM1: read fault maps PTE writable",
-    "no write-notify on VM1: page granularity"
+    "no write-notify on VM1: page granularity",
+    "INVALIDATE of X not acknowledged before Y is granted"
 };
 static const char *v_name[] = { "PASS", "WARN", "FAIL", "INCONCLUSIVE" };
 
@@ -193,9 +198,16 @@ static struct wres *wres_page(int sc, int w)
         (size_t)(SC_COUNT - 1 + num_workers + sc * num_workers + w) * PAGE_SZ);
 }
 
+/* The 'mp' scenario writes X first and then Y (= payload_page(SC_MP)): X is the very last page */
+static struct payload *mpx_page(void)
+{
+    return (struct payload *)(shm_base +
+        (size_t)(SC_COUNT - 1 + num_workers + (size_t)SC_COUNT * num_workers) * PAGE_SZ);
+}
+
 static size_t total_pages(void)
 {
-    return (size_t)(SC_COUNT - 1) + num_workers + (size_t)SC_COUNT * num_workers;
+    return (size_t)(SC_COUNT - 1) + num_workers + (size_t)SC_COUNT * num_workers + 1;
 }
 
 /* ---- small helpers ---- */
@@ -261,6 +273,14 @@ static void vm1_write(int sc, struct payload *p, uint64_t k)
     if (sc == SC_RWFIELD) sink = p->other;  /* another field, same 4K page  */
     (void)sink;
 
+    if (sc == SC_MP) {
+        /* X first, then Y: whoever sees the new Y must see the new X (release/acquire) */
+        struct payload *x = mpx_page();
+
+        for (int i = 0; i < NDATA; i++) x->data[i] = k;
+        __atomic_store_n(&x->seq, k, __ATOMIC_RELEASE);
+    }
+
     if (sc == SC_ATOMIC) {
         /* write-first RMW, like chunks_written in dsmimagetest */
         for (int i = 0; i < NDATA; i++) __sync_fetch_and_add(&p->data[i], 1);
@@ -315,6 +335,8 @@ static void worker_poll(int w, int sc)
             if (d[0] < s) order++;
             for (int i = 1; i < NDATA; i++)
                 if (d[i] != d[0]) { torn++; break; }
+            if (sc == SC_MP && __atomic_load_n(&mpx_page()->seq, __ATOMIC_ACQUIRE) < s)
+                order++;                      /* Y is new but X is still old: message passing broken */
             last = s;
             r->ack = s;                       /* the working direction: VM2 write */
             t_idle = now_us();
