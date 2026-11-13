@@ -28,6 +28,8 @@
 #include <linux/eventpoll.h>
 #include <linux/kdebug.h>
 #include <linux/pagemap.h> // Required for unlock_page and put_page
+#include <linux/task_work.h> // P2: arm the write-notify ops from process context
+#include <linux/module.h>
 
 // Helper for modern x86_64 syscall wrappers (__x64_sys_*)
 // The first argument (regs->di) is a pointer to the real pt_regs!
@@ -6685,8 +6687,13 @@ static int entry_handler_shmat(struct kretprobe_instance *ri, struct pt_regs *re
     return 0;
 }
 
+static void mattx_shm_arm_schedule(long ret);   // P2, defined below
+
 static int ret_handler_shmat(struct kretprobe_instance *ri, struct pt_regs *regs) {
-    if (!is_guest_process(current->tgid)) return 0;
+    if (!is_guest_process(current->tgid)) {
+        mattx_shm_arm_schedule((long)regs_return_value(regs));  // P2: a native shmat() gets write-notify
+        return 0;
+    }
     if (fatal_signal_pending(current) || (current->flags & PF_EXITING)) return 0;
 
     struct shmat_kretprobe_data *data = (struct shmat_kretprobe_data *)ri->data;
@@ -6830,7 +6837,7 @@ static int ret_handler_shmem_fault(struct kretprobe_instance *ri, struct pt_regs
                       current->pid, data->offset / PAGE_SIZE, data->shmid, data->is_write ? "write" : "read", st, ns);
             data->needs_sync = true;
         } else if (ns > 0) {
-            mattx_dbg("[MESI_VM1] Fault passed: PID %d Page %lu of SHMID %u (%s), state=%u sharers=%d -> shmem_fault maps it, no write-notify\n",
+            mattx_dbg("[MESI_VM1] Fault passed: PID %d Page %lu of SHMID %u (%s), state=%u sharers=%d -> shmem_fault maps it\n",
                       current->pid, data->offset / PAGE_SIZE, data->shmid, data->is_write ? "write" : "read", st, ns);
         }
     }
@@ -6865,6 +6872,167 @@ static int ret_handler_shmem_fault(struct kretprobe_instance *ri, struct pt_regs
     return 0;
 }
 
+
+
+/*
+ * P2: WRITE-NOTIFY ON VM1 (MESI_MODE=1, issue #66)
+ *
+ * The hole: SysV shm VMAs have no page_mkwrite, so the kernel does not track writes of them: a native READ fault
+ * maps the page WRITABLE, and the following store retires without any fault. The directory never hears of it
+ * (dsmreadwritetest rw / rwfield: the manager loads, then stores, and the remote sharer keeps its stale copy).
+ *
+ * The fix, natively: the VMA gets a copy of shm_vm_ops with a real page_mkwrite(). With a page_mkwrite the kernel
+ * itself keeps vm_page_prot write-protected (vma_wants_writenotify): a read fault maps the page read-only, and the
+ * first store faults into mattx_shm_page_mkwrite(), which asks the directory.
+ *
+ *  - Armed per VMA, when a native process returns from shmat() (task_work: process context, before the task
+ *    runs another user instruction; a kretprobe cannot take mmap_write_lock). Only writable shared non-hugetlb
+ *    SYSV VMAs, only in atomic mode. Children of a fork inherit the ops (vm_ops->open).
+ *  - page_mkwrite() takes the folio lock and returns VM_FAULT_LOCKED, so the lock is held until the kernel has
+ *    made the PTE writable: the folio fence of the pump (mattx_fileio.c) also covers this path.
+ *  - A remote holder (the same predicate as the fault intercept) -> unlock, freeze the task, schedule the sync
+ *    worker, return VM_FAULT_NOPAGE: the kernel finishes the fault without a PTE and drops the mmap lock itself
+ *    (no manual lock handling like the VM_FAULT_RETRY of the shmem_fault intercept), the task stops on its way
+ *    back to user space, and the store faults again when the sync worker woke it up.
+ *  - Every armed VMA holds a module reference (open: +1, close: -1): rmmod is refused while one exists.
+ *
+ * Lock/order: folio lock -> mattx_dsm_lock (spinlock), as everywhere else.
+ */
+static struct vm_operations_struct mattx_shm_vm_ops;                // the clone
+static const struct vm_operations_struct *mattx_shm_orig_ops;       // shm_vm_ops of the running kernel, learnt at runtime
+static DEFINE_SPINLOCK(mattx_shm_ops_lock);
+static atomic_t mattx_shm_armed = ATOMIC_INIT(0);
+
+static vm_fault_t mattx_shm_page_mkwrite(struct vm_fault *vmf)
+{
+    struct vm_area_struct *vma = vmf->vma;
+    struct folio *folio = page_folio(vmf->page);
+    u32 shmid = vma->vm_file->f_inode->i_ino;
+    unsigned long offset = (vmf->address & PAGE_MASK) - vma->vm_start;
+    u8 st;
+    int ns;
+
+    folio_lock(folio);
+    if (folio->mapping != vma->vm_file->f_mapping) {
+        folio_unlock(folio);
+        return VM_FAULT_NOPAGE;     // truncated under us: the store faults again
+    }
+
+    // Kernel threads (the pump, the sync workers) pass, like in the shmem_fault intercept
+    if (!(current->flags & PF_KTHREAD) && config_dsm_mode == 2 && config_mesi_mode == 1 &&
+        mattx_fault_sync_now(shmid, offset / PAGE_SIZE, true, &st, &ns)) {
+        folio_unlock(folio);
+        mattx_dbg("[MESI_VM1] Write-notify: PID %d Page %lu of SHMID %u: state=%u sharers=%d -> routed to the sync worker\n",
+                  current->pid, offset / PAGE_SIZE, shmid, st, ns);
+        send_sig(SIGSTOP, current, 0);
+        mattx_schedule_vm1_sync(current->pid, shmid, offset, true);
+        return VM_FAULT_NOPAGE;
+    }
+    return VM_FAULT_LOCKED;         // the kernel makes the PTE writable under the folio lock
+}
+
+// fork() duplicates the VMA: the child holds a module reference as well
+static void mattx_shm_open(struct vm_area_struct *vma)
+{
+    __module_get(THIS_MODULE);
+    atomic_inc(&mattx_shm_armed);
+    if (mattx_shm_orig_ops->open)
+        mattx_shm_orig_ops->open(vma);
+}
+
+static void mattx_shm_close(struct vm_area_struct *vma)
+{
+    if (mattx_shm_orig_ops->close)
+        mattx_shm_orig_ops->close(vma);
+    atomic_dec(&mattx_shm_armed);
+    module_put(THIS_MODULE);
+}
+
+// Called with mmap_write_lock held
+static void mattx_shm_arm_vma(struct vm_area_struct *vma)
+{
+    const struct vm_operations_struct *ops = vma->vm_ops;
+    const char *name;
+
+    if (!ops || !vma->vm_file || !vma->vm_file->f_path.dentry)
+        return;
+    if ((vma->vm_flags & (VM_WRITE | VM_SHARED | VM_HUGETLB)) != (VM_WRITE | VM_SHARED))
+        return;                     // read-only attach, private, or hugetlb: nothing to track
+    name = vma->vm_file->f_path.dentry->d_name.name;
+    if (!name || strncmp(name, "SYSV", 4) != 0)
+        return;
+    if (ops == &mattx_shm_vm_ops || ops->page_mkwrite)
+        return;                     // armed already, or somebody else tracks the writes
+
+    spin_lock(&mattx_shm_ops_lock);
+    if (!mattx_shm_orig_ops) {
+        // The first SysV VMA teaches us the ops of this kernel: no symbol lookup for a static table
+        mattx_shm_vm_ops = *ops;
+        mattx_shm_vm_ops.open = mattx_shm_open;
+        mattx_shm_vm_ops.close = mattx_shm_close;
+        mattx_shm_vm_ops.page_mkwrite = mattx_shm_page_mkwrite;
+        mattx_shm_orig_ops = ops;
+    }
+    spin_unlock(&mattx_shm_ops_lock);
+    if (ops != mattx_shm_orig_ops)
+        return;                     // other kind of SysV ops than the one we cloned: leave it alone
+
+    if (!try_module_get(THIS_MODULE))
+        return;
+    vma->vm_ops = &mattx_shm_vm_ops;
+    // What vma_set_page_prot() does for a VMA that wants write-notify: read faults map read-only from now on.
+    // The shared and the private prot of a writable VMA differ in _PAGE_RW only (x86), so only that bit goes.
+    // (pgprot_modify() is not an option for a module: its _PAGE_CHG_MASK reads cc_mask, which is not exported)
+    vma->vm_page_prot = __pgprot(pgprot_val(vma->vm_page_prot) & ~_PAGE_RW);
+    atomic_inc(&mattx_shm_armed);
+    mattx_dbg("[MESI_VM1] Write-notify armed: SHMID %lu at 0x%lx (PID %d), %d armed VMA(s)\n",
+              vma->vm_file->f_inode->i_ino, vma->vm_start, current->pid, atomic_read(&mattx_shm_armed));
+}
+
+struct mattx_shm_arm_work {
+    struct callback_head cb;
+    unsigned long addr;
+};
+
+static void mattx_shm_arm_twork(struct callback_head *cb)
+{
+    struct mattx_shm_arm_work *w = container_of(cb, struct mattx_shm_arm_work, cb);
+    struct mm_struct *mm = current->mm;
+
+    if (mm && mmap_write_lock_killable(mm) == 0) {
+        struct vm_area_struct *vma = find_vma(mm, w->addr);
+
+        if (vma && vma->vm_start == w->addr)
+            mattx_shm_arm_vma(vma);
+        mmap_write_unlock(mm);
+    }
+    kfree(w);
+    module_put(THIS_MODULE);
+}
+
+// shmat() of a native process returned @ret: arm its VMA before the task runs user code again
+static void mattx_shm_arm_schedule(long ret)
+{
+    struct mattx_shm_arm_work *w;
+
+    if (config_dsm_mode != 2 || config_mesi_mode != 1)
+        return;
+    if (IS_ERR_VALUE((unsigned long)ret) || (current->flags & (PF_KTHREAD | PF_EXITING)) || !current->mm)
+        return;
+    if (!try_module_get(THIS_MODULE))
+        return;
+    w = kzalloc(sizeof(*w), GFP_ATOMIC);
+    if (!w) {
+        module_put(THIS_MODULE);
+        return;
+    }
+    init_task_work(&w->cb, mattx_shm_arm_twork);
+    w->addr = (unsigned long)ret;
+    if (task_work_add(current, &w->cb, TWA_RESUME)) {
+        kfree(w);
+        module_put(THIS_MODULE);
+    }
+}
 
 
 
