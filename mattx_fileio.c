@@ -2238,6 +2238,126 @@ static void handle_sys_write_reply(struct mattx_link *link, struct mattx_header 
 }
 
 
+// === DATA PLANE: SEND engine (sendto and sendmsg, issue #67 P2) ===
+/*
+ * The socket send of a Surrogate for a socket that lives on the home node, without ever blocking where the
+ * Surrogate's CANCEL cannot reach us. Same contract as the recv side: the kworker of the request is
+ * CANCELLABLE and sends exactly ONE reply: the real result (bytes that were sent are never thrown away) or
+ * -EINTR when the CANCEL came first and nothing was sent.
+ *
+ * The socket is only ever written with MSG_DONTWAIT | MSG_NOSIGNAL; the waiting is done here, so the blocking
+ * semantics are the application's, not the kworker's:
+ *   - MSG_DONTWAIT, or an O_NONBLOCK socket: -EAGAIN at once when the send buffer is full. The kernel's own
+ *     sendto() adds the O_NONBLOCK of the file, kernel_sendmsg() does not: the old code BLOCKED the kworker
+ *     for a non-blocking socket, and ignored the flags of the application altogether.
+ *   - SO_SNDTIMEO is honoured (-EAGAIN when it expires).
+ *   - A stream socket takes the data chunk by chunk (a cancel or an error after some bytes returns them).
+ *     A datagram / seqpacket socket takes a message whole or not at all: if this request is only a part of
+ *     what the application asked for (total_len > len) the answer is -EMSGSIZE, never a truncated datagram.
+ *   - SIGPIPE is raised on the Surrogate thread (unless MSG_NOSIGNAL), not on the kworker.
+ * The wait sleeps on the socket's own wait queue (sk_sleep): room in the send buffer and errors wake us at
+ * once, and a 10 ms ceiling looks at cancel / unload / lost link.
+ */
+static ssize_t mattx_send_cancellable(struct socket *sock, struct file *file, struct sockaddr_storage *addr, int addrlen,
+                                      const void *buf, size_t len, size_t total_len, int flags,
+                                      int sender, u32 orig_pid, u32 req_id, bool *abandoned)
+{
+    bool nonblock = (flags & MSG_DONTWAIT) || (file->f_flags & O_NONBLOCK);
+    long sndtimeo = nonblock ? 0 : READ_ONCE(sock->sk->sk_sndtimeo);
+    bool timed = !nonblock && sndtimeo != MAX_SCHEDULE_TIMEOUT;
+    unsigned long deadline = jiffies + sndtimeo;
+    int kflags = (flags & MATTX_SEND_FLAGS) | MSG_DONTWAIT | MSG_NOSIGNAL;
+    DEFINE_WAIT_FUNC(wait, woken_wake_function);
+    size_t total = 0;
+    ssize_t result;
+    ssize_t ret;
+
+    if (total_len > len && sock->type != SOCK_STREAM)
+        return -EMSGSIZE;
+
+    // On the wait queue BEFORE the first look, so that no wake-up can slip between look and sleep
+    add_wait_queue(sk_sleep(sock->sk), &wait);
+
+    for (;;) {
+        struct msghdr msg = { .msg_flags = kflags };
+        struct kvec iov = { .iov_base = (void *)((const char *)buf + total), .iov_len = len - total };
+
+        if (addr && addrlen > 0) {
+            msg.msg_name = addr;
+            msg.msg_namelen = addrlen;
+        }
+
+        // 1. Try: never blocks
+        ret = kernel_sendmsg(sock, &msg, &iov, 1, len - total);
+        if (ret > 0) {
+            total += ret;
+            if (total >= len) {
+                result = total;
+                goto out;
+            }
+            continue;                           // a stream took part of it: the rest right away
+        }
+        if (ret == 0) {                         // nothing to send (len == 0), or nothing taken
+            result = total;
+            goto out;
+        }
+        if (ret != -EAGAIN) {                   // a real error (EPIPE, ECONNRESET, ...): bytes in hand win
+            result = total ? (ssize_t)total : ret;
+            goto out;
+        }
+
+        // 2. The send buffer is full right now
+        if (nonblock || (timed && time_after(jiffies, deadline))) {
+            result = total ? (ssize_t)total : -EAGAIN;
+            goto out;
+        }
+        if (mattx_req_take_cancelled(sender, orig_pid, req_id)) {
+            mattx_dbg("[WORMHOLE] SEND for PID %u req %u cancelled by the Surrogate (%zu bytes in hand)\n", orig_pid, req_id, total);
+            result = total ? (ssize_t)total : -EINTR;
+            goto out;
+        }
+        if (READ_ONCE(mattx_cancellable_stopping) || !READ_ONCE(cluster_map[sender])) {
+            *abandoned = true;
+            result = -EINTR;
+            goto out;
+        }
+
+        // 3. Sleep until the socket wakes us (room in the send buffer, an error), or 10 ms, or the SO_SNDTIMEO deadline
+        {
+            long to = msecs_to_jiffies(10);
+
+            if (timed && (long)(deadline - jiffies) < to)
+                to = (long)(deadline - jiffies) > 0 ? (long)(deadline - jiffies) : 1;
+            wait_woken(&wait, TASK_INTERRUPTIBLE, to);
+        }
+    }
+
+out:
+    remove_wait_queue(sk_sleep(sock->sk), &wait);
+    return result;
+}
+
+// The file of the request (a socket of the Deputy) and the send: shared by the sendto and sendmsg kworkers.
+static ssize_t mattx_send_proxy(int sender, u32 orig_pid, u32 req_id, u32 fd, struct sockaddr_storage *addr, int addrlen,
+                                const void *buf, size_t len, size_t total_len, int flags, bool *abandoned)
+{
+    struct file *file = mattx_get_remote_file(orig_pid, fd);
+    struct socket *sock;
+    ssize_t ret;
+
+    if (!file)
+        return -EBADF;
+    sock = sock_from_file(file);
+    if (!sock || !sock->sk)
+        ret = -ENOTSOCK;
+    else
+        ret = mattx_send_cancellable(sock, file, addr, addrlen, buf, len, total_len, flags,
+                                     sender, orig_pid, req_id, abandoned);
+    fput(file);
+    return ret;
+}
+
+
 // === DATA PLANE: LSEEK ===
 struct mattx_lseek_kworker_ctx { struct work_struct work; struct mattx_sys_lseek_req req; int target_node; };
 
@@ -2991,64 +3111,115 @@ static void handle_sys_generic_int_reply(struct mattx_link *link, struct mattx_h
 
 
 // === DATA PLANE: SENDTO ===
+/*
+ * SEND_REQ (sendto()/send() on a socket that lives on the home node): the kworker of the request runs on
+ * mattx_wait_wq, is CANCELLABLE (see mattx_send_cancellable()) and gets exactly ONE reply with the req_id
+ * echoed. The destination address of sendto() (UDP, unix datagram) is carried in the request.
+ */
 struct mattx_sendto_kworker_ctx {
     struct work_struct work;
-    u32 orig_pid;
-    int fd;
-    int flags;
-    size_t len;
     int target_node;
-    char data[];
+    struct mattx_sys_send_req req;      // req.data[] is a flexible array: must stay the LAST member
 };
+
+static void mattx_send_reply_send(int node, u32 orig_pid, u32 req_id, ssize_t ret)
+{
+    struct mattx_sys_send_reply reply;
+    struct mattx_link *link = READ_ONCE(cluster_map[node]);
+
+    // Zeroed: the old reply went out with uninitialised padding, and the legacy Surrogate read that padding as the result
+    memset(&reply, 0, sizeof(reply));
+    reply.orig_pid = orig_pid;
+    reply.bytes_sent = ret;
+    reply.error = (ret < 0) ? ret : 0;
+    reply.req_id = req_id;
+    if (link)
+        mattx_comm_send(link, MATTX_MSG_SYS_SEND_REPLY, &reply, sizeof(reply));
+}
 
 static void mattx_sendto_kworker(struct work_struct *work) {
     struct mattx_sendto_kworker_ctx *ctx = container_of(work, struct mattx_sendto_kworker_ctx, work);
-    struct file *file = mattx_get_remote_file(ctx->orig_pid, ctx->fd);
-    struct mattx_sys_send_reply reply;
-    int ret = -EBADF;
+    struct mattx_sys_send_req *req = &ctx->req;
+    size_t total_len = max_t(size_t, req->total_len, req->len);    // 0: legacy request
+    bool abandoned = false;
+    ssize_t ret;
 
-    if (file) {
-        struct socket *sock = sock_from_file(file);
-        if (sock) {
-            struct msghdr msg = {0};
-            struct kvec iov;
-            iov.iov_base = ctx->data;
-            iov.iov_len = ctx->len;
-            
-            // Execute the send natively in the Kworker! No signals, no interruptions!
-            ret = kernel_sendmsg(sock, &msg, &iov, 1, ctx->len);
-        } else {
-            ret = -ENOTSOCK;
-        }
-        fput(file);
+    mattx_dbg("[WORMHOLE] Received SEND request for FD %u (req %u, %zu bytes of %zu, addrlen %d) from Node %d. Sending (kworker)...\n",
+              req->fd, req->req_id, req->len, total_len, req->addrlen, ctx->target_node);
+
+    ret = mattx_send_proxy(ctx->target_node, req->orig_pid, req->req_id, req->fd,
+                           req->addrlen > 0 ? &req->addr : NULL, req->addrlen,
+                           req->data, req->len, total_len, req->flags, &abandoned);
+
+    if (abandoned) {
+        mattx_dbg("[WORMHOLE] SEND for FD %u (req %u): nobody left to answer, reply dropped\n", req->fd, req->req_id);
+    } else {
+        mattx_dbg("[WORMHOLE] SEND for FD %u (req %u) done: %zd\n", req->fd, req->req_id, ret);
+        mattx_send_reply_send(ctx->target_node, req->orig_pid, req->req_id, ret);
     }
 
-    reply.orig_pid = ctx->orig_pid;
-    reply.bytes_sent = ret;
-    reply.error = (ret < 0) ? ret : 0;
-
-    if (cluster_map[ctx->target_node]) {
-        mattx_comm_send(cluster_map[ctx->target_node], MATTX_MSG_SYS_SEND_REPLY, &reply, sizeof(reply));
-    }
-    kfree(ctx);
+    kvfree(ctx);
+    atomic_dec(&mattx_cancellable_inflight);
 }
 
 static void handle_sys_send_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
-    if (payload) {
-        struct mattx_sys_send_req *req = payload;
-        struct mattx_sendto_kworker_ctx *ctx = kmalloc(sizeof(*ctx) + req->len, GFP_ATOMIC);
-        if (ctx) {
-            INIT_WORK(&ctx->work, mattx_sendto_kworker);
-            ctx->orig_pid = req->orig_pid;
-            ctx->fd = req->fd;
-            ctx->flags = req->flags;
-            ctx->len = req->len;
-            ctx->target_node = hdr->sender_id;
-            memcpy(ctx->data, req->data, req->len);
-            
-            schedule_work(&ctx->work); // Dispatch to the Data Plane!
+    struct mattx_sys_send_req *req = payload;
+    struct mattx_sendto_kworker_ctx *ctx;
+
+    if (!payload || hdr->length < sizeof(*req)) return;
+    if (hdr->sender_id >= MAX_NODES || READ_ONCE(mattx_cancellable_stopping)) return;
+
+    if (req->len > MATTX_SEND_CHUNK || req->len > hdr->length - sizeof(*req) ||
+        req->addrlen < 0 || req->addrlen > (int)sizeof(req->addr)) {
+        printk(KERN_ERR "MattX:[WORMHOLE] SEND_REQ %u of PID %u malformed (len %zu, addrlen %d, message %u bytes)\n",
+               req->req_id, req->orig_pid, req->len, req->addrlen, hdr->length);
+        mattx_send_reply_send(hdr->sender_id, req->orig_pid, req->req_id, -EINVAL);
+        return;
+    }
+
+    ctx = kvmalloc(sizeof(*ctx) + req->len, GFP_KERNEL);   // the receiver kthread may sleep (it kvmalloc()s the payload as well)
+    if (!ctx) {
+        // Still answer: the Surrogate thread sleeps on this ticket
+        printk(KERN_ERR "MattX:[WORMHOLE] SEND_REQ %u of PID %u: out of memory\n", req->req_id, req->orig_pid);
+        mattx_send_reply_send(hdr->sender_id, req->orig_pid, req->req_id, -ENOMEM);
+        return;
+    }
+    INIT_WORK(&ctx->work, mattx_sendto_kworker);
+    memcpy(&ctx->req, req, sizeof(*req) + req->len);
+    ctx->target_node = hdr->sender_id;
+    atomic_inc(&mattx_cancellable_inflight);
+    mattx_queue_wait_work(&ctx->work);
+}
+
+// Surrogate side: a reply that carries a ticket id belongs to exactly one waiting thread (mattx_ticket_*).
+// req_id 0 is the legacy reply (fallback without task_work): it goes through the per-guest slot.
+static void handle_sys_send_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    struct mattx_sys_send_reply *reply = payload;
+    ssize_t result;
+    int i;
+
+    if (!payload || hdr->length < sizeof(*reply)) return;
+    result = (reply->bytes_sent >= 0) ? reply->bytes_sent : reply->error;
+
+    mattx_dbg("[RPC] Received SEND_REPLY for Orig PID %u req %u. Result: %zd\n", reply->orig_pid, reply->req_id, result);
+
+    if (reply->req_id) {
+        if (!mattx_ticket_complete(hdr->sender_id, reply->orig_pid, reply->req_id, result, NULL, 0))
+            mattx_dbg("[RPC] SEND_REPLY req %u: nobody waits for it any more, dropped\n", reply->req_id);
+        return;
+    }
+
+    spin_lock(&guest_lock);
+    for (i = 0; i < guest_count; i++) {
+        if (guest_registry[i].orig_pid == reply->orig_pid && guest_registry[i].home_node == hdr->sender_id) {
+            guest_registry[i].rpc_fsync_res = result;
+            guest_registry[i].rpc_done = true;
+            if (guest_registry[i].rpc_wq)
+                wake_up_interruptible(guest_registry[i].rpc_wq);
+            break;
         }
     }
+    spin_unlock(&guest_lock);
 }
 
 
@@ -5085,83 +5256,104 @@ static void handle_sys_getsockopt_reply(struct mattx_link *link, struct mattx_he
 
 
 // === DATA PLANE: SENDMSG (Scatter/Gather) ===
+/*
+ * SENDMSG_REQ (sendmsg() on a socket that lives on the home node, issue #67 P2): the Surrogate has already
+ * flattened msg_iov into one buffer (and carried msg_name). The kworker of the request runs on mattx_wait_wq,
+ * is CANCELLABLE (the engine is mattx_send_cancellable(), shared with sendto) and gets exactly ONE reply with
+ * the req_id echoed. Ancillary data (msg_control, SCM_RIGHTS) is not carried.
+ */
 struct mattx_sendmsg_kworker_ctx {
     struct work_struct work;
-    u32 orig_pid;
-    int fd;
-    int flags;
-    int addrlen;
-    size_t datalen;
-    struct sockaddr_storage addr;
     int target_node;
-    char data[];
+    struct mattx_sys_sendmsg_req req;   // req.data[] is a flexible array: must stay the LAST member
 };
+
+static void mattx_sendmsg_reply_send(int node, u32 orig_pid, u32 req_id, ssize_t ret)
+{
+    struct mattx_sys_sendmsg_reply reply;
+    struct mattx_link *link = READ_ONCE(cluster_map[node]);
+
+    memset(&reply, 0, sizeof(reply));
+    reply.orig_pid = orig_pid;
+    reply.bytes_sent = ret;
+    reply.error = (ret < 0) ? ret : 0;
+    reply.req_id = req_id;
+    if (link)
+        mattx_comm_send(link, MATTX_MSG_SYS_SENDMSG_REPLY, &reply, sizeof(reply));
+}
 
 static void mattx_sendmsg_kworker(struct work_struct *work) {
     struct mattx_sendmsg_kworker_ctx *ctx = container_of(work, struct mattx_sendmsg_kworker_ctx, work);
-    struct file *file = mattx_get_remote_file(ctx->orig_pid, ctx->fd);
-    struct mattx_sys_sendmsg_reply reply;
-    int ret = -EBADF;
+    struct mattx_sys_sendmsg_req *req = &ctx->req;
+    size_t total_len = max_t(size_t, req->total_len, req->datalen);    // 0: legacy request
+    bool abandoned = false;
+    ssize_t ret;
 
-    if (file) {
-        struct socket *sock = sock_from_file(file);
-        if (sock) {
-            struct msghdr msg = {0};
-            struct kvec iov;
-            
-            if (ctx->addrlen > 0) {
-                msg.msg_name = &ctx->addr;
-                msg.msg_namelen = ctx->addrlen;
-            }
-            
-            iov.iov_base = ctx->data;
-            iov.iov_len = ctx->datalen;
-            
-            // The data is already flattened! Send it natively!
-            ret = kernel_sendmsg(sock, &msg, &iov, 1, ctx->datalen);
-        } else {
-            ret = -ENOTSOCK;
-        }
-        fput(file);
+    mattx_dbg("[WORMHOLE] Received SENDMSG request for FD %d (req %u, %zu bytes of %zu, addrlen %d) from Node %d. Sending (kworker)...\n",
+              req->fd, req->req_id, req->datalen, total_len, req->addrlen, ctx->target_node);
+
+    ret = mattx_send_proxy(ctx->target_node, req->orig_pid, req->req_id, req->fd,
+                           req->addrlen > 0 ? &req->addr : NULL, req->addrlen,
+                           req->data, req->datalen, total_len, req->flags, &abandoned);
+
+    if (abandoned) {
+        mattx_dbg("[WORMHOLE] SENDMSG for FD %d (req %u): nobody left to answer, reply dropped\n", req->fd, req->req_id);
+    } else {
+        mattx_dbg("[WORMHOLE] SENDMSG for FD %d (req %u) done: %zd\n", req->fd, req->req_id, ret);
+        mattx_sendmsg_reply_send(ctx->target_node, req->orig_pid, req->req_id, ret);
     }
 
-    reply.orig_pid = ctx->orig_pid;
-    reply.bytes_sent = ret;
-    reply.error = (ret < 0) ? ret : 0;
-
-    if (cluster_map[ctx->target_node]) {
-        mattx_comm_send(cluster_map[ctx->target_node], MATTX_MSG_SYS_SENDMSG_REPLY, &reply, sizeof(reply));
-    }
-    kfree(ctx);
+    kvfree(ctx);
+    atomic_dec(&mattx_cancellable_inflight);
 }
 
 static void handle_sys_sendmsg_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
-    if (payload) {
-        struct mattx_sys_sendmsg_req *req = payload;
-        struct mattx_sendmsg_kworker_ctx *ctx = kmalloc(sizeof(*ctx) + req->datalen, GFP_ATOMIC);
-        if (ctx) {
-            INIT_WORK(&ctx->work, mattx_sendmsg_kworker);
-            ctx->orig_pid = req->orig_pid;
-            ctx->fd = req->fd;
-            ctx->flags = req->flags;
-            ctx->addrlen = req->addrlen;
-            ctx->datalen = req->datalen;
-            ctx->target_node = hdr->sender_id;
-            memcpy(&ctx->addr, &req->addr, sizeof(struct sockaddr_storage));
-            memcpy(ctx->data, req->data, req->datalen);
-            
-            schedule_work(&ctx->work); // Dispatch to the Data Plane!
-        }
+    struct mattx_sys_sendmsg_req *req = payload;
+    struct mattx_sendmsg_kworker_ctx *ctx;
+
+    if (!payload || hdr->length < sizeof(*req)) return;
+    if (hdr->sender_id >= MAX_NODES || READ_ONCE(mattx_cancellable_stopping)) return;
+
+    // Never trust datalen beyond what really arrived in this message
+    if (req->datalen > MATTX_SEND_CHUNK || req->datalen > hdr->length - sizeof(*req) ||
+        req->addrlen < 0 || req->addrlen > (int)sizeof(req->addr)) {
+        printk(KERN_ERR "MattX:[WORMHOLE] SENDMSG_REQ %u of PID %u malformed (datalen %zu, addrlen %d, message %u bytes)\n",
+               req->req_id, req->orig_pid, req->datalen, req->addrlen, hdr->length);
+        mattx_sendmsg_reply_send(hdr->sender_id, req->orig_pid, req->req_id, -EINVAL);
+        return;
     }
+
+    ctx = kvmalloc(sizeof(*ctx) + req->datalen, GFP_KERNEL);   // the receiver kthread may sleep (it kvmalloc()s the payload as well)
+    if (!ctx) {
+        // Still answer: the Surrogate thread sleeps on this ticket
+        printk(KERN_ERR "MattX:[WORMHOLE] SENDMSG_REQ %u of PID %u: out of memory\n", req->req_id, req->orig_pid);
+        mattx_sendmsg_reply_send(hdr->sender_id, req->orig_pid, req->req_id, -ENOMEM);
+        return;
+    }
+    INIT_WORK(&ctx->work, mattx_sendmsg_kworker);
+    memcpy(&ctx->req, req, sizeof(*req) + req->datalen);
+    ctx->target_node = hdr->sender_id;
+    atomic_inc(&mattx_cancellable_inflight);
+    mattx_queue_wait_work(&ctx->work);
 }
 
 
+// Surrogate side: a reply that carries a ticket id belongs to exactly one waiting thread (mattx_ticket_*).
+// req_id 0 is the legacy reply (fallback without task_work): it goes through the per-guest slot.
 static void handle_sys_sendmsg_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
-    if (payload) {
+    if (payload && hdr->length >= sizeof(struct mattx_sys_sendmsg_reply)) {
         struct mattx_sys_sendmsg_reply *reply = payload;
         int i;
-        
-        mattx_dbg("[RPC] Received SENDMSG_REPLY for Orig PID %u. Bytes sent: %zd\n", reply->orig_pid, reply->bytes_sent);
+
+        mattx_dbg("[RPC] Received SENDMSG_REPLY for Orig PID %u req %u. Bytes sent: %zd\n", reply->orig_pid, reply->req_id, reply->bytes_sent);
+
+        if (reply->req_id) {
+            long result = (reply->bytes_sent >= 0) ? reply->bytes_sent : reply->error;
+
+            if (!mattx_ticket_complete(hdr->sender_id, reply->orig_pid, reply->req_id, result, NULL, 0))
+                mattx_dbg("[RPC] SENDMSG_REPLY req %u: nobody waits for it any more, dropped\n", reply->req_id);
+            return;
+        }
 
         spin_lock(&guest_lock);
         for (i = 0; i < guest_count; i++) {
@@ -9810,7 +10002,7 @@ void mattx_fileio_init_handlers(void) {
     mattx_register_handler(MATTX_MSG_SYS_LISTEN_REQ, handle_sys_listen_req);
     mattx_register_handler(MATTX_MSG_SYS_LISTEN_REPLY, handle_sys_generic_int_reply);
     mattx_register_handler(MATTX_MSG_SYS_SEND_REQ, handle_sys_send_req);
-    mattx_register_handler(MATTX_MSG_SYS_SEND_REPLY, handle_sys_generic_int_reply); // We can reuse the generic int reply for send!
+    mattx_register_handler(MATTX_MSG_SYS_SEND_REPLY, handle_sys_send_reply);
     mattx_register_handler(MATTX_MSG_SYS_RECV_REQ, handle_sys_recv_req);
     mattx_register_handler(MATTX_MSG_SYS_RECV_REPLY, handle_sys_recv_reply);
     mattx_register_handler(MATTX_MSG_SYS_ACCEPT_REQ, handle_sys_accept_req);

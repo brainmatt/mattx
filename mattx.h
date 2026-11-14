@@ -520,18 +520,35 @@ struct mattx_sys_listen_reply {
 };
 
 // Send/Recv Payloads ---
+/*
+ * SEND (sendto, issue #67 P2). Ticket based: the Surrogate thread waits for the real result on its own
+ * ticket. One request carries at most MATTX_SEND_CHUNK bytes. A stream socket may be fed chunk by chunk;
+ * a datagram / seqpacket socket cannot be split: total_len (what the application asked to send) tells the
+ * home node that this request is only a part of it, and the answer is -EMSGSIZE, never a truncated datagram.
+ */
+#define MATTX_SEND_CHUNK (64 * 1024)
+
+// The send flags that are carried to the home node (the home node always adds MSG_DONTWAIT | MSG_NOSIGNAL
+// itself and does the waiting and the SIGPIPE on behalf of the application, see mattx_send_cancellable())
+#define MATTX_SEND_FLAGS (MSG_OOB | MSG_DONTROUTE | MSG_DONTWAIT | MSG_NOSIGNAL | MSG_MORE | MSG_EOR | MSG_CONFIRM)
+
 struct mattx_sys_send_req {
     u32 orig_pid;
     u32 fd;
     int flags;
-    size_t len;
-    char data[]; 
+    size_t len;                 // bytes in data[], at most MATTX_SEND_CHUNK
+    u32 req_id;                 // ticket id: matches the reply to the one thread that waits for it (0 = legacy SIGSTOP path)
+    u32 total_len;              // everything the application asked to send (0 = legacy: same as len)
+    int addrlen;                // destination address (sendto's dest_addr), 0: none
+    struct sockaddr_storage addr;
+    char data[];                // must stay the LAST member
 };
 
 struct mattx_sys_send_reply {
     u32 orig_pid;
-    ssize_t bytes_sent;
+    ssize_t bytes_sent;         // bytes sent (0 .. len) or -errno; -EINTR: cancelled, nothing was sent
     int error;
+    u32 req_id;                 // echo of the request's ticket id (0 = legacy reply)
 };
 
 struct mattx_sys_recv_req {
@@ -767,15 +784,18 @@ struct mattx_sys_sendmsg_req {
     int fd;
     int flags;
     int addrlen;
-    size_t datalen;
+    size_t datalen;             // bytes in data[], at most MATTX_SEND_CHUNK
     struct sockaddr_storage addr;
+    u32 req_id;                 // ticket id: matches the reply to the one thread that waits for it (0 = legacy SIGSTOP path)
+    u32 total_len;              // everything the application asked to send (0 = legacy: same as datalen)
     char data[]; // Flexible array for the flattened data!
 };
 
 struct mattx_sys_sendmsg_reply {
     u32 orig_pid;
-    ssize_t bytes_sent;
+    ssize_t bytes_sent;         // bytes sent (0 .. datalen) or -errno; -EINTR: cancelled, nothing was sent
     int error;
+    u32 req_id;                 // echo of the request's ticket id (0 = legacy reply)
 };
 
 struct mattx_sys_recvmsg_req {
