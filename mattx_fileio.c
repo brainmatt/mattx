@@ -1057,56 +1057,71 @@ static loff_t mattx_fake_llseek(struct file *file, loff_t offset, int whence) {
     return ret_offset;
 }
 
-// --- NEW: The Fake File FSync Operation (Runs on Node 2) ---
-static int mattx_fake_fsync(struct file *file, loff_t start, loff_t end, int datasync) {
-    struct mattx_fake_fd_info *fd_info = file->private_data;
+/*
+ * FSYNC (Surrogate side, issue #67, P2): the thread that called fsync() waits for the real result on its
+ * own ticket. It used to share the per-guest slot (rpc_done / rpc_wq / rpc_fsync_res) with every other
+ * proxied call of the process: an fsync that was interrupted left its late reply behind, and that reply
+ * answered the NEXT call of any thread. The kprobe fallback also froze the whole thread group.
+ *
+ * Called in process context of the calling thread: from mattx_fake_fsync() below (fsync, fdatasync and
+ * sync_file_range style callers all arrive through ->fsync) and from the task_work of the fsync()
+ * kretprobe (mattx_fsync_tw_fn in mattx_hooks.c). The home node cannot abort a flush that is under way:
+ * an interruption sends the generic CANCEL and the home node answers with the real result if the flush
+ * finishes soon, otherwise the caller returns -EINTR (allowed by POSIX) and the late reply is dropped.
+ */
+int mattx_wormhole_fsync(u32 orig_pid, int home_node, u32 remote_fd, loff_t start, loff_t end, int datasync)
+{
     struct mattx_sys_fsync_req req;
-    DECLARE_WAIT_QUEUE_HEAD_ONSTACK(rpc_wq);
+    struct mattx_ticket *t;
+    struct mattx_link *link;
     pid_t my_pid = current->pid;
-    int i;
-    int ret_error = -EIO;
+    int ret;
 
-    if (!fd_info || !cluster_map[fd_info->home_node]) return -EIO;
+    if (home_node < 0 || home_node >= MAX_NODES) return -EIO;
+    link = READ_ONCE(cluster_map[home_node]);
+    if (!link) return -EIO;
 
-    req.orig_pid = fd_info->orig_pid;
-    req.fd = fd_info->remote_fd;
+    // Only THIS thread waits, on its own ticket: no shared per-guest slot, no wake-up mix-ups
+    t = mattx_ticket_add(orig_pid, home_node, 0);
+    if (!t) return -ENOMEM;
+
+    memset(&req, 0, sizeof(req));
+    req.orig_pid = orig_pid;
+    req.fd = remote_fd;
     req.start = start;
     req.end = end;
     req.datasync = datasync;
+    req.req_id = t->req_id;
 
-    // 1. Attach our wait queue to the registry
-    spin_lock(&guest_lock);
-    for (i = 0; i < guest_count; i++) {
-        if (mattx_pid_shares_tgid_with_guest(my_pid, guest_registry[i].local_pid)) {
-            guest_registry[i].rpc_wq = &rpc_wq;
-            guest_registry[i].rpc_done = false;
-            guest_registry[i].rpc_fsync_res = -1;
-            break;
-        }
+    mattx_dbg("[WORMHOLE] Surrogate %d requesting FSYNC for FD %u (datasync %d, req %u). Sleeping...\n", my_pid, req.fd, datasync, req.req_id);
+
+    if (mattx_comm_send(link, MATTX_MSG_SYS_FSYNC_REQ, &req, sizeof(req)) < 0) {
+        ret = -EIO;
+        goto out;
     }
-    spin_unlock(&guest_lock);
 
-    mattx_dbg("[WORMHOLE] Surrogate %d requesting FSYNC for FD %u. Sleeping...\n", my_pid, req.fd);
-
-    // 2. Send the request to Node 1
-    mattx_comm_send(cluster_map[fd_info->home_node], MATTX_MSG_SYS_FSYNC_REQ, &req, sizeof(req));
-
-    // 3. Go to sleep until Node 1 replies!
-    wait_event_interruptible(rpc_wq, check_rpc_done(my_pid));
-
-    // 4. We woke up! Collect the data from the registry
-    spin_lock(&guest_lock);
-    for (i = 0; i < guest_count; i++) {
-        if (mattx_pid_shares_tgid_with_guest(my_pid, guest_registry[i].local_pid)) {
-            ret_error = guest_registry[i].rpc_fsync_res;
-            guest_registry[i].rpc_wq = NULL;
-            break;
-        }
+    // Sleep until Node 1 replies. If we are interrupted (signal, freeze of a migration or recall)
+    // the wait cancels the request and still hands back the real result if the flush finished meanwhile.
+    if (mattx_ticket_wait(t, MAX_SCHEDULE_TIMEOUT)) {
+        ret = -EINTR;
+        goto out;
     }
-    spin_unlock(&guest_lock);
+    ret = (int)t->retval;
 
-    mattx_dbg("[WORMHOLE] Surrogate %d woke up! FSYNC result: %d.\n", my_pid, ret_error);
-    return ret_error;
+out:
+    mattx_dbg("[WORMHOLE] Surrogate %d woke up! FSYNC result: %d (req %u).\n", my_pid, ret, req.req_id);
+    mattx_ticket_del(t);
+    return ret;
+}
+EXPORT_SYMBOL(mattx_wormhole_fsync);
+
+// --- NEW: The Fake File FSync Operation (Runs on Node 2) ---
+static int mattx_fake_fsync(struct file *file, loff_t start, loff_t end, int datasync) {
+    struct mattx_fake_fd_info *fd_info = file->private_data;
+
+    if (!fd_info || !cluster_map[fd_info->home_node]) return -EIO;
+
+    return mattx_wormhole_fsync(fd_info->orig_pid, fd_info->home_node, fd_info->remote_fd, start, end, datasync);
 }
 
 // --- NEW: The Fake File Read Operation (Runs on Node 2) ---
@@ -2390,33 +2405,82 @@ static void handle_sys_lseek_req(struct mattx_link *link, struct mattx_header *h
 }
 
 // === DATA PLANE: FSYNC ===
+/*
+ * FSYNC_REQ (fsync()/fdatasync() on a file that lives on the home node): the flush can take seconds, so it
+ * runs in its own kworker on mattx_wait_wq (never in the receiver kthread) and gets exactly ONE reply with
+ * the req_id echoed. A flush that is under way cannot be aborted; a CANCEL that arrives before it starts
+ * skips it (-EINTR). req_id 0 is the legacy request (fallback without task_work).
+ */
 struct mattx_fsync_kworker_ctx { struct work_struct work; struct mattx_sys_fsync_req req; int target_node; };
+
+static void mattx_fsync_reply_send(int node, u32 orig_pid, u32 req_id, int ret)
+{
+    struct mattx_sys_fsync_reply reply;
+    struct mattx_link *link = READ_ONCE(cluster_map[node]);
+
+    memset(&reply, 0, sizeof(reply));
+    reply.orig_pid = orig_pid;
+    reply.error = ret;
+    reply.req_id = req_id;
+    if (link)
+        mattx_comm_send(link, MATTX_MSG_SYS_FSYNC_REPLY, &reply, sizeof(reply));
+}
 
 static void mattx_fsync_kworker(struct work_struct *work) {
     struct mattx_fsync_kworker_ctx *ctx = container_of(work, struct mattx_fsync_kworker_ctx, work);
-    struct file *file = mattx_get_remote_file(ctx->req.orig_pid, ctx->req.fd);
-    struct mattx_sys_fsync_reply reply;
+    struct mattx_sys_fsync_req *req = &ctx->req;
+    bool abandoned = false;
     int ret = -EBADF;
 
-    if (file) {
-        ret = vfs_fsync_range(file, ctx->req.start, ctx->req.end, ctx->req.datasync);
-        fput(file);
+    if (req->req_id && mattx_req_take_cancelled(ctx->target_node, req->orig_pid, req->req_id)) {
+        mattx_dbg("[WORMHOLE] FSYNC for FD %u (req %u) cancelled by the Surrogate before the flush, skipped\n", req->fd, req->req_id);
+        ret = -EINTR;
+    } else if (READ_ONCE(mattx_cancellable_stopping) || !READ_ONCE(cluster_map[ctx->target_node])) {
+        abandoned = true;
+    } else {
+        struct file *file = mattx_get_remote_file(req->orig_pid, req->fd);
+
+        if (file) {
+            mattx_dbg("[WORMHOLE] FSYNC for FD %u (req %u, datasync %d) from Node %d. Flushing (kworker)...\n",
+                      req->fd, req->req_id, req->datasync, ctx->target_node);
+            ret = vfs_fsync_range(file, req->start, req->end, req->datasync);
+            fput(file);
+            // A CANCEL that came in during the flush is of no use any more: consume it, the real result is sent
+            if (req->req_id)
+                mattx_req_take_cancelled(ctx->target_node, req->orig_pid, req->req_id);
+        }
     }
 
-    reply.orig_pid = ctx->req.orig_pid;
-    reply.error = ret;
-    if (cluster_map[ctx->target_node]) mattx_comm_send(cluster_map[ctx->target_node], MATTX_MSG_SYS_FSYNC_REPLY, &reply, sizeof(reply));
+    if (abandoned) {
+        mattx_dbg("[WORMHOLE] FSYNC for FD %u (req %u): nobody left to answer, reply dropped\n", req->fd, req->req_id);
+    } else {
+        mattx_dbg("[WORMHOLE] FSYNC for FD %u (req %u) done: %d\n", req->fd, req->req_id, ret);
+        mattx_fsync_reply_send(ctx->target_node, req->orig_pid, req->req_id, ret);
+    }
+
     kfree(ctx);
+    atomic_dec(&mattx_cancellable_inflight);
 }
 
 static void handle_sys_fsync_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
     struct mattx_sys_fsync_req *req = payload;
-    struct mattx_fsync_kworker_ctx *ctx = kmalloc(sizeof(*ctx), GFP_ATOMIC);
-    if (ctx) {
-        INIT_WORK(&ctx->work, mattx_fsync_kworker);
-        memcpy(&ctx->req, req, sizeof(*req)); ctx->target_node = hdr->sender_id;
-        schedule_work(&ctx->work);
+    struct mattx_fsync_kworker_ctx *ctx;
+
+    if (!payload || hdr->length < sizeof(*req)) return;
+    if (hdr->sender_id >= MAX_NODES || READ_ONCE(mattx_cancellable_stopping)) return;
+
+    ctx = kmalloc(sizeof(*ctx), GFP_ATOMIC);
+    if (!ctx) {
+        // Still answer: the Surrogate thread sleeps on this ticket
+        printk(KERN_ERR "MattX:[WORMHOLE] FSYNC_REQ %u of PID %u: out of memory\n", req->req_id, req->orig_pid);
+        mattx_fsync_reply_send(hdr->sender_id, req->orig_pid, req->req_id, -ENOMEM);
+        return;
     }
+    INIT_WORK(&ctx->work, mattx_fsync_kworker);
+    memcpy(&ctx->req, req, sizeof(*req));
+    ctx->target_node = hdr->sender_id;
+    atomic_inc(&mattx_cancellable_inflight);
+    mattx_queue_wait_work(&ctx->work);
 }
 
 // === DATA PLANE: STATX ===
@@ -2952,26 +3016,34 @@ static void handle_sys_dup_reply(struct mattx_link *link, struct mattx_header *h
     }
 }
 
+// Surrogate side: a reply that carries a ticket id belongs to exactly one waiting thread (mattx_ticket_*).
+// req_id 0 is the legacy reply (fallback without task_work): it goes through the per-guest slot.
 static void handle_sys_fsync_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
-    if (payload) {
-        struct mattx_sys_fsync_reply *reply = (struct mattx_sys_fsync_reply *)payload;
-        int i;
+    struct mattx_sys_fsync_reply *reply = (struct mattx_sys_fsync_reply *)payload;
+    int i;
 
-        mattx_dbg("[RPC] Received FSYNC_REPLY for Orig PID %u. Error: %d\n", reply->orig_pid, reply->error);
+    if (!payload || hdr->length < sizeof(*reply)) return;
 
-        spin_lock(&guest_lock);
-        for (i = 0; i < guest_count; i++) {
-            if (guest_registry[i].orig_pid == reply->orig_pid && guest_registry[i].home_node == hdr->sender_id) {
-                guest_registry[i].rpc_fsync_res = reply->error;
-                guest_registry[i].rpc_done = true;
-                if (guest_registry[i].rpc_wq) {
-                    wake_up_interruptible(guest_registry[i].rpc_wq);
-                }
-                break;
-            }
-        }
-        spin_unlock(&guest_lock);
+    mattx_dbg("[RPC] Received FSYNC_REPLY for Orig PID %u req %u. Error: %d\n", reply->orig_pid, reply->req_id, reply->error);
+
+    if (reply->req_id) {
+        if (!mattx_ticket_complete(hdr->sender_id, reply->orig_pid, reply->req_id, reply->error, NULL, 0))
+            mattx_dbg("[RPC] FSYNC_REPLY req %u: nobody waits for it any more, dropped\n", reply->req_id);
+        return;
     }
+
+    spin_lock(&guest_lock);
+    for (i = 0; i < guest_count; i++) {
+        if (guest_registry[i].orig_pid == reply->orig_pid && guest_registry[i].home_node == hdr->sender_id) {
+            guest_registry[i].rpc_fsync_res = reply->error;
+            guest_registry[i].rpc_done = true;
+            if (guest_registry[i].rpc_wq) {
+                wake_up_interruptible(guest_registry[i].rpc_wq);
+            }
+            break;
+        }
+    }
+    spin_unlock(&guest_lock);
 }
 
 static void handle_sys_socket_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
@@ -9317,9 +9389,10 @@ int mattx_rpc_vfs_fsync(int node_id, int remote_fd, loff_t start, loff_t end, in
 
     wait_event_interruptible(vfs_rpc_registry[slot].wq, vfs_rpc_registry[slot].done);
 
-    err = vfs_rpc_registry[slot].error;
-
+    // Woken by a signal (or the freeze of a migration) and not by the reply: the slot holds no result yet,
+    // -EINTR is the answer (a late reply finds no slot with its req_id any more and is dropped).
     spin_lock(&vfs_rpc_lock);
+    err = vfs_rpc_registry[slot].done ? vfs_rpc_registry[slot].error : -EINTR;
     vfs_rpc_registry[slot].in_use = false;
     spin_unlock(&vfs_rpc_lock);
 
@@ -9786,32 +9859,72 @@ static void handle_vfs_lseek_reply(struct mattx_link *link, struct mattx_header 
     }
 }
 
-static void handle_vfs_fsync_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
-    if (payload) {
-        struct mattx_vfs_fsync_req *req = payload;
-        struct mattx_vfs_fsync_reply reply;
-        struct file *f = NULL;
+/*
+ * VFS_FSYNC_REQ (fsync() on a MattXFS file): the flush can take seconds. It used to run right here, in the
+ * receiver kthread of the link, so every message from that node (page faults, replies, ...) waited for the
+ * disk. Now a kworker on mattx_wait_wq flushes and sends the one reply (issue #67, P2).
+ */
+struct mattx_vfs_fsync_kworker_ctx { struct work_struct work; struct mattx_vfs_fsync_req req; int target_node; };
 
-        memset(&reply, 0, sizeof(reply));
-        reply.req_id = req->req_id;
-        reply.error = -EBADF;
+static void mattx_vfs_fsync_reply_send(int node, u64 req_id, int error)
+{
+    struct mattx_vfs_fsync_reply reply;
+    struct mattx_link *link = READ_ONCE(cluster_map[node]);
 
-        spin_lock(&mfs_file_lock);
-        if (req->remote_fd < MAX_FDS && mfs_open_files[req->remote_fd]) {
-            f = mfs_open_files[req->remote_fd];
-            get_file(f);
-        }
-        spin_unlock(&mfs_file_lock);
+    memset(&reply, 0, sizeof(reply));
+    reply.req_id = req_id;
+    reply.error = error;
+    if (link)
+        mattx_comm_send(link, MATTX_MSG_VFS_FSYNC_REPLY, &reply, sizeof(reply));
+}
 
-        if (f) {
-            reply.error = vfs_fsync_range(f, req->start, req->end, req->datasync);
-            fput(f);
-        }
+static void mattx_vfs_fsync_kworker(struct work_struct *work) {
+    struct mattx_vfs_fsync_kworker_ctx *ctx = container_of(work, struct mattx_vfs_fsync_kworker_ctx, work);
+    struct mattx_vfs_fsync_req *req = &ctx->req;
+    struct file *f = NULL;
+    int error = -EBADF;
 
-        if (cluster_map[hdr->sender_id]) {
-            mattx_comm_send(cluster_map[hdr->sender_id], MATTX_MSG_VFS_FSYNC_REPLY, &reply, sizeof(reply));
-        }
+    spin_lock(&mfs_file_lock);
+    if (req->remote_fd >= 0 && req->remote_fd < MAX_FDS && mfs_open_files[req->remote_fd]) {
+        f = mfs_open_files[req->remote_fd];
+        get_file(f);
     }
+    spin_unlock(&mfs_file_lock);
+
+    if (f) {
+        mattx_dbg("[VFS] FSYNC for MattXFS FD %d (req %llu) from Node %d. Flushing (kworker)...\n",
+                  req->remote_fd, req->req_id, ctx->target_node);
+        error = vfs_fsync_range(f, req->start, req->end, req->datasync);
+        fput(f);
+    }
+
+    mattx_dbg("[VFS] FSYNC for MattXFS FD %d (req %llu) done: %d\n", req->remote_fd, req->req_id, error);
+    if (!READ_ONCE(mattx_cancellable_stopping))
+        mattx_vfs_fsync_reply_send(ctx->target_node, req->req_id, error);
+
+    kfree(ctx);
+    atomic_dec(&mattx_cancellable_inflight);
+}
+
+static void handle_vfs_fsync_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    struct mattx_vfs_fsync_req *req = payload;
+    struct mattx_vfs_fsync_kworker_ctx *ctx;
+
+    if (!payload || hdr->length < sizeof(*req)) return;
+    if (hdr->sender_id >= MAX_NODES || READ_ONCE(mattx_cancellable_stopping)) return;
+
+    ctx = kmalloc(sizeof(*ctx), GFP_ATOMIC);
+    if (!ctx) {
+        // Still answer: the Surrogate thread sleeps on this request
+        printk(KERN_ERR "MattX:[VFS] FSYNC_REQ %llu: out of memory\n", req->req_id);
+        mattx_vfs_fsync_reply_send(hdr->sender_id, req->req_id, -ENOMEM);
+        return;
+    }
+    INIT_WORK(&ctx->work, mattx_vfs_fsync_kworker);
+    memcpy(&ctx->req, req, sizeof(*req));
+    ctx->target_node = hdr->sender_id;
+    atomic_inc(&mattx_cancellable_inflight);
+    mattx_queue_wait_work(&ctx->work);
 }
 
 static void handle_vfs_fsync_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload) {

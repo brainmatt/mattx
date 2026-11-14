@@ -462,11 +462,13 @@ struct mattx_sys_fsync_req {
     loff_t start;
     loff_t end;
     int datasync;
+    u32 req_id;                 // ticket id (issue #67, P2); 0: legacy request, answered through the per-guest slot
 };
 
 struct mattx_sys_fsync_reply {
     u32 orig_pid;
     int error;
+    u32 req_id;                 // echo of the request's ticket id (0: legacy)
 };
 
 struct mattx_sys_socket_req {
@@ -724,6 +726,8 @@ int mattx_ticket_wait(struct mattx_ticket *t, long timeout);
 // write() of a Surrogate thread to a Deputy file (issue #67, P2): chunks of MATTX_WRITE_CHUNK, one ticket each.
 // Bytes written or -errno. Raises SIGPIPE on -EPIPE, like write(2). Runs in the calling thread (task_work or fop).
 ssize_t mattx_wormhole_write(u32 orig_pid, int home_node, u32 remote_fd, const char __user *ubuf, size_t count);
+// fsync()/fdatasync() of a Surrogate thread on a Deputy file (issue #67, P2): one request, one ticket. 0 or -errno.
+int mattx_wormhole_fsync(u32 orig_pid, int home_node, u32 remote_fd, loff_t start, loff_t end, int datasync);
 struct mattx_epoll_pending *mattx_epoll_pending_add(u32 orig_pid, int home_node);
 void mattx_epoll_pending_del(struct mattx_epoll_pending *p);
 void mattx_epoll_cancelled_purge(void);

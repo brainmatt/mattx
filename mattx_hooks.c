@@ -65,7 +65,8 @@ static void mattx_rpc_worker(struct work_struct *work) {
 
     // FSYNC WORKER ---
     } else if (rpc->is_fsync) {
-        struct mattx_sys_fsync_req req = { .orig_pid = rpc->orig_pid, .fd = rpc->remote_fd, .datasync = rpc->datasync };
+        // end = LLONG_MAX: the whole file (it was 0, so the home node only flushed byte 0). req_id 0: legacy request
+        struct mattx_sys_fsync_req req = { .orig_pid = rpc->orig_pid, .fd = rpc->remote_fd, .end = LLONG_MAX, .datasync = rpc->datasync };
         if (cluster_map[rpc->home_node]) mattx_comm_send(cluster_map[rpc->home_node], MATTX_MSG_SYS_FSYNC_REQ, &req, sizeof(req));
 
     // STATX WORKER ---
@@ -4317,7 +4318,8 @@ static int entry_handler_fileio(struct kretprobe_instance *ri, struct pt_regs *r
         if (data->fd >= 0) {
             struct file *f = fget(data->fd);
             if (f) {
-                if (f->f_op == &mattx_fops && !config_mattxfs_enabled) data->is_wormhole = true;
+                // fsync on a Ghost file needs no sabotage: ->fsync IS mattx_fake_fsync (ticket, process context)
+                if (f->f_op == &mattx_fops && !config_mattxfs_enabled && get_kretprobe(ri) != &fsync_kprobe) data->is_wormhole = true;
                 else if (f->f_op != &mattx_fops) {
                     struct inode *inode = file_inode(f);
                     if (S_ISFIFO(inode->i_mode) || S_ISSOCK(inode->i_mode)) data->is_wormhole = true;
@@ -4328,7 +4330,7 @@ static int entry_handler_fileio(struct kretprobe_instance *ri, struct pt_regs *r
 
         if (data->is_wormhole) {
             if (get_kretprobe(ri) == &lseek_kprobe) { data->offset = (loff_t)sys_regs->si; data->whence = (int)sys_regs->dx; }
-            else if (get_kretprobe(ri) == &fsync_kprobe) { data->datasync = (int)sys_regs->si; }
+            else if (get_kretprobe(ri) == &fsync_kprobe) { data->datasync = 0; /* fsync(fd) has ONE argument: rsi was garbage */ }
             else if (get_kretprobe(ri) == &statx_kprobe) { data->flags = (int)sys_regs->dx; data->mask = (u32)sys_regs->r10; data->buf = (void __user *)sys_regs->r8; }
             sys_regs->di = -1; // Sabotage!
         }
@@ -4336,9 +4338,42 @@ static int entry_handler_fileio(struct kretprobe_instance *ri, struct pt_regs *r
     return 0;
 }
 
+/*
+ * fsync() (issue #67, P2): the sabotaged call ends in a task_work that runs when the syscall returns to user
+ * mode, in the thread's own process context. Same pattern as read() and write(): only this thread sleeps (on
+ * its own ticket), the other threads of the process keep running, the reply is matched by req_id.
+ * mattx_wormhole_fsync() (mattx_fileio.c) also serves mattx_fake_fsync(), the fop of the Ghost files.
+ */
+struct mattx_fsync_tw {
+    struct callback_head cb;
+    u32 orig_pid;
+    int home_node;
+    int fd;
+    int datasync;
+};
+
+static void mattx_fsync_tw_fn(struct callback_head *cb) {
+    struct mattx_fsync_tw *tw = container_of(cb, struct mattx_fsync_tw, cb);
+    struct pt_regs *regs = task_pt_regs(current);
+    long ret = -EINTR;
+
+    if (fatal_signal_pending(current) || tw->home_node < 0 || tw->home_node >= MAX_NODES)
+        goto out;
+
+    mattx_dbg("[RPC] Thread %d: fsync(fd=%d) goes to Node %d...\n", current->pid, tw->fd, tw->home_node);
+    ret = mattx_wormhole_fsync(tw->orig_pid, tw->home_node, tw->fd, 0, LLONG_MAX, tw->datasync);
+    mattx_dbg("[RPC] Illusion Complete! fsync() on Ghost FD returned %ld (thread %d)\n", ret, current->pid);
+
+out:
+    regs->ax = ret;
+    kfree(tw);
+}
+
 static int ret_handler_fileio(struct kretprobe_instance *ri, struct pt_regs *regs) {
     struct fileio_kretprobe_data *data = (struct fileio_kretprobe_data *)ri->data;
     int home_node = -1; u32 orig_pid = 0;
+    // fsync waits on its own ticket (task_work): it must not touch the per-guest slot of the legacy calls
+    bool ticketed = get_kretprobe(ri) == &fsync_kprobe && real_task_work_add;
 
     if (!data->is_wormhole) return 0;
     if (fatal_signal_pending(current) || (current->flags & PF_EXITING)) return 0; // THE ATOMIC SHIELD!
@@ -4347,11 +4382,33 @@ static int ret_handler_fileio(struct kretprobe_instance *ri, struct pt_regs *reg
     for (int i = 0; i < guest_count; i++) {
         if (guest_registry[i].local_pid == current->tgid) {
             home_node = guest_registry[i].home_node; orig_pid = guest_registry[i].orig_pid;
-            guest_registry[i].rpc_done = false; break;
+            if (!ticketed) guest_registry[i].rpc_done = false;
+            break;
         }
     }
     spin_unlock(&guest_lock);
 
+    if (home_node != -1 && ticketed) {
+        struct mattx_fsync_tw *tw = kzalloc(sizeof(*tw), GFP_ATOMIC);
+        if (tw) {
+            init_task_work(&tw->cb, mattx_fsync_tw_fn);
+            tw->orig_pid = orig_pid;
+            tw->home_node = home_node;
+            tw->fd = data->fd;
+            tw->datasync = data->datasync;
+
+            mattx_dbg("[HOOK] Intercepted fsync(fd=%d). Thread %d waits on its own ticket...\n", data->fd, current->pid);
+            // The sabotaged call returns -EBADF; the task_work overwrites it with the real result.
+            regs->ax = -EINTR;
+
+            if (real_task_work_add(current, &tw->cb, TWA_RESUME))
+                kfree(tw);
+        }
+        return 0;
+    }
+
+    // Fallback (lseek, statx, or no task_work resolver): the old way, freeze the whole group and let the
+    // rpc worker poll the per-guest slot. The home node answers fsync with req_id 0 then.
     if (home_node != -1) {
         struct mattx_rpc_work *rpc = kzalloc(sizeof(*rpc), GFP_ATOMIC); 
         if (rpc) {
