@@ -64,7 +64,8 @@ static int nodes_show(struct seq_file *m, void *v) {
     seq_printf(m, "Accept Guests: %s\n", config_accept_guests ? "YES" : "NO");
     seq_printf(m, "HPC Local Libs: %s\n", config_hpc_local_libs ? "ON" : "OFF");
     seq_printf(m, "DSM Mode: %d\n", config_dsm_mode);
-    seq_printf(m, "MESI Mode: %d (%s)\n", config_mesi_mode, config_mesi_mode ? "ATOMIC" : "LAZY");
+    seq_printf(m, "MESI Mode: %d (%s)\n", config_mesi_mode,
+               config_mesi_mode >= 2 ? "ATOMIC+P3" : config_mesi_mode ? "ATOMIC" : "LAZY");
     seq_printf(m, "Debug Mode: %s\n", config_debug_mode ? "ON" : "OFF");
     seq_printf(m, "Node Affinity: %u (0 = Auto)\n", config_node_affinity);
     seq_printf(m, "Migration Excludes: %s\n", config_migration_excludes);
@@ -435,8 +436,9 @@ static ssize_t admin_write(struct file *file, const char __user *ubuf, size_t co
         }
 
         else if (strcmp(cmd, "mesi_mode") == 0 && arg1 != -1) {
-            config_mesi_mode = (arg1 != 0) ? 1 : 0;
-            mattx_dbg(" [ADMIN] MESI Mode set to %d (%s)\n", config_mesi_mode, config_mesi_mode ? "ATOMIC" : "LAZY");
+            config_mesi_mode = clamp(arg1, 0, 2);
+            mattx_dbg(" [ADMIN] MESI Mode set to %d (%s)\n", config_mesi_mode,
+                      config_mesi_mode >= 2 ? "ATOMIC+P3" : config_mesi_mode ? "ATOMIC" : "LAZY");
         }
 
         else if (strcmp(cmd, "migrate") == 0 && arg1 != -1 && arg2_str[0] != '\0') {

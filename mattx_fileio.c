@@ -115,6 +115,18 @@ static int mattx_vfs_rpc_wait(int slot)
 }
 
 /*
+ * MESI_MODE of DSM mode 2:  0 = lazy (Sweeper)   1 = atomic (synchronous shootdowns, write-notify, folio fence)
+ *                           2 = atomic + P3 (acknowledged INVALIDATEs, bounded FLUSH waits; issue #66)
+ * Mode 1 behaves exactly as before P3: fire-and-forget INVALIDATEs, unbounded FLUSH waits.
+ */
+extern int config_mesi_mode;    // mattx_main.c
+
+static inline bool mattx_mesi_p3(void)
+{
+    return config_dsm_mode == 2 && config_mesi_mode >= 2;
+}
+
+/*
  * Wait for the reply of a DSM FLUSH_REQ in @slot (VM1, kworker context), at most MATTX_FLUSH_TIMEOUT_MS. The
  * waits used to be unbounded: a VM2 that died between the FLUSH_REQ and its reply hung the transaction of the
  * page (and with it every fault in its stripe) for ever. Returns the error of the reply, or -ETIMEDOUT. The slot
@@ -126,6 +138,16 @@ static int mattx_vfs_rpc_wait(int slot)
 static int mattx_flush_wait(int slot, u32 shmid, unsigned long offset)
 {
     int err;
+
+    if (!mattx_mesi_p3()) {
+        // MESI_MODE < 2: the wait of the old days, unbounded
+        wait_event_interruptible(vfs_rpc_registry[slot].wq, vfs_rpc_registry[slot].done);
+        err = vfs_rpc_registry[slot].error;
+        spin_lock(&vfs_rpc_lock);
+        vfs_rpc_registry[slot].in_use = false;
+        spin_unlock(&vfs_rpc_lock);
+        return err;
+    }
 
     wait_event_timeout(vfs_rpc_registry[slot].wq, READ_ONCE(vfs_rpc_registry[slot].done),
                        msecs_to_jiffies(MATTX_FLUSH_TIMEOUT_MS));
@@ -533,12 +555,10 @@ static void mattx_dsm_pin_exit(void)
  * used to re-arm the trap is switched off in atomic mode, so this hole is deterministic (dsmreadwritetest
  * rw / rwfield) until the write-notify step.
  */
-extern int config_mesi_mode;    // 0 = lazy, 1 = atomic (mattx_main.c)
-
-// The atomic engine only exists inside Mode 2
+// The atomic engine only exists inside Mode 2 (MESI_MODE 1 = atomic, 2 = atomic + P3, see mattx_mesi_p3())
 static inline bool mattx_mesi_atomic(void)
 {
-    return config_dsm_mode == 2 && config_mesi_mode == 1;
+    return config_dsm_mode == 2 && config_mesi_mode >= 1;
 }
 
 // Rips the native PTEs of one page of @shmid out of all processes of this node. false: nothing was done
@@ -7261,13 +7281,10 @@ EXPORT_SYMBOL(mattx_inject_dsm_cleanup);
 // so a sharer could still read its old copy AFTER the writer had written (message passing across two pages breaks).
 // Now every INVALIDATE carries a req_id, the VM2 kworker answers with an INVALIDATE_REPLY once the copy is invalid
 // and zapped, and VM1 grants / resumes only when all sharers have answered (or after MATTX_INV_ACK_TIMEOUT_MS:
-// then it proceeds exactly like before and logs INV-ACK-TIMEOUT). dsm_inv_ack=0 switches back to fire-and-forget.
+// then it proceeds exactly like before and logs INV-ACK-TIMEOUT). Only with MESI_MODE=2: in mode 1 the INVALIDATEs
+// stay fire-and-forget (req_id 0, the VM2 kworker does not answer).
 #define MATTX_INV_ACK_SLOTS      64     // >= the 64 transaction stripes: at most one waiting transaction per stripe
 #define MATTX_INV_ACK_TIMEOUT_MS 1000
-
-static bool dsm_inv_ack = true;
-module_param_named(dsm_inv_ack, dsm_inv_ack, bool, 0644);
-MODULE_PARM_DESC(dsm_inv_ack, "DSM MESI: wait for the INVALIDATE acknowledgements before a write is granted (default 1)");
 
 struct mattx_inv_ack_slot {
     bool in_use;
@@ -7304,7 +7321,7 @@ static void mattx_inv_send(const u64 *mask, u32 orig_pid, u32 shmid, unsigned lo
         if ((mask[node / 64] & (1ULL << (node % 64))) && cluster_map[node]) nodes++;
     if (!nodes) return;
 
-    if (READ_ONCE(dsm_inv_ack)) {
+    if (mattx_mesi_p3()) {
         spin_lock(&mattx_inv_ack_lock);
         for (int i = 0; i < MATTX_INV_ACK_SLOTS; i++) {
             if (!mattx_inv_acks[i].in_use) {

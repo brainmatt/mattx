@@ -58,7 +58,7 @@ struct mattx_config {
     uint8_t accept_guests;
     uint8_t local_libs; // local libs
     uint8_t dsm_mode; // DSM config
-    uint8_t mesi_mode; // MESI engine of DSM mode 2: 0 = Lazy, 1 = Atomic
+    uint8_t mesi_mode; // MESI engine of DSM mode 2: 0 = Lazy, 1 = Atomic, 2 = Atomic + P3 (acknowledged INVALIDATEs)
     char autodiscovery[32]; // Discovery Mode ---
 };
 
@@ -268,7 +268,7 @@ void load_config() {
 
         int temp_mesi;
         if (sscanf(line, "MESI_MODE=%d", &temp_mesi) == 1) {
-            config.mesi_mode = temp_mesi ? 1 : 0;
+            config.mesi_mode = temp_mesi < 0 ? 0 : (temp_mesi > 2 ? 2 : temp_mesi);
             continue;
         }
     }

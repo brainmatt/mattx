@@ -58,7 +58,7 @@ EXPORT_SYMBOL(config_hpc_local_libs);
 // DSM Sweeper
 int config_dsm_mode = 1; // 0 = Lazy, 1 = Dirty Sweeper
 EXPORT_SYMBOL(config_dsm_mode);
-int config_mesi_mode = 0; // MESI engine of DSM mode 2: 0 = Lazy (Sweeper), 1 = Atomic (synchronous shootdowns)
+int config_mesi_mode = 0; // MESI engine of DSM mode 2: 0 = Lazy (Sweeper), 1 = Atomic (synchronous shootdowns), 2 = Atomic + P3 (acknowledged INVALIDATEs)
 EXPORT_SYMBOL(config_mesi_mode);
 static struct task_struct *dsm_sweeper_thread;
 
@@ -239,8 +239,9 @@ static int mattx_nl_cmd_set_config(struct sk_buff *skb, struct genl_info *info) 
         mattx_dbg("[NL] DSM Mode set to: %d\n", config_dsm_mode);
     }
     if (info->attrs[MATTX_ATTR_MESI_MODE]) {
-        config_mesi_mode = nla_get_u8(info->attrs[MATTX_ATTR_MESI_MODE]) ? 1 : 0;
-        mattx_dbg("[NL] MESI Mode set to: %d (%s)\n", config_mesi_mode, config_mesi_mode ? "ATOMIC" : "LAZY");
+        config_mesi_mode = min_t(int, nla_get_u8(info->attrs[MATTX_ATTR_MESI_MODE]), 2);
+        mattx_dbg("[NL] MESI Mode set to: %d (%s)\n", config_mesi_mode,
+                  config_mesi_mode >= 2 ? "ATOMIC+P3" : config_mesi_mode ? "ATOMIC" : "LAZY");
     }
 
     mattx_dbg(" Configuration Updated - FileIO: %s, NetworkIO: %s, MattXFS: %s, Accept: %s, HPC Local Libs: %s, DSM Mode: %d, MESI Mode: %d\n",
