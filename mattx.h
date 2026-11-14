@@ -57,6 +57,7 @@
 #include <linux/workqueue.h>     
 #include <linux/bitops.h>        
 #include <linux/stat.h>
+#include <linux/fcntl.h>       // struct flock (F_SETLKW)
 #include <linux/statfs.h>          
 #include <linux/version.h>
 #include <linux/time64.h> // Ensure we have time64_t
@@ -264,6 +265,8 @@ enum mattx_msg_type {
     MATTX_MSG_SYS_REQ_CANCEL,        // generic: a Surrogate thread gives up on a ticket-based request
     MATTX_MSG_SYS_WRITE_REQ,         // issue #67 (P2): write() of a Surrogate to a Deputy file, ticket based
     MATTX_MSG_SYS_WRITE_REPLY,
+    MATTX_MSG_SYS_SETLKW_REQ,        // issue #67 (P2): F_SETLKW / F_OFD_SETLKW of a Surrogate on a Deputy file, ticket based
+    MATTX_MSG_SYS_SETLKW_REPLY,
 };
 
 struct mattx_header {
@@ -701,6 +704,26 @@ struct mattx_sys_write_req {
     u32 req_id;                 // ticket id, never 0
     u32 len;                    // bytes in data[], at most MATTX_WRITE_CHUNK
     char data[];                // must stay the LAST member
+};
+
+/*
+ * F_SETLKW / F_OFD_SETLKW (issue #67, P2): the blocking lock of a Surrogate thread on a file of the Deputy.
+ * The request carries the struct flock; the kernel does not write it back for these commands, so the reply
+ * is only the result. The home node waits in the kernel's own lock wait (fairness, EDEADLK) in an Engine 2
+ * helper that wears the identity of the Deputy; the Deputy itself is not woken.
+ */
+struct mattx_sys_setlkw_req {
+    u32 orig_pid;
+    int fd;                     // the FD in the Deputy's table
+    int cmd;                    // F_SETLKW or F_OFD_SETLKW
+    u32 req_id;                 // ticket id, never 0
+    struct flock fl;
+};
+
+struct mattx_sys_setlkw_reply {
+    u32 orig_pid;
+    u32 req_id;                 // echo of the request's ticket id
+    s64 retval;                 // 0 or -errno; -EINTR: cancelled
 };
 
 struct mattx_sys_write_reply {
@@ -1626,6 +1649,11 @@ extern mattx_sys_prctl_fn real_sys_prctl;
 
 typedef long (*mattx_sys_fcntl_fn)(const struct pt_regs *regs);
 extern mattx_sys_fcntl_fn real_sys_fcntl;
+
+// put_files_struct() is not exported: resolved at load like the syscalls above. F_SETLKW pins the files table of
+// the Deputy for the whole (possibly long) lock wait with it; without it F_SETLKW stays on the legacy path.
+typedef void (*mattx_put_files_struct_fn)(struct files_struct *files);
+extern mattx_put_files_struct_fn real_put_files_struct;
 
 typedef long (*mattx_sys_ioctl_fn)(const struct pt_regs *regs);
 extern mattx_sys_ioctl_fn real_sys_ioctl;

@@ -4919,6 +4919,248 @@ static void handle_sys_open_reply(struct mattx_link *link, struct mattx_header *
 }
 
 
+/*
+ * === DATA PLANE: F_SETLKW / F_OFD_SETLKW (issue #67, P2) ===
+ *
+ * SETLKW_REQ: the blocking lock of a Surrogate thread on a file of the Deputy. It used to be a task_work on the
+ * Deputy thread (woken for it): the lock wait slept IN the Deputy, could not be cancelled, and every other fcntl
+ * of that process queued behind it on the same thread.
+ *
+ * Now the request runs in its own kworker (mattx_wait_wq, CANCELLABLE, exactly ONE reply with the req_id echoed)
+ * and the wait itself in an Engine 2 helper kthread that wears the Deputy's identity (files, mm, cred) and runs
+ * the native fcntl on a scratchpad flock below the stopped Deputy's stack, like mattx_execute_as_deputy(). The
+ * kernel's own lock wait stays: wait queue fairness and EDEADLK detection. The lock owner is the Deputy's files
+ * table, so the locks belong to the Deputy process exactly as before; the Deputy is never woken.
+ *
+ * A lock wait lasts as long as another process holds the lock, and the Deputy can be killed meanwhile: the
+ * helper must not run on a files table / mm that exit_files() / exit_mm() frees under it. So both are pinned for
+ * the whole wait (files->count under the task_lock, released with put_files_struct(), which is resolved at load;
+ * get_mm / mmput), and the struct file is pinned too. A Deputy that starts dying kicks the helper.
+ *
+ * Known wart: the kernel records the pid of the CALLING thread as the pid of a classic POSIX lock, so F_GETLK's
+ * l_pid and /proc/locks show the helper kthread (F_OFD_SETLKW has no pid). Owner and deadlock detection are right.
+ */
+struct mattx_setlkw_kworker_ctx {
+    struct work_struct work;
+    struct mattx_sys_setlkw_req req;
+    int target_node;
+};
+
+struct mattx_setlkw_blk_arg {
+    struct task_struct *deputy;
+    struct files_struct *files;     // pinned
+    struct mm_struct *mm;           // pinned
+    const struct cred *cred;        // pinned
+    int fd;
+    int cmd;
+    struct flock fl;
+};
+
+// The helper kthread of Engine 2: runs the native fcntl as the Deputy. Blocks in the kernel's lock wait.
+static long mattx_setlkw_blk_fn(void *arg)
+{
+    struct mattx_setlkw_blk_arg *a = arg;
+    struct files_struct *old_files;
+    const struct cred *old_cred;
+    struct pt_regs regs;
+    unsigned long scratch;
+    long ret;
+
+    memset(&regs, 0, sizeof(regs));
+    kthread_use_mm(a->mm);
+    old_cred = override_creds(a->cred);
+    task_lock(current);
+    old_files = current->files;
+    current->files = a->files;
+    task_unlock(current);
+
+    scratch = task_pt_regs(a->deputy)->sp - 8192;       // below the stack of the stopped Deputy
+    if (copy_to_user((void __user *)scratch, &a->fl, sizeof(a->fl))) {
+        ret = -EFAULT;
+    } else {
+        regs.di = a->fd;
+        regs.si = a->cmd;
+        regs.dx = scratch;
+        ret = real_sys_fcntl(&regs);
+    }
+
+    // Always give the helper's own files table back: do_exit() puts what is in current->files
+    task_lock(current);
+    current->files = old_files;
+    task_unlock(current);
+    revert_creds(old_cred);
+    kthread_unuse_mm(a->mm);
+
+    // A kick (SIGKILL) interrupts the wait
+    if (ret == -ERESTARTSYS || ret == -ERESTARTNOINTR || ret == -ERESTARTNOHAND || ret == -ERESTART_RESTARTBLOCK)
+        ret = -EINTR;
+    return ret;
+}
+
+static void mattx_setlkw_reply_send(int node, u32 orig_pid, u32 req_id, long ret)
+{
+    struct mattx_sys_setlkw_reply reply;
+    struct mattx_link *link = READ_ONCE(cluster_map[node]);
+
+    memset(&reply, 0, sizeof(reply));
+    reply.orig_pid = orig_pid;
+    reply.req_id = req_id;
+    reply.retval = ret;
+    if (link)
+        mattx_comm_send(link, MATTX_MSG_SYS_SETLKW_REPLY, &reply, sizeof(reply));
+}
+
+static inline bool mattx_task_dying(struct task_struct *t)
+{
+    return (READ_ONCE(t->flags) & PF_EXITING) || fatal_signal_pending(t);
+}
+
+static void mattx_setlkw_kworker(struct work_struct *work) {
+    struct mattx_setlkw_kworker_ctx *ctx = container_of(work, struct mattx_setlkw_kworker_ctx, work);
+    struct mattx_sys_setlkw_req *req = &ctx->req;
+    struct mattx_setlkw_blk_arg arg;
+    struct mattx_blocker *b;
+    struct task_struct *deputy = NULL;
+    struct files_struct *files = NULL;
+    struct mm_struct *mm = NULL;
+    const struct cred *cred = NULL;
+    struct file *file = NULL;
+    bool abandoned = false;
+    bool cancelled = false;
+    long ret = -ESRCH;
+
+    mattx_dbg("[WORMHOLE] Received SETLKW request for FD %d (cmd %d, req %u) from Node %d (kworker)...\n",
+              req->fd, req->cmd, req->req_id, ctx->target_node);
+
+    if (!real_sys_fcntl || !real_put_files_struct) {
+        ret = -EOPNOTSUPP;
+        goto reply;
+    }
+    if ((req->cmd != F_SETLKW && req->cmd != F_OFD_SETLKW) || req->fd < 0) {
+        ret = -EINVAL;
+        goto reply;
+    }
+
+    rcu_read_lock();
+    deputy = pid_task(find_vpid(req->orig_pid), PIDTYPE_PID);
+    if (deputy) get_task_struct(deputy);
+    rcu_read_unlock();
+    if (!deputy)
+        goto reply;
+
+    if (mattx_req_take_cancelled(ctx->target_node, req->orig_pid, req->req_id)) {
+        mattx_dbg("[WORMHOLE] SETLKW for PID %u req %u cancelled by the Surrogate before it started\n", req->orig_pid, req->req_id);
+        ret = -EINTR;
+        goto put_deputy;
+    }
+
+    // The struct file stays alive whatever happens to the Deputy's fd table (and -EBADF comes early)
+    file = mattx_get_remote_file(req->orig_pid, req->fd);
+    if (!file) {
+        ret = -EBADF;
+        goto put_deputy;
+    }
+
+    // Pin what the helper borrows for the whole wait
+    task_lock(deputy);
+    files = deputy->files;
+    if (files)
+        atomic_inc(&files->count);
+    task_unlock(deputy);
+    mm = get_task_mm(deputy);
+    cred = get_task_cred(deputy);
+    if (!files || !mm || mattx_task_dying(deputy)) {
+        ret = -ESRCH;
+        goto unpin;
+    }
+
+    memset(&arg, 0, sizeof(arg));
+    arg.deputy = deputy;
+    arg.files = files;
+    arg.mm = mm;
+    arg.cred = cred;
+    arg.fd = req->fd;
+    arg.cmd = req->cmd;
+    arg.fl = req->fl;
+
+    b = mattx_blocker_start("setlkw", mattx_setlkw_blk_fn, &arg);
+    if (IS_ERR(b)) {
+        ret = PTR_ERR(b);
+        goto unpin;
+    }
+
+    while (!mattx_blocker_wait(b, msecs_to_jiffies(10))) {
+        if (!cancelled && mattx_req_take_cancelled(ctx->target_node, req->orig_pid, req->req_id)) {
+            mattx_dbg("[WORMHOLE] SETLKW for PID %u req %u cancelled by the Surrogate, kicking the helper\n", req->orig_pid, req->req_id);
+            cancelled = true;
+        }
+        if (READ_ONCE(mattx_cancellable_stopping) || !READ_ONCE(cluster_map[ctx->target_node])) {
+            abandoned = true;
+            cancelled = true;
+        }
+        if (mattx_task_dying(deputy))
+            cancelled = true;               // the Deputy is going away: its locks go with it
+        if (cancelled)
+            mattx_blocker_kick(b);          // every round: a signal that came too early is lost
+    }
+
+    // A lock that was granted while the cancel was on its way is reported as granted: the Surrogate waits for
+    // this final answer, so it never believes it failed to get a lock it holds.
+    ret = mattx_blocker_finish(b);
+
+unpin:
+    if (cred) put_cred(cred);
+    if (mm) mmput(mm);
+    if (files) real_put_files_struct(files);
+    if (file) fput(file);
+put_deputy:
+    put_task_struct(deputy);
+reply:
+    if (abandoned) {
+        mattx_dbg("[WORMHOLE] SETLKW for FD %d (req %u): nobody left to answer, reply dropped\n", req->fd, req->req_id);
+    } else {
+        mattx_dbg("[WORMHOLE] SETLKW for FD %d (req %u) done: %ld\n", req->fd, req->req_id, ret);
+        mattx_setlkw_reply_send(ctx->target_node, req->orig_pid, req->req_id, ret);
+    }
+
+    kfree(ctx);
+    atomic_dec(&mattx_cancellable_inflight);
+}
+
+static void handle_sys_setlkw_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    struct mattx_sys_setlkw_req *req = payload;
+    struct mattx_setlkw_kworker_ctx *ctx;
+
+    if (!payload || hdr->length < sizeof(*req)) return;
+    if (hdr->sender_id >= MAX_NODES || READ_ONCE(mattx_cancellable_stopping)) return;
+
+    ctx = kmalloc(sizeof(*ctx), GFP_ATOMIC);
+    if (!ctx) {
+        // Still answer: the Surrogate thread sleeps on this ticket
+        printk(KERN_ERR "MattX:[WORMHOLE] SETLKW_REQ %u of PID %u: out of memory\n", req->req_id, req->orig_pid);
+        mattx_setlkw_reply_send(hdr->sender_id, req->orig_pid, req->req_id, -ENOMEM);
+        return;
+    }
+    INIT_WORK(&ctx->work, mattx_setlkw_kworker);
+    memcpy(&ctx->req, req, sizeof(*req));
+    ctx->target_node = hdr->sender_id;
+    atomic_inc(&mattx_cancellable_inflight);
+    mattx_queue_wait_work(&ctx->work);
+}
+
+// Surrogate side: the reply belongs to exactly one waiting thread (mattx_ticket_*). A reply nobody waits for any
+// more means the thread was killed or the link was lost for good: the lock stays with the Deputy until it closes
+// the file or exits.
+static void handle_sys_setlkw_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    struct mattx_sys_setlkw_reply *reply = payload;
+
+    if (!payload || hdr->length < sizeof(*reply) || !reply->req_id) return;
+
+    mattx_dbg("[RPC] Received SETLKW_REPLY for Orig PID %u req %u. Result: %lld\n", reply->orig_pid, reply->req_id, (long long)reply->retval);
+    if (!mattx_ticket_complete(hdr->sender_id, reply->orig_pid, reply->req_id, reply->retval, NULL, 0))
+        mattx_dbg("[RPC] SETLKW_REPLY req %u: nobody waits for it any more, dropped\n", reply->req_id);
+}
+
 static void mattx_epoll_wait_fail(struct mattx_epoll_wait_ctx *ctx, int err) {
     struct mattx_sys_epoll_wait_reply reply;    // no events: the flexible array stays empty
 
@@ -10356,6 +10598,8 @@ void mattx_fileio_init_handlers(void) {
     mattx_register_handler(MATTX_MSG_SYS_READ_REPLY, handle_sys_read_reply);
     mattx_register_handler(MATTX_MSG_SYS_WRITE_REQ, handle_sys_write_req);
     mattx_register_handler(MATTX_MSG_SYS_WRITE_REPLY, handle_sys_write_reply);
+    mattx_register_handler(MATTX_MSG_SYS_SETLKW_REQ, handle_sys_setlkw_req);
+    mattx_register_handler(MATTX_MSG_SYS_SETLKW_REPLY, handle_sys_setlkw_reply);
     mattx_register_handler(MATTX_MSG_SYS_LSEEK_REQ, handle_sys_lseek_req);
     mattx_register_handler(MATTX_MSG_SYS_LSEEK_REPLY, handle_sys_lseek_reply);
     mattx_register_handler(MATTX_MSG_SYS_STATX_REQ, handle_sys_statx_req);

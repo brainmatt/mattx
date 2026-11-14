@@ -5979,12 +5979,122 @@ static int entry_handler_fcntl(struct kretprobe_instance *ri, struct pt_regs *re
     return 0;
 }
 
+/*
+ * F_SETLKW / F_OFD_SETLKW (issue #67, P2): the sabotaged call ends in a task_work that runs when the syscall
+ * returns to user mode, in the thread's own process context. Same pattern as read() and accept(): only this
+ * thread sleeps (on its own ticket), the other threads keep running (one of them may be the one that has to
+ * unlock), the reply is matched by req_id. The struct flock is read from user space by the task_work itself
+ * (it used to be guessed from "arg > 4096"). The Deputy is not woken: the home node waits in an Engine 2 helper.
+ */
+struct mattx_setlkw_tw {
+    struct callback_head cb;
+    u32 orig_pid;
+    int home_node;
+    int remote_fd;
+    int cmd;
+    const struct flock __user *uflock;
+};
+
+static void mattx_setlkw_tw_fn(struct callback_head *cb) {
+    struct mattx_setlkw_tw *tw = container_of(cb, struct mattx_setlkw_tw, cb);
+    struct pt_regs *regs = task_pt_regs(current);
+    struct mattx_sys_setlkw_req *req = NULL;
+    struct mattx_ticket *t;
+    struct mattx_link *link;
+    long ret = -EINTR;
+
+    if (fatal_signal_pending(current) || tw->home_node < 0 || tw->home_node >= MAX_NODES)
+        goto out;
+
+    link = READ_ONCE(cluster_map[tw->home_node]);
+    if (!link) {
+        ret = -EIO;
+        goto out;
+    }
+
+    req = kzalloc(sizeof(*req), GFP_KERNEL);
+    if (!req) {
+        ret = -ENOMEM;
+        goto out;
+    }
+    if (copy_from_user(&req->fl, tw->uflock, sizeof(req->fl))) {
+        ret = -EFAULT;
+        goto out;
+    }
+
+    t = mattx_ticket_add(tw->orig_pid, tw->home_node, 0);
+    if (!t) {
+        ret = -ENOMEM;
+        goto out;
+    }
+
+    req->orig_pid = tw->orig_pid;
+    req->fd = tw->remote_fd;
+    req->cmd = tw->cmd;
+    req->req_id = t->req_id;
+
+    mattx_dbg("[RPC] Thread %d: fcntl(fd=%d, %s) as req %u, sleeping on its own ticket...\n", current->pid, tw->remote_fd,
+              tw->cmd == F_OFD_SETLKW ? "F_OFD_SETLKW" : "F_SETLKW", t->req_id);
+
+    if (mattx_comm_send(link, MATTX_MSG_SYS_SETLKW_REQ, req, sizeof(*req)) < 0) {
+        // Never sleep for a reply to a request that was never sent
+        mattx_dbg("[RPC] Thread %d: SETLKW_REQ send failed\n", current->pid);
+        ret = -EIO;
+    } else if (mattx_ticket_wait(t, MAX_SCHEDULE_TIMEOUT) == 0) {
+        // Interrupted (signal, freeze of a migration or recall)? The wait cancels the request and still hands
+        // back the lock if the home node had granted it meanwhile; otherwise we return -EINTR.
+        ret = t->retval;
+    }
+    mattx_ticket_del(t);
+    mattx_dbg("[RPC] Illusion Complete! F_SETLKW on Ghost FD returned %ld (thread %d)\n", ret, current->pid);
+
+out:
+    regs->ax = ret;
+    kfree(req);
+    kfree(tw);
+}
+
 static int ret_handler_fcntl(struct kretprobe_instance *ri, struct pt_regs *regs) {
     struct fcntl_kretprobe_data *data = (struct fcntl_kretprobe_data *)ri->data;
     if (!is_guest_process(current->tgid) || !data->is_ghost) return 0;
     if (fatal_signal_pending(current) || (current->flags & PF_EXITING)) return 0;
 
     int home_node = -1; u32 orig_pid = 0;
+
+    // The blocking locks have their own path; everything else (and a node without the resolved
+    // put_files_struct or task_work) keeps the Deputy hijack below
+    if (real_task_work_add && real_put_files_struct &&
+        (data->cmd == F_SETLKW || data->cmd == F_OFD_SETLKW) &&
+        !strstr(get_kretprobe(ri)->kp.symbol_name, "ioctl")) {
+        spin_lock(&guest_lock);
+        for (int i = 0; i < guest_count; i++) {
+            if (guest_registry[i].local_pid == current->tgid) {
+                home_node = guest_registry[i].home_node; orig_pid = guest_registry[i].orig_pid;
+                break;                          // the per-guest slot is not touched: this lock has its own ticket
+            }
+        }
+        spin_unlock(&guest_lock);
+
+        if (home_node != -1) {
+            struct mattx_setlkw_tw *tw = kzalloc(sizeof(*tw), GFP_ATOMIC);
+            if (tw) {
+                init_task_work(&tw->cb, mattx_setlkw_tw_fn);
+                tw->orig_pid = orig_pid;
+                tw->home_node = home_node;
+                tw->remote_fd = data->remote_fd;
+                tw->cmd = data->cmd;
+                tw->uflock = (const struct flock __user *)data->arg;
+
+                mattx_dbg("[HOOK] Intercepted fcntl(F_SETLKW). Thread %d waits on its own ticket...\n", current->pid);
+                // The sabotaged call returns -EBADF; the task_work overwrites it with the real result.
+                regs->ax = -EINTR;
+
+                if (real_task_work_add(current, &tw->cb, TWA_RESUME))
+                    kfree(tw);
+            }
+        }
+        return 0;
+    }
     spin_lock(&guest_lock);
     for (int i = 0; i < guest_count; i++) {
         if (guest_registry[i].local_pid == current->tgid) {

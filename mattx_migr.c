@@ -55,6 +55,7 @@ mattx_sys_close_fn real_sys_close = NULL;
 mattx_sys_prlimit64_fn real_sys_prlimit64 = NULL;
 mattx_sys_prctl_fn real_sys_prctl = NULL;
 mattx_sys_fcntl_fn real_sys_fcntl = NULL;
+mattx_put_files_struct_fn real_put_files_struct = NULL;
 mattx_sys_ioctl_fn real_sys_ioctl = NULL;
 mattx_sys_statfs_fn real_sys_statfs = NULL;
 mattx_sys_fstatfs_fn real_sys_fstatfs = NULL;
@@ -251,6 +252,15 @@ static void mattx_resolve_hidden_symbols(void) {
     if (register_kprobe(&kp) == 0) { 
         real_sys_fcntl = (mattx_sys_fcntl_fn)kp.addr; 
         unregister_kprobe(&kp); 
+    }
+
+    memset(&kp, 0, sizeof(kp));
+    kp.symbol_name = "put_files_struct";
+    if (register_kprobe(&kp) == 0) {
+        real_put_files_struct = (mattx_put_files_struct_fn)kp.addr;
+        unregister_kprobe(&kp);
+    } else {
+        printk(KERN_WARNING "MattX: put_files_struct not resolved: F_SETLKW stays on the legacy path\n");
     }
 
     memset(&kp, 0, sizeof(kp)); 
