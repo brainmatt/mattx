@@ -1166,39 +1166,108 @@ out:
     return ret;
 }
 
-static ssize_t mattx_fake_write(struct file *file, const char __user *buf, size_t count, loff_t *pos) {
-    struct mattx_fake_fd_info *fd_info = file->private_data;
-    size_t to_send;
-    size_t packet_size;
-    void *packet_buf;
-    struct mattx_header *hdr;
-    struct mattx_syscall_req *req;
+/*
+ * WRITE (Surrogate side, issue #67 P2): the thread that called write() waits for the real result on its
+ * own ticket. It used to be fire-and-forget: the Surrogate was told "written" before anything happened, so
+ * EPIPE / EAGAIN / EBADF never reached the application, a full pipe could not slow the writer down
+ * (the home node queued without limit) and one blocked write held up every forwarded write of the node.
+ *
+ * Called in process context of the writing thread: from mattx_fake_write() below and from the task_work
+ * of the write() kretprobe (mattx_write_tw_fn in mattx_hooks.c). A blocking write writes everything
+ * (chunk by chunk); it stops early on an error, an interruption, or a short write (non-blocking file).
+ */
+// One request of at most MATTX_WRITE_CHUNK bytes. Bytes written (0 .. chunk) or -errno; -EINTR: interrupted
+// before anything was written.
+static long mattx_wormhole_write_one(u32 orig_pid, int home_node, u32 remote_fd, const char __user *ubuf, size_t chunk)
+{
+    struct mattx_sys_write_req *req;
+    struct mattx_ticket *t;
+    struct mattx_link *link;
+    long ret = -EINTR;
 
-    if (!fd_info || !cluster_map[fd_info->home_node]) return count; 
+    link = READ_ONCE(cluster_map[home_node]);
+    if (!link)
+        return -EIO;
 
-    to_send = min_t(size_t, count, 4096);
+    req = kmalloc(sizeof(*req) + chunk, GFP_KERNEL);
+    if (!req)
+        return -ENOMEM;
 
-    packet_size = sizeof(struct mattx_header) + sizeof(struct mattx_syscall_req) + to_send;
-    packet_buf = kmalloc(packet_size, GFP_KERNEL);
-    if (!packet_buf) return -ENOMEM;
-
-    hdr = (struct mattx_header *)packet_buf;
-    req = (struct mattx_syscall_req *)(packet_buf + sizeof(struct mattx_header));
-
-    req->orig_pid = fd_info->orig_pid;
-    req->fd = fd_info->remote_fd; 
-    req->len = to_send;
-
-    if (copy_from_user(req->data, buf, to_send)) {
-        kfree(packet_buf);
+    if (chunk && copy_from_user(req->data, ubuf, chunk)) {
+        kfree(req);
         return -EFAULT;
     }
 
-    mattx_comm_send(cluster_map[fd_info->home_node], MATTX_MSG_SYSCALL_FWD, packet_buf + sizeof(struct mattx_header), sizeof(struct mattx_syscall_req) + to_send);
+    // The reply carries no data: only the result
+    t = mattx_ticket_add(orig_pid, home_node, 0);
+    if (!t) {
+        kfree(req);
+        return -ENOMEM;
+    }
 
-    kfree(packet_buf);
-    *pos += to_send;
-    return to_send; 
+    req->orig_pid = orig_pid;
+    req->fd = remote_fd;
+    req->req_id = t->req_id;
+    req->len = chunk;
+
+    mattx_dbg("[RPC] Thread %d: write(fd=%u, %zu bytes) as req %u, sleeping on its own ticket...\n", current->pid, remote_fd, chunk, t->req_id);
+
+    if (mattx_comm_send(link, MATTX_MSG_SYS_WRITE_REQ, req, sizeof(*req) + chunk) < 0) {
+        // Never sleep for a reply to a request that was never sent
+        mattx_dbg("[RPC] Thread %d: WRITE_REQ send failed\n", current->pid);
+        ret = -EIO;
+        goto done;
+    }
+
+    // Interrupted (signal, freeze of a migration or recall)? The wait cancels the request and still hands
+    // back the bytes if the home node had already written them; otherwise we return -EINTR.
+    if (mattx_ticket_wait(t, MAX_SCHEDULE_TIMEOUT) == 0) {
+        ret = t->retval;
+        if (ret > (long)chunk)
+            ret = -EIO;         // more than we sent: protocol error
+    }
+
+done:
+    mattx_ticket_del(t);
+    kfree(req);
+    return ret;
+}
+
+ssize_t mattx_wormhole_write(u32 orig_pid, int home_node, u32 remote_fd, const char __user *ubuf, size_t count)
+{
+    size_t total = 0;
+
+    if (home_node < 0 || home_node >= MAX_NODES)
+        return -EIO;
+
+    do {
+        size_t chunk = min_t(size_t, count - total, MATTX_WRITE_CHUNK);
+        long r = mattx_wormhole_write_one(orig_pid, home_node, remote_fd, ubuf + total, chunk);
+
+        if (r < 0) {
+            if (r == -EPIPE)
+                send_sig(SIGPIPE, current, 0);  // the SIGPIPE of the real write(2) goes to the writing thread
+            return total ? (ssize_t)total : r;  // bytes already written win over the error
+        }
+        total += r;
+        if ((size_t)r < chunk)
+            break;                              // short: non-blocking file, full buffer, nothing more fits
+    } while (total < count);
+
+    mattx_dbg("[RPC] Illusion Complete! write(fd=%u) returned %zu (thread %d)\n", remote_fd, total, current->pid);
+    return total;
+}
+
+static ssize_t mattx_fake_write(struct file *file, const char __user *buf, size_t count, loff_t *pos) {
+    struct mattx_fake_fd_info *fd_info = file->private_data;
+    ssize_t ret;
+
+    if (!fd_info || !cluster_map[fd_info->home_node]) return count; 
+
+    ret = mattx_wormhole_write(fd_info->orig_pid, fd_info->home_node, fd_info->remote_fd, buf, count);
+    if (ret > 0)
+        *pos += ret;
+    return ret;
 }
 
 static int mattx_fake_release(struct inode *inode, struct file *file) {
@@ -1827,7 +1896,7 @@ static void handle_sys_read_req(struct mattx_link *link, struct mattx_header *hd
     memcpy(&ctx->req, payload, sizeof(ctx->req));
     ctx->target_node = hdr->sender_id;
     atomic_inc(&mattx_cancellable_inflight);
-    schedule_work(&ctx->work);
+    mattx_queue_wait_work(&ctx->work);
 }
 
 static void handle_sys_read_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
@@ -1883,6 +1952,289 @@ static void handle_sys_read_reply(struct mattx_link *link, struct mattx_header *
         }
         spin_unlock(&guest_lock);
     }
+}
+
+
+// === DATA PLANE: WRITE (issue #67, P2) ===
+/*
+ * WRITE_REQ (write() of a Surrogate to a pipe / FIFO / socket / eventfd / file of the Deputy)
+ *
+ * Same contract as the wormhole read: the request runs in its own kworker (a blocked write never holds up
+ * the receiver kthread or another write: the global FIFO of the old fire-and-forget path is gone), is
+ * CANCELLABLE, and gets exactly ONE reply (req_id echoed): the real result (bytes that were written are
+ * never thrown away) or -EINTR when the Surrogate's CANCEL came first and nothing was written.
+ *
+ * Waiting is done here, so the blocking semantics are the application's, not the kworker's:
+ *   - Sockets are only ever written with MSG_DONTWAIT | MSG_NOSIGNAL: O_NONBLOCK sockets get -EAGAIN at
+ *     once (kernel_sendmsg() does not add the O_NONBLOCK of the file, the old code BLOCKED the kworker),
+ *     SO_SNDTIMEO is honoured, SIGPIPE is raised on the Surrogate thread, not here.
+ *   - Pipes, FIFOs, eventfds and every other file with ->poll: wait for writability (poll, short sleeps,
+ *     cancel check on every round), then ONE plain write, exactly like mattx_read_cancellable().
+ *     A write of at most PIPE_BUF bytes finds room after EPOLLOUT; if another writer takes it in the
+ *     meantime the plain write waits (the same small race as the read side).
+ *   - O_NONBLOCK files: plain write at once (-EAGAIN).
+ */
+struct mattx_write_kworker_ctx {
+    struct work_struct work;
+    int target_node;
+    struct mattx_sys_write_req req;     // req.data[] is a flexible array: must stay the LAST member
+};
+
+static void mattx_write_reply_send(int node, u32 orig_pid, u32 req_id, long retval)
+{
+    struct mattx_sys_write_reply reply = { .orig_pid = orig_pid, .req_id = req_id, .retval = retval };
+    struct mattx_link *link = READ_ONCE(cluster_map[node]);
+
+    if (link)
+        mattx_comm_send(link, MATTX_MSG_SYS_WRITE_REPLY, &reply, sizeof(reply));
+}
+
+// The Deputy's file (or the exported MattXFS file for fd >= 1000) with a reference, or NULL. *deputy_out is
+// the Deputy with a reference (the caller puts it) or NULL for exported files.
+static struct file *mattx_wormhole_lookup(u32 orig_pid, u32 fd, struct task_struct **deputy_out)
+{
+    struct task_struct *deputy = NULL;
+    struct file *file = NULL;
+    int i;
+
+    *deputy_out = NULL;
+    if (fd >= 1000) {
+        int slot = fd - 1000;
+
+        spin_lock(&export_lock);
+        for (i = 0; i < export_count; i++) {
+            if (export_registry[i].orig_pid == orig_pid) {
+                if (slot < MAX_FDS && export_registry[i].remote_files[slot]) {
+                    file = export_registry[i].remote_files[slot];
+                    get_file(file);
+                }
+                break;
+            }
+        }
+        spin_unlock(&export_lock);
+        return file;
+    }
+
+    rcu_read_lock();
+    deputy = pid_task(find_vpid(orig_pid), PIDTYPE_PID);
+    if (deputy)
+        get_task_struct(deputy);
+    rcu_read_unlock();
+
+    if (deputy) {
+        struct files_struct *files = deputy->files;
+
+        if (files) {
+            spin_lock(&files->file_lock);
+            {
+                struct fdtable *fdt = files_fdtable(files);
+
+                if (fd < fdt->max_fds) {
+                    file = rcu_dereference_raw(fdt->fd[fd]);
+                    if (file)
+                        get_file(file);
+                }
+            }
+            spin_unlock(&files->file_lock);
+        }
+    }
+    *deputy_out = deputy;
+    return file;
+}
+
+// Writes to a socket without ever blocking where the Surrogate's CANCEL cannot reach us.
+// Returns the bytes sent, or -errno; -EINTR: cancelled, nothing was sent. *abandoned: nobody is left to answer.
+static ssize_t mattx_write_sock_cancellable(struct socket *sock, struct file *file, const void *buf, size_t count,
+                                            int sender, u32 orig_pid, u32 req_id, bool *abandoned)
+{
+    bool nonblock = file->f_flags & O_NONBLOCK;
+    long sndtimeo = nonblock ? 0 : READ_ONCE(sock->sk->sk_sndtimeo);
+    bool timed = !nonblock && sndtimeo != MAX_SCHEDULE_TIMEOUT;
+    unsigned long deadline = jiffies + sndtimeo;
+    DEFINE_WAIT_FUNC(wait, woken_wake_function);
+    size_t total = 0;
+    ssize_t result;
+    ssize_t ret;
+
+    // On the wait queue BEFORE the first look, so that no wake-up can slip between look and sleep
+    add_wait_queue(sk_sleep(sock->sk), &wait);
+
+    for (;;) {
+        struct msghdr msg = { .msg_flags = MSG_DONTWAIT | MSG_NOSIGNAL };
+        struct kvec iov = { .iov_base = (void *)((const char *)buf + total), .iov_len = count - total };
+
+        // 1. Try: never blocks
+        ret = kernel_sendmsg(sock, &msg, &iov, 1, count - total);
+        if (ret > 0) {
+            total += ret;
+            if (total >= count) {
+                result = total;
+                goto out;
+            }
+            continue;                           // a stream took part of it: the rest right away
+        }
+        if (ret == 0) {                         // nothing to send (count == 0), or nothing taken
+            result = total;
+            goto out;
+        }
+        if (ret != -EAGAIN) {                   // a real error (EPIPE, ECONNRESET, ...): bytes in hand win
+            result = total ? (ssize_t)total : ret;
+            goto out;
+        }
+
+        // 2. The send buffer is full right now
+        if (nonblock || (timed && time_after(jiffies, deadline))) {
+            result = total ? (ssize_t)total : -EAGAIN;
+            goto out;
+        }
+        if (mattx_req_take_cancelled(sender, orig_pid, req_id)) {
+            mattx_dbg("[WORMHOLE] WRITE for PID %u req %u cancelled by the Surrogate (%zu bytes in hand)\n", orig_pid, req_id, total);
+            result = total ? (ssize_t)total : -EINTR;
+            goto out;
+        }
+        if (READ_ONCE(mattx_cancellable_stopping) || !READ_ONCE(cluster_map[sender])) {
+            *abandoned = true;
+            result = -EINTR;
+            goto out;
+        }
+
+        // 3. Sleep until the socket wakes us (room in the send buffer, an error), or 10 ms, or the SO_SNDTIMEO deadline
+        {
+            long to = msecs_to_jiffies(10);
+
+            if (timed && (long)(deadline - jiffies) < to)
+                to = (long)(deadline - jiffies) > 0 ? (long)(deadline - jiffies) : 1;
+            wait_woken(&wait, TASK_INTERRUPTIBLE, to);
+        }
+    }
+
+out:
+    remove_wait_queue(sk_sleep(sock->sk), &wait);
+    return result;
+}
+
+// Writes to a pipe / FIFO / eventfd / file: wait for writability (cancellable), then ONE plain write.
+static ssize_t mattx_write_file_cancellable(struct file *file, struct task_struct *deputy, const void *buf, size_t count,
+                                            int sender, u32 orig_pid, u32 req_id, bool *abandoned)
+{
+    const struct cred *old_cred = NULL;
+    unsigned long delay_us = 200;
+    loff_t pos = file->f_pos;
+    ssize_t ret;
+
+    if (file->f_op && file->f_op->poll && !(file->f_flags & O_NONBLOCK)) {
+        for (;;) {
+            __poll_t mask;
+
+            if (mattx_req_take_cancelled(sender, orig_pid, req_id)) {
+                mattx_dbg("[WORMHOLE] WRITE for PID %u req %u cancelled by the Surrogate, nothing written\n", orig_pid, req_id);
+                return -EINTR;
+            }
+            if (READ_ONCE(mattx_cancellable_stopping) || !READ_ONCE(cluster_map[sender])) {
+                *abandoned = true;
+                return -EINTR;
+            }
+
+            mask = vfs_poll(file, NULL);
+            if (mask & (EPOLLOUT | EPOLLWRNORM | EPOLLERR | EPOLLHUP))
+                break;      // room, or no reader left (the write below returns -EPIPE at once)
+
+            usleep_range(delay_us, delay_us + delay_us / 2);    // 0.2 ms ... ~10 ms
+            if (delay_us < 10000)
+                delay_us *= 2;
+        }
+    }
+
+    if (deputy) {
+        if (deputy->mm) kthread_use_mm(deputy->mm);
+        old_cred = override_creds(deputy->cred);
+    }
+    ret = mattx_wormhole_kernel_write(file, buf, count, &pos);
+    if (deputy) {
+        revert_creds(old_cred);
+        if (deputy->mm) kthread_unuse_mm(deputy->mm);
+    }
+    if (ret >= 0)
+        file->f_pos = pos;
+    return ret;
+}
+
+static void mattx_write_kworker(struct work_struct *work)
+{
+    struct mattx_write_kworker_ctx *ctx = container_of(work, struct mattx_write_kworker_ctx, work);
+    struct mattx_sys_write_req *req = &ctx->req;
+    struct task_struct *deputy = NULL;
+    struct file *file;
+    bool abandoned = false;
+    ssize_t ret = -EBADF;
+
+    mattx_dbg("[WORMHOLE] Received WRITE request for FD %u (req %u, %u bytes) from Node %d. Writing to Deputy file (kworker)...\n",
+              req->fd, req->req_id, req->len, ctx->target_node);
+
+    file = mattx_wormhole_lookup(req->orig_pid, req->fd, &deputy);
+    if (file) {
+        struct socket *sock = sock_from_file(file);
+
+        if (sock && sock->sk)
+            ret = mattx_write_sock_cancellable(sock, file, req->data, req->len,
+                                               ctx->target_node, req->orig_pid, req->req_id, &abandoned);
+        else
+            ret = mattx_write_file_cancellable(file, deputy, req->data, req->len,
+                                               ctx->target_node, req->orig_pid, req->req_id, &abandoned);
+        fput(file);
+    }
+    if (deputy)
+        put_task_struct(deputy);
+
+    if (abandoned) {
+        mattx_dbg("[WORMHOLE] WRITE for FD %u (req %u): nobody left to answer, reply dropped\n", req->fd, req->req_id);
+    } else {
+        mattx_dbg("[WORMHOLE] WRITE for FD %u (req %u) done: %zd\n", req->fd, req->req_id, ret);
+        mattx_write_reply_send(ctx->target_node, req->orig_pid, req->req_id, ret);
+    }
+
+    kfree(ctx);
+    atomic_dec(&mattx_cancellable_inflight);
+}
+
+static void handle_sys_write_req(struct mattx_link *link, struct mattx_header *hdr, void *payload)
+{
+    struct mattx_sys_write_req *req = payload;
+    struct mattx_write_kworker_ctx *ctx;
+
+    if (!payload || hdr->length < sizeof(*req)) return;
+    if (hdr->sender_id >= MAX_NODES || READ_ONCE(mattx_cancellable_stopping)) return;
+
+    if (req->len > MATTX_WRITE_CHUNK || req->len > hdr->length - sizeof(*req)) {
+        printk(KERN_ERR "MattX:[WORMHOLE] WRITE_REQ %u of PID %u malformed (len %u, message %u bytes)\n",
+               req->req_id, req->orig_pid, req->len, hdr->length);
+        mattx_write_reply_send(hdr->sender_id, req->orig_pid, req->req_id, -EINVAL);
+        return;
+    }
+
+    ctx = kmalloc(sizeof(*ctx) + req->len, GFP_ATOMIC);
+    if (!ctx) {
+        // Still answer: the Surrogate thread sleeps on this ticket
+        printk(KERN_ERR "MattX:[WORMHOLE] WRITE_REQ %u of PID %u: out of memory\n", req->req_id, req->orig_pid);
+        mattx_write_reply_send(hdr->sender_id, req->orig_pid, req->req_id, -ENOMEM);
+        return;
+    }
+    INIT_WORK(&ctx->work, mattx_write_kworker);
+    memcpy(&ctx->req, req, sizeof(*req) + req->len);
+    ctx->target_node = hdr->sender_id;
+    atomic_inc(&mattx_cancellable_inflight);
+    mattx_queue_wait_work(&ctx->work);
+}
+
+static void handle_sys_write_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload)
+{
+    struct mattx_sys_write_reply *reply = payload;
+
+    if (!payload || hdr->length < sizeof(*reply)) return;
+
+    mattx_dbg("[RPC] Received WRITE_REPLY for Orig PID %u req %u. Result: %lld\n", reply->orig_pid, reply->req_id, (long long)reply->retval);
+    if (!reply->req_id || !mattx_ticket_complete(hdr->sender_id, reply->orig_pid, reply->req_id, (long)reply->retval, NULL, 0))
+        mattx_dbg("[RPC] WRITE_REPLY req %u: nobody waits for it any more, dropped\n", reply->req_id);
 }
 
 
@@ -2397,7 +2749,7 @@ static void handle_sys_connect_req(struct mattx_link *link, struct mattx_header 
 
     mattx_dbg("[RPC] Dispatching CONNECT_REQ to Kworker...\n");
     atomic_inc(&mattx_cancellable_inflight);
-    schedule_work(&ctx->work);
+    mattx_queue_wait_work(&ctx->work);
 }
 
 
@@ -2875,7 +3227,7 @@ static void handle_sys_recv_req(struct mattx_link *link, struct mattx_header *hd
     ctx->flags = req->flags;
     ctx->target_node = hdr->sender_id;
     atomic_inc(&mattx_cancellable_inflight);
-    schedule_work(&ctx->work); // Dispatch to the Data Plane!
+    mattx_queue_wait_work(&ctx->work); // Dispatch to the Data Plane!
 }
 
 
@@ -3115,7 +3467,7 @@ static void handle_sys_accept_req(struct mattx_link *link, struct mattx_header *
 
     mattx_dbg("[RPC] Dispatching ACCEPT_REQ to Kworker...\n");
     atomic_inc(&mattx_cancellable_inflight);
-    schedule_work(&ctx->work);
+    mattx_queue_wait_work(&ctx->work);
 }
 
 
@@ -3429,7 +3781,7 @@ static void handle_sys_poll_req(struct mattx_link *link, struct mattx_header *hd
     ctx->target_node = hdr->sender_id;
 
     atomic_inc(&mattx_cancellable_inflight);
-    schedule_work(&ctx->work);
+    mattx_queue_wait_work(&ctx->work);
 }
 
 static void handle_sys_poll_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
@@ -4044,6 +4396,88 @@ int mattx_ticket_wait(struct mattx_ticket *t, long timeout)
         return 0;
     mattx_dbg("[RPC] PID %u req %u: no answer to the CANCEL, giving up\n", t->orig_pid, t->req_id);
     return -EINTR;
+}
+
+
+/*
+ * ENGINE 2: an interruptible helper kthread for the waits that have no poll interface (issue #67, P2).
+ *
+ * Reads, receives, writes and sends wait by polling readiness and then make ONE plain call (Engine 1).
+ * Some waits cannot be polled: the open of a FIFO that has no partner yet, a blocking POSIX lock
+ * (F_SETLKW), ... The kernel sleeps in them, interruptibly, and only a signal makes them return.
+ * kworkers do not take signals, so such a call runs in a small kthread that does (allow_signal, the way
+ * lockd and nfsd do it). The kworker of the request owns the helper: it waits in short rounds, checks
+ * CANCEL / unload / lost link and calls mattx_blocker_kick() when the Surrogate gave up.
+ *
+ * The signal is sent again every round: a kthread ignores every signal until it has called
+ * allow_signal(), so one that arrives too early is lost. mattx_blocker_finish() joins the helper
+ * (kthread_stop), so it can never outlive the kworker, and the kworker is counted in
+ * mattx_cancellable_inflight for rmmod.
+ */
+struct mattx_blocker {
+    struct task_struct *task;
+    struct completion done;
+    long (*fn)(void *arg);
+    void *arg;
+    long ret;
+};
+
+static int mattx_blocker_thread(void *data)
+{
+    struct mattx_blocker *b = data;
+
+    allow_signal(SIGKILL);
+    b->ret = b->fn(b->arg);
+    flush_signals(current);
+    complete(&b->done);
+    return 0;
+}
+
+struct mattx_blocker *mattx_blocker_start(const char *name, long (*fn)(void *arg), void *arg)
+{
+    struct mattx_blocker *b = kzalloc(sizeof(*b), GFP_KERNEL);
+    struct task_struct *task;
+
+    if (!b)
+        return ERR_PTR(-ENOMEM);
+    init_completion(&b->done);
+    b->fn = fn;
+    b->arg = arg;
+
+    task = kthread_create(mattx_blocker_thread, b, "mattx-blk/%s", name);
+    if (IS_ERR(task)) {
+        long err = PTR_ERR(task);
+
+        kfree(b);
+        return ERR_PTR(err);
+    }
+    get_task_struct(task);          // kthread_stop() and the kicks stay valid after the helper has exited
+    b->task = task;
+    wake_up_process(task);
+    return b;
+}
+
+// True: fn has returned (its result is ready). False: still running after the timeout.
+bool mattx_blocker_wait(struct mattx_blocker *b, unsigned long timeout)
+{
+    return wait_for_completion_timeout(&b->done, timeout) > 0 || completion_done(&b->done);
+}
+
+void mattx_blocker_kick(struct mattx_blocker *b)
+{
+    if (!completion_done(&b->done))
+        send_sig(SIGKILL, b->task, 1);
+}
+
+long mattx_blocker_finish(struct mattx_blocker *b)
+{
+    long ret;
+
+    kthread_stop(b->task);          // joins; the helper has returned, or returns as soon as fn does
+    put_task_struct(b->task);
+    ret = b->ret;
+    kfree(b);
+    return ret;
 }
 
 
@@ -4951,7 +5385,7 @@ static void handle_sys_recvmsg_req(struct mattx_link *link, struct mattx_header 
     ctx->datalen = req->datalen;
     ctx->target_node = hdr->sender_id;
     atomic_inc(&mattx_cancellable_inflight);
-    schedule_work(&ctx->work); // Dispatch to the Data Plane!
+    mattx_queue_wait_work(&ctx->work); // Dispatch to the Data Plane!
 }
 
 
@@ -9355,6 +9789,8 @@ void mattx_fileio_init_handlers(void) {
     mattx_register_handler(MATTX_MSG_SYS_CLOSE_REQ, handle_sys_close_req);
     mattx_register_handler(MATTX_MSG_SYS_READ_REQ, handle_sys_read_req);
     mattx_register_handler(MATTX_MSG_SYS_READ_REPLY, handle_sys_read_reply);
+    mattx_register_handler(MATTX_MSG_SYS_WRITE_REQ, handle_sys_write_req);
+    mattx_register_handler(MATTX_MSG_SYS_WRITE_REPLY, handle_sys_write_reply);
     mattx_register_handler(MATTX_MSG_SYS_LSEEK_REQ, handle_sys_lseek_req);
     mattx_register_handler(MATTX_MSG_SYS_LSEEK_REPLY, handle_sys_lseek_reply);
     mattx_register_handler(MATTX_MSG_SYS_STATX_REQ, handle_sys_statx_req);

@@ -262,6 +262,8 @@ enum mattx_msg_type {
     MATTX_MSG_DSM_FLUSH_REPLY,
     MATTX_MSG_SYS_EPOLL_WAIT_CANCEL, // appended last so the numbering of the older messages is unchanged
     MATTX_MSG_SYS_REQ_CANCEL,        // generic: a Surrogate thread gives up on a ticket-based request
+    MATTX_MSG_SYS_WRITE_REQ,         // issue #67 (P2): write() of a Surrogate to a Deputy file, ticket based
+    MATTX_MSG_SYS_WRITE_REPLY,
 };
 
 struct mattx_header {
@@ -664,10 +666,47 @@ struct mattx_sys_req_cancel {
     u32 req_id;
 };
 
+/*
+ * WRITE (issue #67, P2): write() of a Surrogate to a pipe / FIFO / socket / eventfd / file of the Deputy.
+ * No longer fire-and-forget: the Surrogate thread waits on its own ticket for the real result, so errors
+ * (EPIPE, EAGAIN, EBADF), blocking (full pipe / socket buffer) and backpressure reach the application.
+ * One request carries at most MATTX_WRITE_CHUNK bytes; the Surrogate asks chunk by chunk.
+ */
+#define MATTX_WRITE_CHUNK 4096
+
+struct mattx_sys_write_req {
+    u32 orig_pid;
+    u32 fd;
+    u32 req_id;                 // ticket id, never 0
+    u32 len;                    // bytes in data[], at most MATTX_WRITE_CHUNK
+    char data[];                // must stay the LAST member
+};
+
+struct mattx_sys_write_reply {
+    u32 orig_pid;
+    u32 req_id;                 // echo of the request's ticket id
+    s64 retval;                 // bytes written (0 .. len) or -errno; -EINTR: cancelled, nothing was written
+};
+
+/*
+ * ENGINE 2 (home node): a wait that has no poll interface (open of a FIFO, F_SETLKW, ...) runs in a
+ * helper kthread that accepts SIGKILL. The kworker of the request owns it: it waits in short rounds,
+ * looks for CANCEL / unload / lost link every round and kicks the helper (a signal) when the Surrogate
+ * gave up. mattx_blocker_finish() always joins the helper, so nothing outlives the kworker.
+ */
+struct mattx_blocker;
+struct mattx_blocker *mattx_blocker_start(const char *name, long (*fn)(void *arg), void *arg);
+bool mattx_blocker_wait(struct mattx_blocker *b, unsigned long timeout);   // true: fn has returned
+void mattx_blocker_kick(struct mattx_blocker *b);                          // SIGKILL: the interruptible wait in fn returns
+long mattx_blocker_finish(struct mattx_blocker *b);                        // join, free, return fn's result
+
 struct mattx_ticket *mattx_ticket_add(u32 orig_pid, int home_node, size_t data_cap);
 void mattx_ticket_del(struct mattx_ticket *t);
 bool mattx_ticket_complete(int home_node, u32 orig_pid, u32 req_id, long retval, const void *data, size_t len);
 int mattx_ticket_wait(struct mattx_ticket *t, long timeout);
+// write() of a Surrogate thread to a Deputy file (issue #67, P2): chunks of MATTX_WRITE_CHUNK, one ticket each.
+// Bytes written or -errno. Raises SIGPIPE on -EPIPE, like write(2). Runs in the calling thread (task_work or fop).
+ssize_t mattx_wormhole_write(u32 orig_pid, int home_node, u32 remote_fd, const char __user *ubuf, size_t count);
 struct mattx_epoll_pending *mattx_epoll_pending_add(u32 orig_pid, int home_node);
 void mattx_epoll_pending_del(struct mattx_epoll_pending *p);
 void mattx_epoll_cancelled_purge(void);

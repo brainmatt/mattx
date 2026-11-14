@@ -4001,6 +4001,40 @@ static int entry_handler_write(struct kretprobe_instance *ri, struct pt_regs *re
     return 0;
 }
 
+/*
+ * IPC WORMHOLE write(): the thread that called write() waits for the real result on its own ticket, in a
+ * task_work that runs when the (sabotaged) syscall returns to user mode (issue #67, P2). It used to be
+ * fire-and-forget: the Surrogate was told "written" at once, nothing reached the application (EPIPE, EAGAIN,
+ * backpressure) and the home node queued every write in one global FIFO. Same pattern as read(): only this
+ * thread sleeps, the other threads of the process keep running, the reply is matched by req_id.
+ * mattx_wormhole_write() (mattx_fileio.c) also serves mattx_fake_write(), the fop of the Ghost files.
+ */
+struct mattx_write_tw {
+    struct callback_head cb;
+    u32 orig_pid;
+    int home_node;
+    int fd;
+    const char __user *buf;     // read by the task_work: it runs in the thread's own process context
+    size_t count;
+};
+
+static void mattx_write_tw_fn(struct callback_head *cb) {
+    struct mattx_write_tw *tw = container_of(cb, struct mattx_write_tw, cb);
+    struct pt_regs *regs = task_pt_regs(current);
+    long ret = -EINTR;
+
+    if (fatal_signal_pending(current) || tw->home_node < 0 || tw->home_node >= MAX_NODES)
+        goto out;
+
+    mattx_dbg("[RPC] Thread %d: write(fd=%d, %zu bytes) goes to Node %d...\n", current->pid, tw->fd, tw->count, tw->home_node);
+    ret = mattx_wormhole_write(tw->orig_pid, tw->home_node, tw->fd, tw->buf, tw->count);
+    mattx_dbg("[RPC] Illusion Complete! write() on Ghost FD returned %ld (thread %d)\n", ret, current->pid);
+
+out:
+    regs->ax = ret;
+    kfree(tw);
+}
+
 static int ret_handler_write(struct kretprobe_instance *ri, struct pt_regs *regs) {
     pid_t my_pid = current->pid;
     struct rw_kretprobe_data *data = (struct rw_kretprobe_data *)ri->data;
@@ -4015,7 +4049,6 @@ static int ret_handler_write(struct kretprobe_instance *ri, struct pt_regs *regs
         if (guest_registry[i].local_pid == current->tgid) {
             home_node = guest_registry[i].home_node;
             orig_pid = guest_registry[i].orig_pid;
-            guest_registry[i].rpc_done = false; 
             break;
         }
     }
@@ -4031,8 +4064,39 @@ static int ret_handler_write(struct kretprobe_instance *ri, struct pt_regs *regs
             return 0;
         }
 
-        struct mattx_rpc_work *rpc = kzalloc(sizeof(*rpc), GFP_ATOMIC); 
+        if (real_task_work_add) {
+            struct mattx_write_tw *tw = kzalloc(sizeof(*tw), GFP_ATOMIC);
+            if (tw) {
+                init_task_work(&tw->cb, mattx_write_tw_fn);
+                tw->orig_pid = orig_pid;
+                tw->home_node = home_node;
+                tw->fd = data->fd;
+                tw->buf = (const char __user *)data->buf;
+                tw->count = data->count;
+
+                mattx_dbg("[HOOK] Intercepted write(fd=%d). Thread %d waits on its own ticket...\n", data->fd, my_pid);
+                // The sabotaged call returns -EBADF; the task_work overwrites it with the real result.
+                regs->ax = -EINTR;
+
+                if (real_task_work_add(current, &tw->cb, TWA_RESUME))
+                    kfree(tw);
+            }
+            return 0;
+        }
+
+        // Fallback if the task_work resolver is missing: the old way (freeze the whole group, fire and
+        // forget through SYSCALL_FWD, the rpc worker answers from the per-guest slot).
+        struct mattx_rpc_work *rpc = kzalloc(sizeof(*rpc), GFP_ATOMIC);
         if (rpc) {
+            spin_lock(&guest_lock);
+            for (i = 0; i < guest_count; i++) {
+                if (guest_registry[i].local_pid == current->tgid) {
+                    guest_registry[i].rpc_done = false;
+                    break;
+                }
+            }
+            spin_unlock(&guest_lock);
+
             INIT_WORK(&rpc->work, mattx_rpc_worker);
             rpc->local_pid = my_pid;
             rpc->orig_pid = orig_pid;
@@ -4042,7 +4106,7 @@ static int ret_handler_write(struct kretprobe_instance *ri, struct pt_regs *regs
             rpc->buff = data->buf;
             rpc->len = data->count;
 
-            mattx_dbg("[HOOK] Intercepted write(fd=%d). Freezing Surrogate %d...\n", data->fd, my_pid);
+            mattx_dbg("[HOOK] Intercepted write(fd=%d). Freezing Surrogate %d (fallback)...\n", data->fd, my_pid);
             send_sig(SIGSTOP, current, 0);
             schedule_work(&rpc->work);
         }
