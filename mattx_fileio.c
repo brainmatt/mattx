@@ -27,6 +27,7 @@
 #include <linux/wait.h>
 #include <linux/poll.h>
 #include <linux/namei.h> // For kern_path
+#include <linux/fs_struct.h> // For get_fs_pwd (cwd of the Deputy)
 #include <linux/nsproxy.h>
 #include <linux/highmem.h> // Required for kmap_local_page
 #include <linux/pagemap.h> // Required for read_mapping_page
@@ -1553,121 +1554,6 @@ static void handle_syscall_fwd(struct mattx_link *link, struct mattx_header *hdr
     }
     if (kick) schedule_work(&mattx_fwd_write_work);
 }
-
-// --- DATA PLANE: OPENAT (Kworker Native Injector) ---
-struct mattx_open_kworker_ctx {
-    struct work_struct work;
-    struct mattx_sys_open_req req;
-    int target_node;
-};
-
-static void mattx_open_kworker(struct work_struct *work) {
-    struct mattx_open_kworker_ctx *ctx = container_of(work, struct mattx_open_kworker_ctx, work);
-    struct mattx_sys_open_reply reply;
-    struct file *filp = NULL;
-    struct task_struct *deputy = NULL;
-    int remote_fd = -1;
-    int err = -EBADF;
-
-    memset(&reply, 0, sizeof(reply));
-    reply.orig_pid = ctx->req.orig_pid;
-
-    rcu_read_lock();
-    deputy = pid_task(find_vpid(ctx->req.orig_pid), PIDTYPE_PID);
-    if (deputy) get_task_struct(deputy);
-    rcu_read_unlock();
-
-    if (deputy) {
-        // Temporarily wear the Deputy's face so file permissions are checked correctly!
-        const struct cred *old_cred = override_creds(deputy->cred);
-
-        // Open the file natively in the kernel! (No user-space scratchpad needed!)
-        filp = filp_open(ctx->req.filename, ctx->req.flags, ctx->req.mode);
-        
-        revert_creds(old_cred);
-
-        if (IS_ERR(filp)) {
-            err = PTR_ERR(filp);
-            mattx_dbg("[KWORKER] Failed to open file '%s' (err: %d)\n", ctx->req.filename, err);
-        } else {
-            // --- THE NATIVE INJECTOR ---
-            // Forcefully inject the open file into the sleeping Deputy's FD table!
-            if (deputy->files) {
-                spin_lock(&deputy->files->file_lock);
-                struct fdtable *fdt = files_fdtable(deputy->files);
-                for (int j = 3; j < fdt->max_fds; j++) {
-                    if (!rcu_dereference_raw(fdt->fd[j])) {
-                        rcu_assign_pointer(fdt->fd[j], filp);
-                        __set_bit(j, fdt->open_fds);
-                        remote_fd = j;
-                        err = 0;
-                        break;
-                    }
-                }
-                spin_unlock(&deputy->files->file_lock);
-            }
-            
-            if (remote_fd == -1) {
-                fput(filp);
-                err = -ENFILE;
-            } else {
-                mattx_dbg("[KWORKER] Successfully injected '%s' into Deputy Native FD: %d\n", ctx->req.filename, remote_fd);
-            }
-        }
-        put_task_struct(deputy);
-    } else {
-        err = -ESRCH;
-    }
-
-    reply.remote_fd = remote_fd;
-    reply.error = err;
-
-    if (cluster_map[ctx->target_node]) {
-        mattx_comm_send(cluster_map[ctx->target_node], MATTX_MSG_SYS_OPEN_REPLY, &reply, sizeof(reply));
-    }
-
-    kfree(ctx);
-}
-
-static void handle_sys_open_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
-    if (payload) {
-        struct mattx_sys_open_req *req = payload;
-        struct mattx_open_kworker_ctx *ctx = kmalloc(sizeof(*ctx), GFP_ATOMIC);
-        
-        if (ctx) {
-            INIT_WORK(&ctx->work, mattx_open_kworker);
-            memcpy(&ctx->req, req, sizeof(*req));
-            ctx->target_node = hdr->sender_id;
-            
-            mattx_dbg("[RPC] Dispatching OPEN_REQ for '%s' to Kworker...\n", req->filename);
-            schedule_work(&ctx->work);
-        }
-    }
-}
-
-
-static void handle_sys_open_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
-    if (payload) {
-        struct mattx_sys_open_reply *reply = (struct mattx_sys_open_reply *)payload;
-        int i;
-
-        mattx_dbg("[RPC] Received OPEN_REPLY for Orig PID %u. Remote FD is %d.\n", reply->orig_pid, reply->remote_fd);
-
-        spin_lock(&guest_lock);
-        for (i = 0; i < guest_count; i++) {
-            if (guest_registry[i].orig_pid == reply->orig_pid && guest_registry[i].home_node == hdr->sender_id) {
-                guest_registry[i].rpc_remote_fd = reply->remote_fd;
-                guest_registry[i].rpc_done = true;
-                if (guest_registry[i].rpc_wq) {
-                    wake_up_interruptible(guest_registry[i].rpc_wq);
-                }
-                break;
-            }
-        }
-        spin_unlock(&guest_lock);
-    }
-}
-
 
 static void handle_sys_close_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
     if (payload) {
@@ -4721,6 +4607,315 @@ long mattx_blocker_finish(struct mattx_blocker *b)
     ret = b->ret;
     kfree(b);
     return ret;
+}
+
+
+/*
+ * === DATA PLANE: OPENAT (kprobe fallback, issue #67, P2) ===
+ *
+ * OPEN_REQ: the open runs in its own kworker on mattx_wait_wq, is CANCELLABLE and gets exactly ONE reply
+ * with the req_id echoed. The open of a FIFO that has no partner yet (and a few other files) sleeps in the
+ * kernel until something happens elsewhere: such an open runs in an Engine 2 helper kthread that a signal
+ * can interrupt (mattx_open_cancellable()), everything else is a plain filp_open().
+ *
+ * mattx_open_cancellable() is shared with the MattXFS open (handle_vfs_open_req).
+ */
+
+// The helper kthread of Engine 2 for a blocking open: wears the identity and calls filp_open().
+struct mattx_open_blk_arg {
+    const char *path;
+    int flags;
+    umode_t mode;
+    const struct cred *cred;
+};
+
+static long mattx_open_blk_fn(void *arg)
+{
+    struct mattx_open_blk_arg *a = arg;
+    const struct cred *old_cred = override_creds(a->cred);
+    struct file *f = filp_open(a->path, a->flags, a->mode);
+
+    revert_creds(old_cred);
+    // A kick (SIGKILL) interrupts the open: tell the kworker so
+    if (IS_ERR(f) && (PTR_ERR(f) == -ERESTARTSYS || PTR_ERR(f) == -ERESTARTNOINTR))
+        f = ERR_PTR(-EINTR);
+    return (long)f;
+}
+
+/*
+ * Opens 'path' wearing 'cred'. A FIFO that is opened without O_NONBLOCK and not O_RDWR waits for its
+ * partner: that open is run by an interruptible helper and watched every 10 ms for a CANCEL of the Surrogate,
+ * an unloading module and a lost link. Every other file is opened at once. The classification is a plain
+ * lookup before the open: a file that is swapped for a FIFO in between is opened without the cancel (rare).
+ * Returns the file or ERR_PTR; -EINTR: cancelled, nothing is left open. *abandoned: nobody is left to answer.
+ */
+static struct file *mattx_open_cancellable(const char *path, int flags, umode_t mode, const struct cred *cred,
+                                           int sender, u32 orig_pid, u32 req_id, bool *abandoned)
+{
+    struct mattx_open_blk_arg arg = { .path = path, .flags = flags, .mode = mode, .cred = cred };
+    struct mattx_blocker *b;
+    struct file *f;
+    bool may_block = false;
+    bool cancelled = false;
+
+    if (req_id && mattx_req_take_cancelled(sender, orig_pid, req_id)) {
+        mattx_dbg("[WORMHOLE] OPEN for PID %u req %u cancelled by the Surrogate before it started\n", orig_pid, req_id);
+        return ERR_PTR(-EINTR);
+    }
+
+    if (!(flags & O_NONBLOCK) && (flags & O_ACCMODE) != O_RDWR) {
+        const struct cred *old_cred = override_creds(cred);
+        struct path p;
+
+        if (kern_path(path, LOOKUP_FOLLOW, &p) == 0) {
+            may_block = S_ISFIFO(d_inode(p.dentry)->i_mode);
+            path_put(&p);
+        }
+        revert_creds(old_cred);
+    }
+
+    if (!may_block) {
+        const struct cred *old_cred = override_creds(cred);
+
+        f = filp_open(path, flags, mode);
+        revert_creds(old_cred);
+        return f;
+    }
+
+    mattx_dbg("[WORMHOLE] OPEN '%s' for PID %u req %u may block (FIFO): interruptible helper\n", path, orig_pid, req_id);
+    b = mattx_blocker_start("open", mattx_open_blk_fn, &arg);
+    if (IS_ERR(b))
+        return ERR_CAST(b);
+
+    while (!mattx_blocker_wait(b, msecs_to_jiffies(10))) {
+        if (!cancelled && req_id && mattx_req_take_cancelled(sender, orig_pid, req_id)) {
+            mattx_dbg("[WORMHOLE] OPEN for PID %u req %u cancelled by the Surrogate, kicking the helper\n", orig_pid, req_id);
+            cancelled = true;
+        }
+        if (READ_ONCE(mattx_cancellable_stopping) || !READ_ONCE(cluster_map[sender])) {
+            *abandoned = true;
+            cancelled = true;
+        }
+        if (cancelled)
+            mattx_blocker_kick(b);      // every round: a signal that came too early is lost
+    }
+
+    f = (struct file *)mattx_blocker_finish(b);
+    if (cancelled) {
+        // The open and the cancel met: nothing may stay open for a Surrogate that gave up
+        if (!IS_ERR(f))
+            fput(f);
+        return ERR_PTR(-EINTR);
+    }
+    return f;
+}
+
+struct mattx_open_kworker_ctx {
+    struct work_struct work;
+    struct mattx_sys_open_req req;
+    int target_node;
+};
+
+static void mattx_open_reply_send(int node, u32 orig_pid, u32 req_id, int remote_fd, int err)
+{
+    struct mattx_sys_open_reply reply;
+    struct mattx_link *link = READ_ONCE(cluster_map[node]);
+
+    memset(&reply, 0, sizeof(reply));
+    reply.orig_pid = orig_pid;
+    reply.remote_fd = remote_fd;
+    reply.error = err;
+    reply.req_id = req_id;
+    if (link)
+        mattx_comm_send(link, MATTX_MSG_SYS_OPEN_REPLY, &reply, sizeof(reply));
+}
+
+/*
+ * A relative path is relative to the Deputy's working directory, not to the kworker's. The Deputy's cwd is
+ * read as text under its task_lock (it cannot vanish meanwhile); the Deputy's fs_struct itself is never
+ * borrowed, so a Deputy that dies in the middle of the open cannot pull it out from under us.
+ * out must hold PATH_MAX bytes.
+ */
+static int mattx_open_resolve_path(struct task_struct *deputy, const char *name, char *out)
+{
+    struct path pwd;
+    char *page, *cwd;
+    int n;
+
+    if (name[0] == '/') {
+        strscpy(out, name, PATH_MAX);
+        return 0;
+    }
+
+    task_lock(deputy);
+    if (!deputy->fs) {
+        task_unlock(deputy);
+        return -ESRCH;
+    }
+    get_fs_pwd(deputy->fs, &pwd);
+    task_unlock(deputy);
+
+    if (d_unlinked(pwd.dentry)) {           // the directory was removed: nothing can be created or found in it
+        path_put(&pwd);
+        return -ENOENT;
+    }
+    page = (char *)__get_free_page(GFP_KERNEL);
+    if (!page) {
+        path_put(&pwd);
+        return -ENOMEM;
+    }
+    cwd = d_path(&pwd, page, PAGE_SIZE);
+    path_put(&pwd);
+    if (IS_ERR(cwd) || cwd[0] != '/') {     // "(unreachable)": the cwd is outside this root
+        free_page((unsigned long)page);
+        return -ENOENT;
+    }
+    n = snprintf(out, PATH_MAX, "%s%s%s", cwd, strcmp(cwd, "/") ? "/" : "", name);
+    free_page((unsigned long)page);
+    return n >= PATH_MAX ? -ENAMETOOLONG : 0;
+}
+
+static void mattx_open_kworker(struct work_struct *work) {
+    struct mattx_open_kworker_ctx *ctx = container_of(work, struct mattx_open_kworker_ctx, work);
+    struct mattx_sys_open_req *req = &ctx->req;
+    struct task_struct *deputy = NULL;
+    const struct cred *cred = NULL;
+    struct file *filp = NULL;
+    char *path = NULL;
+    bool abandoned = false;
+    int remote_fd = -1;
+    int err = -ESRCH;
+
+    req->filename[sizeof(req->filename) - 1] = '\0';
+
+    rcu_read_lock();
+    deputy = pid_task(find_vpid(req->orig_pid), PIDTYPE_PID);
+    if (deputy) get_task_struct(deputy);
+    rcu_read_unlock();
+
+    if (deputy) {
+        path = kmalloc(PATH_MAX, GFP_KERNEL);
+        // Temporarily wear the Deputy's face so file permissions are checked correctly (a reference
+        // that stays valid for the helper kthread of a blocking open as well)
+        cred = get_task_cred(deputy);
+        if (!path) {
+            err = -ENOMEM;
+        } else {
+            err = mattx_open_resolve_path(deputy, req->filename, path);
+        }
+
+        if (!err) {
+            // Open the file natively in the kernel! (No user-space scratchpad needed!)
+            filp = mattx_open_cancellable(path, req->flags, req->mode, cred,
+                                          ctx->target_node, req->orig_pid, req->req_id, &abandoned);
+            if (IS_ERR(filp)) {
+                err = PTR_ERR(filp);
+                mattx_dbg("[KWORKER] Failed to open file '%s' (err: %d)\n", path, err);
+            } else if (abandoned) {
+                fput(filp);
+                err = -EINTR;
+            } else {
+                // --- THE NATIVE INJECTOR ---
+                // Forcefully inject the open file into the sleeping Deputy's FD table!
+                err = -ENFILE;
+                if (deputy->files) {
+                    spin_lock(&deputy->files->file_lock);
+                    struct fdtable *fdt = files_fdtable(deputy->files);
+                    for (int j = 3; j < fdt->max_fds; j++) {
+                        if (!rcu_dereference_raw(fdt->fd[j])) {
+                            rcu_assign_pointer(fdt->fd[j], filp);
+                            __set_bit(j, fdt->open_fds);
+                            remote_fd = j;
+                            err = 0;
+                            break;
+                        }
+                    }
+                    spin_unlock(&deputy->files->file_lock);
+                }
+
+                if (remote_fd == -1) {
+                    fput(filp);
+                } else {
+                    mattx_dbg("[KWORKER] Successfully injected '%s' into Deputy Native FD: %d\n", path, remote_fd);
+                }
+            }
+        }
+        put_cred(cred);
+        kfree(path);
+        put_task_struct(deputy);
+    }
+
+    if (abandoned) {
+        mattx_dbg("[WORMHOLE] OPEN '%s' (req %u): nobody left to answer, reply dropped\n", req->filename, req->req_id);
+    } else {
+        mattx_open_reply_send(ctx->target_node, req->orig_pid, req->req_id, remote_fd, err);
+    }
+
+    kfree(ctx);
+    atomic_dec(&mattx_cancellable_inflight);
+}
+
+static void handle_sys_open_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    struct mattx_sys_open_req *req = payload;
+    struct mattx_open_kworker_ctx *ctx;
+
+    if (!payload || hdr->length < sizeof(*req)) return;
+    if (hdr->sender_id >= MAX_NODES || READ_ONCE(mattx_cancellable_stopping)) return;
+
+    ctx = kmalloc(sizeof(*ctx), GFP_ATOMIC);
+    if (!ctx) {
+        // Still answer: the Surrogate thread sleeps on this ticket
+        printk(KERN_ERR "MattX:[RPC] OPEN_REQ %u of PID %u: out of memory\n", req->req_id, req->orig_pid);
+        mattx_open_reply_send(hdr->sender_id, req->orig_pid, req->req_id, -1, -ENOMEM);
+        return;
+    }
+    INIT_WORK(&ctx->work, mattx_open_kworker);
+    memcpy(&ctx->req, req, sizeof(*req));
+    ctx->target_node = hdr->sender_id;
+
+    mattx_dbg("[RPC] Dispatching OPEN_REQ for '%s' (req %u) to Kworker...\n", req->filename, req->req_id);
+    atomic_inc(&mattx_cancellable_inflight);
+    mattx_queue_wait_work(&ctx->work);
+}
+
+// Surrogate side: a reply that carries a ticket id belongs to exactly one waiting thread (mattx_ticket_*).
+// req_id 0 is the legacy reply (fallback without task_work): it goes through the per-guest slot.
+static void handle_sys_open_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    struct mattx_sys_open_reply *reply = (struct mattx_sys_open_reply *)payload;
+    int i;
+
+    if (!payload || hdr->length < sizeof(*reply)) return;
+
+    mattx_dbg("[RPC] Received OPEN_REPLY for Orig PID %u req %u. Remote FD is %d, error %d.\n",
+              reply->orig_pid, reply->req_id, reply->remote_fd, reply->error);
+
+    if (reply->req_id) {
+        long retval = reply->error ? reply->error : reply->remote_fd;
+
+        if (!mattx_ticket_complete(hdr->sender_id, reply->orig_pid, reply->req_id, retval, NULL, 0)) {
+            mattx_dbg("[RPC] OPEN_REPLY req %u: nobody waits for it any more\n", reply->req_id);
+            // The thread gave up for good and nobody will claim the file the home node opened for it
+            if (reply->error == 0 && reply->remote_fd >= 0) {
+                struct mattx_sys_close_req close_req = { .orig_pid = reply->orig_pid, .remote_fd = reply->remote_fd };
+
+                mattx_comm_send(link, MATTX_MSG_SYS_CLOSE_REQ, &close_req, sizeof(close_req));
+            }
+        }
+        return;
+    }
+
+    spin_lock(&guest_lock);
+    for (i = 0; i < guest_count; i++) {
+        if (guest_registry[i].orig_pid == reply->orig_pid && guest_registry[i].home_node == hdr->sender_id) {
+            guest_registry[i].rpc_remote_fd = reply->remote_fd;
+            guest_registry[i].rpc_done = true;
+            if (guest_registry[i].rpc_wq) {
+                wake_up_interruptible(guest_registry[i].rpc_wq);
+            }
+            break;
+        }
+    }
+    spin_unlock(&guest_lock);
 }
 
 
@@ -9062,7 +9257,8 @@ EXPORT_SYMBOL(mattx_rpc_vfs_readdir);
 
 int mattx_rpc_vfs_open(int node_id, const char *path, int flags, int mode, int *remote_fd) {
     int i, slot = -1;
-    u64 req_id;
+    int err;
+    struct mattx_ticket *t;
     struct mattx_vfs_open_req req;
 
     bool is_local_hpc = (config_hpc_local_libs && is_hpc_local_lib(path));
@@ -9107,41 +9303,44 @@ int mattx_rpc_vfs_open(int node_id, const char *path, int flags, int mode, int *
     }
 
     if (!cluster_map[node_id]) return -ENOTCONN;
+    if (strlen(path) >= sizeof(req.path)) return -ENAMETOOLONG;     // never open a silently truncated name
 
-    spin_lock(&vfs_rpc_lock);
-    for (i = 0; i < MAX_VFS_RPC; i++) {
-        if (!vfs_rpc_registry[i].in_use) {
-            slot = i;
-            vfs_rpc_registry[i].in_use = true;
-            req_id = next_req_id++;
-            vfs_rpc_registry[i].req_id = req_id;
-            vfs_rpc_registry[i].done = false;
-            init_waitqueue_head(&vfs_rpc_registry[i].wq);
-            break;
-        }
-    }
-    spin_unlock(&vfs_rpc_lock);
+    // The thread that opens waits on its own ticket (issue #67, P2): an open that blocks at the home node (a FIFO
+    // without partner) can be interrupted, the home node is told to give up (generic CANCEL), and the slot
+    // registry is no longer involved. The ticket id travels in req_id. orig_pid 0: the caller of an open on a
+    // MattXFS mount is not necessarily a guest process, and the ticket is identified by its id and home node.
+    t = mattx_ticket_add(0, node_id, 0);
+    if (!t) return -ENOMEM;
 
-    if (slot == -1) return -EBUSY;
-
-    req.req_id = req_id;
+    memset(&req, 0, sizeof(req));
+    req.req_id = t->req_id;
     req.flags = flags;
     req.mode = mode;
     // Grab the identity of the user typing the command! ---
     req.uid = from_kuid(&init_user_ns, current_fsuid());
     req.gid = from_kgid(&init_user_ns, current_fsgid());
     strscpy_pad(req.path, path, sizeof(req.path));
-    mattx_comm_send(cluster_map[node_id], MATTX_MSG_VFS_OPEN_REQ, &req, sizeof(req));
 
-    wait_event_interruptible(vfs_rpc_registry[slot].wq, vfs_rpc_registry[slot].done);
+    mattx_dbg("[VFS] OPEN '%s' on Node %d as req %u. Sleeping...\n", req.path, node_id, t->req_id);
+    if (mattx_comm_send(cluster_map[node_id], MATTX_MSG_VFS_OPEN_REQ, &req, sizeof(req)) < 0) {
+        err = -EIO;
+        goto out;
+    }
 
-    int err = vfs_rpc_registry[slot].error;
-    if (err == 0) *remote_fd = vfs_rpc_registry[slot].remote_fd;
+    // Interrupted (signal, freeze of a migration or recall): the wait cancels the request and still hands back the
+    // file if the home node had already opened it; otherwise -EINTR. The slot of the old code answered the
+    // stale error of its previous user in that case.
+    if (mattx_ticket_wait(t, MAX_SCHEDULE_TIMEOUT)) {
+        err = -EINTR;
+    } else if (t->retval >= 0) {
+        *remote_fd = (int)t->retval;
+        err = 0;
+    } else {
+        err = (int)t->retval;
+    }
 
-    spin_lock(&vfs_rpc_lock);
-    vfs_rpc_registry[slot].in_use = false;
-    spin_unlock(&vfs_rpc_lock);
-
+out:
+    mattx_ticket_del(t);
     return err;
 }
 EXPORT_SYMBOL(mattx_rpc_vfs_open);
@@ -9632,69 +9831,130 @@ static void handle_vfs_readdir_reply(struct mattx_link *link, struct mattx_heade
 
 // --- VFS NETWORK HANDLERS ---
 
-static void handle_vfs_open_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
-    if (payload) {
-        struct mattx_vfs_open_req *req = payload;
-        struct mattx_vfs_open_reply reply;
-        struct file *f;
-        int i, fd_slot = -1;
-        const struct cred *old_cred = NULL;
-        struct cred *new_cred = NULL;
+/*
+ * VFS_OPEN_REQ (open() on a MattXFS file): the open runs in its own kworker on mattx_wait_wq and is
+ * CANCELLABLE (issue #67, P2). It used to run right here, in the receiver kthread of the link: the open of a
+ * FIFO that has no partner yet (or any slow open) stalled every message from that node. The request id is the
+ * ticket id of the Surrogate thread; it is also what the generic CANCEL names (orig_pid 0). One reply.
+ */
+struct mattx_vfs_open_kworker_ctx { struct work_struct work; struct mattx_vfs_open_req req; int target_node; };
 
-        memset(&reply, 0, sizeof(reply));
-        reply.req_id = req->req_id;
+static void mattx_vfs_open_reply_send(int node, u64 req_id, int remote_fd, int error)
+{
+    struct mattx_vfs_open_reply reply;
+    struct mattx_link *link = READ_ONCE(cluster_map[node]);
 
-        // Put on the mask of the remote user! ---
-        old_cred = mattx_override_creds(req->uid, req->gid, &new_cred);
-
-        f = filp_open(req->path, req->flags, req->mode);
-        
-        // Take off the mask
-        mattx_revert_creds(old_cred, new_cred);
-
-        if (!IS_ERR(f)) {
-            spin_lock(&mfs_file_lock);
-            for (i = 0; i < MAX_FDS; i++) {
-                if (mfs_open_files[i] == NULL) {
-                    mfs_open_files[i] = f;
-                    fd_slot = i;
-                    break;
-                }
-            }
-            spin_unlock(&mfs_file_lock);
-
-            if (fd_slot != -1) {
-                reply.remote_fd = fd_slot;
-                reply.error = 0;
-            } else {
-                fput(f);
-                reply.error = -ENFILE;
-            }
-        } else {
-            reply.error = PTR_ERR(f);
-        }
-
-        if (cluster_map[hdr->sender_id]) {
-            mattx_comm_send(cluster_map[hdr->sender_id], MATTX_MSG_VFS_OPEN_REPLY, &reply, sizeof(reply));
-        }
-    }
+    memset(&reply, 0, sizeof(reply));
+    reply.req_id = req_id;
+    reply.remote_fd = remote_fd;
+    reply.error = error;
+    if (link)
+        mattx_comm_send(link, MATTX_MSG_VFS_OPEN_REPLY, &reply, sizeof(reply));
 }
 
-static void handle_vfs_open_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
-    if (payload) {
-        struct mattx_vfs_open_reply *reply = payload;
-        int i;
-        spin_lock(&vfs_rpc_lock);
-        for (i = 0; i < MAX_VFS_RPC; i++) {
-            if (vfs_rpc_registry[i].in_use && vfs_rpc_registry[i].req_id == reply->req_id) {
-                vfs_rpc_registry[i].error = reply->error;
-                vfs_rpc_registry[i].remote_fd = reply->remote_fd;
-                vfs_rpc_registry[i].done = true;
-                wake_up_interruptible(&vfs_rpc_registry[i].wq);
+static void mattx_vfs_open_kworker(struct work_struct *work) {
+    struct mattx_vfs_open_kworker_ctx *ctx = container_of(work, struct mattx_vfs_open_kworker_ctx, work);
+    struct mattx_vfs_open_req *req = &ctx->req;
+    struct cred *cred;
+    struct file *f;
+    bool abandoned = false;
+    int i, fd_slot = -1;
+    int error;
+
+    req->path[sizeof(req->path) - 1] = '\0';
+
+    // Put on the mask of the remote user! ---
+    cred = prepare_creds();
+    if (!cred) {
+        error = -ENOMEM;
+        f = ERR_PTR(error);
+    } else {
+        cred->uid = make_kuid(&init_user_ns, req->uid);
+        cred->euid = cred->uid;
+        cred->fsuid = cred->uid;
+        cred->gid = make_kgid(&init_user_ns, req->gid);
+        cred->egid = cred->gid;
+        cred->fsgid = cred->gid;
+
+        mattx_dbg("[VFS] OPEN '%s' (req %llu) from Node %d. Opening (kworker)...\n", req->path, req->req_id, ctx->target_node);
+        f = mattx_open_cancellable(req->path, req->flags, req->mode, cred,
+                                   ctx->target_node, 0, (u32)req->req_id, &abandoned);
+        put_cred(cred);
+    }
+
+    if (IS_ERR(f)) {
+        error = PTR_ERR(f);
+    } else if (abandoned) {
+        fput(f);
+        error = -EINTR;
+    } else {
+        spin_lock(&mfs_file_lock);
+        for (i = 0; i < MAX_FDS; i++) {
+            if (mfs_open_files[i] == NULL) {
+                mfs_open_files[i] = f;
+                fd_slot = i;
                 break;
             }
         }
-        spin_unlock(&vfs_rpc_lock);
+        spin_unlock(&mfs_file_lock);
+
+        if (fd_slot != -1) {
+            error = 0;
+        } else {
+            fput(f);
+            error = -ENFILE;
+        }
+    }
+
+    if (abandoned) {
+        mattx_dbg("[VFS] OPEN '%s' (req %llu): nobody left to answer, reply dropped\n", req->path, req->req_id);
+    } else {
+        mattx_dbg("[VFS] OPEN '%s' (req %llu) done: slot %d, error %d\n", req->path, req->req_id, fd_slot, error);
+        mattx_vfs_open_reply_send(ctx->target_node, req->req_id, fd_slot, error);
+    }
+
+    kfree(ctx);
+    atomic_dec(&mattx_cancellable_inflight);
+}
+
+static void handle_vfs_open_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    struct mattx_vfs_open_req *req = payload;
+    struct mattx_vfs_open_kworker_ctx *ctx;
+
+    if (!payload || hdr->length < sizeof(*req)) return;
+    if (hdr->sender_id >= MAX_NODES || READ_ONCE(mattx_cancellable_stopping)) return;
+
+    ctx = kmalloc(sizeof(*ctx), GFP_ATOMIC);
+    if (!ctx) {
+        // Still answer: the Surrogate thread sleeps on this request
+        printk(KERN_ERR "MattX:[VFS] OPEN_REQ %llu: out of memory\n", req->req_id);
+        mattx_vfs_open_reply_send(hdr->sender_id, req->req_id, -1, -ENOMEM);
+        return;
+    }
+    INIT_WORK(&ctx->work, mattx_vfs_open_kworker);
+    memcpy(&ctx->req, req, sizeof(*req));
+    ctx->target_node = hdr->sender_id;
+    atomic_inc(&mattx_cancellable_inflight);
+    mattx_queue_wait_work(&ctx->work);
+}
+
+// Surrogate side: the request id is the ticket id of the thread that waits (see mattx_rpc_vfs_open()).
+static void handle_vfs_open_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    struct mattx_vfs_open_reply *reply = payload;
+    long retval;
+
+    if (!payload || hdr->length < sizeof(*reply)) return;
+
+    retval = reply->error ? reply->error : reply->remote_fd;
+    if (!mattx_ticket_complete(hdr->sender_id, 0, (u32)reply->req_id, retval, NULL, 0)) {
+        mattx_dbg("[VFS] OPEN_REPLY req %llu: nobody waits for it any more\n", reply->req_id);
+        // The thread gave up for good and nobody will claim the file the home node opened for it:
+        // close it there instead of leaking the slot.
+        if (reply->error == 0 && reply->remote_fd >= 0) {
+            struct mattx_vfs_close_req close_req = { .remote_fd = reply->remote_fd };
+
+            mattx_comm_send(link, MATTX_MSG_VFS_CLOSE_REQ, &close_req, sizeof(close_req));
+        }
     }
 }
 

@@ -389,13 +389,15 @@ struct mattx_sys_open_req {
     u32 orig_pid;
     int flags;
     int mode;
-    char filename[256];
+    char filename[256];         // NUL terminated; longer paths are refused with -ENAMETOOLONG on the Surrogate
+    u32 req_id;                 // ticket id (issue #67, P2); 0: legacy request, answered through the per-guest slot
 };
 
 struct mattx_sys_open_reply {
     u32 orig_pid;
     int remote_fd;
     int error;
+    u32 req_id;                 // echo of the request's ticket id (0: legacy)
 };
 
 struct mattx_sys_close_req {

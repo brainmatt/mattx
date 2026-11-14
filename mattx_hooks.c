@@ -1754,6 +1754,7 @@ struct kretprobe_data {
     const char __user *filename_ptr;
     int flags;
     int mode;
+    int dfd;
     bool is_hpc_fastpath; // <-- NEW
 };
 
@@ -1765,6 +1766,7 @@ static int entry_handler_openat(struct kretprobe_instance *ri, struct pt_regs *r
     if (config_mattxfs_enabled) return 0; 
 
     data->filename_ptr = (const char __user *)regs->si;
+    data->dfd = (int)regs->di;
     
     struct open_how *how = (struct open_how *)regs->dx;
     if (how) {
@@ -1795,6 +1797,154 @@ static int entry_handler_openat(struct kretprobe_instance *ri, struct pt_regs *r
     return 0;
 }
 
+/*
+ * open()/openat() (kprobe fallback, issue #67, P2): the sabotaged call ends in a task_work that runs when the
+ * syscall returns to user mode, in the thread's own process context. Same pattern as read() and accept():
+ * only this thread sleeps (on its own ticket), the other threads of the process keep running, the reply is
+ * matched by req_id. The errno of a failed open (ENOENT, EACCES, ...) now reaches the application: it used to
+ * see what the sabotage left behind. The new FD is allocated natively (get_unused_fd_flags + fd_install: fd
+ * table expansion, RLIMIT_NOFILE and O_CLOEXEC are handled by the kernel).
+ */
+struct mattx_open_tw {
+    struct callback_head cb;
+    u32 orig_pid;
+    int home_node;
+    const char __user *filename;    // read by the task_work: it runs in the thread's own process context
+    int flags;
+    int mode;
+    int dfd;
+};
+
+// Tells the home node to close an FD it opened for us but that we cannot hand to the application
+static void mattx_open_tw_close_remote(struct mattx_open_tw *tw, int remote_fd)
+{
+    struct mattx_sys_close_req close_req = { .orig_pid = tw->orig_pid, .remote_fd = remote_fd };
+    struct mattx_link *link = READ_ONCE(cluster_map[tw->home_node]);
+
+    if (link)
+        mattx_comm_send(link, MATTX_MSG_SYS_CLOSE_REQ, &close_req, sizeof(close_req));
+}
+
+static void mattx_open_tw_fn(struct callback_head *cb) {
+    struct mattx_open_tw *tw = container_of(cb, struct mattx_open_tw, cb);
+    struct pt_regs *regs = task_pt_regs(current);
+    struct mattx_sys_open_req *req = NULL;
+    struct mattx_ticket *t;
+    struct mattx_link *link;
+    long ret = -EINTR;
+    long n;
+
+    if (fatal_signal_pending(current) || tw->home_node < 0 || tw->home_node >= MAX_NODES)
+        goto out;
+
+    link = READ_ONCE(cluster_map[tw->home_node]);
+    if (!link) {
+        ret = -EIO;
+        goto out;
+    }
+
+    req = kzalloc(sizeof(*req), GFP_KERNEL);
+    if (!req) {
+        ret = -ENOMEM;
+        goto out;
+    }
+
+    n = strncpy_from_user(req->filename, tw->filename, sizeof(req->filename));
+    if (n < 0) {
+        ret = n;                                    // -EFAULT
+        goto out;
+    }
+    if (n == 0) {
+        ret = -ENOENT;
+        goto out;
+    }
+    if (n >= (long)sizeof(req->filename)) {         // no NUL within the buffer: the path is too long for the request
+        mattx_dbg("[RPC] Thread %d: open() path is longer than %zu bytes: -ENAMETOOLONG\n", current->pid, sizeof(req->filename) - 1);
+        ret = -ENAMETOOLONG;
+        goto out;
+    }
+    if (req->filename[0] != '/' && tw->dfd != AT_FDCWD) {
+        // The home node resolves relative paths against the Deputy's cwd only (openat(dirfd, ...) is not carried yet)
+        mattx_dbg("[RPC] Thread %d: openat(dirfd=%d, '%s') is not supported: -EOPNOTSUPP\n", current->pid, tw->dfd, req->filename);
+        ret = -EOPNOTSUPP;
+        goto out;
+    }
+
+    t = mattx_ticket_add(tw->orig_pid, tw->home_node, 0);
+    if (!t) {
+        ret = -ENOMEM;
+        goto out;
+    }
+
+    req->orig_pid = tw->orig_pid;
+    req->flags = tw->flags;
+    req->mode = tw->mode;
+    req->req_id = t->req_id;
+
+    mattx_dbg("[RPC] Thread %d: open('%s') as req %u, sleeping on its own ticket...\n", current->pid, req->filename, t->req_id);
+
+    if (mattx_comm_send(link, MATTX_MSG_SYS_OPEN_REQ, req, sizeof(*req)) < 0) {
+        // Never sleep for a reply to a request that was never sent
+        mattx_dbg("[RPC] Thread %d: OPEN_REQ send failed\n", current->pid);
+        ret = -EIO;
+        goto done;
+    }
+
+    // Interrupted (signal, freeze of a migration or recall)? The wait cancels the request and still hands back
+    // the file if the home node had already opened it; otherwise we return -EINTR.
+    if (mattx_ticket_wait(t, MAX_SCHEDULE_TIMEOUT) == 0) {
+        ret = t->retval;
+
+        if (ret >= 0) {
+            // The home node opened the file and injected it as FD 'remote_fd': build the proxy FD
+            int remote_fd = ret;
+            struct mattx_fake_fd_info *fd_info;
+            struct file *fake_file;
+            int local_fd;
+
+            fd_info = kmalloc(sizeof(*fd_info), GFP_KERNEL);
+            if (!fd_info) {
+                mattx_open_tw_close_remote(tw, remote_fd);
+                ret = -ENOMEM;
+                goto done;
+            }
+            fd_info->home_node = tw->home_node;
+            fd_info->orig_pid = tw->orig_pid;
+            fd_info->remote_fd = remote_fd;
+
+            // Use the original flags (filtered to file access modes) to create the fake file
+            fake_file = anon_inode_getfile("mattx_vfs_proxy", &mattx_fops, fd_info, tw->flags & O_ACCMODE);
+            if (IS_ERR(fake_file)) {
+                kfree(fd_info);
+                mattx_open_tw_close_remote(tw, remote_fd);
+                ret = -ENFILE;
+                goto done;
+            }
+            // Inject our custom inode_operations so we can catch fstat/getattr!
+            if (fake_file->f_inode)
+                fake_file->f_inode->i_op = &mattx_iops;
+
+            local_fd = get_unused_fd_flags((tw->flags & O_CLOEXEC) ? O_CLOEXEC : 0);
+            if (local_fd < 0) {
+                fput(fake_file);                // its release closes the remote FD at the home node
+                ret = local_fd;
+                goto done;
+            }
+
+            fd_install(local_fd, fake_file);
+            ret = local_fd;
+            mattx_dbg("[RPC] Illusion Complete! Mapped Remote FD %d to Local FD %d (thread %d)\n", remote_fd, local_fd, current->pid);
+        }
+    }
+
+done:
+    mattx_ticket_del(t);
+out:
+    regs->ax = ret;
+    kfree(req);
+    kfree(tw);
+}
+
 static int ret_handler_openat(struct kretprobe_instance *ri, struct pt_regs *regs) {
     pid_t my_pid = current->pid;
     struct kretprobe_data *data = (struct kretprobe_data *)ri->data;
@@ -1808,6 +1958,52 @@ static int ret_handler_openat(struct kretprobe_instance *ri, struct pt_regs *reg
 
     // --- THE HPC FAST-PATH BYPASS ---
     if (data->is_hpc_fastpath) return 0; // Let the native result flow back to the app!
+
+    if (real_task_work_add) {
+        spin_lock(&guest_lock);
+        for (i = 0; i < guest_count; i++) {
+            if (guest_registry[i].local_pid == current->tgid) {
+                home_node = guest_registry[i].home_node;
+                orig_pid = guest_registry[i].orig_pid;
+                break;                          // the per-guest slot is not touched: this open has its own ticket
+            }
+        }
+        spin_unlock(&guest_lock);
+
+        if (home_node != -1 && data->filename_ptr) {
+            struct mattx_open_tw *tw;
+
+            // --- THE ATOMIC SHIELD ---
+            // If the process is dying (SIGKILL) or exiting, DO NOT freeze it!
+            if (fatal_signal_pending(current) || (current->flags & PF_EXITING)) {
+                mattx_dbg("[HOOK] Surrogate %s is dying. Aborting RPC.\n", current->comm);
+                return 0;
+            }
+            if (!config_migrate_file_io) return 0;      // Local Breakout, as below
+
+            tw = kzalloc(sizeof(*tw), GFP_ATOMIC);
+            if (tw) {
+                init_task_work(&tw->cb, mattx_open_tw_fn);
+                tw->orig_pid = orig_pid;
+                tw->home_node = home_node;
+                tw->filename = data->filename_ptr;
+                tw->flags = data->flags;
+                tw->mode = data->mode;
+                tw->dfd = data->dfd;
+
+                mattx_dbg("[HOOK] Intercepted open(). Thread %d waits on its own ticket...\n", my_pid);
+                // The sabotaged call returns -EFAULT; the task_work overwrites it with the real result.
+                regs->ax = -EINTR;
+
+                if (real_task_work_add(current, &tw->cb, TWA_RESUME))
+                    kfree(tw);
+            }
+        }
+        return 0;
+    }
+
+    // Fallback if the task_work resolver is missing: the old way (freeze the whole group, the rpc worker
+    // polls the per-guest slot). The home node answers with req_id 0 then.
 
     if (strncpy_from_user(filename, data->filename_ptr, sizeof(filename) - 1) > 0) {
         spin_lock(&guest_lock);
