@@ -108,6 +108,9 @@ static ssize_t mattxfs_remote_file_read(struct file *file, char __user *buf, siz
 
     if (!fi) return -EIO;
 
+    if (count > MATTX_VFS_READ_MAX)     // one request carries at most that: a short read is fine
+        count = MATTX_VFS_READ_MAX;
+
     kbuf = kvmalloc(count, GFP_KERNEL);
     if (!kbuf) return -ENOMEM;
 
