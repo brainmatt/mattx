@@ -58,6 +58,7 @@
 #include <linux/bitops.h>        
 #include <linux/stat.h>
 #include <linux/fcntl.h>       // struct flock (F_SETLKW)
+#include <linux/filelock.h>    // struct file_lock, FL_POSIX / FL_FLOCK / FL_OFDLCK (MattXFS locks, issue #67 P3)
 #include <linux/statfs.h>          
 #include <linux/version.h>
 #include <linux/time64.h> // Ensure we have time64_t
@@ -267,6 +268,10 @@ enum mattx_msg_type {
     MATTX_MSG_SYS_WRITE_REPLY,
     MATTX_MSG_SYS_SETLKW_REQ,        // issue #67 (P2): F_SETLKW / F_OFD_SETLKW of a Surrogate on a Deputy file, ticket based
     MATTX_MSG_SYS_SETLKW_REPLY,
+    MATTX_MSG_VFS_LOCK_REQ,          // issue #67 (P3): fcntl locks of a MattXFS file (F_SETLK / F_SETLKW / F_GETLK), ticket based
+    MATTX_MSG_VFS_LOCK_REPLY,
+    MATTX_MSG_VFS_FLOCK_REQ,         // issue #67 (P3): flock() of a MattXFS file, ticket based
+    MATTX_MSG_VFS_FLOCK_REPLY,
 };
 
 struct mattx_header {
@@ -1394,6 +1399,44 @@ struct mattx_vfs_write_reply {
     int error;
 };
 
+/*
+ * MattXFS file locks (issue #67, P3). The lock lives on the HOME node: its struct file in mfs_open_files[] is the
+ * owner (OFD style), so every node and every native process of the home node exclude each other. The Surrogate
+ * thread that locks waits on its own ticket (ticket id in req_id, orig_pid 0). The numbers are the ones of the
+ * kernel (F_RDLCK / F_WRLCK / F_UNLCK, F_GETLK / F_SETLK / F_SETLKW), both nodes run the same build.
+ */
+struct mattx_vfs_lock_req {
+    u64 req_id;
+    int remote_fd;
+    int cmd;                // F_GETLK, F_SETLK or F_SETLKW
+    int type;               // F_RDLCK, F_WRLCK or F_UNLCK
+    int pad;
+    s64 start;
+    s64 end;                // OFFSET_MAX: up to the end of the file
+};
+
+struct mattx_vfs_lock_reply {
+    u64 req_id;
+    int error;
+    int type;               // F_GETLK: F_UNLCK, or the type of the conflicting lock
+    s64 start;              // F_GETLK: the conflicting range
+    s64 end;
+};
+
+struct mattx_vfs_flock_req {
+    u64 req_id;
+    int remote_fd;
+    int cmd;                // F_SETLK (LOCK_NB) or F_SETLKW
+    int type;               // F_RDLCK (LOCK_SH), F_WRLCK (LOCK_EX) or F_UNLCK (LOCK_UN)
+    int pad;
+};
+
+struct mattx_vfs_flock_reply {
+    u64 req_id;
+    int error;
+    int pad;
+};
+
 struct mattx_vfs_close_req {
     int remote_fd;
 };
@@ -1879,6 +1922,8 @@ ssize_t mattx_rpc_vfs_write(int node_id, int remote_fd, const void *buf, size_t 
 void mattx_rpc_vfs_close(int node_id, int remote_fd);
 loff_t mattx_rpc_vfs_llseek(int node_id, int remote_fd, loff_t offset, int whence);
 int mattx_rpc_vfs_fsync(int node_id, int remote_fd, loff_t start, loff_t end, int datasync);
+int mattx_rpc_vfs_lock(int node_id, int remote_fd, int cmd, struct file_lock *fl);    // MattXFS .lock
+int mattx_rpc_vfs_flock(int node_id, int remote_fd, int cmd, struct file_lock *fl);   // MattXFS .flock
 int mattx_rpc_vfs_unlink(int node_id, const char *path);
 
 #endif // MATTX_H

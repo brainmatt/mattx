@@ -10885,6 +10885,504 @@ static void handle_vfs_close_req(struct mattx_link *link, struct mattx_header *h
 }
 
 /*
+ * MATTXFS FILE LOCKS (issue #67, P3)
+ *
+ * mattxfs_remote_file_fops had no .lock and no .flock: the kernel of the Surrogate recorded fcntl / flock locks in
+ * its own inode, so Surrogates on different nodes (and the native processes of the home node) never excluded each
+ * other. Now both fops forward the request to the home node, where the lock is taken on the struct file of the
+ * MattXFS slot: that open file is the owner (OFD style). The kernel of the home node then does everything else:
+ * conflicts with native processes, fairness, wake-ups, and the release of all locks of a file when its last
+ * reference goes (VFS_CLOSE_REQ, or mattx_vfs_node_gone() if the node died).
+ *
+ * The thread that locks waits on its own ticket. A request that cannot be granted at once (F_SETLKW, flock without
+ * LOCK_NB) runs in an interruptible Engine 2 helper, watched every 10 ms for the CANCEL of the Surrogate, an
+ * unloading module and a lost link; a lock that is granted at the moment of the cancel is reported as granted.
+ * Everything else cannot sleep and runs in the kworker. Flat: one handler, kworker and reply per syscall; only the
+ * building of the struct file_lock and the apply step (F_SETLK / F_SETLKW / F_GETLK) are shared, and they are also
+ * the local path of the home node's own MattXFS mount.
+ *
+ * Owner = the open file: threads of one process share it, files shared by fork share the lock, and closing one fd
+ * does not drop locks taken through another. The kernel does no deadlock detection for OFD owners: an ABBA pair
+ * across nodes waits until it is interrupted. A conflicting lock is reported to F_GETLK with l_pid -1.
+ */
+static struct file *mattx_vfs_slot_get(int remote_fd)
+{
+    struct file *f = NULL;
+
+    spin_lock(&mfs_file_lock);
+    if (remote_fd >= 0 && remote_fd < MAX_FDS && mfs_open_files[remote_fd]) {
+        f = mfs_open_files[remote_fd];
+        get_file(f);
+    }
+    spin_unlock(&mfs_file_lock);
+    return f;
+}
+
+// The lock of a home file for a request of a Surrogate: owner = that open file, never a task
+static struct file_lock *mattx_vfs_lock_build(struct file *f, bool posix, int type, loff_t start, loff_t end, bool sleep)
+{
+    struct file_lock *fl = locks_alloc_lock();
+
+    if (!fl)
+        return NULL;
+    fl->c.flc_file = f;
+    fl->c.flc_owner = (fl_owner_t)f;
+    fl->c.flc_pid = current->tgid;
+    fl->c.flc_type = type;
+    fl->c.flc_flags = (posix ? (FL_POSIX | FL_OFDLCK) : FL_FLOCK) | (sleep ? FL_SLEEP : 0);
+    fl->fl_start = start;
+    fl->fl_end = end;
+    return fl;
+}
+
+static bool mattx_vfs_lock_type_ok(int type)
+{
+    return type == F_RDLCK || type == F_WRLCK || type == F_UNLCK;
+}
+
+// F_GETLK / F_SETLK / F_SETLKW on a home file, the way fcntl_getlk() and fcntl_setlk() do it. F_SETLKW sleeps
+// (interruptibly) until the lock is granted; res is filled for F_GETLK.
+static int mattx_vfs_lock_apply(struct file *f, int cmd, int type, s64 start, s64 end, struct mattx_vfs_lock_reply *res)
+{
+    struct file_lock *fl;
+    int err;
+
+    if (!mattx_vfs_lock_type_ok(type) || start < 0 || end < start)
+        return -EINVAL;
+
+    fl = mattx_vfs_lock_build(f, true, type, start, end, cmd == F_SETLKW);
+    if (!fl)
+        return -ENOMEM;
+
+    switch (cmd) {
+    case F_GETLK:
+        err = vfs_test_lock(f, fl);
+        if (!err) {
+            res->type = fl->c.flc_type;
+            if (fl->c.flc_type != F_UNLCK) {
+                res->start = fl->fl_start;
+                res->end = fl->fl_end;
+            }
+        }
+        break;
+    case F_SETLK:
+    case F_SETLKW:
+        if (f->f_op->lock)                  // the file system locks itself (NFS, FUSE, ...) and sleeps itself
+            err = vfs_lock_file(f, cmd, fl, NULL);
+        else
+            err = locks_lock_file_wait(f, fl);
+        break;
+    default:
+        err = -EINVAL;
+    }
+    locks_free_lock(fl);
+    return err;
+}
+
+// flock() on a home file, the way the flock system call does it
+static int mattx_vfs_flock_apply(struct file *f, int cmd, int type)
+{
+    struct file_lock *fl;
+    int err;
+
+    if (!mattx_vfs_lock_type_ok(type) || (cmd != F_SETLK && cmd != F_SETLKW))
+        return -EINVAL;
+
+    fl = mattx_vfs_lock_build(f, false, type, 0, OFFSET_MAX, cmd == F_SETLKW);
+    if (!fl)
+        return -ENOMEM;
+    if (f->f_op->flock)
+        err = f->f_op->flock(f, cmd, fl);
+    else
+        err = locks_lock_file_wait(f, fl);
+    locks_free_lock(fl);
+    return err;
+}
+
+// A lock request that can wait: it only sleeps for F_SETLKW (and flock without LOCK_NB) that is not an unlock
+static bool mattx_vfs_lock_may_block(int cmd, int type)
+{
+    return cmd == F_SETLKW && type != F_UNLCK;
+}
+
+// --- Surrogate side: fcntl locks ---
+int mattx_rpc_vfs_lock(int node_id, int remote_fd, int cmd, struct file_lock *fl)
+{
+    struct mattx_vfs_lock_reply local_res, *res = &local_res;
+    struct mattx_ticket *t;
+    struct mattx_vfs_lock_req req;
+    int type = fl->c.flc_type;
+    int err;
+
+    memset(&local_res, 0, sizeof(local_res));
+    local_res.type = F_UNLCK;
+
+    // The home node's own mount: the same kernel calls in the caller's thread, no RPC (interruptible natively)
+    if (node_id == my_node_id) {
+        struct file *f = mattx_vfs_slot_get(remote_fd);
+
+        if (!f)
+            return -EBADF;
+        err = mattx_vfs_lock_apply(f, cmd, type, fl->fl_start, fl->fl_end, &local_res);
+        fput(f);
+        goto done;
+    }
+
+    if (node_id < 0 || node_id >= MAX_NODES || !cluster_map[node_id])
+        return -ENOTCONN;
+
+    t = mattx_ticket_add(0, node_id, sizeof(*res));
+    if (!t)
+        return -ENOMEM;
+
+    memset(&req, 0, sizeof(req));
+    req.req_id = t->req_id;
+    req.remote_fd = remote_fd;
+    req.cmd = cmd;
+    req.type = type;
+    req.start = fl->fl_start;
+    req.end = fl->fl_end;
+
+    mattx_dbg("[VFS] LOCK cmd %d type %d [%lld..%lld] on fd %d of Node %d as req %u. Sleeping...\n",
+              cmd, type, (long long)req.start, (long long)req.end, remote_fd, node_id, t->req_id);
+    if (mattx_comm_send(cluster_map[node_id], MATTX_MSG_VFS_LOCK_REQ, &req, sizeof(req)) < 0) {
+        err = -EIO;
+    } else if (mattx_ticket_wait(t, MAX_SCHEDULE_TIMEOUT)) {
+        // Interrupted (signal, freeze of a migration or recall) and no final answer: the lock was not granted,
+        // the syscall is restarted (a lock that was granted at the moment of the cancel is the real result below)
+        err = -ERESTARTSYS;
+    } else {
+        err = (int)t->retval;
+        if (!err && cmd == F_GETLK) {
+            if (!t->data || t->data_len < sizeof(*res))
+                err = -EIO;
+            else
+                res = t->data;
+        }
+    }
+    if (!err && cmd == F_GETLK) {
+        fl->c.flc_type = res->type;
+        if (res->type != F_UNLCK) {
+            fl->fl_start = res->start;
+            fl->fl_end = res->end;
+            fl->c.flc_pid = -1;             // a lock of another node or open file: no pid that means anything here
+        }
+    }
+    mattx_ticket_del(t);
+    return err;
+
+done:
+    if (!err && cmd == F_GETLK) {
+        fl->c.flc_type = local_res.type;
+        if (local_res.type != F_UNLCK) {
+            fl->fl_start = local_res.start;
+            fl->fl_end = local_res.end;
+            fl->c.flc_pid = -1;
+        }
+    }
+    return err;
+}
+EXPORT_SYMBOL(mattx_rpc_vfs_lock);
+
+// --- Surrogate side: flock ---
+int mattx_rpc_vfs_flock(int node_id, int remote_fd, int cmd, struct file_lock *fl)
+{
+    struct mattx_ticket *t;
+    struct mattx_vfs_flock_req req;
+    int type = fl->c.flc_type;
+    int err;
+
+    if (node_id == my_node_id) {
+        struct file *f = mattx_vfs_slot_get(remote_fd);
+
+        if (!f)
+            return -EBADF;
+        err = mattx_vfs_flock_apply(f, cmd, type);
+        fput(f);
+        return err;
+    }
+
+    if (node_id < 0 || node_id >= MAX_NODES || !cluster_map[node_id])
+        return -ENOTCONN;
+
+    t = mattx_ticket_add(0, node_id, 0);
+    if (!t)
+        return -ENOMEM;
+
+    memset(&req, 0, sizeof(req));
+    req.req_id = t->req_id;
+    req.remote_fd = remote_fd;
+    req.cmd = cmd;
+    req.type = type;
+
+    mattx_dbg("[VFS] FLOCK cmd %d type %d on fd %d of Node %d as req %u. Sleeping...\n", cmd, type, remote_fd, node_id, t->req_id);
+    if (mattx_comm_send(cluster_map[node_id], MATTX_MSG_VFS_FLOCK_REQ, &req, sizeof(req)) < 0)
+        err = -EIO;
+    else if (mattx_ticket_wait(t, MAX_SCHEDULE_TIMEOUT))
+        err = -ERESTARTSYS;     // not granted, restart (see mattx_rpc_vfs_lock())
+    else
+        err = (int)t->retval;
+    mattx_ticket_del(t);
+    return err;
+}
+EXPORT_SYMBOL(mattx_rpc_vfs_flock);
+
+// --- Home side: fcntl locks ---
+struct mattx_vfs_lock_kworker_ctx { struct work_struct work; struct mattx_vfs_lock_req req; int target_node; };
+
+static void mattx_vfs_lock_reply_send(int node, u64 req_id, int error, const struct mattx_vfs_lock_reply *res)
+{
+    struct mattx_vfs_lock_reply reply;
+    struct mattx_link *link = READ_ONCE(cluster_map[node]);
+
+    memset(&reply, 0, sizeof(reply));
+    reply.req_id = req_id;
+    reply.error = error;
+    reply.type = F_UNLCK;
+    if (!error && res) {
+        reply.type = res->type;
+        reply.start = res->start;
+        reply.end = res->end;
+    }
+    if (link)
+        mattx_comm_send(link, MATTX_MSG_VFS_LOCK_REPLY, &reply, sizeof(reply));
+}
+
+struct mattx_vfs_lock_blk_arg { struct file *f; int cmd; int type; s64 start; s64 end; struct mattx_vfs_lock_reply res; };
+
+// Runs in the Engine 2 helper: F_SETLKW sleeps interruptibly until the lock is granted or a signal arrives
+static long mattx_vfs_lock_blk_fn(void *p)
+{
+    struct mattx_vfs_lock_blk_arg *a = p;
+    int err = mattx_vfs_lock_apply(a->f, a->cmd, a->type, a->start, a->end, &a->res);
+
+    if (err == -ERESTARTSYS || err == -ERESTARTNOINTR || err == -ERESTARTNOHAND || err == -ERESTART_RESTARTBLOCK)
+        err = -EINTR;
+    return err;
+}
+
+static void mattx_vfs_lock_kworker(struct work_struct *work)
+{
+    struct mattx_vfs_lock_kworker_ctx *ctx = container_of(work, struct mattx_vfs_lock_kworker_ctx, work);
+    struct mattx_vfs_lock_req *req = &ctx->req;
+    u32 id = (u32)req->req_id;
+    struct mattx_vfs_lock_reply res;
+    struct file *f;
+    bool abandoned = false;
+    int err;
+
+    memset(&res, 0, sizeof(res));
+    res.type = F_UNLCK;
+    f = mattx_vfs_slot_get(req->remote_fd);
+
+    if (!f) {
+        err = -EBADF;
+    } else if (mattx_req_take_cancelled(ctx->target_node, 0, id)) {
+        mattx_dbg("[VFS] LOCK (req %u) cancelled by the Surrogate before it started\n", id);
+        err = -EINTR;
+    } else if (!mattx_vfs_lock_may_block(req->cmd, req->type)) {
+        mattx_dbg("[VFS] LOCK cmd %d type %d [%lld..%lld] fd %d (req %u) from Node %d: no wait (kworker)\n",
+                  req->cmd, req->type, (long long)req->start, (long long)req->end, req->remote_fd, id, ctx->target_node);
+        err = mattx_vfs_lock_apply(f, req->cmd, req->type, req->start, req->end, &res);
+    } else {
+        struct mattx_vfs_lock_blk_arg arg = { .f = f, .cmd = req->cmd, .type = req->type, .start = req->start, .end = req->end };
+        struct mattx_blocker *b;
+        bool cancelled = false;
+
+        arg.res.type = F_UNLCK;
+        mattx_dbg("[VFS] LOCK cmd %d type %d [%lld..%lld] fd %d (req %u) from Node %d may wait: interruptible helper\n",
+                  req->cmd, req->type, (long long)req->start, (long long)req->end, req->remote_fd, id, ctx->target_node);
+        b = mattx_blocker_start("vfs_lock", mattx_vfs_lock_blk_fn, &arg);
+        if (IS_ERR(b)) {
+            err = PTR_ERR(b);
+        } else {
+            while (!mattx_blocker_wait(b, msecs_to_jiffies(10))) {
+                if (!cancelled && mattx_req_take_cancelled(ctx->target_node, 0, id)) {
+                    mattx_dbg("[VFS] LOCK (req %u) cancelled by the Surrogate, kicking the helper\n", id);
+                    cancelled = true;
+                }
+                if (READ_ONCE(mattx_cancellable_stopping) || !READ_ONCE(cluster_map[ctx->target_node])) {
+                    abandoned = true;
+                    cancelled = true;
+                }
+                if (cancelled)
+                    mattx_blocker_kick(b);      // every round: a signal that came too early is lost
+            }
+            // A lock that was granted at the moment of the cancel is reported as granted
+            err = (int)mattx_blocker_finish(b);
+        }
+    }
+
+    if (abandoned) {
+        mattx_dbg("[VFS] LOCK (req %u): nobody left to answer, reply dropped\n", id);
+    } else {
+        mattx_dbg("[VFS] LOCK (req %u) done: %d\n", id, err);
+        mattx_vfs_lock_reply_send(ctx->target_node, req->req_id, err, &res);
+    }
+
+    if (f)
+        fput(f);
+    kfree(ctx);
+    atomic_dec(&mattx_cancellable_inflight);
+}
+
+static void handle_vfs_lock_req(struct mattx_link *link, struct mattx_header *hdr, void *payload)
+{
+    struct mattx_vfs_lock_req *req = payload;
+    struct mattx_vfs_lock_kworker_ctx *ctx;
+
+    if (!payload || hdr->length < sizeof(*req)) return;
+    if (hdr->sender_id >= MAX_NODES || READ_ONCE(mattx_cancellable_stopping)) return;
+
+    ctx = kmalloc(sizeof(*ctx), GFP_ATOMIC);
+    if (!ctx) {
+        // Still answer: the Surrogate thread sleeps on this request
+        printk(KERN_ERR "MattX:[VFS] LOCK_REQ %llu: out of memory\n", req->req_id);
+        mattx_vfs_lock_reply_send(hdr->sender_id, req->req_id, -ENOMEM, NULL);
+        return;
+    }
+    INIT_WORK(&ctx->work, mattx_vfs_lock_kworker);
+    memcpy(&ctx->req, req, sizeof(*req));
+    ctx->target_node = hdr->sender_id;
+    atomic_inc(&mattx_cancellable_inflight);
+    mattx_queue_wait_work(&ctx->work);
+}
+
+// Surrogate side: the request id is the ticket id of the thread that waits. The whole reply travels as ticket data
+// (F_GETLK needs the conflicting lock). A lock that was granted for a thread that gave up stays with the home file
+// until the file is closed (VFS_CLOSE_REQ) or the node is gone (mattx_vfs_node_gone()).
+static void handle_vfs_lock_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload)
+{
+    struct mattx_vfs_lock_reply *reply = payload;
+
+    if (!payload || hdr->length < sizeof(*reply)) return;
+
+    if (!mattx_ticket_complete(hdr->sender_id, 0, (u32)reply->req_id, reply->error, reply, sizeof(*reply)))
+        mattx_dbg("[VFS] LOCK_REPLY req %llu: nobody waits for it any more\n", reply->req_id);
+}
+
+// --- Home side: flock ---
+struct mattx_vfs_flock_kworker_ctx { struct work_struct work; struct mattx_vfs_flock_req req; int target_node; };
+
+static void mattx_vfs_flock_reply_send(int node, u64 req_id, int error)
+{
+    struct mattx_vfs_flock_reply reply;
+    struct mattx_link *link = READ_ONCE(cluster_map[node]);
+
+    memset(&reply, 0, sizeof(reply));
+    reply.req_id = req_id;
+    reply.error = error;
+    if (link)
+        mattx_comm_send(link, MATTX_MSG_VFS_FLOCK_REPLY, &reply, sizeof(reply));
+}
+
+struct mattx_vfs_flock_blk_arg { struct file *f; int cmd; int type; };
+
+// Runs in the Engine 2 helper: flock() without LOCK_NB sleeps interruptibly until the lock is granted or a signal arrives
+static long mattx_vfs_flock_blk_fn(void *p)
+{
+    struct mattx_vfs_flock_blk_arg *a = p;
+    int err = mattx_vfs_flock_apply(a->f, a->cmd, a->type);
+
+    if (err == -ERESTARTSYS || err == -ERESTARTNOINTR || err == -ERESTARTNOHAND || err == -ERESTART_RESTARTBLOCK)
+        err = -EINTR;
+    return err;
+}
+
+static void mattx_vfs_flock_kworker(struct work_struct *work)
+{
+    struct mattx_vfs_flock_kworker_ctx *ctx = container_of(work, struct mattx_vfs_flock_kworker_ctx, work);
+    struct mattx_vfs_flock_req *req = &ctx->req;
+    u32 id = (u32)req->req_id;
+    struct file *f;
+    bool abandoned = false;
+    int err;
+
+    f = mattx_vfs_slot_get(req->remote_fd);
+
+    if (!f) {
+        err = -EBADF;
+    } else if (mattx_req_take_cancelled(ctx->target_node, 0, id)) {
+        mattx_dbg("[VFS] FLOCK (req %u) cancelled by the Surrogate before it started\n", id);
+        err = -EINTR;
+    } else if (!mattx_vfs_lock_may_block(req->cmd, req->type)) {
+        mattx_dbg("[VFS] FLOCK cmd %d type %d fd %d (req %u) from Node %d: no wait (kworker)\n",
+                  req->cmd, req->type, req->remote_fd, id, ctx->target_node);
+        err = mattx_vfs_flock_apply(f, req->cmd, req->type);
+    } else {
+        struct mattx_vfs_flock_blk_arg arg = { .f = f, .cmd = req->cmd, .type = req->type };
+        struct mattx_blocker *b;
+        bool cancelled = false;
+
+        mattx_dbg("[VFS] FLOCK cmd %d type %d fd %d (req %u) from Node %d may wait: interruptible helper\n",
+                  req->cmd, req->type, req->remote_fd, id, ctx->target_node);
+        b = mattx_blocker_start("vfs_flock", mattx_vfs_flock_blk_fn, &arg);
+        if (IS_ERR(b)) {
+            err = PTR_ERR(b);
+        } else {
+            while (!mattx_blocker_wait(b, msecs_to_jiffies(10))) {
+                if (!cancelled && mattx_req_take_cancelled(ctx->target_node, 0, id)) {
+                    mattx_dbg("[VFS] FLOCK (req %u) cancelled by the Surrogate, kicking the helper\n", id);
+                    cancelled = true;
+                }
+                if (READ_ONCE(mattx_cancellable_stopping) || !READ_ONCE(cluster_map[ctx->target_node])) {
+                    abandoned = true;
+                    cancelled = true;
+                }
+                if (cancelled)
+                    mattx_blocker_kick(b);      // every round: a signal that came too early is lost
+            }
+            err = (int)mattx_blocker_finish(b);
+        }
+    }
+
+    if (abandoned) {
+        mattx_dbg("[VFS] FLOCK (req %u): nobody left to answer, reply dropped\n", id);
+    } else {
+        mattx_dbg("[VFS] FLOCK (req %u) done: %d\n", id, err);
+        mattx_vfs_flock_reply_send(ctx->target_node, req->req_id, err);
+    }
+
+    if (f)
+        fput(f);
+    kfree(ctx);
+    atomic_dec(&mattx_cancellable_inflight);
+}
+
+static void handle_vfs_flock_req(struct mattx_link *link, struct mattx_header *hdr, void *payload)
+{
+    struct mattx_vfs_flock_req *req = payload;
+    struct mattx_vfs_flock_kworker_ctx *ctx;
+
+    if (!payload || hdr->length < sizeof(*req)) return;
+    if (hdr->sender_id >= MAX_NODES || READ_ONCE(mattx_cancellable_stopping)) return;
+
+    ctx = kmalloc(sizeof(*ctx), GFP_ATOMIC);
+    if (!ctx) {
+        // Still answer: the Surrogate thread sleeps on this request
+        printk(KERN_ERR "MattX:[VFS] FLOCK_REQ %llu: out of memory\n", req->req_id);
+        mattx_vfs_flock_reply_send(hdr->sender_id, req->req_id, -ENOMEM);
+        return;
+    }
+    INIT_WORK(&ctx->work, mattx_vfs_flock_kworker);
+    memcpy(&ctx->req, req, sizeof(*req));
+    ctx->target_node = hdr->sender_id;
+    atomic_inc(&mattx_cancellable_inflight);
+    mattx_queue_wait_work(&ctx->work);
+}
+
+// Surrogate side: the request id is the ticket id of the thread that waits (see mattx_rpc_vfs_flock())
+static void handle_vfs_flock_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload)
+{
+    struct mattx_vfs_flock_reply *reply = payload;
+
+    if (!payload || hdr->length < sizeof(*reply)) return;
+
+    if (!mattx_ticket_complete(hdr->sender_id, 0, (u32)reply->req_id, reply->error, NULL, 0))
+        mattx_dbg("[VFS] FLOCK_REPLY req %llu: nobody waits for it any more\n", reply->req_id);
+}
+
+/*
  * A node is gone (its socket died, or it is disconnected / replaced / unloaded): every file it had open here goes
  * with it. Without this the slots of a crashed Surrogate stayed forever, and with them whatever the files hold:
  * the file locks of issue #67 (P3) would wedge every other node. Dropping the slot reference is all it takes: the
@@ -10979,6 +11477,10 @@ void mattx_fileio_init_handlers(void) {
     mattx_register_handler(MATTX_MSG_VFS_LSEEK_REPLY, handle_vfs_lseek_reply);
     mattx_register_handler(MATTX_MSG_VFS_FSYNC_REQ, handle_vfs_fsync_req);
     mattx_register_handler(MATTX_MSG_VFS_FSYNC_REPLY, handle_vfs_fsync_reply);
+    mattx_register_handler(MATTX_MSG_VFS_LOCK_REQ, handle_vfs_lock_req);
+    mattx_register_handler(MATTX_MSG_VFS_LOCK_REPLY, handle_vfs_lock_reply);
+    mattx_register_handler(MATTX_MSG_VFS_FLOCK_REQ, handle_vfs_flock_req);
+    mattx_register_handler(MATTX_MSG_VFS_FLOCK_REPLY, handle_vfs_flock_reply);
     mattx_register_handler(MATTX_MSG_SYS_EPOLL_CREATE_REQ, handle_sys_epoll_create_req);
     mattx_register_handler(MATTX_MSG_SYS_EPOLL_CREATE_REPLY, handle_sys_epoll_create_reply);
     mattx_register_handler(MATTX_MSG_SYS_EPOLL_CTL_REQ, handle_sys_epoll_ctl_req);

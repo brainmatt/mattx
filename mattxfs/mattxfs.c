@@ -204,6 +204,21 @@ static int mattxfs_remote_file_release(struct inode *inode, struct file *file) {
     return 0;
 }
 
+// fcntl() locks and flock() of a remote file: the lock is taken on the home node, on the open file there (issue #67, P3)
+static int mattxfs_remote_file_lock(struct file *file, int cmd, struct file_lock *fl) {
+    struct mattxfs_file_info *fi = file->private_data;
+
+    if (!fi) return -EIO;
+    return mattx_rpc_vfs_lock(fi->node_id, fi->remote_fd, cmd, fl);
+}
+
+static int mattxfs_remote_file_flock(struct file *file, int cmd, struct file_lock *fl) {
+    struct mattxfs_file_info *fi = file->private_data;
+
+    if (!fi) return -EIO;
+    return mattx_rpc_vfs_flock(fi->node_id, fi->remote_fd, cmd, fl);
+}
+
 // Wire them up!
 static const struct file_operations mattxfs_remote_file_fops = {
     .open    = mattxfs_remote_file_open,
@@ -212,6 +227,8 @@ static const struct file_operations mattxfs_remote_file_fops = {
     .release = mattxfs_remote_file_release,
     .llseek  = mattxfs_remote_file_llseek,
     .fsync   = mattxfs_remote_file_fsync,
+    .lock    = mattxfs_remote_file_lock,
+    .flock   = mattxfs_remote_file_flock,
 };
 
 // ============================================================================
