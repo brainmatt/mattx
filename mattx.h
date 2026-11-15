@@ -1784,6 +1784,7 @@ int mattx_comm_send(struct mattx_link *link, u32 type, void *data, u32 len);
 int mattx_comm_send_ctrl(struct mattx_link *link, u32 type, void *data, u32 len);
 struct mattx_link* mattx_comm_connect(__be32 ip_addr, int node_id);
 void mattx_comm_disconnect(int node_id);
+void mattx_vfs_node_gone(int node_id);     // closes the MattXFS files a dead node had open here (mattx_fileio.c)
 int mattx_listener_loop(void *data);
 int mattx_balancer_loop(void *data);
 void mattx_watcher_kick(void); // The Funeral Bell: a guest is about to die, the Guest Watcher looks at once

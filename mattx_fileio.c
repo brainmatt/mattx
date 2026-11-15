@@ -868,6 +868,9 @@ out:
 // Global File Table for MattXFS ---
 // This holds the real files opened on behalf of remote MattXFS clients
 static struct file *mfs_open_files[MAX_FDS];
+// Which node opened the file in each slot (valid while the slot is in use): when that node dies, so do its files
+// (and the locks they hold), see mattx_vfs_node_gone(). Both arrays are protected by mfs_file_lock.
+static int mfs_open_owner[MAX_FDS];
 static DEFINE_SPINLOCK(mfs_file_lock);
 
 #include <linux/version.h>
@@ -9573,6 +9576,7 @@ int mattx_rpc_vfs_open(int node_id, const char *path, int flags, int mode, int *
         for (i = 0; i < MAX_FDS; i++) {
             if (mfs_open_files[i] == NULL) {
                 mfs_open_files[i] = f;
+                mfs_open_owner[i] = my_node_id;
                 *remote_fd = i;
                 slot = i;
                 break;
@@ -10188,6 +10192,7 @@ static void mattx_vfs_open_kworker(struct work_struct *work) {
         for (i = 0; i < MAX_FDS; i++) {
             if (mfs_open_files[i] == NULL) {
                 mfs_open_files[i] = f;
+                mfs_open_owner[i] = ctx->target_node;
                 fd_slot = i;
                 break;
             }
@@ -10877,6 +10882,41 @@ static void handle_vfs_close_req(struct mattx_link *link, struct mattx_header *h
             fput(f_to_close);
         }
     }
+}
+
+/*
+ * A node is gone (its socket died, or it is disconnected / replaced / unloaded): every file it had open here goes
+ * with it. Without this the slots of a crashed Surrogate stayed forever, and with them whatever the files hold:
+ * the file locks of issue #67 (P3) would wedge every other node. Dropping the slot reference is all it takes: the
+ * file is released (and its locks with it) as soon as the last request that still works on it has finished.
+ * Idempotent: called when the receiver sees the socket die and again from mattx_comm_disconnect(), because a
+ * request that was still in a kworker may install a slot for the dead node in between. Files that were opened on
+ * this node itself (the local fast path) are never touched.
+ */
+void mattx_vfs_node_gone(int node_id)
+{
+    int i, n = 0;
+
+    if (node_id < 0 || node_id >= MAX_NODES || node_id == my_node_id)
+        return;
+
+    for (i = 0; i < MAX_FDS; i++) {
+        struct file *f = NULL;
+
+        spin_lock(&mfs_file_lock);
+        if (mfs_open_files[i] && mfs_open_owner[i] == node_id) {
+            f = mfs_open_files[i];
+            mfs_open_files[i] = NULL;
+        }
+        spin_unlock(&mfs_file_lock);
+
+        if (f) {                // fput safely OUTSIDE the spinlock
+            fput(f);
+            n++;
+        }
+    }
+    if (n)
+        mattx_dbg("[VFS] Node %d is gone: closed the %d MattXFS files it had open here\n", node_id, n);
 }
 
 void mattx_fileio_init_handlers(void) {

@@ -115,6 +115,10 @@ static int mattx_receiver_loop(void *data) {
         }
     }
     
+    // The socket died (not a stop request): the node is gone, so are its open MattXFS files and their locks
+    if (!kthread_should_stop() && link->node_id >= 0)
+        mattx_vfs_node_gone(link->node_id);
+
     mattx_dbg("[COMM] Receiver thread for Node %d entering Zombie Halt...\n", link->node_id);
     
     // ==============================================================================
@@ -386,6 +390,7 @@ int mattx_listener_loop(void *data) {
 
 void mattx_comm_disconnect(int node_id) {
     if (node_id < 0 || node_id >= MAX_NODES || !cluster_map[node_id]) return;
+    mattx_vfs_node_gone(node_id);       // idempotent: a request that was still in a kworker may have added a file
     if (cluster_map[node_id]->receiver_thread) kthread_stop(cluster_map[node_id]->receiver_thread);
     sock_release(cluster_map[node_id]->sock);
     kfree(cluster_map[node_id]);
