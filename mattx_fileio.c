@@ -4448,7 +4448,7 @@ void mattx_ticket_del(struct mattx_ticket *t)
     spin_lock(&mattx_ticket_lock);
     list_del_init(&t->node);
     spin_unlock(&mattx_ticket_lock);
-    kfree(t->data);
+    kvfree(t->data);
     kfree(t);
 }
 
@@ -4460,8 +4460,10 @@ bool mattx_ticket_complete(int home_node, u32 orig_pid, u32 req_id, long retval,
     bool found = false;
 
     if (data && len) {
-        copy = kmemdup(data, len, GFP_KERNEL);
-        if (!copy)
+        copy = kvmalloc(len, GFP_KERNEL);       // a MattXFS read reply can carry up to MATTX_VFS_READ_MAX
+        if (copy)
+            memcpy(copy, data, len);
+        else
             retval = -ENOMEM;
     }
 
@@ -4469,11 +4471,11 @@ bool mattx_ticket_complete(int home_node, u32 orig_pid, u32 req_id, long retval,
     list_for_each_entry(t, &mattx_ticket_list, node) {
         if (t->req_id == req_id && t->orig_pid == orig_pid && t->home_node == home_node) {
             if (copy && len > t->data_cap) {    // more than the waiter asked for: protocol error
-                kfree(copy);
+                kvfree(copy);
                 copy = NULL;
                 retval = -EIO;
             }
-            kfree(t->data);
+            kvfree(t->data);
             t->data = copy;
             t->data_len = copy ? len : 0;
             copy = NULL;                        // now owned by the ticket
@@ -4485,7 +4487,7 @@ bool mattx_ticket_complete(int home_node, u32 orig_pid, u32 req_id, long retval,
     }
     spin_unlock(&mattx_ticket_lock);
 
-    kfree(copy);                                // nobody waits: drop it
+    kvfree(copy);                               // nobody waits: drop it
     return found;
 }
 
@@ -9588,8 +9590,7 @@ out:
 EXPORT_SYMBOL(mattx_rpc_vfs_open);
 
 ssize_t mattx_rpc_vfs_read(int node_id, int remote_fd, void *buf, size_t count, loff_t *pos) {
-    int i, slot = -1;
-    u64 req_id;
+    struct mattx_ticket *t;
     struct mattx_vfs_read_req req;
     ssize_t bytes_read = -EIO;
 
@@ -9610,42 +9611,46 @@ ssize_t mattx_rpc_vfs_read(int node_id, int remote_fd, void *buf, size_t count, 
     }
 
     if (!cluster_map[node_id]) return -ENOTCONN;
+    if (!count) return 0;
+    if (count > MATTX_VFS_READ_MAX) count = MATTX_VFS_READ_MAX;     // a short read is fine
 
-    spin_lock(&vfs_rpc_lock);
-    for (i = 0; i < MAX_VFS_RPC; i++) {
-        if (!vfs_rpc_registry[i].in_use) {
-            slot = i;
-            vfs_rpc_registry[i].in_use = true;
-            req_id = next_req_id++;
-            vfs_rpc_registry[i].req_id = req_id;
-            vfs_rpc_registry[i].done = false;
-            vfs_rpc_registry[i].bytes_rw = 0;
-            vfs_rpc_registry[i].data_buf = buf; 
-            vfs_rpc_registry[i].data_cap = count;
-            init_waitqueue_head(&vfs_rpc_registry[i].wq);
-            break;
-        }
-    }
-    spin_unlock(&vfs_rpc_lock);
+    // The thread that reads waits on its own ticket (issue #67, P3): a read that blocks at the home node (a FIFO
+    // without data) can be interrupted, the home node is told to give up (generic CANCEL), and the receiver kthread
+    // of the home node never blocks in it. The ticket id travels in req_id, orig_pid is 0 (see mattx_rpc_vfs_open()).
+    t = mattx_ticket_add(0, node_id, count);
+    if (!t) return -ENOMEM;
 
-    if (slot == -1) return -EBUSY;
-
-    req.req_id = req_id;
+    memset(&req, 0, sizeof(req));
+    req.req_id = t->req_id;
     req.remote_fd = remote_fd;
     req.count = count;
     req.pos = *pos;
-    mattx_comm_send(cluster_map[node_id], MATTX_MSG_VFS_READ_REQ, &req, sizeof(req));
 
-    if (mattx_vfs_rpc_wait(slot))
-        return -ERESTARTSYS; // slot already released
+    mattx_dbg("[VFS] READ %zu bytes at %lld of fd %d on Node %d as req %u. Sleeping...\n", count, (long long)*pos, remote_fd, node_id, t->req_id);
+    if (mattx_comm_send(cluster_map[node_id], MATTX_MSG_VFS_READ_REQ, &req, sizeof(req)) < 0) {
+        bytes_read = -EIO;
+        goto out;
+    }
 
-    bytes_read = vfs_rpc_registry[slot].bytes_rw;
-    if (bytes_read > 0) *pos += bytes_read; 
+    // Interrupted (signal, freeze of a migration or recall): the wait cancels the request and still hands back the
+    // bytes the home node had already consumed; otherwise nothing was read and the syscall is restarted.
+    if (mattx_ticket_wait(t, MAX_SCHEDULE_TIMEOUT)) {
+        bytes_read = -ERESTARTSYS;
+        goto out;
+    }
 
-    spin_lock(&vfs_rpc_lock);
-    vfs_rpc_registry[slot].in_use = false;
-    spin_unlock(&vfs_rpc_lock);
+    bytes_read = t->retval;
+    if (bytes_read > 0) {
+        if (!t->data || (size_t)bytes_read > t->data_len || (size_t)bytes_read > count) {
+            bytes_read = -EIO;      // never copy more than was asked for
+        } else {
+            memcpy(buf, t->data, bytes_read);
+            *pos += bytes_read;
+        }
+    }
 
+out:
+    mattx_ticket_del(t);
     return bytes_read;
 }
 EXPORT_SYMBOL(mattx_rpc_vfs_read);
@@ -10200,65 +10205,197 @@ static void handle_vfs_open_reply(struct mattx_link *link, struct mattx_header *
     }
 }
 
-static void handle_vfs_read_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
-    if (payload) {
-        struct mattx_vfs_read_req *req = payload;
-        struct file *f = NULL;
-        
-        spin_lock(&mfs_file_lock);
-        if (req->remote_fd < MAX_FDS && mfs_open_files[req->remote_fd]) {
-            f = mfs_open_files[req->remote_fd];
-            get_file(f);
-        }
-        spin_unlock(&mfs_file_lock);
+struct mattx_vfs_read_kworker_ctx { struct work_struct work; struct mattx_vfs_read_req req; int target_node; };
 
-        if (f) {
-            void *read_buf = kmalloc(req->count, GFP_KERNEL);
-            if (read_buf) {
-                loff_t pos = req->pos;
-                ssize_t ret = kernel_read(f, read_buf, req->count, &pos);
-                
-                size_t reply_size = sizeof(struct mattx_vfs_read_reply) + (ret > 0 ? ret : 0);
-                struct mattx_vfs_read_reply *reply = kmalloc(reply_size, GFP_KERNEL);
-                if (reply) {
-                    reply->req_id = req->req_id;
-                    reply->bytes_read = ret;
-                    reply->error = (ret < 0) ? ret : 0;
-                    if (ret > 0) memcpy(reply->data, read_buf, ret);
-                    
-                    if (cluster_map[hdr->sender_id]) {
-                        mattx_comm_send(cluster_map[hdr->sender_id], MATTX_MSG_VFS_READ_REPLY, reply, reply_size);
-                    }
-                    kfree(reply);
-                }
-                kfree(read_buf);
-            }
-            fput(f);
-        }
+// Sends the one reply of a MattXFS read: the bytes (ret > 0, data) or the error. Never blocks the caller for long.
+static void mattx_vfs_read_reply_send(int node, u64 req_id, const void *data, ssize_t ret)
+{
+    struct mattx_link *link = READ_ONCE(cluster_map[node]);
+    struct mattx_vfs_read_reply head;
+    struct mattx_vfs_read_reply *reply;
+    size_t n = (ret > 0 && data) ? (size_t)ret : 0;
+
+    if (!link)
+        return;
+
+    if (!n) {
+        memset(&head, 0, sizeof(head));
+        head.req_id = req_id;
+        head.bytes_read = ret < 0 ? 0 : ret;
+        head.error = ret < 0 ? (int)ret : 0;
+        mattx_comm_send(link, MATTX_MSG_VFS_READ_REPLY, &head, sizeof(head));
+        return;
     }
+
+    reply = kvzalloc(sizeof(*reply) + n, GFP_KERNEL);
+    if (!reply) {
+        memset(&head, 0, sizeof(head));
+        head.req_id = req_id;
+        head.error = -ENOMEM;
+        mattx_comm_send(link, MATTX_MSG_VFS_READ_REPLY, &head, sizeof(head));
+        return;
+    }
+    reply->req_id = req_id;
+    reply->bytes_read = ret;
+    reply->error = 0;
+    memcpy(reply->data, data, n);
+    mattx_comm_send(link, MATTX_MSG_VFS_READ_REPLY, reply, sizeof(*reply) + n);
+    kvfree(reply);
 }
 
-static void handle_vfs_read_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
-    if (payload) {
-        struct mattx_vfs_read_reply *reply = payload;
-        int i;
-        spin_lock(&vfs_rpc_lock);
-        for (i = 0; i < MAX_VFS_RPC; i++) {
-            if (vfs_rpc_registry[i].in_use && vfs_rpc_registry[i].req_id == reply->req_id) {
-                vfs_rpc_registry[i].bytes_rw = reply->bytes_read;
-                if (reply->bytes_read > 0 && vfs_rpc_registry[i].data_buf) {
-                    if ((size_t)reply->bytes_read <= vfs_rpc_registry[i].data_cap)
-                        memcpy(vfs_rpc_registry[i].data_buf, reply->data, reply->bytes_read);
-                    else
-                        vfs_rpc_registry[i].bytes_rw = -EIO; // more than was asked for: never overrun the buffer
+struct mattx_vfs_read_blk_arg { struct file *f; void *buf; size_t count; loff_t pos; };
+
+// Runs in the Engine 2 helper: the read of a FIFO / pipe / tty sleeps interruptibly until data or a signal arrives.
+static long mattx_vfs_read_blk_fn(void *p)
+{
+    struct mattx_vfs_read_blk_arg *a = p;
+    loff_t pos = a->pos;
+    ssize_t r = kernel_read(a->f, a->buf, a->count, &pos);
+
+    if (r == -ERESTARTSYS || r == -ERESTARTNOINTR || r == -ERESTARTNOHAND || r == -ERESTART_RESTARTBLOCK)
+        r = -EINTR;
+    return (long)r;
+}
+
+/*
+ * MattXFS read at the home node (issue #67, P3). It used to run kernel_read() in the receiver kthread: a read of a
+ * FIFO or pipe without data stopped every message of that node, and a bad fd or an out-of-memory was never answered.
+ * Now a kworker answers exactly once:
+ *  - regular file, directory, block device, or O_NONBLOCK: one plain kernel_read (bounded, cannot park);
+ *  - FIFO, pipe, char device, socket (it may sleep): kernel_read in an interruptible Engine 2 helper, watched
+ *    every 10 ms for a CANCEL of the Surrogate, an unloading module and a lost link, so the wait is race-free
+ *    (no poll-then-read) and bytes that were consumed are never thrown away.
+ */
+static void mattx_vfs_read_kworker(struct work_struct *work) {
+    struct mattx_vfs_read_kworker_ctx *ctx = container_of(work, struct mattx_vfs_read_kworker_ctx, work);
+    struct mattx_vfs_read_req *req = &ctx->req;
+    u32 id = (u32)req->req_id;
+    size_t count = req->count;
+    struct file *f = NULL;
+    void *buf = NULL;
+    ssize_t ret;
+    bool abandoned = false;
+
+    if (count > MATTX_VFS_READ_MAX)
+        count = MATTX_VFS_READ_MAX;
+
+    spin_lock(&mfs_file_lock);
+    if (req->remote_fd >= 0 && req->remote_fd < MAX_FDS && mfs_open_files[req->remote_fd]) {
+        f = mfs_open_files[req->remote_fd];
+        get_file(f);
+    }
+    spin_unlock(&mfs_file_lock);
+
+    if (!f) {
+        ret = -EBADF;
+    } else if (!count) {
+        ret = 0;
+    } else if (mattx_req_take_cancelled(ctx->target_node, 0, id)) {
+        mattx_dbg("[VFS] READ (req %u) cancelled by the Surrogate before it started\n", id);
+        ret = -EINTR;
+    } else {
+        buf = kvmalloc(count, GFP_KERNEL);
+        if (!buf) {
+            ret = -ENOMEM;
+        } else {
+            umode_t mode = file_inode(f)->i_mode;
+            bool may_block = (S_ISFIFO(mode) || S_ISCHR(mode) || S_ISSOCK(mode)) && !(f->f_flags & O_NONBLOCK);
+
+            if (!may_block) {
+                loff_t pos = req->pos;
+
+                mattx_dbg("[VFS] READ fd %d count %zu pos %lld (req %u) from Node %d: plain read (kworker)\n",
+                          req->remote_fd, count, (long long)req->pos, id, ctx->target_node);
+                ret = kernel_read(f, buf, count, &pos);
+            } else {
+                struct mattx_vfs_read_blk_arg arg = { .f = f, .buf = buf, .count = count, .pos = req->pos };
+                struct mattx_blocker *b;
+                bool cancelled = false;
+
+                mattx_dbg("[VFS] READ fd %d count %zu (req %u) from Node %d may block (FIFO/pipe/tty): interruptible helper\n",
+                          req->remote_fd, count, id, ctx->target_node);
+                b = mattx_blocker_start("vfs_read", mattx_vfs_read_blk_fn, &arg);
+                if (IS_ERR(b)) {
+                    ret = PTR_ERR(b);
+                } else {
+                    while (!mattx_blocker_wait(b, msecs_to_jiffies(10))) {
+                        if (!cancelled && mattx_req_take_cancelled(ctx->target_node, 0, id)) {
+                            mattx_dbg("[VFS] READ (req %u) cancelled by the Surrogate, kicking the helper\n", id);
+                            cancelled = true;
+                        }
+                        if (READ_ONCE(mattx_cancellable_stopping) || !READ_ONCE(cluster_map[ctx->target_node])) {
+                            abandoned = true;
+                            cancelled = true;
+                        }
+                        if (cancelled)
+                            mattx_blocker_kick(b);      // every round: a signal that came too early is lost
+                    }
+                    // A cancel that met a finished read still answers with the bytes: they were consumed
+                    ret = (ssize_t)mattx_blocker_finish(b);
                 }
-                vfs_rpc_registry[i].done = true;
-                wake_up_interruptible(&vfs_rpc_registry[i].wq);
-                break;
             }
         }
-        spin_unlock(&vfs_rpc_lock);
     }
+
+    if (abandoned) {
+        mattx_dbg("[VFS] READ (req %u): nobody left to answer, reply dropped\n", id);
+    } else {
+        mattx_dbg("[VFS] READ (req %u) done: %zd\n", id, ret);
+        mattx_vfs_read_reply_send(ctx->target_node, req->req_id, buf, ret);
+    }
+
+    if (f)
+        fput(f);
+    kvfree(buf);
+    kfree(ctx);
+    atomic_dec(&mattx_cancellable_inflight);
+}
+
+static void handle_vfs_read_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    struct mattx_vfs_read_req *req = payload;
+    struct mattx_vfs_read_kworker_ctx *ctx;
+
+    if (!payload || hdr->length < sizeof(*req)) return;
+    if (hdr->sender_id >= MAX_NODES || READ_ONCE(mattx_cancellable_stopping)) return;
+
+    ctx = kmalloc(sizeof(*ctx), GFP_ATOMIC);
+    if (!ctx) {
+        // Still answer: the Surrogate thread sleeps on this request
+        printk(KERN_ERR "MattX:[VFS] READ_REQ %llu: out of memory\n", req->req_id);
+        mattx_vfs_read_reply_send(hdr->sender_id, req->req_id, NULL, -ENOMEM);
+        return;
+    }
+    INIT_WORK(&ctx->work, mattx_vfs_read_kworker);
+    memcpy(&ctx->req, req, sizeof(*req));
+    ctx->target_node = hdr->sender_id;
+    atomic_inc(&mattx_cancellable_inflight);
+    mattx_queue_wait_work(&ctx->work);
+}
+
+// Surrogate side: the request id is the ticket id of the thread that waits (see mattx_rpc_vfs_read()).
+static void handle_vfs_read_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    struct mattx_vfs_read_reply *reply = payload;
+    size_t n = 0;
+    long retval;
+
+    if (!payload || hdr->length < sizeof(*reply)) return;
+
+    if (reply->error) {
+        retval = reply->error;
+    } else if (reply->bytes_read > 0) {
+        // never trust the length of the reply beyond what the message really holds
+        if ((size_t)reply->bytes_read > hdr->length - offsetof(struct mattx_vfs_read_reply, data)) {
+            retval = -EIO;
+        } else {
+            retval = reply->bytes_read;
+            n = reply->bytes_read;
+        }
+    } else {
+        retval = reply->bytes_read;
+    }
+
+    if (!mattx_ticket_complete(hdr->sender_id, 0, (u32)reply->req_id, retval, n ? reply->data : NULL, n))
+        mattx_dbg("[VFS] READ_REPLY req %llu: nobody waits for it any more\n", reply->req_id);
 }
 
 static void handle_vfs_write_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {

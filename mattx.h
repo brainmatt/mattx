@@ -1352,6 +1352,13 @@ struct mattx_vfs_open_reply {
     int error;
 };
 
+/*
+ * MattXFS read (issue #67, P3): the Surrogate thread waits on its own ticket, the ticket id travels in req_id
+ * (orig_pid 0, as for the MattXFS open). One request carries at most MATTX_VFS_READ_MAX bytes: a bigger read()
+ * is a short read, which read(2) allows. The reply carries the bytes (or -errno in 'error').
+ */
+#define MATTX_VFS_READ_MAX (1024 * 1024)
+
 struct mattx_vfs_read_req {
     u64 req_id;
     int remote_fd;
