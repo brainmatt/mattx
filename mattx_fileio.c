@@ -84,36 +84,12 @@ static DEFINE_SPINLOCK(vfs_rpc_lock);
 static u64 next_req_id = 1;
 
 /*
- * Wait for the reply of the VFS RPC in @slot.
- *
- * wait_event_interruptible() also returns when a signal arrives, and the freeze that precedes a
- * migration or recall is a TWA_SIGNAL task_work, so a Surrogate blocked in here can be woken
- * with no reply yet. The read/write callers then went on to use bytes_rw, which still held the
- * result of an EARLIER request that had used the slot (it was never reset): a read of 16 bytes
- * "returned" the 30 bytes of the previous reply, and mattxfs_remote_file_read() copied 30 bytes out
- * of its 16-byte buffer. Hardened usercopy turned that into a kernel BUG on the node, which showed
- * up as the intermittent "lost at cycle N" of the pingpong test (about 1 cycle in 100).
- *
- * On an interrupted wait the slot is given back (a reply that arrives later finds no in-use slot
- * with its req_id and is dropped) and -ERESTARTSYS is returned, so the syscall is restarted.
+ * (mattx_vfs_rpc_wait() is gone: read, write and open wait on their own ticket now (issue #67, P3). The slot of this
+ * registry is still shared by lseek, getattr, readdir, fsync and unlink. History: a slot that was given up after an
+ * interrupt kept the result of an EARLIER request, a read of 16 bytes "returned" the 30 bytes of the previous reply
+ * and hardened usercopy turned that into a kernel BUG ("lost at cycle N" of the pingpong test). A ticket belongs to
+ * exactly one waiter, so that cannot happen to the three syscalls that moved.)
  */
-static int mattx_vfs_rpc_wait(int slot)
-{
-    int rc = wait_event_interruptible(vfs_rpc_registry[slot].wq, vfs_rpc_registry[slot].done);
-
-    if (!rc)
-        return 0;
-
-    spin_lock(&vfs_rpc_lock);
-    if (vfs_rpc_registry[slot].done) {          // the reply raced in; use it
-        spin_unlock(&vfs_rpc_lock);
-        return 0;
-    }
-    vfs_rpc_registry[slot].in_use = false;
-    vfs_rpc_registry[slot].data_buf = NULL;
-    spin_unlock(&vfs_rpc_lock);
-    return rc;
-}
 
 /*
  * MESI_MODE of DSM mode 2:  0 = lazy (Sweeper)   1 = atomic (synchronous shootdowns, write-notify, folio fence)
@@ -1869,10 +1845,11 @@ static void handle_sys_read_reply(struct mattx_link *link, struct mattx_header *
  *   - Sockets are only ever written with MSG_DONTWAIT | MSG_NOSIGNAL: O_NONBLOCK sockets get -EAGAIN at
  *     once (kernel_sendmsg() does not add the O_NONBLOCK of the file, the old code BLOCKED the kworker),
  *     SO_SNDTIMEO is honoured, SIGPIPE is raised on the Surrogate thread, not here.
- *   - Pipes, FIFOs, eventfds and every other file with ->poll: wait for writability (poll, short sleeps,
+ *   - Pipes and FIFOs: the write runs in an interruptible Engine 2 helper, the kworker watches it (CANCEL / unload /
+ *     lost link every 10 ms). No poll-then-write, so there is no race with another writer and a write that
+ *     needs more room than EPOLLOUT promised stays cancellable.
+ *   - Eventfds and every other file with ->poll: wait for writability (poll, short sleeps,
  *     cancel check on every round), then ONE plain write, exactly like mattx_read_cancellable().
- *     A write of at most PIPE_BUF bytes finds room after EPOLLOUT; if another writer takes it in the
- *     meantime the plain write waits (the same small race as the read side).
  *   - O_NONBLOCK files: plain write at once (-EAGAIN).
  */
 struct mattx_write_kworker_ctx {
@@ -2014,6 +1991,26 @@ out:
     return result;
 }
 
+struct mattx_write_blk_arg { struct file *file; const void *buf; size_t count; const struct cred *cred; };
+
+// Runs in the Engine 2 helper: the write to a full FIFO / pipe sleeps interruptibly until room or a signal arrives.
+static long mattx_write_blk_fn(void *p)
+{
+    struct mattx_write_blk_arg *a = p;
+    const struct cred *old_cred = NULL;
+    loff_t pos = 0;                 // a FIFO / pipe is a stream: no position
+    ssize_t r;
+
+    if (a->cred)
+        old_cred = override_creds(a->cred);
+    r = mattx_wormhole_kernel_write(a->file, a->buf, a->count, &pos);
+    if (a->cred)
+        revert_creds(old_cred);
+    if (r == -ERESTARTSYS || r == -ERESTARTNOINTR || r == -ERESTARTNOHAND || r == -ERESTART_RESTARTBLOCK)
+        r = -EINTR;
+    return (long)r;
+}
+
 // Writes to a pipe / FIFO / eventfd / file: wait for writability (cancellable), then ONE plain write.
 static ssize_t mattx_write_file_cancellable(struct file *file, struct task_struct *deputy, const void *buf, size_t count,
                                             int sender, u32 orig_pid, u32 req_id, bool *abandoned)
@@ -2022,6 +2019,50 @@ static ssize_t mattx_write_file_cancellable(struct file *file, struct task_struc
     unsigned long delay_us = 200;
     loff_t pos = file->f_pos;
     ssize_t ret;
+
+    /*
+     * A pipe or FIFO write that may block runs in an interruptible Engine 2 helper instead of poll-then-write
+     * (issue #67, P3). EPOLLOUT only says that SOME room exists: a write of more than that blocks inside the
+     * kernel until a reader drains the rest, and another writer can take the room between the poll and the write.
+     * Both left the kworker parked where the CANCEL of the Surrogate could not reach it. The helper takes the
+     * signal; bytes already written when it is interrupted are reported (the real result), never lost.
+     */
+    if (S_ISFIFO(file_inode(file)->i_mode) && !(file->f_flags & O_NONBLOCK)) {
+        struct mattx_write_blk_arg arg = { .file = file, .buf = buf, .count = count };
+        struct mattx_blocker *b;
+        bool cancelled = false;
+
+        if (mattx_req_take_cancelled(sender, orig_pid, req_id)) {
+            mattx_dbg("[WORMHOLE] WRITE for PID %u req %u cancelled by the Surrogate, nothing written\n", orig_pid, req_id);
+            return -EINTR;
+        }
+
+        // The Deputy's credentials, pinned for as long as the helper runs (the Deputy may die meanwhile)
+        arg.cred = deputy ? get_task_cred(deputy) : NULL;
+        mattx_dbg("[WORMHOLE] WRITE to a pipe/FIFO for PID %u req %u (%zu bytes) may block: interruptible helper\n", orig_pid, req_id, count);
+        b = mattx_blocker_start("write", mattx_write_blk_fn, &arg);
+        if (IS_ERR(b)) {
+            if (arg.cred)
+                put_cred(arg.cred);
+            return PTR_ERR(b);
+        }
+        while (!mattx_blocker_wait(b, msecs_to_jiffies(10))) {
+            if (!cancelled && mattx_req_take_cancelled(sender, orig_pid, req_id)) {
+                mattx_dbg("[WORMHOLE] WRITE for PID %u req %u cancelled by the Surrogate, kicking the helper\n", orig_pid, req_id);
+                cancelled = true;
+            }
+            if (READ_ONCE(mattx_cancellable_stopping) || !READ_ONCE(cluster_map[sender])) {
+                *abandoned = true;
+                cancelled = true;
+            }
+            if (cancelled)
+                mattx_blocker_kick(b);      // every round: a signal that came too early is lost
+        }
+        ret = (ssize_t)mattx_blocker_finish(b);
+        if (arg.cred)
+            put_cred(arg.cred);
+        return ret;
+    }
 
     if (file->f_op && file->f_op->poll && !(file->f_flags & O_NONBLOCK)) {
         for (;;) {
@@ -9572,10 +9613,11 @@ int mattx_rpc_vfs_open(int node_id, const char *path, int flags, int mode, int *
     }
 
     // Interrupted (signal, freeze of a migration or recall): the wait cancels the request and still hands back the
-    // file if the home node had already opened it; otherwise -EINTR. The slot of the old code answered the
-    // stale error of its previous user in that case.
+    // file if the home node had already opened it; otherwise nothing was opened and the syscall is restarted
+    // (-ERESTARTSYS, like a FIFO open and the MattXFS read: a migration or recall must not show the app an EINTR).
+    // The slot of the old code answered the stale error of its previous user in that case.
     if (mattx_ticket_wait(t, MAX_SCHEDULE_TIMEOUT)) {
-        err = -EINTR;
+        err = -ERESTARTSYS;
     } else if (t->retval >= 0) {
         *remote_fd = (int)t->retval;
         err = 0;
@@ -9656,13 +9698,10 @@ out:
 EXPORT_SYMBOL(mattx_rpc_vfs_read);
 
 ssize_t mattx_rpc_vfs_write(int node_id, int remote_fd, const void *buf, size_t count, loff_t *pos) {
-    int i, slot = -1;
-    u64 req_id;
-    size_t payload_size = sizeof(struct mattx_vfs_write_req) + count;
-    struct mattx_vfs_write_req *req = kmalloc(payload_size, GFP_KERNEL);
+    struct mattx_ticket *t;
+    struct mattx_vfs_write_req *req;
+    size_t payload_size;
     ssize_t bytes_written = -EIO;
-
-    if (!req) return -ENOMEM;
 
     // --- NEW: The Local Fast-Path! ---
     if (node_id == my_node_id) {
@@ -9674,52 +9713,61 @@ ssize_t mattx_rpc_vfs_write(int node_id, int remote_fd, const void *buf, size_t 
         }
         spin_unlock(&mfs_file_lock);
         
-        if (!f) { kfree(req); return -EBADF; }
+        if (!f) return -EBADF;
         bytes_written = kernel_write(f, buf, count, pos);
         fput(f);
-        kfree(req);
         return bytes_written;
     }
 
-    if (!cluster_map[node_id]) { kfree(req); return -ENOTCONN; }
+    if (!cluster_map[node_id]) return -ENOTCONN;
+    if (!count) return 0;
+    if (count > MATTX_VFS_WRITE_MAX) count = MATTX_VFS_WRITE_MAX;   // the write fop asks chunk by chunk
 
-    spin_lock(&vfs_rpc_lock);
-    for (i = 0; i < MAX_VFS_RPC; i++) {
-        if (!vfs_rpc_registry[i].in_use) {
-            slot = i;
-            vfs_rpc_registry[i].in_use = true;
-            req_id = next_req_id++;
-            vfs_rpc_registry[i].req_id = req_id;
-            vfs_rpc_registry[i].done = false;
-            vfs_rpc_registry[i].bytes_rw = 0;
-            vfs_rpc_registry[i].data_buf = NULL;
-            init_waitqueue_head(&vfs_rpc_registry[i].wq);
-            break;
-        }
+    payload_size = sizeof(*req) + count;
+    req = kvmalloc(payload_size, GFP_KERNEL);
+    if (!req) return -ENOMEM;
+
+    // The thread that writes waits on its own ticket (issue #67, P3): a write that blocks at the home node (a full
+    // pipe) can be interrupted, the home node is told to give up (generic CANCEL), and the receiver kthread of the
+    // home node never blocks in it. The ticket id travels in req_id, orig_pid is 0 (see mattx_rpc_vfs_open()).
+    t = mattx_ticket_add(0, node_id, 0);
+    if (!t) {
+        kvfree(req);
+        return -ENOMEM;
     }
-    spin_unlock(&vfs_rpc_lock);
 
-    if (slot == -1) { kfree(req); return -EBUSY; }
-
-    req->req_id = req_id;
+    memset(req, 0, sizeof(*req));
+    req->req_id = t->req_id;
     req->remote_fd = remote_fd;
     req->count = count;
     req->pos = *pos;
-    memcpy(req->data, buf, count); 
+    memcpy(req->data, buf, count);
 
-    mattx_comm_send(cluster_map[node_id], MATTX_MSG_VFS_WRITE_REQ, req, payload_size);
-    kfree(req);
+    mattx_dbg("[VFS] WRITE %zu bytes at %lld of fd %d on Node %d as req %u. Sleeping...\n", count, (long long)*pos, remote_fd, node_id, t->req_id);
+    if (mattx_comm_send(cluster_map[node_id], MATTX_MSG_VFS_WRITE_REQ, req, payload_size) < 0) {
+        kvfree(req);
+        bytes_written = -EIO;
+        goto out;
+    }
+    kvfree(req);
 
-    if (mattx_vfs_rpc_wait(slot))
-        return -ERESTARTSYS; // slot already released
+    // Interrupted (signal, freeze of a migration or recall): the wait cancels the request and still hands back the
+    // bytes the home node had already written; otherwise nothing was written and the syscall is restarted.
+    if (mattx_ticket_wait(t, MAX_SCHEDULE_TIMEOUT)) {
+        bytes_written = -ERESTARTSYS;
+        goto out;
+    }
 
-    bytes_written = vfs_rpc_registry[slot].bytes_rw;
-    if (bytes_written > 0) *pos += bytes_written;
+    bytes_written = t->retval;
+    if (bytes_written > 0) {
+        if ((size_t)bytes_written > count)
+            bytes_written = -EIO;       // more than was sent: protocol error
+        else
+            *pos += bytes_written;
+    }
 
-    spin_lock(&vfs_rpc_lock);
-    vfs_rpc_registry[slot].in_use = false;
-    spin_unlock(&vfs_rpc_lock);
-
+out:
+    mattx_ticket_del(t);
     return bytes_written;
 }
 EXPORT_SYMBOL(mattx_rpc_vfs_write);
@@ -9835,10 +9883,11 @@ int mattx_rpc_vfs_fsync(int node_id, int remote_fd, loff_t start, loff_t end, in
 
     wait_event_interruptible(vfs_rpc_registry[slot].wq, vfs_rpc_registry[slot].done);
 
-    // Woken by a signal (or the freeze of a migration) and not by the reply: the slot holds no result yet,
-    // -EINTR is the answer (a late reply finds no slot with its req_id any more and is dropped).
+    // Woken by a signal (or the freeze of a migration) and not by the reply: the slot holds no result yet, the
+    // syscall is restarted (-ERESTARTSYS, so a migration or recall does not show the app an EINTR; a late reply
+    // finds no slot with its req_id any more and is dropped).
     spin_lock(&vfs_rpc_lock);
-    err = vfs_rpc_registry[slot].done ? vfs_rpc_registry[slot].error : -EINTR;
+    err = vfs_rpc_registry[slot].done ? vfs_rpc_registry[slot].error : -ERESTARTSYS;
     vfs_rpc_registry[slot].in_use = false;
     spin_unlock(&vfs_rpc_lock);
 
@@ -10398,52 +10447,164 @@ static void handle_vfs_read_reply(struct mattx_link *link, struct mattx_header *
         mattx_dbg("[VFS] READ_REPLY req %llu: nobody waits for it any more\n", reply->req_id);
 }
 
-static void handle_vfs_write_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
-    if (payload) {
-        struct mattx_vfs_write_req *req = payload;
-        struct mattx_vfs_write_reply reply;
-        struct file *f = NULL;
-        
-        memset(&reply, 0, sizeof(reply));
-        reply.req_id = req->req_id;
-        reply.bytes_written = -EBADF;
+struct mattx_vfs_write_kworker_ctx {
+    struct work_struct work;
+    int target_node;
+    struct mattx_vfs_write_req req;     // req.data[] is a flexible array: must stay the LAST member
+};
 
-        spin_lock(&mfs_file_lock);
-        if (req->remote_fd < MAX_FDS && mfs_open_files[req->remote_fd]) {
-            f = mfs_open_files[req->remote_fd];
-            get_file(f);
-        }
-        spin_unlock(&mfs_file_lock);
+// The one reply of a MattXFS write: the bytes written, or the error
+static void mattx_vfs_write_reply_send(int node, u64 req_id, ssize_t ret)
+{
+    struct mattx_vfs_write_reply reply;
+    struct mattx_link *link = READ_ONCE(cluster_map[node]);
 
-        if (f) {
-            loff_t pos = req->pos;
-            reply.bytes_written = kernel_write(f, req->data, req->count, &pos);
-            reply.error = (reply.bytes_written < 0) ? reply.bytes_written : 0;
-            fput(f);
-        }
-
-        if (cluster_map[hdr->sender_id]) {
-            mattx_comm_send(cluster_map[hdr->sender_id], MATTX_MSG_VFS_WRITE_REPLY, &reply, sizeof(reply));
-        }
-    }
+    memset(&reply, 0, sizeof(reply));
+    reply.req_id = req_id;
+    reply.bytes_written = ret;
+    reply.error = ret < 0 ? (int)ret : 0;
+    if (link)
+        mattx_comm_send(link, MATTX_MSG_VFS_WRITE_REPLY, &reply, sizeof(reply));
 }
 
-static void handle_vfs_write_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
-    if (payload) {
-        struct mattx_vfs_write_reply *reply = payload;
-        int i;
-        spin_lock(&vfs_rpc_lock);
-        for (i = 0; i < MAX_VFS_RPC; i++) {
-            if (vfs_rpc_registry[i].in_use && vfs_rpc_registry[i].req_id == reply->req_id) {
-                vfs_rpc_registry[i].bytes_rw = reply->bytes_written;
-                vfs_rpc_registry[i].error = reply->error;
-                vfs_rpc_registry[i].done = true;
-                wake_up_interruptible(&vfs_rpc_registry[i].wq);
-                break;
+struct mattx_vfs_write_blk_arg { struct file *f; const void *buf; size_t count; loff_t pos; };
+
+// Runs in the Engine 2 helper: the write to a full FIFO / pipe sleeps interruptibly until room or a signal arrives.
+static long mattx_vfs_write_blk_fn(void *p)
+{
+    struct mattx_vfs_write_blk_arg *a = p;
+    loff_t pos = a->pos;
+    ssize_t r = kernel_write(a->f, a->buf, a->count, &pos);
+
+    if (r == -ERESTARTSYS || r == -ERESTARTNOINTR || r == -ERESTARTNOHAND || r == -ERESTART_RESTARTBLOCK)
+        r = -EINTR;
+    return (long)r;
+}
+
+/*
+ * MattXFS write at the home node (issue #67, P3). It used to run kernel_write() in the receiver kthread: a write to a
+ * full FIFO or pipe stopped every message of that node, including the read that would have drained it, and nothing
+ * was answered for a bad fd. Now a kworker answers exactly once:
+ *  - regular file, directory, block device, or O_NONBLOCK: one plain kernel_write (bounded, cannot park);
+ *  - FIFO, pipe, char device, socket (it may sleep): kernel_write in an interruptible Engine 2 helper, watched
+ *    every 10 ms for a CANCEL of the Surrogate, an unloading module and a lost link. A write that was interrupted
+ *    after it had written some bytes answers with those bytes (the real result), never with an error.
+ * The SIGPIPE of a pipe without reader goes to the helper, which ignores it; the Surrogate raises it for the writer.
+ */
+static void mattx_vfs_write_kworker(struct work_struct *work) {
+    struct mattx_vfs_write_kworker_ctx *ctx = container_of(work, struct mattx_vfs_write_kworker_ctx, work);
+    struct mattx_vfs_write_req *req = &ctx->req;
+    u32 id = (u32)req->req_id;
+    size_t count = req->count;
+    struct file *f = NULL;
+    ssize_t ret;
+    bool abandoned = false;
+
+    spin_lock(&mfs_file_lock);
+    if (req->remote_fd >= 0 && req->remote_fd < MAX_FDS && mfs_open_files[req->remote_fd]) {
+        f = mfs_open_files[req->remote_fd];
+        get_file(f);
+    }
+    spin_unlock(&mfs_file_lock);
+
+    if (!f) {
+        ret = -EBADF;
+    } else if (!count) {
+        ret = 0;
+    } else if (mattx_req_take_cancelled(ctx->target_node, 0, id)) {
+        mattx_dbg("[VFS] WRITE (req %u) cancelled by the Surrogate before it started, nothing written\n", id);
+        ret = -EINTR;
+    } else {
+        umode_t mode = file_inode(f)->i_mode;
+        bool may_block = (S_ISFIFO(mode) || S_ISCHR(mode) || S_ISSOCK(mode)) && !(f->f_flags & O_NONBLOCK);
+
+        if (!may_block) {
+            loff_t pos = req->pos;
+
+            mattx_dbg("[VFS] WRITE fd %d count %zu pos %lld (req %u) from Node %d: plain write (kworker)\n",
+                      req->remote_fd, count, (long long)req->pos, id, ctx->target_node);
+            ret = kernel_write(f, req->data, count, &pos);
+        } else {
+            struct mattx_vfs_write_blk_arg arg = { .f = f, .buf = req->data, .count = count, .pos = req->pos };
+            struct mattx_blocker *b;
+            bool cancelled = false;
+
+            mattx_dbg("[VFS] WRITE fd %d count %zu (req %u) from Node %d may block (FIFO/pipe/tty): interruptible helper\n",
+                      req->remote_fd, count, id, ctx->target_node);
+            b = mattx_blocker_start("vfs_write", mattx_vfs_write_blk_fn, &arg);
+            if (IS_ERR(b)) {
+                ret = PTR_ERR(b);
+            } else {
+                while (!mattx_blocker_wait(b, msecs_to_jiffies(10))) {
+                    if (!cancelled && mattx_req_take_cancelled(ctx->target_node, 0, id)) {
+                        mattx_dbg("[VFS] WRITE (req %u) cancelled by the Surrogate, kicking the helper\n", id);
+                        cancelled = true;
+                    }
+                    if (READ_ONCE(mattx_cancellable_stopping) || !READ_ONCE(cluster_map[ctx->target_node])) {
+                        abandoned = true;
+                        cancelled = true;
+                    }
+                    if (cancelled)
+                        mattx_blocker_kick(b);      // every round: a signal that came too early is lost
+                }
+                // A cancel that met a finished (or partly finished) write still answers with the bytes written
+                ret = (ssize_t)mattx_blocker_finish(b);
             }
         }
-        spin_unlock(&vfs_rpc_lock);
     }
+
+    if (abandoned) {
+        mattx_dbg("[VFS] WRITE (req %u): nobody left to answer, reply dropped\n", id);
+    } else {
+        mattx_dbg("[VFS] WRITE (req %u) done: %zd\n", id, ret);
+        mattx_vfs_write_reply_send(ctx->target_node, req->req_id, ret);
+    }
+
+    if (f)
+        fput(f);
+    kvfree(ctx);
+    atomic_dec(&mattx_cancellable_inflight);
+}
+
+static void handle_vfs_write_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    struct mattx_vfs_write_req *req = payload;
+    struct mattx_vfs_write_kworker_ctx *ctx;
+
+    if (!payload || hdr->length < sizeof(*req)) return;
+    if (hdr->sender_id >= MAX_NODES || READ_ONCE(mattx_cancellable_stopping)) return;
+
+    if (req->count > MATTX_VFS_WRITE_MAX || req->count > hdr->length - sizeof(*req)) {
+        printk(KERN_ERR "MattX:[VFS] WRITE_REQ %llu malformed (count %zu, message %u bytes)\n",
+               req->req_id, req->count, hdr->length);
+        mattx_vfs_write_reply_send(hdr->sender_id, req->req_id, -EINVAL);
+        return;
+    }
+
+    // The receiver kthread runs in process context: a big request may sleep for memory here, it is not atomic
+    ctx = kvmalloc(sizeof(*ctx) + req->count, GFP_KERNEL);
+    if (!ctx) {
+        // Still answer: the Surrogate thread sleeps on this request
+        printk(KERN_ERR "MattX:[VFS] WRITE_REQ %llu: out of memory\n", req->req_id);
+        mattx_vfs_write_reply_send(hdr->sender_id, req->req_id, -ENOMEM);
+        return;
+    }
+    INIT_WORK(&ctx->work, mattx_vfs_write_kworker);
+    memcpy(&ctx->req, req, sizeof(*req) + req->count);
+    ctx->target_node = hdr->sender_id;
+    atomic_inc(&mattx_cancellable_inflight);
+    mattx_queue_wait_work(&ctx->work);
+}
+
+// Surrogate side: the request id is the ticket id of the thread that waits (see mattx_rpc_vfs_write()).
+static void handle_vfs_write_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
+    struct mattx_vfs_write_reply *reply = payload;
+    long retval;
+
+    if (!payload || hdr->length < sizeof(*reply)) return;
+
+    retval = reply->error ? reply->error : reply->bytes_written;
+    if (!mattx_ticket_complete(hdr->sender_id, 0, (u32)reply->req_id, retval, NULL, 0))
+        mattx_dbg("[VFS] WRITE_REPLY req %llu: nobody waits for it any more\n", reply->req_id);
 }
 
 static void handle_vfs_lseek_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {

@@ -131,23 +131,44 @@ static ssize_t mattxfs_remote_file_read(struct file *file, char __user *buf, siz
 
 static ssize_t mattxfs_remote_file_write(struct file *file, const char __user *buf, size_t count, loff_t *pos) {
     struct mattxfs_file_info *fi = file->private_data;
+    size_t chunk = min_t(size_t, count, MATTX_VFS_WRITE_MAX);
+    size_t done = 0;
+    ssize_t err = 0;
     void *kbuf;
-    ssize_t bytes_written;
 
     if (!fi) return -EIO;
+    if (!count) return 0;
 
-    kbuf = kvmalloc(count, GFP_KERNEL);
+    kbuf = kvmalloc(chunk, GFP_KERNEL);
     if (!kbuf) return -ENOMEM;
 
-    if (copy_from_user(kbuf, buf, count)) {
-        kvfree(kbuf);
-        return -EFAULT;
+    // One request carries at most MATTX_VFS_WRITE_MAX bytes: ask chunk by chunk until everything is written, a short
+    // write (non-blocking file, interrupted pipe write) or an error. What was written is reported, not the error.
+    while (done < count) {
+        size_t n = min_t(size_t, count - done, MATTX_VFS_WRITE_MAX);
+        ssize_t w;
+
+        if (copy_from_user(kbuf, buf + done, n)) {
+            err = -EFAULT;
+            break;
+        }
+        w = mattx_rpc_vfs_write(fi->node_id, fi->remote_fd, kbuf, n, pos);
+        if (w < 0) {
+            err = w;
+            break;
+        }
+        done += w;
+        if ((size_t)w < n)
+            break;
     }
 
-    bytes_written = mattx_rpc_vfs_write(fi->node_id, fi->remote_fd, kbuf, count, pos);
-    
     kvfree(kbuf);
-    return bytes_written;
+
+    // The SIGPIPE of the real pipe_write() / sock_write_iter() goes to the writing thread, here the Surrogate's
+    if (err == -EPIPE)
+        send_sig(SIGPIPE, current, 0);
+
+    return done ? (ssize_t)done : err;
 }
 
 static loff_t mattxfs_remote_file_llseek(struct file *file, loff_t offset, int whence) {

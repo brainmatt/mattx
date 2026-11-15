@@ -1381,6 +1381,13 @@ struct mattx_vfs_write_req {
     char data[]; 
 };
 
+/*
+ * MattXFS write (issue #67, P3): like the read, the Surrogate thread waits on its own ticket (ticket id in req_id,
+ * orig_pid 0). One request carries at most MATTX_VFS_WRITE_MAX bytes; the Surrogate's write fop asks chunk by chunk
+ * until everything is written, a short write or an error (a blocking pipe write must not return short).
+ */
+#define MATTX_VFS_WRITE_MAX (1024 * 1024)
+
 struct mattx_vfs_write_reply {
     u64 req_id;
     ssize_t bytes_written;
