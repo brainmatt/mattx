@@ -11693,6 +11693,219 @@ static void handle_sys_flock_reply(struct mattx_link *link, struct mattx_header 
 }
 
 /*
+ * truncate() / ftruncate() of a MattXFS file (issue #67, P3). Without a .setattr the kernel's simple_setattr() only
+ * resized the Surrogate's local inode: ftruncate() returned 0 and the file at the home node stayed as it was.
+ * Home node: the file is the open file of the slot registry (ftruncate) or the path (truncate), cut with
+ * vfs_truncate() (permission check, write access, lease break, security hook) while wearing the identity of the
+ * caller; a non-root caller does not keep the capabilities of the kworker.
+ */
+static struct cred *mattx_vfs_user_cred(u32 uid, u32 gid)
+{
+    struct cred *cred = prepare_creds();
+
+    if (!cred)
+        return NULL;
+    cred->uid = make_kuid(&init_user_ns, uid);
+    cred->euid = cred->uid;
+    cred->fsuid = cred->uid;
+    cred->gid = make_kgid(&init_user_ns, gid);
+    cred->egid = cred->gid;
+    cred->fsgid = cred->gid;
+    if (uid) {                              // the kworker is root: only a root caller keeps its capabilities
+        cap_clear(cred->cap_effective);
+        cap_clear(cred->cap_permitted);
+    }
+    return cred;
+}
+
+static int mattx_vfs_setattr_apply(const struct mattx_vfs_setattr_req *req, bool wear_creds)
+{
+    const struct cred *old_cred = NULL;
+    struct cred *cred = NULL;
+    struct file *f = NULL;
+    struct path p;
+    int err;
+
+    if ((req->valid & ~MATTX_SETATTR_SIZE) || !(req->valid & MATTX_SETATTR_SIZE) || req->size < 0)
+        return -EINVAL;
+
+    if (wear_creds) {
+        cred = mattx_vfs_user_cred(req->uid, req->gid);
+        if (!cred)
+            return -ENOMEM;
+        old_cred = override_creds(cred);
+    }
+
+    if (req->remote_fd >= 0) {
+        f = mattx_vfs_slot_get(req->remote_fd);
+        if (!f) {
+            err = -EBADF;
+        } else {
+            p = f->f_path;
+            path_get(&p);
+            err = 0;
+        }
+    } else {
+        err = kern_path(req->path, LOOKUP_FOLLOW, &p);
+    }
+    if (!err) {
+        mattx_dbg("[VFS] TRUNCATE %s%.*s%s to %lld bytes\n", f ? "fd " : "'", f ? 0 : 255, f ? "" : req->path,
+                  f ? "" : "'", (long long)req->size);
+        err = vfs_truncate(&p, req->size);
+        path_put(&p);
+    }
+    if (f)
+        fput(f);
+
+    if (wear_creds) {
+        revert_creds(old_cred);
+        put_cred(cred);
+    }
+    return err;
+}
+
+// --- Surrogate side ---
+int mattx_rpc_vfs_truncate(int node_id, int remote_fd, const char *path, loff_t size)
+{
+    struct mattx_vfs_setattr_req *req;
+    struct mattx_ticket *t;
+    int err;
+
+    if (size < 0)
+        return -EINVAL;
+    if (remote_fd < 0 && strlen(path) >= sizeof(req->path))
+        return -ENAMETOOLONG;
+
+    req = kzalloc(sizeof(*req), GFP_KERNEL);
+    if (!req)
+        return -ENOMEM;
+    req->remote_fd = remote_fd;
+    req->valid = MATTX_SETATTR_SIZE;
+    req->size = size;
+    req->uid = from_kuid(&init_user_ns, current_fsuid());
+    req->gid = from_kgid(&init_user_ns, current_fsgid());
+    if (remote_fd < 0)
+        strscpy(req->path, path, sizeof(req->path));
+
+    // The home node's own MattXFS mount: the same kernel calls in the caller's thread, with the caller's own identity
+    if (node_id == my_node_id) {
+        err = mattx_vfs_setattr_apply(req, false);
+        kfree(req);
+        return err;
+    }
+
+    if (node_id < 0 || node_id >= MAX_NODES || !cluster_map[node_id]) {
+        kfree(req);
+        return -ENOTCONN;
+    }
+
+    t = mattx_ticket_add(0, node_id, 0);
+    if (!t) {
+        kfree(req);
+        return -ENOMEM;
+    }
+    req->req_id = t->req_id;
+
+    mattx_dbg("[VFS] TRUNCATE to %lld bytes (%s %d) on Node %d as req %u. Sleeping...\n", (long long)size,
+              remote_fd >= 0 ? "fd" : "path", remote_fd, node_id, t->req_id);
+    if (mattx_comm_send(cluster_map[node_id], MATTX_MSG_VFS_SETATTR_REQ, req, sizeof(*req)) < 0)
+        err = -EIO;
+    else if (mattx_ticket_wait(t, MAX_SCHEDULE_TIMEOUT))
+        err = -ERESTARTSYS;     // no final answer: restart the system call (truncating to the same size twice is harmless)
+    else
+        err = (int)t->retval;
+    mattx_ticket_del(t);
+    kfree(req);
+    return err;
+}
+EXPORT_SYMBOL(mattx_rpc_vfs_truncate);
+
+// --- Home side: a flat kworker, never the receiver kthread ---
+struct mattx_vfs_setattr_kworker_ctx { struct work_struct work; struct mattx_vfs_setattr_req req; int target_node; };
+
+static void mattx_vfs_setattr_reply_send(int node, u64 req_id, int error)
+{
+    struct mattx_vfs_setattr_reply reply;
+    struct mattx_link *link = READ_ONCE(cluster_map[node]);
+
+    memset(&reply, 0, sizeof(reply));
+    reply.req_id = req_id;
+    reply.error = error;
+    if (link)
+        mattx_comm_send(link, MATTX_MSG_VFS_SETATTR_REPLY, &reply, sizeof(reply));
+}
+
+/*
+ * A truncate that is under way cannot be aborted (like fsync): a CANCEL that arrives before it starts skips it
+ * (-EINTR), one that arrives later is of no use and consumed; the real result is sent. Exactly one reply.
+ */
+static void mattx_vfs_setattr_kworker(struct work_struct *work)
+{
+    struct mattx_vfs_setattr_kworker_ctx *ctx = container_of(work, struct mattx_vfs_setattr_kworker_ctx, work);
+    struct mattx_vfs_setattr_req *req = &ctx->req;
+    u32 id = (u32)req->req_id;
+    bool abandoned = false;
+    int err;
+
+    req->path[sizeof(req->path) - 1] = '\0';
+
+    if (mattx_req_take_cancelled(ctx->target_node, 0, id)) {
+        mattx_dbg("[VFS] SETATTR (req %u) cancelled by the Surrogate before it started, skipped\n", id);
+        err = -EINTR;
+    } else if (READ_ONCE(mattx_cancellable_stopping) || !READ_ONCE(cluster_map[ctx->target_node])) {
+        abandoned = true;
+        err = -EINTR;
+    } else {
+        mattx_dbg("[VFS] SETATTR valid 0x%x (req %u) from Node %d (kworker)\n", req->valid, id, ctx->target_node);
+        err = mattx_vfs_setattr_apply(req, true);
+        mattx_req_take_cancelled(ctx->target_node, 0, id);      // a CANCEL during the truncate is of no use any more
+    }
+
+    if (abandoned) {
+        mattx_dbg("[VFS] SETATTR (req %u): nobody left to answer, reply dropped\n", id);
+    } else {
+        mattx_dbg("[VFS] SETATTR (req %u) done: %d\n", id, err);
+        mattx_vfs_setattr_reply_send(ctx->target_node, req->req_id, err);
+    }
+
+    kfree(ctx);
+    atomic_dec(&mattx_cancellable_inflight);
+}
+
+static void handle_vfs_setattr_req(struct mattx_link *link, struct mattx_header *hdr, void *payload)
+{
+    struct mattx_vfs_setattr_req *req = payload;
+    struct mattx_vfs_setattr_kworker_ctx *ctx;
+
+    if (!payload || hdr->length < sizeof(*req)) return;
+    if (hdr->sender_id >= MAX_NODES || READ_ONCE(mattx_cancellable_stopping)) return;
+
+    ctx = kmalloc(sizeof(*ctx), GFP_ATOMIC);
+    if (!ctx) {
+        // Still answer: the Surrogate thread sleeps on this request
+        printk(KERN_ERR "MattX:[VFS] SETATTR_REQ %llu: out of memory\n", req->req_id);
+        mattx_vfs_setattr_reply_send(hdr->sender_id, req->req_id, -ENOMEM);
+        return;
+    }
+    INIT_WORK(&ctx->work, mattx_vfs_setattr_kworker);
+    memcpy(&ctx->req, req, sizeof(*req));
+    ctx->target_node = hdr->sender_id;
+    atomic_inc(&mattx_cancellable_inflight);
+    mattx_queue_wait_work(&ctx->work);
+}
+
+// Surrogate side: the request id is the ticket id of the thread that waits (see mattx_rpc_vfs_truncate())
+static void handle_vfs_setattr_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload)
+{
+    struct mattx_vfs_setattr_reply *reply = payload;
+
+    if (!payload || hdr->length < sizeof(*reply)) return;
+
+    if (!mattx_ticket_complete(hdr->sender_id, 0, (u32)reply->req_id, reply->error, NULL, 0))
+        mattx_dbg("[VFS] SETATTR_REPLY req %llu: nobody waits for it any more\n", reply->req_id);
+}
+
+/*
  * A node is gone (its socket died, or it is disconnected / replaced / unloaded): every file it had open here goes
  * with it. Without this the slots of a crashed Surrogate stayed forever, and with them whatever the files hold:
  * the file locks of issue #67 (P3) would wedge every other node. Dropping the slot reference is all it takes: the
@@ -11793,6 +12006,8 @@ void mattx_fileio_init_handlers(void) {
     mattx_register_handler(MATTX_MSG_VFS_FLOCK_REPLY, handle_vfs_flock_reply);
     mattx_register_handler(MATTX_MSG_SYS_FLOCK_REQ, handle_sys_flock_req);
     mattx_register_handler(MATTX_MSG_SYS_FLOCK_REPLY, handle_sys_flock_reply);
+    mattx_register_handler(MATTX_MSG_VFS_SETATTR_REQ, handle_vfs_setattr_req);
+    mattx_register_handler(MATTX_MSG_VFS_SETATTR_REPLY, handle_vfs_setattr_reply);
     mattx_register_handler(MATTX_MSG_SYS_EPOLL_CREATE_REQ, handle_sys_epoll_create_req);
     mattx_register_handler(MATTX_MSG_SYS_EPOLL_CREATE_REPLY, handle_sys_epoll_create_reply);
     mattx_register_handler(MATTX_MSG_SYS_EPOLL_CTL_REQ, handle_sys_epoll_ctl_req);

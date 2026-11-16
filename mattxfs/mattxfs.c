@@ -36,6 +36,7 @@ MODULE_DESCRIPTION("MattX SSI - FS Module");
 
 // Forward declarations for the remote operations
 static const struct inode_operations mattxfs_remote_iops;
+static const struct inode_operations mattxfs_remote_file_iops;
 static const struct file_operations mattxfs_remote_dir_fops;
 
 // 1: Path Building Magic ---
@@ -309,6 +310,7 @@ static struct dentry *mattxfs_remote_lookup(struct inode *dir, struct dentry *de
         set_nlink(inode, 2);
     } else {
         // Give regular files the ability to be read and written! ---
+        inode->i_op = &mattxfs_remote_file_iops;
         inode->i_fop = &mattxfs_remote_file_fops;
         set_nlink(inode, 1);
     }
@@ -356,12 +358,64 @@ static int mattxfs_remote_create(struct user_namespace *mnt_userns, struct inode
     
     simple_inode_init_ts(inode);
     
+    inode->i_op = &mattxfs_remote_file_iops;
     inode->i_fop = &mattxfs_remote_file_fops;
     set_nlink(inode, 1);
     
     d_instantiate(dentry, inode);
     return 0;
 }
+
+/*
+ * truncate() / ftruncate() of a remote file (issue #67, P3). Without a .setattr the kernel's simple_setattr() only
+ * resized this node's local inode: the call returned 0 and the file at the home node stayed as it was. The size is
+ * cut at the home node FIRST; only when that worked the local inode follows. Every other attribute (mode, owner,
+ * times) is still only recorded locally, as before (it will be forwarded in a later step).
+ * ftruncate() comes with the open file (ATTR_FILE): its remote FD is used, truncate() is by path.
+ */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
+static int mattxfs_remote_setattr(struct mnt_idmap *idmap, struct dentry *dentry, struct iattr *attr) {
+#else
+static int mattxfs_remote_setattr(struct user_namespace *idmap, struct dentry *dentry, struct iattr *attr) {
+#endif
+    struct inode *inode = d_inode(dentry);
+    int err;
+
+    err = setattr_prepare(idmap, dentry, attr);
+    if (err)
+        return err;
+
+    if (attr->ia_valid & ATTR_SIZE) {
+        struct mattxfs_file_info *fi = NULL;
+        char path_buf[256];
+        int node_id, remote_fd = -1;
+
+        if ((attr->ia_valid & ATTR_FILE) && attr->ia_file && attr->ia_file->f_op == &mattxfs_remote_file_fops)
+            fi = attr->ia_file->private_data;
+        if (fi) {
+            node_id = fi->node_id;
+            remote_fd = fi->remote_fd;
+            path_buf[0] = '\0';
+        } else {
+            node_id = get_node_id_from_dentry(dentry);
+            get_remote_path_from_dentry(dentry, path_buf, sizeof(path_buf));
+        }
+
+        mattx_dbg("[TRUNCATE] %s to %lld bytes on Node %d\n", fi ? "ftruncate" : path_buf, (long long)attr->ia_size, node_id);
+        err = mattx_rpc_vfs_truncate(node_id, remote_fd, path_buf, attr->ia_size);
+        if (err)
+            return err;
+        truncate_setsize(inode, attr->ia_size);
+    }
+
+    setattr_copy(idmap, inode, attr);
+    mark_inode_dirty(inode);
+    return 0;
+}
+
+static const struct inode_operations mattxfs_remote_file_iops = {
+    .setattr        = mattxfs_remote_setattr,
+};
 
 static const struct inode_operations mattxfs_remote_iops = {
     .lookup         = mattxfs_remote_lookup,  

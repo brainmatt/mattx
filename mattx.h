@@ -274,6 +274,8 @@ enum mattx_msg_type {
     MATTX_MSG_VFS_FLOCK_REPLY,
     MATTX_MSG_SYS_FLOCK_REQ,         // issue #67 (P3): flock() of a Surrogate on a Deputy file (Ghost file), ticket based
     MATTX_MSG_SYS_FLOCK_REPLY,
+    MATTX_MSG_VFS_SETATTR_REQ,       // issue #67 (P3): truncate() / ftruncate() (later chmod, chown, utimes) of a MattXFS file, ticket based
+    MATTX_MSG_VFS_SETATTR_REPLY,
 };
 
 struct mattx_header {
@@ -1478,6 +1480,43 @@ struct mattx_vfs_flock_reply {
     int pad;
 };
 
+/*
+ * truncate() / ftruncate() of a MattXFS file (issue #67, P3). The file is the open file remote_fd (ftruncate) or, if
+ * remote_fd is -1, the path (truncate). valid tells what to change: only MATTX_SETATTR_SIZE is carried today, the
+ * other members are reserved for chmod / chown / utimes so the layout does not have to change again; an unknown bit
+ * is answered with -EINVAL. uid / gid: the home node wears the identity of the caller for the permission checks.
+ */
+#define MATTX_SETATTR_SIZE   0x01
+#define MATTX_SETATTR_MODE   0x02       // reserved
+#define MATTX_SETATTR_UID    0x04       // reserved
+#define MATTX_SETATTR_GID    0x08       // reserved
+#define MATTX_SETATTR_ATIME  0x10       // reserved
+#define MATTX_SETATTR_MTIME  0x20       // reserved
+
+struct mattx_vfs_setattr_req {
+    u64 req_id;
+    s32 remote_fd;          // >= 0: the open file at the home node; -1: path
+    u32 valid;              // MATTX_SETATTR_*
+    u32 uid;                // fsuid / fsgid of the caller
+    u32 gid;
+    s64 size;               // MATTX_SETATTR_SIZE (>= 0)
+    u32 new_mode;           // reserved
+    u32 new_uid;            // reserved
+    u32 new_gid;            // reserved
+    u32 pad;
+    s64 atime_sec;          // reserved
+    s64 atime_nsec;
+    s64 mtime_sec;
+    s64 mtime_nsec;
+    char path[256];         // NUL terminated, used if remote_fd is -1
+};
+
+struct mattx_vfs_setattr_reply {
+    u64 req_id;
+    int error;
+    int pad;
+};
+
 struct mattx_vfs_close_req {
     int remote_fd;
 };
@@ -1966,6 +2005,7 @@ int mattx_rpc_vfs_fsync(int node_id, int remote_fd, loff_t start, loff_t end, in
 int mattx_rpc_vfs_lock(int node_id, int remote_fd, int cmd, struct file_lock *fl);    // MattXFS .lock
 int mattx_rpc_vfs_flock(int node_id, int remote_fd, int cmd, struct file_lock *fl);   // MattXFS .flock
 int mattx_rpc_vfs_unlink(int node_id, const char *path);
+int mattx_rpc_vfs_truncate(int node_id, int remote_fd, const char *path, loff_t size);   // MattXFS .setattr (ATTR_SIZE)
 
 #endif // MATTX_H
 
