@@ -7855,7 +7855,8 @@ static void mattx_shm_arm_schedule(long ret)
     }
     init_task_work(&w->cb, mattx_shm_arm_twork);
     w->addr = (unsigned long)ret;
-    if (task_work_add(current, &w->cb, TWA_RESUME)) {
+    /* task_work_add() is not exported to modules; real_task_work_add is the kprobe-resolved pointer (mattx_migr.c) */
+    if (!real_task_work_add || real_task_work_add(current, &w->cb, TWA_RESUME)) {
         kfree(w);
         module_put(THIS_MODULE);
     }
