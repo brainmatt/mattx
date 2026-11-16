@@ -1104,9 +1104,70 @@ static int mattx_fake_fsync(struct file *file, loff_t start, loff_t end, int dat
     return mattx_wormhole_fsync(fd_info->orig_pid, fd_info->home_node, fd_info->remote_fd, start, end, datasync);
 }
 
-// --- NEW: The Fake File Read Operation (Runs on Node 2) ---
-static ssize_t mattx_fake_read(struct file *file, char __user *buf, size_t count, loff_t *pos) {
+/*
+ * FLOCK (Surrogate side, issue #67, P3): flock() on a Ghost file. Without a .flock fop the kernel recorded the lock
+ * on the anonymous inode of the Ghost file: it excluded nobody, neither another node nor the native processes of
+ * the home node. Now the lock is taken on the Deputy's real file, on the home node (SYS_FLOCK_REQ), so a Surrogate
+ * and a native process, or two Surrogates, exclude each other like two processes on one machine. The thread waits
+ * on its own ticket; interrupted (signal, freeze of a migration or recall) it sends the generic CANCEL and returns
+ * -ERESTARTSYS unless the final answer is already there (a lock granted at the moment of the cancel is the real
+ * result). The Surrogate kernel records nothing locally: the lock goes with the Deputy's file (CLOSE_REQ).
+ */
+int mattx_wormhole_flock(u32 orig_pid, int home_node, u32 remote_fd, int cmd, int type)
+{
+    struct mattx_sys_flock_req req;
+    struct mattx_ticket *t;
+    struct mattx_link *link;
+    int ret;
+
+    if (home_node < 0 || home_node >= MAX_NODES) return -EIO;
+    link = READ_ONCE(cluster_map[home_node]);
+    if (!link)
+        return type == F_UNLCK ? 0 : -EIO;     // the home node is gone, and its locks with it
+
+    t = mattx_ticket_add(orig_pid, home_node, 0);
+    if (!t) return -ENOMEM;
+
+    memset(&req, 0, sizeof(req));
+    req.orig_pid = orig_pid;
+    req.fd = remote_fd;
+    req.req_id = t->req_id;
+    req.cmd = cmd;
+    req.type = type;
+
+    mattx_dbg("[WORMHOLE] Surrogate %d requesting FLOCK cmd %d type %d for FD %u (req %u). Sleeping...\n",
+              current->pid, cmd, type, remote_fd, t->req_id);
+
+    if (mattx_comm_send(link, MATTX_MSG_SYS_FLOCK_REQ, &req, sizeof(req)) < 0)
+        ret = -EIO;
+    else if (mattx_ticket_wait(t, MAX_SCHEDULE_TIMEOUT))
+        ret = -ERESTARTSYS;     // not granted: restart the system call (a migration freezes like a signal)
+    else
+        ret = (int)t->retval;
+
+    mattx_dbg("[WORMHOLE] Surrogate %d woke up! FLOCK result: %d (req %u).\n", current->pid, ret, req.req_id);
+    mattx_ticket_del(t);
+    return ret;
+}
+EXPORT_SYMBOL(mattx_wormhole_flock);
+
+static int mattx_fake_flock(struct file *file, int cmd, struct file_lock *fl)
+{
     struct mattx_fake_fd_info *fd_info = file->private_data;
+
+    if (!fd_info) return -EIO;
+    return mattx_wormhole_flock(fd_info->orig_pid, fd_info->home_node, fd_info->remote_fd, cmd, fl->c.flc_type);
+}
+
+// --- NEW: The Fake File Read Operation (Runs on Node 2) ---
+/*
+ * One READ_REQ on a ticket of its own (issue #67, P2). The bytes go to buf (read(2)) or, for readv / preadv /
+ * sendfile / splice (issue #67, P3), straight into the iov_iter. positional: preadv, read at ppos and leave the
+ * file position of the Deputy's file alone. The caller advances its own position.
+ */
+static ssize_t mattx_fake_read_one(struct mattx_fake_fd_info *fd_info, size_t count, bool positional, loff_t ppos,
+                                   char __user *buf, struct iov_iter *to)
+{
     struct mattx_sys_read_req req;
     struct mattx_ticket *t;
     struct mattx_link *link;
@@ -1129,8 +1190,11 @@ static ssize_t mattx_fake_read(struct file *file, char __user *buf, size_t count
     req.fd = fd_info->remote_fd;
     req.count = to_read;
     req.req_id = t->req_id;
+    req.flags = positional ? MATTX_READ_POSITIONAL : 0;
+    req.pos = positional ? ppos : 0;
 
-    mattx_dbg("[WORMHOLE] Surrogate %d requesting %zu bytes from FD %u (req %u). Sleeping...\n", my_pid, to_read, req.fd, req.req_id);
+    mattx_dbg("[WORMHOLE] Surrogate %d requesting %zu bytes from FD %u%s (req %u). Sleeping...\n", my_pid, to_read, req.fd,
+              positional ? " at a given offset" : "", req.req_id);
 
     if (mattx_comm_send(link, MATTX_MSG_SYS_READ_REQ, &req, sizeof(req)) < 0) {
         ret = -EIO;
@@ -1148,16 +1212,42 @@ static ssize_t mattx_fake_read(struct file *file, char __user *buf, size_t count
     if (ret > 0) {
         if (!t->data || (size_t)ret > t->data_len) {
             ret = -EIO;
+        } else if (to) {
+            if (copy_to_iter(t->data, ret, to) != (size_t)ret)
+                ret = -EFAULT;
         } else if (copy_to_user(buf, t->data, ret)) {
             ret = -EFAULT;
-        } else {
-            *pos += ret; // Advance the file position!
         }
     }
 
 out:
     mattx_dbg("[WORMHOLE] Surrogate %d woke up! Read %zd bytes (req %u).\n", my_pid, ret, req.req_id);
     mattx_ticket_del(t);
+    return ret;
+}
+
+static ssize_t mattx_fake_read(struct file *file, char __user *buf, size_t count, loff_t *pos) {
+    ssize_t ret = mattx_fake_read_one(file->private_data, count, false, 0, buf, NULL);
+
+    if (ret > 0)
+        *pos += ret; // Advance the file position!
+    return ret;
+}
+
+// readv / preadv / sendfile / splice (read(2) keeps the scalar fop). preadv() passes its own offset: ki_pos then
+// differs from the file position (read(2) and readv() start at f_pos), so it is read THERE and f_pos stays.
+// (A preadv() at exactly the current f_pos cannot be told from readv(): it reads at the Deputy's position.)
+static ssize_t mattx_fake_read_iter(struct kiocb *iocb, struct iov_iter *to)
+{
+    struct file *file = iocb->ki_filp;
+    bool positional = iocb->ki_pos != file->f_pos;
+    ssize_t ret;
+
+    if (!iov_iter_count(to))
+        return 0;
+    ret = mattx_fake_read_one(file->private_data, iov_iter_count(to), positional, iocb->ki_pos, NULL, to);
+    if (ret > 0)
+        iocb->ki_pos += ret;
     return ret;
 }
 
@@ -1173,7 +1263,7 @@ out:
  */
 // One request of at most MATTX_WRITE_CHUNK bytes. Bytes written (0 .. chunk) or -errno; -EINTR: interrupted
 // before anything was written.
-static long mattx_wormhole_write_one(u32 orig_pid, int home_node, u32 remote_fd, const char __user *ubuf, size_t chunk,
+static long mattx_wormhole_write_one(u32 orig_pid, int home_node, u32 remote_fd, struct iov_iter *from, size_t chunk,
                                      bool positional, loff_t pos)
 {
     struct mattx_sys_write_req *req;
@@ -1189,7 +1279,7 @@ static long mattx_wormhole_write_one(u32 orig_pid, int home_node, u32 remote_fd,
     if (!req)
         return -ENOMEM;
 
-    if (chunk && copy_from_user(req->data, ubuf, chunk)) {
+    if (chunk && copy_from_iter(req->data, chunk, from) != chunk) {
         kfree(req);
         return -EFAULT;
     }
@@ -1233,9 +1323,14 @@ done:
     return ret;
 }
 
-// positional (pwrite64): written at pos + the bytes already written, the file position of the Deputy's file stays
-ssize_t mattx_wormhole_write(u32 orig_pid, int home_node, u32 remote_fd, const char __user *ubuf, size_t count,
-                             bool positional, loff_t pos)
+/*
+ * The bytes come from an iov_iter: ONE iterator, so a writev() is cut into requests of MATTX_WRITE_CHUNK bytes that
+ * are not bounded by the segments (a writev() of small pieces is one request, not one per piece: atomic for
+ * everything up to a chunk). positional (pwrite64 / pwritev): written at pos + the bytes already written, the file
+ * position of the Deputy's file stays.
+ */
+static ssize_t mattx_wormhole_write_iter(u32 orig_pid, int home_node, u32 remote_fd, struct iov_iter *from,
+                                         bool positional, loff_t pos)
 {
     size_t total = 0;
 
@@ -1243,8 +1338,8 @@ ssize_t mattx_wormhole_write(u32 orig_pid, int home_node, u32 remote_fd, const c
         return -EIO;
 
     do {
-        size_t chunk = min_t(size_t, count - total, MATTX_WRITE_CHUNK);
-        long r = mattx_wormhole_write_one(orig_pid, home_node, remote_fd, ubuf + total, chunk, positional, pos + total);
+        size_t chunk = min_t(size_t, iov_iter_count(from), MATTX_WRITE_CHUNK);
+        long r = mattx_wormhole_write_one(orig_pid, home_node, remote_fd, from, chunk, positional, pos + total);
 
         if (r < 0) {
             if (r == -EPIPE)
@@ -1252,12 +1347,26 @@ ssize_t mattx_wormhole_write(u32 orig_pid, int home_node, u32 remote_fd, const c
             return total ? (ssize_t)total : r;  // bytes already written win over the error
         }
         total += r;
-        if ((size_t)r < chunk)
-            break;                              // short: non-blocking file, full buffer, nothing more fits
-    } while (total < count);
+        if ((size_t)r < chunk) {
+            iov_iter_revert(from, chunk - r);   // short: what was not written stays in the iterator
+            break;                              // non-blocking file, full buffer, nothing more fits
+        }
+    } while (iov_iter_count(from));
 
     mattx_dbg("[RPC] Illusion Complete! write(fd=%u) returned %zu (thread %d)\n", remote_fd, total, current->pid);
     return total;
+}
+
+// positional (pwrite64): written at pos + the bytes already written, the file position of the Deputy's file stays
+ssize_t mattx_wormhole_write(u32 orig_pid, int home_node, u32 remote_fd, const char __user *ubuf, size_t count,
+                             bool positional, loff_t pos)
+{
+    struct iov_iter from;
+    int err = import_ubuf(ITER_SOURCE, (void __user *)ubuf, count, &from);
+
+    if (err)
+        return err;
+    return mattx_wormhole_write_iter(orig_pid, home_node, remote_fd, &from, positional, pos);
 }
 
 static ssize_t mattx_fake_write(struct file *file, const char __user *buf, size_t count, loff_t *pos) {
@@ -1274,6 +1383,24 @@ static ssize_t mattx_fake_write(struct file *file, const char __user *buf, size_
                                positional, positional ? *pos : 0);
     if (ret > 0 && pos)
         *pos += ret;
+    return ret;
+}
+
+// writev / pwritev / sendfile / splice (write(2) keeps the scalar fop). Like mattx_fake_read_iter(): pwritev()
+// passes its own offset (ki_pos != f_pos); it is written THERE and the Deputy's file position stays.
+static ssize_t mattx_fake_write_iter(struct kiocb *iocb, struct iov_iter *from)
+{
+    struct file *file = iocb->ki_filp;
+    struct mattx_fake_fd_info *fd_info = file->private_data;
+    bool positional = iocb->ki_pos != file->f_pos;
+    ssize_t ret;
+
+    if (!fd_info || fd_info->home_node < 0 || fd_info->home_node >= MAX_NODES || !READ_ONCE(cluster_map[fd_info->home_node]))
+        return -EIO;
+    ret = mattx_wormhole_write_iter(fd_info->orig_pid, fd_info->home_node, fd_info->remote_fd, from,
+                                    positional, positional ? iocb->ki_pos : 0);
+    if (ret > 0)
+        iocb->ki_pos += ret;
     return ret;
 }
 
@@ -1319,8 +1446,13 @@ static __poll_t mattx_fake_poll(struct file *file, struct poll_table_struct *wai
 const struct file_operations mattx_fops = {
     .llseek = mattx_fake_llseek,
     .fsync = mattx_fake_fsync,
+    .flock = mattx_fake_flock,
     .read = mattx_fake_read,
     .write = mattx_fake_write,
+    .read_iter = mattx_fake_read_iter,
+    .write_iter = mattx_fake_write_iter,
+    .splice_read = copy_splice_read,
+    .splice_write = iter_file_splice_write,
     .poll = mattx_fake_poll, // THE PACIFIER!
     .release = mattx_fake_release,
     .owner = THIS_MODULE,
@@ -1735,14 +1867,22 @@ static void mattx_read_kworker(struct work_struct *work) {
     }
 
     if (file) {
-        reply = kmalloc(sizeof(*reply) + count, GFP_KERNEL);
-        if (reply) {
-            loff_t pos = file->f_pos;
+        bool positional = req->flags & MATTX_READ_POSITIONAL;
+        bool malformed = (req->flags & ~MATTX_READ_POSITIONAL) || (positional && req->pos < 0);
+
+        if (malformed)
+            printk(KERN_ERR "MattX:[WORMHOLE] READ_REQ %u of PID %u malformed (flags 0x%x, pos %lld)\n",
+                   req->req_id, req->orig_pid, req->flags, (long long)req->pos);
+        reply = malformed ? NULL : kmalloc(sizeof(*reply) + count, GFP_KERNEL);
+        if (malformed) {
+            ret = -EINVAL;
+        } else if (reply) {
+            loff_t pos = positional ? req->pos : file->f_pos;   // preadv: the offset of the caller, f_pos is not touched
 
             // Reads straight into the reply buffer; may wait, but can be cancelled
             ret = mattx_read_cancellable(file, deputy, reply->data, count, &pos,
                                          ctx->target_node, req->orig_pid, req->req_id, &abandoned);
-            if (ret >= 0) {
+            if (ret >= 0 && !positional) {
                 file->f_pos = pos;
             }
         } else {
@@ -11406,6 +11546,121 @@ static void handle_vfs_flock_reply(struct mattx_link *link, struct mattx_header 
         mattx_dbg("[VFS] FLOCK_REPLY req %llu: nobody waits for it any more\n", reply->req_id);
 }
 
+// --- Home side: flock() of a Surrogate on a file of the Deputy (Ghost file) ---
+struct mattx_sys_flock_kworker_ctx { struct work_struct work; struct mattx_sys_flock_req req; int target_node; };
+
+static void mattx_sys_flock_reply_send(int node, u32 orig_pid, u32 req_id, int error)
+{
+    struct mattx_sys_flock_reply reply;
+    struct mattx_link *link = READ_ONCE(cluster_map[node]);
+
+    memset(&reply, 0, sizeof(reply));
+    reply.orig_pid = orig_pid;
+    reply.req_id = req_id;
+    reply.error = error;
+    if (link)
+        mattx_comm_send(link, MATTX_MSG_SYS_FLOCK_REPLY, &reply, sizeof(reply));
+}
+
+/*
+ * The lock is taken on the Deputy's file itself (mattx_vfs_flock_apply: the same kernel calls as the flock system
+ * call), so the owner is that open file, exactly as for a native process; the Deputy is NOT woken up. A request that
+ * may wait (flock without LOCK_NB, not an unlock) runs in an Engine 2 helper that is watched every 10 ms (cancel /
+ * unload / link gone), everything else cannot sleep and runs here. Exactly one reply.
+ */
+static void mattx_sys_flock_kworker(struct work_struct *work)
+{
+    struct mattx_sys_flock_kworker_ctx *ctx = container_of(work, struct mattx_sys_flock_kworker_ctx, work);
+    struct mattx_sys_flock_req *req = &ctx->req;
+    struct file *f;
+    bool abandoned = false;
+    int err;
+
+    f = mattx_get_remote_file(req->orig_pid, req->fd);
+
+    if (!f) {
+        err = -EBADF;
+    } else if (mattx_req_take_cancelled(ctx->target_node, req->orig_pid, req->req_id)) {
+        mattx_dbg("[WORMHOLE] FLOCK for FD %u (req %u) cancelled by the Surrogate before it started\n", req->fd, req->req_id);
+        err = -EINTR;
+    } else if (!mattx_vfs_lock_may_block(req->cmd, req->type)) {
+        mattx_dbg("[WORMHOLE] FLOCK cmd %d type %d FD %u (req %u) from Node %d: no wait (kworker)\n",
+                  req->cmd, req->type, req->fd, req->req_id, ctx->target_node);
+        err = mattx_vfs_flock_apply(f, req->cmd, req->type);
+    } else {
+        struct mattx_vfs_flock_blk_arg arg = { .f = f, .cmd = req->cmd, .type = req->type };
+        struct mattx_blocker *b;
+        bool cancelled = false;
+
+        mattx_dbg("[WORMHOLE] FLOCK cmd %d type %d FD %u (req %u) from Node %d may wait: interruptible helper\n",
+                  req->cmd, req->type, req->fd, req->req_id, ctx->target_node);
+        b = mattx_blocker_start("sys_flock", mattx_vfs_flock_blk_fn, &arg);
+        if (IS_ERR(b)) {
+            err = PTR_ERR(b);
+        } else {
+            while (!mattx_blocker_wait(b, msecs_to_jiffies(10))) {
+                if (!cancelled && mattx_req_take_cancelled(ctx->target_node, req->orig_pid, req->req_id)) {
+                    mattx_dbg("[WORMHOLE] FLOCK (req %u) cancelled by the Surrogate, kicking the helper\n", req->req_id);
+                    cancelled = true;
+                }
+                if (READ_ONCE(mattx_cancellable_stopping) || !READ_ONCE(cluster_map[ctx->target_node])) {
+                    abandoned = true;
+                    cancelled = true;
+                }
+                if (cancelled)
+                    mattx_blocker_kick(b);      // every round: a signal that came too early is lost
+            }
+            err = (int)mattx_blocker_finish(b);
+        }
+    }
+
+    if (abandoned) {
+        mattx_dbg("[WORMHOLE] FLOCK (req %u): nobody left to answer, reply dropped\n", req->req_id);
+    } else {
+        mattx_dbg("[WORMHOLE] FLOCK for FD %u (req %u) done: %d\n", req->fd, req->req_id, err);
+        mattx_sys_flock_reply_send(ctx->target_node, req->orig_pid, req->req_id, err);
+    }
+
+    if (f)
+        fput(f);
+    kfree(ctx);
+    atomic_dec(&mattx_cancellable_inflight);
+}
+
+static void handle_sys_flock_req(struct mattx_link *link, struct mattx_header *hdr, void *payload)
+{
+    struct mattx_sys_flock_req *req = payload;
+    struct mattx_sys_flock_kworker_ctx *ctx;
+
+    if (!payload || hdr->length < sizeof(*req)) return;
+    if (hdr->sender_id >= MAX_NODES || READ_ONCE(mattx_cancellable_stopping)) return;
+
+    ctx = kmalloc(sizeof(*ctx), GFP_ATOMIC);
+    if (!ctx) {
+        // Still answer: the Surrogate thread sleeps on this ticket
+        printk(KERN_ERR "MattX:[WORMHOLE] FLOCK_REQ %u of PID %u: out of memory\n", req->req_id, req->orig_pid);
+        mattx_sys_flock_reply_send(hdr->sender_id, req->orig_pid, req->req_id, -ENOMEM);
+        return;
+    }
+    INIT_WORK(&ctx->work, mattx_sys_flock_kworker);
+    memcpy(&ctx->req, req, sizeof(*req));
+    ctx->target_node = hdr->sender_id;
+    atomic_inc(&mattx_cancellable_inflight);
+    mattx_queue_wait_work(&ctx->work);
+}
+
+// Surrogate side: the reply belongs to exactly one waiting thread (its ticket)
+static void handle_sys_flock_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload)
+{
+    struct mattx_sys_flock_reply *reply = payload;
+
+    if (!payload || hdr->length < sizeof(*reply)) return;
+
+    mattx_dbg("[RPC] Received FLOCK_REPLY for Orig PID %u req %u. Error: %d\n", reply->orig_pid, reply->req_id, reply->error);
+    if (!mattx_ticket_complete(hdr->sender_id, reply->orig_pid, reply->req_id, reply->error, NULL, 0))
+        mattx_dbg("[RPC] FLOCK_REPLY req %u: nobody waits for it any more, dropped\n", reply->req_id);
+}
+
 /*
  * A node is gone (its socket died, or it is disconnected / replaced / unloaded): every file it had open here goes
  * with it. Without this the slots of a crashed Surrogate stayed forever, and with them whatever the files hold:
@@ -11505,6 +11760,8 @@ void mattx_fileio_init_handlers(void) {
     mattx_register_handler(MATTX_MSG_VFS_LOCK_REPLY, handle_vfs_lock_reply);
     mattx_register_handler(MATTX_MSG_VFS_FLOCK_REQ, handle_vfs_flock_req);
     mattx_register_handler(MATTX_MSG_VFS_FLOCK_REPLY, handle_vfs_flock_reply);
+    mattx_register_handler(MATTX_MSG_SYS_FLOCK_REQ, handle_sys_flock_req);
+    mattx_register_handler(MATTX_MSG_SYS_FLOCK_REPLY, handle_sys_flock_reply);
     mattx_register_handler(MATTX_MSG_SYS_EPOLL_CREATE_REQ, handle_sys_epoll_create_req);
     mattx_register_handler(MATTX_MSG_SYS_EPOLL_CREATE_REPLY, handle_sys_epoll_create_reply);
     mattx_register_handler(MATTX_MSG_SYS_EPOLL_CTL_REQ, handle_sys_epoll_ctl_req);

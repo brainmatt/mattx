@@ -272,6 +272,8 @@ enum mattx_msg_type {
     MATTX_MSG_VFS_LOCK_REPLY,
     MATTX_MSG_VFS_FLOCK_REQ,         // issue #67 (P3): flock() of a MattXFS file, ticket based
     MATTX_MSG_VFS_FLOCK_REPLY,
+    MATTX_MSG_SYS_FLOCK_REQ,         // issue #67 (P3): flock() of a Surrogate on a Deputy file (Ghost file), ticket based
+    MATTX_MSG_SYS_FLOCK_REPLY,
 };
 
 struct mattx_header {
@@ -418,7 +420,12 @@ struct mattx_sys_read_req {
     u32 fd;
     size_t count;
     u32 req_id; // ticket id: matches the reply to the one thread that waits for it (0 = none)
+    u32 flags;  // MATTX_READ_POSITIONAL or 0 (issue #67, P3: preadv)
+    s64 pos;    // MATTX_READ_POSITIONAL: where to read (>= 0), the file position of the Deputy's file stays
 };
+
+// preadv(): read at pos and leave the file position of the Deputy's file alone (like MATTX_WRITE_POSITIONAL)
+#define MATTX_READ_POSITIONAL 0x1
 
 struct mattx_sys_read_reply {
     u32 orig_pid;
@@ -479,6 +486,23 @@ struct mattx_sys_fsync_reply {
     u32 orig_pid;
     int error;
     u32 req_id;                 // echo of the request's ticket id (0: legacy)
+};
+
+// flock() on a Ghost file (issue #67, P3): the lock is taken on the Deputy's real file, on the home node
+struct mattx_sys_flock_req {
+    u32 orig_pid;
+    u32 fd;
+    u32 req_id;                 // ticket id, never 0
+    int cmd;                    // F_SETLK (LOCK_NB) or F_SETLKW
+    int type;                   // F_RDLCK (LOCK_SH), F_WRLCK (LOCK_EX) or F_UNLCK (LOCK_UN)
+    u32 pad;
+};
+
+struct mattx_sys_flock_reply {
+    u32 orig_pid;
+    int error;
+    u32 req_id;                 // echo of the request's ticket id
+    u32 pad;
 };
 
 struct mattx_sys_socket_req {
@@ -764,6 +788,7 @@ bool mattx_ticket_complete(int home_node, u32 orig_pid, u32 req_id, long retval,
 int mattx_ticket_wait(struct mattx_ticket *t, long timeout);
 // write() of a Surrogate thread to a Deputy file (issue #67, P2): chunks of MATTX_WRITE_CHUNK, one ticket each.
 // Bytes written or -errno. Raises SIGPIPE on -EPIPE, like write(2). Runs in the calling thread (task_work or fop).
+int mattx_wormhole_flock(u32 orig_pid, int home_node, u32 remote_fd, int cmd, int type);
 ssize_t mattx_wormhole_write(u32 orig_pid, int home_node, u32 remote_fd, const char __user *ubuf, size_t count,
                               bool positional, loff_t pos);
 // fsync()/fdatasync() of a Surrogate thread on a Deputy file (issue #67, P2): one request, one ticket. 0 or -errno.

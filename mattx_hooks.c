@@ -5215,9 +5215,8 @@ done:
     return ret;
 }
 
-static void mattx_sendmsg_tw_fn(struct callback_head *cb) {
-    struct mattx_sendmsg_tw *tw = container_of(cb, struct mattx_sendmsg_tw, cb);
-    struct pt_regs *regs = task_pt_regs(current);
+// ONE message (tw->msg): the bytes sent, or -errno. Shared by sendmsg() and, per datagram, by sendmmsg().
+static long mattx_sendmsg_do(struct mattx_sendmsg_tw *tw) {
     struct sockaddr_storage addr;
     struct user_msghdr umsg;
     struct iovec *iovs = NULL;
@@ -5297,7 +5296,14 @@ static void mattx_sendmsg_tw_fn(struct callback_head *cb) {
 
 out:
     kfree(iovs);
-    regs->ax = ret;
+    return ret;
+}
+
+static void mattx_sendmsg_tw_fn(struct callback_head *cb) {
+    struct mattx_sendmsg_tw *tw = container_of(cb, struct mattx_sendmsg_tw, cb);
+    struct pt_regs *regs = task_pt_regs(current);
+
+    regs->ax = mattx_sendmsg_do(tw);
     kfree(tw);
 }
 
@@ -5375,6 +5381,123 @@ static int ret_handler_msg(struct kretprobe_instance *ri, struct pt_regs *regs) 
     return 0;
 }
 
+
+// --- SENDMMSG HOOK ---
+/*
+ * sendmmsg() on a socket that lives on the home node (issue #67, P3). glibc's resolver sends its DNS queries with it
+ * (A and AAAA in one call), so a Surrogate resolving a name used to hit the Ghost FD with a real syscall. Same pattern
+ * as sendmsg(): the sabotaged call returns to user mode, and the task_work of the calling thread sends every
+ * datagram (mattx_sendmsg_do() -> SENDMSG_REQ on a ticket of its own), stores each msg_len in the user's mmsghdr and
+ * returns the number of datagrams, like __sys_sendmmsg(): an error is only reported if nothing was sent. No new
+ * message. Without the task_work resolver the call is not intercepted (nothing to fall back to).
+ * NOT carried: ancillary data, like sendmsg().
+ */
+static struct kretprobe sendmmsg_kprobe;
+
+struct mmsg_kretprobe_data { int fd; struct mmsghdr __user *mmsg; unsigned int vlen; int flags; bool is_ghost; int remote_fd; };
+
+static int entry_handler_sendmmsg(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    struct mmsg_kretprobe_data *data = (struct mmsg_kretprobe_data *)ri->data;
+    struct pt_regs *sys_regs = SYSCALL_REGS(regs);
+
+    data->is_ghost = false;
+    if (real_task_work_add && is_guest_process(current->tgid)) {
+        data->fd = (int)sys_regs->di;
+        if (is_wormhole_fd(data->fd, &data->remote_fd)) {
+            data->is_ghost = true;
+            data->mmsg = (struct mmsghdr __user *)sys_regs->si;
+            data->vlen = (unsigned int)sys_regs->dx;
+            data->flags = (int)sys_regs->r10;
+            sys_regs->di = -1; // Sabotage!
+        }
+    }
+    return 0;
+}
+
+struct mattx_sendmmsg_tw {
+    struct callback_head cb;
+    u32 orig_pid;
+    int home_node;
+    int remote_fd;
+    struct mmsghdr __user *mmsg;
+    unsigned int vlen;
+    int flags;
+};
+
+static void mattx_sendmmsg_tw_fn(struct callback_head *cb) {
+    struct mattx_sendmmsg_tw *tw = container_of(cb, struct mattx_sendmmsg_tw, cb);
+    struct pt_regs *regs = task_pt_regs(current);
+    // The per-message part of sendmsg(): everything but the message itself is the same for every datagram
+    struct mattx_sendmsg_tw one = { .orig_pid = tw->orig_pid, .home_node = tw->home_node,
+                                    .remote_fd = tw->remote_fd, .flags = tw->flags };
+    unsigned int vlen = min_t(unsigned int, tw->vlen, UIO_MAXIOV);
+    unsigned int done = 0;
+    long err = 0;
+
+    mattx_dbg("[RPC] Thread %d: sendmmsg(fd=%d) of %u datagrams\n", current->pid, tw->remote_fd, vlen);
+
+    while (done < vlen) {
+        struct mmsghdr __user *entry = tw->mmsg + done;
+        long r;
+
+        one.msg = (struct user_msghdr __user *)&entry->msg_hdr;
+        r = mattx_sendmsg_do(&one);
+        if (r < 0) {
+            err = r;
+            break;
+        }
+        if (put_user((unsigned int)r, &entry->msg_len)) {
+            err = -EFAULT;
+            break;
+        }
+        done++;
+        cond_resched();
+    }
+
+    // Like __sys_sendmmsg(): the datagrams sent win over the error that stopped the loop
+    regs->ax = done ? (long)done : err;
+    mattx_dbg("[RPC] Illusion Complete! sendmmsg on Ghost FD sent %u datagrams, returned %ld (thread %d)\n",
+              done, (long)regs->ax, current->pid);
+    kfree(tw);
+}
+
+static int ret_handler_sendmmsg(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    struct mmsg_kretprobe_data *data = (struct mmsg_kretprobe_data *)ri->data;
+    int home_node = -1; u32 orig_pid = 0;
+    struct mattx_sendmmsg_tw *tw;
+
+    if (!data->is_ghost) return 0;
+    if (fatal_signal_pending(current) || (current->flags & PF_EXITING)) return 0;
+
+    spin_lock(&guest_lock);
+    for (int i = 0; i < guest_count; i++) {
+        if (guest_registry[i].local_pid == current->tgid) {
+            home_node = guest_registry[i].home_node; orig_pid = guest_registry[i].orig_pid;
+            break;
+        }
+    }
+    spin_unlock(&guest_lock);
+
+    if (home_node == -1 || !real_task_work_add) return 0;
+
+    tw = kzalloc(sizeof(*tw), GFP_ATOMIC);
+    if (!tw) return 0;
+    init_task_work(&tw->cb, mattx_sendmmsg_tw_fn);
+    tw->orig_pid = orig_pid;
+    tw->home_node = home_node;
+    tw->remote_fd = data->remote_fd;
+    tw->mmsg = data->mmsg;
+    tw->vlen = data->vlen;
+    tw->flags = data->flags;
+
+    mattx_dbg("[HOOK] Intercepted sendmmsg(fd=%d, vlen=%u). Thread %d waits on its own tickets...\n", data->fd, data->vlen, current->pid);
+    // The sabotaged call returns -EBADF; the task_work overwrites it with the real result.
+    regs->ax = -EINTR;
+
+    if (real_task_work_add(current, &tw->cb, TWA_RESUME))
+        kfree(tw);
+    return 0;
+}
 
 // --- RECVMSG HOOK ---
 /*
@@ -8331,6 +8454,15 @@ int mattx_hooks_init(void) {
     sendmsg_kprobe.maxactive = 64;
     ret = mattx_register_kretprobe(&sendmsg_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for sendmsg, returned %d\n", ret);
+
+    memset(&sendmmsg_kprobe, 0, sizeof(sendmmsg_kprobe));
+    sendmmsg_kprobe.kp.symbol_name = "__x64_sys_sendmmsg";
+    sendmmsg_kprobe.entry_handler = entry_handler_sendmmsg; // Flat: its own handlers, the per-datagram work is sendmsg's
+    sendmmsg_kprobe.handler = ret_handler_sendmmsg;
+    sendmmsg_kprobe.data_size = sizeof(struct mmsg_kretprobe_data);
+    sendmmsg_kprobe.maxactive = 64;
+    ret = mattx_register_kretprobe(&sendmmsg_kprobe);
+    if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for sendmmsg, returned %d\n", ret);
 
     memset(&recvmsg_kprobe, 0, sizeof(recvmsg_kprobe));
     recvmsg_kprobe.kp.symbol_name = "__x64_sys_recvmsg";
