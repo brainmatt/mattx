@@ -4919,8 +4919,8 @@ static struct file *mattx_open_cancellable(const char *path, int flags, umode_t 
 
 struct mattx_open_kworker_ctx {
     struct work_struct work;
-    struct mattx_sys_open_req req;
     int target_node;
+    struct mattx_sys_open_req req;      // must stay the LAST member: the path follows it (req.pathlen bytes)
 };
 
 static void mattx_open_reply_send(int node, u32 orig_pid, u32 req_id, int remote_fd, int err)
@@ -4938,29 +4938,49 @@ static void mattx_open_reply_send(int node, u32 orig_pid, u32 req_id, int remote
 }
 
 /*
- * A relative path is relative to the Deputy's working directory, not to the kworker's. The Deputy's cwd is
- * read as text under its task_lock (it cannot vanish meanwhile); the Deputy's fs_struct itself is never
- * borrowed, so a Deputy that dies in the middle of the open cannot pull it out from under us.
- * out must hold PATH_MAX bytes.
+ * A relative path is relative to a base directory, not to the kworker's: the Deputy's working directory (AT_FDCWD) or,
+ * for openat(dirfd, ...), the directory the Surrogate's Ghost dirfd stands for (the Deputy's file 'dirfd'; issue #67,
+ * P3). The base is read as text (d_path) with a reference on it, so it cannot vanish meanwhile; the Deputy's
+ * fs_struct itself is never borrowed, so a Deputy that dies in the middle of the open cannot pull it out from under
+ * us. Opening 'base/name' by text keeps the real openat semantics for ".." and symlinks (file_open_root() would make
+ * the directory the ROOT of the lookup). out must hold PATH_MAX bytes.
  */
-static int mattx_open_resolve_path(struct task_struct *deputy, const char *name, char *out)
+static int mattx_open_resolve_path(struct task_struct *deputy, u32 orig_pid, int dirfd, const char *name, char *out)
 {
     struct path pwd;
     char *page, *cwd;
     int n;
 
-    if (name[0] == '/') {
+    if (name[0] == '/') {                   // an absolute path ignores the base, like the kernel
         strscpy(out, name, PATH_MAX);
         return 0;
     }
 
-    task_lock(deputy);
-    if (!deputy->fs) {
+    if (dirfd == AT_FDCWD) {
+        task_lock(deputy);
+        if (!deputy->fs) {
+            task_unlock(deputy);
+            return -ESRCH;
+        }
+        get_fs_pwd(deputy->fs, &pwd);
         task_unlock(deputy);
-        return -ESRCH;
+    } else {
+        struct file *df = mattx_get_remote_file(orig_pid, dirfd);
+        bool isdir;
+
+        if (!df) {
+            mattx_dbg("[KWORKER] openat: the Deputy has no FD %d\n", dirfd);
+            return -EBADF;
+        }
+        pwd = df->f_path;
+        path_get(&pwd);
+        isdir = d_is_dir(pwd.dentry);
+        fput(df);
+        if (!isdir) {
+            path_put(&pwd);
+            return -ENOTDIR;
+        }
     }
-    get_fs_pwd(deputy->fs, &pwd);
-    task_unlock(deputy);
 
     if (d_unlinked(pwd.dentry)) {           // the directory was removed: nothing can be created or found in it
         path_put(&pwd);
@@ -4973,12 +4993,14 @@ static int mattx_open_resolve_path(struct task_struct *deputy, const char *name,
     }
     cwd = d_path(&pwd, page, PAGE_SIZE);
     path_put(&pwd);
-    if (IS_ERR(cwd) || cwd[0] != '/') {     // "(unreachable)": the cwd is outside this root
+    if (IS_ERR(cwd) || cwd[0] != '/') {     // "(unreachable)": the directory is outside this root
         free_page((unsigned long)page);
         return -ENOENT;
     }
     n = snprintf(out, PATH_MAX, "%s%s%s", cwd, strcmp(cwd, "/") ? "/" : "", name);
     free_page((unsigned long)page);
+    if (dirfd != AT_FDCWD)
+        mattx_dbg("[KWORKER] openat(dirfd=%d, '%s') -> '%s'\n", dirfd, name, out);
     return n >= PATH_MAX ? -ENAMETOOLONG : 0;
 }
 
@@ -4993,7 +5015,7 @@ static void mattx_open_kworker(struct work_struct *work) {
     int remote_fd = -1;
     int err = -ESRCH;
 
-    req->filename[sizeof(req->filename) - 1] = '\0';
+    req->filename[req->pathlen - 1] = '\0';      // validated by handle_sys_open_req(), belt and braces
 
     rcu_read_lock();
     deputy = pid_task(find_vpid(req->orig_pid), PIDTYPE_PID);
@@ -5008,7 +5030,7 @@ static void mattx_open_kworker(struct work_struct *work) {
         if (!path) {
             err = -ENOMEM;
         } else {
-            err = mattx_open_resolve_path(deputy, req->filename, path);
+            err = mattx_open_resolve_path(deputy, req->orig_pid, req->dirfd, req->filename, path);
         }
 
         if (!err) {
@@ -5069,7 +5091,16 @@ static void handle_sys_open_req(struct mattx_link *link, struct mattx_header *hd
     if (!payload || hdr->length < sizeof(*req)) return;
     if (hdr->sender_id >= MAX_NODES || READ_ONCE(mattx_cancellable_stopping)) return;
 
-    ctx = kmalloc(sizeof(*ctx), GFP_ATOMIC);
+    // The path is the tail of the request: 1 .. PATH_MAX bytes, NUL terminated, all of it inside the message
+    if (req->pathlen < 1 || req->pathlen > PATH_MAX || hdr->length < sizeof(*req) + req->pathlen ||
+        req->filename[req->pathlen - 1] != '\0') {
+        printk(KERN_ERR "MattX:[RPC] OPEN_REQ %u of PID %u malformed (pathlen %u, message %u bytes)\n",
+               req->req_id, req->orig_pid, req->pathlen, hdr->length);
+        mattx_open_reply_send(hdr->sender_id, req->orig_pid, req->req_id, -1, -EINVAL);
+        return;
+    }
+
+    ctx = kmalloc(sizeof(*ctx) + req->pathlen, GFP_ATOMIC);
     if (!ctx) {
         // Still answer: the Surrogate thread sleeps on this ticket
         printk(KERN_ERR "MattX:[RPC] OPEN_REQ %u of PID %u: out of memory\n", req->req_id, req->orig_pid);
@@ -5077,7 +5108,7 @@ static void handle_sys_open_req(struct mattx_link *link, struct mattx_header *hd
         return;
     }
     INIT_WORK(&ctx->work, mattx_open_kworker);
-    memcpy(&ctx->req, req, sizeof(*req));
+    memcpy(&ctx->req, req, sizeof(*req) + req->pathlen);
     ctx->target_node = hdr->sender_id;
 
     mattx_dbg("[RPC] Dispatching OPEN_REQ for '%s' (req %u) to Kworker...\n", req->filename, req->req_id);

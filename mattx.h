@@ -395,12 +395,18 @@ struct mattx_recall_req {
     u32 orig_pid;
 };
 
+/*
+ * open() / openat() (issue #67, P3): the path is the variable tail of the request, so every path the kernel accepts
+ * (up to PATH_MAX - 1 bytes) can be sent; the request is sizeof(struct) + pathlen bytes long.
+ */
 struct mattx_sys_open_req {
     u32 orig_pid;
     int flags;
     int mode;
-    char filename[256];         // NUL terminated; longer paths are refused with -ENAMETOOLONG on the Surrogate
     u32 req_id;                 // ticket id (issue #67, P2); 0: legacy request, answered through the per-guest slot
+    s32 dirfd;                  // AT_FDCWD: a relative path starts at the Deputy's cwd (a directory fd: see openat)
+    u32 pathlen;                // bytes of filename[] including the NUL: 1 .. PATH_MAX
+    char filename[];            // NUL terminated, must stay the LAST member
 };
 
 struct mattx_sys_open_reply {

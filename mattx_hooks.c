@@ -595,16 +595,24 @@ static void mattx_rpc_worker(struct work_struct *work) {
 
     // OPEN WORKER (DEFAULT FALLBACK)
     } else {
-        struct mattx_sys_open_req req;
-        memset(&req, 0, sizeof(req));
-        req.orig_pid = rpc->orig_pid;
-        strscpy_pad(req.filename, rpc->filename, sizeof(req.filename));
-        req.flags = rpc->flags;
-        req.mode = rpc->mode;
+        size_t plen = strnlen(rpc->filename, sizeof(rpc->filename) - 1) + 1;     // incl. the NUL (255 bytes at most here)
+        struct mattx_sys_open_req *req = kzalloc(sizeof(*req) + plen, GFP_KERNEL);
 
-        mattx_dbg("[RPC] Worker started for PID %d. Sending OPEN_REQ to Node %d...\n", rpc->local_pid, rpc->home_node);
-        if (cluster_map[rpc->home_node]) {
-            mattx_comm_send(cluster_map[rpc->home_node], MATTX_MSG_SYS_OPEN_REQ, &req, sizeof(req));
+        if (!req) {
+            printk(KERN_ERR "MattX:[RPC] OPEN_REQ (legacy) of PID %u: out of memory\n", rpc->orig_pid);
+        } else {
+            req->orig_pid = rpc->orig_pid;
+            req->dirfd = AT_FDCWD;
+            req->pathlen = plen;
+            memcpy(req->filename, rpc->filename, plen - 1);
+            req->flags = rpc->flags;
+            req->mode = rpc->mode;
+
+            mattx_dbg("[RPC] Worker started for PID %d. Sending OPEN_REQ to Node %d...\n", rpc->local_pid, rpc->home_node);
+            if (cluster_map[rpc->home_node]) {
+                mattx_comm_send(cluster_map[rpc->home_node], MATTX_MSG_SYS_OPEN_REQ, req, sizeof(*req) + plen);
+            }
+            kfree(req);
         }
     }
 
@@ -1772,6 +1780,8 @@ static int entry_handler_openat(struct kretprobe_instance *ri, struct pt_regs *r
     if (how) {
         data->flags = how->flags;
         data->mode = how->mode;
+        if (how->resolve)   // RESOLVE_BENEATH, IN_ROOT, NO_SYMLINKS ... are not carried to the home node
+            mattx_dbg("[HOOK] openat2: resolve flags 0x%llx are not carried to the home node (ignored)\n", (unsigned long long)how->resolve);
     } else {
         data->flags = O_RDONLY;
         data->mode = 0;
@@ -1843,13 +1853,13 @@ static void mattx_open_tw_fn(struct callback_head *cb) {
         goto out;
     }
 
-    req = kzalloc(sizeof(*req), GFP_KERNEL);
+    req = kzalloc(sizeof(*req) + PATH_MAX, GFP_KERNEL);
     if (!req) {
         ret = -ENOMEM;
         goto out;
     }
 
-    n = strncpy_from_user(req->filename, tw->filename, sizeof(req->filename));
+    n = strncpy_from_user(req->filename, tw->filename, PATH_MAX);
     if (n < 0) {
         ret = n;                                    // -EFAULT
         goto out;
@@ -1858,16 +1868,39 @@ static void mattx_open_tw_fn(struct callback_head *cb) {
         ret = -ENOENT;
         goto out;
     }
-    if (n >= (long)sizeof(req->filename)) {         // no NUL within the buffer: the path is too long for the request
-        mattx_dbg("[RPC] Thread %d: open() path is longer than %zu bytes: -ENAMETOOLONG\n", current->pid, sizeof(req->filename) - 1);
+    if (n >= PATH_MAX) {                            // no NUL within PATH_MAX bytes: the kernel refuses it too
+        mattx_dbg("[RPC] Thread %d: open() path is longer than %d bytes: -ENAMETOOLONG\n", current->pid, PATH_MAX - 1);
         ret = -ENAMETOOLONG;
         goto out;
     }
+    req->pathlen = n + 1;                           // with the NUL
+    req->dirfd = AT_FDCWD;
     if (req->filename[0] != '/' && tw->dfd != AT_FDCWD) {
-        // The home node resolves relative paths against the Deputy's cwd only (openat(dirfd, ...) is not carried yet)
-        mattx_dbg("[RPC] Thread %d: openat(dirfd=%d, '%s') is not supported: -EOPNOTSUPP\n", current->pid, tw->dfd, req->filename);
-        ret = -EOPNOTSUPP;
-        goto out;
+        // openat(dirfd, relative): the home node needs the Deputy's FD behind our Ghost directory FD
+        struct mattx_fake_fd_info *dir_info = NULL;
+        struct file *dirf = tw->dfd >= 0 ? fget(tw->dfd) : NULL;
+
+        if (!dirf) {
+            ret = -EBADF;
+            goto out;
+        }
+        if (dirf->f_op == &mattx_fops)
+            dir_info = dirf->private_data;
+        if (!dir_info) {
+            // A native FD of the Surrogate cannot be named at the home node
+            mattx_dbg("[RPC] Thread %d: openat(dirfd=%d, '%s'): the directory is not a Ghost FD: -EOPNOTSUPP\n", current->pid, tw->dfd, req->filename);
+            fput(dirf);
+            ret = -EOPNOTSUPP;
+            goto out;
+        }
+        if (dir_info->home_node != tw->home_node || dir_info->orig_pid != tw->orig_pid) {
+            fput(dirf);
+            ret = -EBADF;
+            goto out;
+        }
+        req->dirfd = dir_info->remote_fd;
+        mattx_dbg("[RPC] Thread %d: openat(dirfd=%d -> Deputy FD %d, '%s')\n", current->pid, tw->dfd, req->dirfd, req->filename);
+        fput(dirf);
     }
 
     t = mattx_ticket_add(tw->orig_pid, tw->home_node, 0);
@@ -1883,7 +1916,7 @@ static void mattx_open_tw_fn(struct callback_head *cb) {
 
     mattx_dbg("[RPC] Thread %d: open('%s') as req %u, sleeping on its own ticket...\n", current->pid, req->filename, t->req_id);
 
-    if (mattx_comm_send(link, MATTX_MSG_SYS_OPEN_REQ, req, sizeof(*req)) < 0) {
+    if (mattx_comm_send(link, MATTX_MSG_SYS_OPEN_REQ, req, sizeof(*req) + req->pathlen) < 0) {
         // Never sleep for a reply to a request that was never sent
         mattx_dbg("[RPC] Thread %d: OPEN_REQ send failed\n", current->pid);
         ret = -EIO;
