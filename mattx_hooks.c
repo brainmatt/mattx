@@ -5662,9 +5662,8 @@ done:
     return ret;
 }
 
-static void mattx_recvmsg_tw_fn(struct callback_head *cb) {
-    struct mattx_recvmsg_tw *tw = container_of(cb, struct mattx_recvmsg_tw, cb);
-    struct pt_regs *regs = task_pt_regs(current);
+// ONE message (tw->msg, tw->flags): the bytes received, or -errno. Shared by recvmsg() and, per datagram, recvmmsg().
+static long mattx_recvmsg_do(struct mattx_recvmsg_tw *tw) {
     struct mattx_recvmsg_blob meta;
     struct user_msghdr umsg;
     struct iovec *iovs = NULL;
@@ -5763,7 +5762,14 @@ static void mattx_recvmsg_tw_fn(struct callback_head *cb) {
 
 out:
     kfree(iovs);
-    regs->ax = ret;
+    return ret;
+}
+
+static void mattx_recvmsg_tw_fn(struct callback_head *cb) {
+    struct mattx_recvmsg_tw *tw = container_of(cb, struct mattx_recvmsg_tw, cb);
+    struct pt_regs *regs = task_pt_regs(current);
+
+    regs->ax = mattx_recvmsg_do(tw);
     kfree(tw);
 }
 
@@ -5836,6 +5842,163 @@ static int ret_handler_recvmsg(struct kretprobe_instance *ri, struct pt_regs *re
             schedule_work(&rpc->work);
         }
     }
+    return 0;
+}
+
+
+// --- RECVMMSG HOOK ---
+/*
+ * recvmmsg() on a socket that lives on the home node (issue #67, P3). glibc's resolver reads its DNS answers with it,
+ * after sending the queries with sendmmsg(). Same pattern as recvmsg(): the sabotaged call returns to user mode and
+ * the task_work of the calling thread receives every datagram (mattx_recvmsg_do() -> RECVMSG_REQ on a ticket of its
+ * own), stores each msg_len in the user's mmsghdr and returns the number of datagrams. No new message.
+ * Semantics of __sys_recvmmsg(): vlen is capped at UIO_MAXIOV; MSG_WAITFORONE blocks for the first datagram only
+ * (MSG_DONTWAIT is added after it); the timeout is checked only BETWEEN datagrams (it does not interrupt a blocked
+ * receive, as documented in recvmmsg(2)); a datagram with MSG_OOB ends the loop; an error is only returned if nothing
+ * was received. Not reproduced: the sk_err re-arm after a late error (the socket lives on the home node).
+ * NOT carried: ancillary data (as for recvmsg), MSG_ERRQUEUE (-EOPNOTSUPP per message), recvmmsg_time32.
+ * Without the task_work resolver the call is not intercepted.
+ */
+static struct kretprobe recvmmsg_kprobe;
+
+struct recvmmsg_kretprobe_data {
+    int fd;
+    struct mmsghdr __user *mmsg;
+    unsigned int vlen;
+    int flags;
+    struct __kernel_timespec __user *timeout;
+    bool is_ghost;
+    int remote_fd;
+};
+
+static int entry_handler_recvmmsg(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    struct recvmmsg_kretprobe_data *data = (struct recvmmsg_kretprobe_data *)ri->data;
+    struct pt_regs *sys_regs = SYSCALL_REGS(regs);
+
+    data->is_ghost = false;
+    if (real_task_work_add && is_guest_process(current->tgid)) {
+        data->fd = (int)sys_regs->di;
+        if (is_wormhole_fd(data->fd, &data->remote_fd)) {
+            data->is_ghost = true;
+            data->mmsg = (struct mmsghdr __user *)sys_regs->si;
+            data->vlen = (unsigned int)sys_regs->dx;
+            data->flags = (int)sys_regs->r10;
+            data->timeout = (struct __kernel_timespec __user *)sys_regs->r8;
+            sys_regs->di = -1; // Sabotage!
+        }
+    }
+    return 0;
+}
+
+struct mattx_recvmmsg_tw {
+    struct callback_head cb;
+    u32 orig_pid;
+    int home_node;
+    int remote_fd;
+    struct mmsghdr __user *mmsg;
+    unsigned int vlen;
+    int flags;
+    struct __kernel_timespec __user *timeout;
+};
+
+static void mattx_recvmmsg_tw_fn(struct callback_head *cb) {
+    struct mattx_recvmmsg_tw *tw = container_of(cb, struct mattx_recvmmsg_tw, cb);
+    struct pt_regs *regs = task_pt_regs(current);
+    // The per-message part of recvmsg(): everything but the message and the flags is the same for every datagram
+    struct mattx_recvmsg_tw one = { .orig_pid = tw->orig_pid, .home_node = tw->home_node, .remote_fd = tw->remote_fd };
+    unsigned int vlen = min_t(unsigned int, tw->vlen, UIO_MAXIOV);
+    int flags = tw->flags & ~MSG_WAITFORONE;
+    bool waitforone = tw->flags & MSG_WAITFORONE;
+    struct __kernel_timespec ts;
+    u64 deadline_ns = 0;
+    unsigned int done = 0;
+    long err = 0;
+
+    if (tw->timeout) {
+        if (copy_from_user(&ts, tw->timeout, sizeof(ts))) {
+            regs->ax = -EFAULT;
+            goto out;
+        }
+        if (ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= NSEC_PER_SEC) {
+            regs->ax = -EINVAL;
+            goto out;
+        }
+        deadline_ns = ktime_get_ns() + (u64)ts.tv_sec * NSEC_PER_SEC + ts.tv_nsec;
+    }
+
+    mattx_dbg("[RPC] Thread %d: recvmmsg(fd=%d) of up to %u datagrams%s\n", current->pid, tw->remote_fd, vlen,
+              tw->timeout ? " (with timeout)" : "");
+
+    while (done < vlen) {
+        struct mmsghdr __user *entry = tw->mmsg + done;
+        unsigned int msg_flags = 0;
+        long r;
+
+        one.msg = (struct user_msghdr __user *)&entry->msg_hdr;
+        one.flags = flags;
+        r = mattx_recvmsg_do(&one);
+        if (r < 0) {
+            err = r;
+            break;
+        }
+        if (put_user((unsigned int)r, &entry->msg_len)) {
+            err = -EFAULT;
+            break;
+        }
+        done++;
+        if (waitforone)
+            flags |= MSG_DONTWAIT;              // only the first datagram may block
+        if (tw->timeout && ktime_get_ns() >= deadline_ns)
+            break;                              // like the kernel: checked between datagrams only
+        if (!get_user(msg_flags, &entry->msg_hdr.msg_flags) && (msg_flags & MSG_OOB))
+            break;                              // out of band data: return right away
+        cond_resched();
+    }
+
+    // Like __sys_recvmmsg(): the datagrams received win over the error that stopped the loop
+    regs->ax = done ? (long)done : err;
+    mattx_dbg("[RPC] Illusion Complete! recvmmsg on Ghost FD received %u datagrams, returned %ld (thread %d)\n",
+              done, (long)regs->ax, current->pid);
+out:
+    kfree(tw);
+}
+
+static int ret_handler_recvmmsg(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    struct recvmmsg_kretprobe_data *data = (struct recvmmsg_kretprobe_data *)ri->data;
+    int home_node = -1; u32 orig_pid = 0;
+    struct mattx_recvmmsg_tw *tw;
+
+    if (!data->is_ghost) return 0;
+    if (fatal_signal_pending(current) || (current->flags & PF_EXITING)) return 0;
+
+    spin_lock(&guest_lock);
+    for (int i = 0; i < guest_count; i++) {
+        if (guest_registry[i].local_pid == current->tgid) {
+            home_node = guest_registry[i].home_node; orig_pid = guest_registry[i].orig_pid;
+            break;
+        }
+    }
+    spin_unlock(&guest_lock);
+
+    if (home_node == -1 || !real_task_work_add) return 0;
+
+    tw = kzalloc(sizeof(*tw), GFP_ATOMIC);
+    if (!tw) return 0;
+    init_task_work(&tw->cb, mattx_recvmmsg_tw_fn);
+    tw->orig_pid = orig_pid;
+    tw->home_node = home_node;
+    tw->remote_fd = data->remote_fd;
+    tw->mmsg = data->mmsg;
+    tw->vlen = data->vlen;
+    tw->flags = data->flags;
+    tw->timeout = data->timeout;
+
+    mattx_dbg("[HOOK] Intercepted recvmmsg(fd=%d, vlen=%u). Thread %d waits on its own tickets...\n", data->fd, data->vlen, current->pid);
+    // The sabotaged call returns -EBADF; the task_work overwrites it with the real result.
+    regs->ax = -EINTR;
+
+    if (real_task_work_add(current, &tw->cb, TWA_RESUME))
+        kfree(tw);
     return 0;
 }
 
@@ -8505,6 +8668,15 @@ int mattx_hooks_init(void) {
     recvmsg_kprobe.maxactive = 64;
     ret = mattx_register_kretprobe(&recvmsg_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for recvmsg, returned %d\n", ret);
+
+    memset(&recvmmsg_kprobe, 0, sizeof(recvmmsg_kprobe));
+    recvmmsg_kprobe.kp.symbol_name = "__x64_sys_recvmmsg";
+    recvmmsg_kprobe.entry_handler = entry_handler_recvmmsg; // Flat: its own handlers, the per-datagram work is recvmsg's
+    recvmmsg_kprobe.handler = ret_handler_recvmmsg;
+    recvmmsg_kprobe.data_size = sizeof(struct recvmmsg_kretprobe_data);
+    recvmmsg_kprobe.maxactive = 64;
+    ret = mattx_register_kretprobe(&recvmmsg_kprobe);
+    if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for recvmmsg, returned %d\n", ret);
 
     memset(&getpid_kprobe, 0, sizeof(getpid_kprobe));
     getpid_kprobe.kp.symbol_name = "__x64_sys_getpid";
