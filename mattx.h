@@ -703,11 +703,20 @@ struct mattx_sys_req_cancel {
  */
 #define MATTX_WRITE_CHUNK 4096
 
+/*
+ * pwrite64() (issue #67, P3): MATTX_WRITE_POSITIONAL says "write at pos and leave the file position of the Deputy's
+ * file alone". Without it (write(2)) the home node writes at, and advances, the position of its own file.
+ */
+#define MATTX_WRITE_POSITIONAL 0x1
+
 struct mattx_sys_write_req {
     u32 orig_pid;
     u32 fd;
     u32 req_id;                 // ticket id, never 0
     u32 len;                    // bytes in data[], at most MATTX_WRITE_CHUNK
+    u32 flags;                  // MATTX_WRITE_POSITIONAL or 0
+    u32 pad;
+    s64 pos;                    // MATTX_WRITE_POSITIONAL: where to write (>= 0)
     char data[];                // must stay the LAST member
 };
 
@@ -755,7 +764,8 @@ bool mattx_ticket_complete(int home_node, u32 orig_pid, u32 req_id, long retval,
 int mattx_ticket_wait(struct mattx_ticket *t, long timeout);
 // write() of a Surrogate thread to a Deputy file (issue #67, P2): chunks of MATTX_WRITE_CHUNK, one ticket each.
 // Bytes written or -errno. Raises SIGPIPE on -EPIPE, like write(2). Runs in the calling thread (task_work or fop).
-ssize_t mattx_wormhole_write(u32 orig_pid, int home_node, u32 remote_fd, const char __user *ubuf, size_t count);
+ssize_t mattx_wormhole_write(u32 orig_pid, int home_node, u32 remote_fd, const char __user *ubuf, size_t count,
+                              bool positional, loff_t pos);
 // fsync()/fdatasync() of a Surrogate thread on a Deputy file (issue #67, P2): one request, one ticket. 0 or -errno.
 int mattx_wormhole_fsync(u32 orig_pid, int home_node, u32 remote_fd, loff_t start, loff_t end, int datasync);
 struct mattx_epoll_pending *mattx_epoll_pending_add(u32 orig_pid, int home_node);

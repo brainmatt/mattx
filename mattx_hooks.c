@@ -4398,7 +4398,7 @@ static void mattx_write_tw_fn(struct callback_head *cb) {
         goto out;
 
     mattx_dbg("[RPC] Thread %d: write(fd=%d, %zu bytes) goes to Node %d...\n", current->pid, tw->fd, tw->count, tw->home_node);
-    ret = mattx_wormhole_write(tw->orig_pid, tw->home_node, tw->fd, tw->buf, tw->count);
+    ret = mattx_wormhole_write(tw->orig_pid, tw->home_node, tw->fd, tw->buf, tw->count, false, 0);   // write(2): the Deputy's file position
     mattx_dbg("[RPC] Illusion Complete! write() on Ghost FD returned %ld (thread %d)\n", ret, current->pid);
 
 out:

@@ -1173,7 +1173,8 @@ out:
  */
 // One request of at most MATTX_WRITE_CHUNK bytes. Bytes written (0 .. chunk) or -errno; -EINTR: interrupted
 // before anything was written.
-static long mattx_wormhole_write_one(u32 orig_pid, int home_node, u32 remote_fd, const char __user *ubuf, size_t chunk)
+static long mattx_wormhole_write_one(u32 orig_pid, int home_node, u32 remote_fd, const char __user *ubuf, size_t chunk,
+                                     bool positional, loff_t pos)
 {
     struct mattx_sys_write_req *req;
     struct mattx_ticket *t;
@@ -1204,8 +1205,12 @@ static long mattx_wormhole_write_one(u32 orig_pid, int home_node, u32 remote_fd,
     req->fd = remote_fd;
     req->req_id = t->req_id;
     req->len = chunk;
+    req->flags = positional ? MATTX_WRITE_POSITIONAL : 0;
+    req->pad = 0;
+    req->pos = positional ? pos : 0;
 
-    mattx_dbg("[RPC] Thread %d: write(fd=%u, %zu bytes) as req %u, sleeping on its own ticket...\n", current->pid, remote_fd, chunk, t->req_id);
+    mattx_dbg("[RPC] Thread %d: %s(fd=%u, %zu bytes%s) as req %u, sleeping on its own ticket...\n", current->pid,
+              positional ? "pwrite" : "write", remote_fd, chunk, positional ? ", at a given offset" : "", t->req_id);
 
     if (mattx_comm_send(link, MATTX_MSG_SYS_WRITE_REQ, req, sizeof(*req) + chunk) < 0) {
         // Never sleep for a reply to a request that was never sent
@@ -1228,7 +1233,9 @@ done:
     return ret;
 }
 
-ssize_t mattx_wormhole_write(u32 orig_pid, int home_node, u32 remote_fd, const char __user *ubuf, size_t count)
+// positional (pwrite64): written at pos + the bytes already written, the file position of the Deputy's file stays
+ssize_t mattx_wormhole_write(u32 orig_pid, int home_node, u32 remote_fd, const char __user *ubuf, size_t count,
+                             bool positional, loff_t pos)
 {
     size_t total = 0;
 
@@ -1237,7 +1244,7 @@ ssize_t mattx_wormhole_write(u32 orig_pid, int home_node, u32 remote_fd, const c
 
     do {
         size_t chunk = min_t(size_t, count - total, MATTX_WRITE_CHUNK);
-        long r = mattx_wormhole_write_one(orig_pid, home_node, remote_fd, ubuf + total, chunk);
+        long r = mattx_wormhole_write_one(orig_pid, home_node, remote_fd, ubuf + total, chunk, positional, pos + total);
 
         if (r < 0) {
             if (r == -EPIPE)
@@ -1257,10 +1264,15 @@ static ssize_t mattx_fake_write(struct file *file, const char __user *buf, size_
     struct mattx_fake_fd_info *fd_info = file->private_data;
     ssize_t ret;
 
+    // pwrite64() calls us with the offset of the caller (vfs_write() passes &file->f_pos only for write(2)): it must
+    // be written THERE, not at the position of the Deputy's file, and that position must stay where it is
+    bool positional = pos && pos != &file->f_pos;
+
     if (!fd_info || !cluster_map[fd_info->home_node]) return count; 
 
-    ret = mattx_wormhole_write(fd_info->orig_pid, fd_info->home_node, fd_info->remote_fd, buf, count);
-    if (ret > 0)
+    ret = mattx_wormhole_write(fd_info->orig_pid, fd_info->home_node, fd_info->remote_fd, buf, count,
+                               positional, positional ? *pos : 0);
+    if (ret > 0 && pos)
         *pos += ret;
     return ret;
 }
@@ -2016,11 +2028,12 @@ static long mattx_write_blk_fn(void *p)
 
 // Writes to a pipe / FIFO / eventfd / file: wait for writability (cancellable), then ONE plain write.
 static ssize_t mattx_write_file_cancellable(struct file *file, struct task_struct *deputy, const void *buf, size_t count,
-                                            int sender, u32 orig_pid, u32 req_id, bool *abandoned)
+                                            int sender, u32 orig_pid, u32 req_id, bool *abandoned,
+                                            bool positional, loff_t ppos)
 {
     const struct cred *old_cred = NULL;
     unsigned long delay_us = 200;
-    loff_t pos = file->f_pos;
+    loff_t pos = positional ? ppos : file->f_pos;   // pwrite64: the offset of the caller, f_pos is not touched
     ssize_t ret;
 
     /*
@@ -2099,7 +2112,7 @@ static ssize_t mattx_write_file_cancellable(struct file *file, struct task_struc
         revert_creds(old_cred);
         if (deputy->mm) kthread_unuse_mm(deputy->mm);
     }
-    if (ret >= 0)
+    if (ret >= 0 && !positional)
         file->f_pos = pos;
     return ret;
 }
@@ -2125,7 +2138,8 @@ static void mattx_write_kworker(struct work_struct *work)
                                                ctx->target_node, req->orig_pid, req->req_id, &abandoned);
         else
             ret = mattx_write_file_cancellable(file, deputy, req->data, req->len,
-                                               ctx->target_node, req->orig_pid, req->req_id, &abandoned);
+                                               ctx->target_node, req->orig_pid, req->req_id, &abandoned,
+                                               req->flags & MATTX_WRITE_POSITIONAL, req->pos);
         fput(file);
     }
     if (deputy)
@@ -2153,6 +2167,13 @@ static void handle_sys_write_req(struct mattx_link *link, struct mattx_header *h
     if (req->len > MATTX_WRITE_CHUNK || req->len > hdr->length - sizeof(*req)) {
         printk(KERN_ERR "MattX:[WORMHOLE] WRITE_REQ %u of PID %u malformed (len %u, message %u bytes)\n",
                req->req_id, req->orig_pid, req->len, hdr->length);
+        mattx_write_reply_send(hdr->sender_id, req->orig_pid, req->req_id, -EINVAL);
+        return;
+    }
+
+    if ((req->flags & ~MATTX_WRITE_POSITIONAL) || ((req->flags & MATTX_WRITE_POSITIONAL) && req->pos < 0)) {
+        printk(KERN_ERR "MattX:[WORMHOLE] WRITE_REQ %u of PID %u malformed (flags 0x%x, pos %lld)\n",
+               req->req_id, req->orig_pid, req->flags, (long long)req->pos);
         mattx_write_reply_send(hdr->sender_id, req->orig_pid, req->req_id, -EINVAL);
         return;
     }
