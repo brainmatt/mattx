@@ -9180,7 +9180,10 @@ static void handle_dsm_flush_reply(struct mattx_link *link, struct mattx_header 
                 memcpy(vfs_rpc_registry[i].data_buf, reply->data, PAGE_SIZE);
             }
             vfs_rpc_registry[i].done = true;
-            wake_up_interruptible(&vfs_rpc_registry[i].wq);
+            // wake_up(), not wake_up_interruptible(): mattx_flush_wait() (MESI_MODE=2) sleeps in wait_event_timeout(),
+            // which is TASK_UNINTERRUPTIBLE. An interruptible wake-up does not wake it: the waiter would only look at
+            // 'done' when its 5 s timeout expires (every native fault stalled for ~5 s)
+            wake_up(&vfs_rpc_registry[i].wq);
             break;
         }
     }
