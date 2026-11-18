@@ -12595,6 +12595,17 @@ static void mattx_vfs_status_reply_send(int node, u32 msg, u64 req_id, int error
  * end_creating_path() replace kern_path_create() / done_path_create() (directory locking centralised). The 6.19 branch
  * follows the kernel's own do_mkdirat(); it was written from the commit series, not compiled against 6.19 / 7.0 here.
  */
+/*
+ * Linux 7.x (since 6.19: directory delegations) vfs_mkdir(), vfs_rmdir() and vfs_symlink() take one more argument, the
+ * delegated_inode (NULL = do not wait for a delegation break, like nfsd does for its own use). The 6.19 boundary is from the
+ * kernel history, the targets that matter are 6.12 and 7.0.
+ */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 19, 0)
+#define MATTX_VFS_DELEG_ARG , NULL
+#else
+#define MATTX_VFS_DELEG_ARG
+#endif
+
 // The start / end of every creation at the home node (mkdir, symlink, link): the parent is locked and the write access taken
 static struct dentry *mattx_vfs_creat_start(const char *path, struct path *parent, unsigned int lookup_flags)
 {
@@ -12625,10 +12636,10 @@ static int mattx_vfs_mkdir_apply(const char *path, umode_t mode)
         return PTR_ERR(dentry);
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 15, 0)
-    dentry = vfs_mkdir(mnt_idmap(parent.mnt), d_inode(parent.dentry), dentry, mode);
+    dentry = vfs_mkdir(mnt_idmap(parent.mnt), d_inode(parent.dentry), dentry, mode MATTX_VFS_DELEG_ARG);
     err = PTR_ERR_OR_ZERO(dentry);
 #else
-    err = vfs_mkdir(mnt_idmap(parent.mnt), d_inode(parent.dentry), dentry, mode);
+    err = vfs_mkdir(mnt_idmap(parent.mnt), d_inode(parent.dentry), dentry, mode MATTX_VFS_DELEG_ARG);
 #endif
 
     mattx_vfs_creat_end(&parent, dentry);
@@ -12755,7 +12766,7 @@ static int mattx_vfs_rmdir_apply(const char *path)
         inode_lock_nested(dir, I_MUTEX_PARENT);
         // Double check that the directory was not moved while we were locking
         if (victim.dentry->d_parent == parent && d_is_positive(victim.dentry))
-            err = vfs_rmdir(mnt_idmap(victim.mnt), dir, victim.dentry);
+            err = vfs_rmdir(mnt_idmap(victim.mnt), dir, victim.dentry MATTX_VFS_DELEG_ARG);
         else
             err = -ENOENT;
         inode_unlock(dir);
@@ -12866,9 +12877,25 @@ static void handle_vfs_rmdir_reply(struct mattx_link *link, struct mattx_header 
 /*
  * rename at this node: the sequence of the kernel's own do_renameat2() on two paths we already know are clean (they come
  * from the dentries of MattXFS): the two parent directories, lock_rename(), the two names looked up below their parent,
- * vfs_rename() with a struct renamedata (5.12+). Not compiled against 6.19 / 7.0 here: the kernel is moving this to
- * start_renaming() (7.1); if lock_rename() / lookup_one_len() are gone there the compile will say so.
+ * vfs_rename() with a struct renamedata. Two kernel generations (the targets are 6.12 and 7.0): until 7.0 lookup_one_len()
+ * and renamedata {old_mnt_idmap, old_dir, new_mnt_idmap, new_dir}; 7.0 lookup_one(idmap, qstr, base) and renamedata
+ * {mnt_idmap, old_parent, new_parent} (dentries). The kernel is moving on to start_renaming() (lock_rename() is no
+ * longer exported after 7.0): that is the next step when the compile on 7.1 says so.
  */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 0, 0)
+static struct dentry *mattx_vfs_lookup_one(struct path *dir, const char *name)
+{
+    struct qstr this = QSTR_INIT(name, strlen(name));
+
+    return lookup_one(mnt_idmap(dir->mnt), &this, dir->dentry);
+}
+#else
+static struct dentry *mattx_vfs_lookup_one(struct path *dir, const char *name)
+{
+    return lookup_one_len(name, dir->dentry, strlen(name));
+}
+#endif
+
 static int mattx_vfs_rename_apply(const char *oldpath, const char *newpath, unsigned int flags)
 {
     char odir[256], ndir[256];
@@ -12915,11 +12942,11 @@ static int mattx_vfs_rename_apply(const char *oldpath, const char *newpath, unsi
         goto drop_write;
     }
 
-    old_d = lookup_one_len(oname, op.dentry, strlen(oname));
+    old_d = mattx_vfs_lookup_one(&op, oname);
     err = PTR_ERR_OR_ZERO(old_d);
     if (err)
         goto unlock;
-    new_d = lookup_one_len(nname, np.dentry, strlen(nname));
+    new_d = mattx_vfs_lookup_one(&np, nname);
     err = PTR_ERR_OR_ZERO(new_d);
     if (err)
         goto put_old_d;
@@ -12938,17 +12965,23 @@ static int mattx_vfs_rename_apply(const char *oldpath, const char *newpath, unsi
     }
 
     memset(&rd, 0, sizeof(rd));
-    rd.old_dir = d_inode(op.dentry);
     rd.old_dentry = old_d;
-    rd.new_dir = d_inode(np.dentry);
     rd.new_dentry = new_d;
     rd.flags = flags;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 0, 0)
+    rd.old_parent = op.dentry;
+    rd.new_parent = np.dentry;
+    rd.mnt_idmap = mnt_idmap(op.mnt);
+#else
+    rd.old_dir = d_inode(op.dentry);
+    rd.new_dir = d_inode(np.dentry);
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
     rd.old_mnt_idmap = mnt_idmap(op.mnt);
     rd.new_mnt_idmap = mnt_idmap(op.mnt);
 #else
     rd.old_mnt_userns = mnt_user_ns(op.mnt);
     rd.new_mnt_userns = mnt_user_ns(op.mnt);
+#endif
 #endif
     err = vfs_rename(&rd);
     goto put_new_d;
@@ -13082,7 +13115,7 @@ static int mattx_vfs_symlink_apply(const char *target, const char *linkpath)
     if (IS_ERR(dentry))
         return PTR_ERR(dentry);
 
-    err = vfs_symlink(mnt_idmap(parent.mnt), d_inode(parent.dentry), dentry, target);
+    err = vfs_symlink(mnt_idmap(parent.mnt), d_inode(parent.dentry), dentry, target MATTX_VFS_DELEG_ARG);
 
     mattx_vfs_creat_end(&parent, dentry);
     return err;
