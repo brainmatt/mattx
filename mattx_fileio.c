@@ -875,12 +875,86 @@ static DEFINE_SPINLOCK(mfs_file_lock);
 
 #include <linux/version.h>
 
-// The Fake File Getattr Operation (Runs on Node 2) ---
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
-static int mattx_fake_getattr(struct mnt_idmap *idmap, const struct path *path, struct kstat *stat, u32 request_mask, unsigned int query_flags) {
+typedef struct mnt_idmap mattx_idmap_t;
 #else
-static int mattx_fake_getattr(struct user_namespace *mnt_userns, const struct path *path, struct kstat *stat, u32 request_mask, unsigned int query_flags) {
+typedef struct user_namespace mattx_idmap_t;
 #endif
+
+/*
+ * The inode_operations of the Ghost files (issue #67, P3). A Ghost file is a file on the ONE inode that the kernel
+ * shares between all its anonymous files (eventfd, epoll, timerfd, pidfd ...); every file has its own dentry, which is
+ * how we tell them apart (the name of the dentry is the name given to anon_inode_getfile()). Overwriting i_op of that
+ * inode used to take the kernel's own anon-inode operations away from all the other anonymous files of the node:
+ * fstat() of an eventfd ended in mattx_fake_getattr() (-EIO), and a setattr fell back to simple_setattr() on the
+ * shared inode. Now the kernel's operations are saved when ours are installed, and everything that is not a Ghost
+ * file is passed to them.
+ */
+static const struct inode_operations *mattx_anon_orig_iops;     // the kernel's i_op of the shared anonymous inode
+static struct inode *mattx_anon_iops_inode;                     // the inode we changed (a reference is held), for the unload
+
+static bool mattx_dentry_is_ghost(const struct dentry *dentry)
+{
+    return str_has_prefix(dentry->d_name.name, "mattx_") != 0;      // mattx_vfs_proxy, mattx_epoll_proxy, mattx_pipe_proxy
+}
+
+void mattx_ghost_install_iops(struct file *fake_file)
+{
+    struct inode *inode = fake_file->f_inode;
+    const struct inode_operations *cur;
+
+    if (!inode)
+        return;
+    cur = READ_ONCE(inode->i_op);
+    if (cur == &mattx_iops)
+        return;
+
+    // Save the kernel's operations BEFORE ours become visible (a racing installer stores the very same pointer)
+    smp_store_release(&mattx_anon_orig_iops, cur);
+    if (!READ_ONCE(mattx_anon_iops_inode)) {
+        ihold(inode);
+        if (cmpxchg(&mattx_anon_iops_inode, NULL, inode))
+            iput(inode);                // somebody else was first
+    }
+    WRITE_ONCE(inode->i_op, &mattx_iops);
+    mattx_dbg("[GHOST] inode_operations installed (kernel's own: getattr %pS, setattr %pS)\n",
+              cur ? cur->getattr : NULL, cur ? cur->setattr : NULL);
+}
+
+static void mattx_ghost_uninstall_iops(void)
+{
+    struct inode *inode = xchg(&mattx_anon_iops_inode, NULL);
+
+    if (!inode)
+        return;
+    if (READ_ONCE(inode->i_op) == &mattx_iops)
+        WRITE_ONCE(inode->i_op, smp_load_acquire(&mattx_anon_orig_iops));       // our ops are about to leave with the module
+    iput(inode);
+    mattx_dbg("[GHOST] inode_operations of the anonymous inode restored\n");
+}
+
+// What the kernel would have done with an anonymous file that is not ours
+static int mattx_anon_getattr_chain(mattx_idmap_t *idmap, const struct path *path, struct kstat *stat, u32 request_mask, unsigned int query_flags)
+{
+    const struct inode_operations *orig = smp_load_acquire(&mattx_anon_orig_iops);
+
+    if (orig && orig->getattr)
+        return orig->getattr(idmap, path, stat, request_mask, query_flags);
+    generic_fillattr(idmap, request_mask, d_inode(path->dentry), stat);
+    return 0;
+}
+
+static int mattx_anon_setattr_chain(mattx_idmap_t *idmap, struct dentry *dentry, struct iattr *attr)
+{
+    const struct inode_operations *orig = smp_load_acquire(&mattx_anon_orig_iops);
+
+    if (orig && orig->setattr)
+        return orig->setattr(idmap, dentry, attr);
+    return simple_setattr(idmap, dentry, attr);
+}
+
+// The Fake File Getattr Operation (Runs on Node 2) ---
+static int mattx_fake_getattr(mattx_idmap_t *idmap, const struct path *path, struct kstat *stat, u32 request_mask, unsigned int query_flags) {
     struct file *file = NULL;
     struct mattx_fake_fd_info *fd_info = NULL;
     struct mattx_sys_statx_req req;
@@ -888,6 +962,10 @@ static int mattx_fake_getattr(struct user_namespace *mnt_userns, const struct pa
     pid_t my_pid = current->pid;
     int i;
     int ret_error = -EIO;
+
+    // An eventfd, an epoll fd ... of this node: not our business
+    if (!mattx_dentry_is_ghost(path->dentry))
+        return mattx_anon_getattr_chain(idmap, path, stat, request_mask, query_flags);
 
     // We need to find the file associated with this dentry to get the private_data
     // Since this is an anonymous inode, we can check if it belongs to current process
@@ -977,8 +1055,59 @@ static int mattx_fake_getattr(struct user_namespace *mnt_userns, const struct pa
     return ret_error;
 }
 
+/*
+ * setattr on a Ghost file (issue #67, P3). Without a .setattr the kernel's simple_setattr() changed the shared
+ * anonymous inode and returned 0: nothing happened at the home node, and the bogus size / mode stayed on the shared
+ * inode. ftruncate() comes with the open file (ATTR_FILE), fchmod() / fchown() / futimens() with the dentry (every
+ * Ghost file has its own, see above): the fd_info names the Deputy's file, which is changed at the home node
+ * (SYS_FSETATTR_REQ: size, mode, owner, times). Note that the kernel holds the inode lock of the SHARED anonymous
+ * inode meanwhile: Ghost setattrs of one node are serialised.
+ */
+static int mattx_fake_setattr(mattx_idmap_t *idmap, struct dentry *dentry, struct iattr *attr)
+{
+    struct mattx_fake_fd_info fi = {};
+    bool ghost = false;
+    int i;
+
+    if (!mattx_dentry_is_ghost(dentry))
+        return mattx_anon_setattr_chain(idmap, dentry, attr);
+
+    if ((attr->ia_valid & ATTR_FILE) && attr->ia_file && attr->ia_file->f_op == &mattx_fops) {
+        struct mattx_fake_fd_info *p = attr->ia_file->private_data;
+
+        if (p) {
+            fi = *p;
+            ghost = true;
+        }
+    } else {
+        // No file given: find the Ghost file of the caller that owns this dentry (every file has its own dentry)
+        rcu_read_lock();
+        if (current->files) {
+            struct fdtable *fdt = files_fdtable(current->files);
+
+            for (i = 0; i < fdt->max_fds; i++) {
+                struct file *file = rcu_dereference(fdt->fd[i]);
+
+                if (file && file->f_path.dentry == dentry && file->f_op == &mattx_fops && file->private_data) {
+                    fi = *(struct mattx_fake_fd_info *)file->private_data;
+                    ghost = true;
+                    break;
+                }
+            }
+        }
+        rcu_read_unlock();
+    }
+    if (!ghost)
+        return -EOPNOTSUPP;             // a mattx proxy file that is not ours to change
+
+    mattx_dbg("[GHOST] SETATTR valid 0x%x (size %lld) on FD %u of PID %u (Node %d)\n", attr->ia_valid, (long long)attr->ia_size,
+              fi.remote_fd, fi.orig_pid, fi.home_node);
+    return mattx_wormhole_fsetattr(fi.orig_pid, fi.home_node, fi.remote_fd, attr);
+}
+
 const struct inode_operations mattx_iops = {
     .getattr = mattx_fake_getattr,
+    .setattr = mattx_fake_setattr,
 };
 
 // --- NEW: The Fake File LSeek Operation (Runs on Node 2) ---
@@ -1150,6 +1279,51 @@ int mattx_wormhole_flock(u32 orig_pid, int home_node, u32 remote_fd, int cmd, in
     return ret;
 }
 EXPORT_SYMBOL(mattx_wormhole_flock);
+
+/*
+ * FSETATTR (Surrogate side, issue #67, P3): ftruncate() / fchmod() / fchown() / futimens() of a Ghost file, see
+ * mattx_fake_setattr(). The thread waits on its own ticket; interrupted (signal, migration freeze) it returns
+ * -ERESTARTSYS unless the final answer is already there (all of these changes are idempotent).
+ */
+int mattx_wormhole_fsetattr(u32 orig_pid, int home_node, u32 remote_fd, const struct iattr *attr)
+{
+    struct mattx_sys_fsetattr_req req;
+    struct mattx_ticket *t;
+    struct mattx_link *link;
+    int ret;
+
+    if ((attr->ia_valid & ATTR_SIZE) && attr->ia_size < 0) return -EINVAL;
+
+    memset(&req, 0, sizeof(req));
+    req.a.valid = mattx_setattr_valid_from_iattr(attr, &req.a);
+    if (!req.a.valid) return 0;                 // nothing for the home node (only "now" times with a size, ctime ...)
+
+    if (home_node < 0 || home_node >= MAX_NODES) return -EIO;
+    link = READ_ONCE(cluster_map[home_node]);
+    if (!link) return -EIO;
+
+    t = mattx_ticket_add(orig_pid, home_node, 0);
+    if (!t) return -ENOMEM;
+
+    req.orig_pid = orig_pid;
+    req.fd = remote_fd;
+    req.req_id = t->req_id;
+
+    mattx_dbg("[WORMHOLE] Surrogate %d requesting FSETATTR valid 0x%x (size %lld) for FD %u (req %u). Sleeping...\n",
+              current->pid, req.a.valid, (long long)req.a.size, remote_fd, t->req_id);
+
+    if (mattx_comm_send(link, MATTX_MSG_SYS_FSETATTR_REQ, &req, sizeof(req)) < 0)
+        ret = -EIO;
+    else if (mattx_ticket_wait(t, MAX_SCHEDULE_TIMEOUT))
+        ret = -ERESTARTSYS;
+    else
+        ret = (int)t->retval;
+
+    mattx_dbg("[WORMHOLE] Surrogate %d woke up! FSETATTR result: %d (req %u).\n", current->pid, ret, req.req_id);
+    mattx_ticket_del(t);
+    return ret;
+}
+EXPORT_SYMBOL(mattx_wormhole_fsetattr);
 
 static int mattx_fake_flock(struct file *file, int cmd, struct file_lock *fl)
 {
@@ -11738,22 +11912,22 @@ static struct cred *mattx_vfs_user_cred(u32 uid, u32 gid)
  * security hook, ctime). Times that were not given explicitly are "now" of THIS node. No delegation handling (a
  * delegation break would show as -EWOULDBLOCK).
  */
-static int mattx_vfs_notify_apply(const struct path *p, const struct mattx_vfs_setattr_req *req)
+static int mattx_vfs_notify_apply(const struct path *p, const struct mattx_setattr_attrs *a)
 {
     struct dentry *dentry = p->dentry;
     struct inode *inode = d_inode(dentry);
     struct iattr newattrs = {};
-    u32 v = req->valid;
+    u32 v = a->valid;
     int err;
 
     if (v & MATTX_SETATTR_UID) {
-        newattrs.ia_uid = make_kuid(&init_user_ns, req->new_uid);
+        newattrs.ia_uid = make_kuid(&init_user_ns, a->new_uid);
         if (!uid_valid(newattrs.ia_uid))
             return -EINVAL;
         newattrs.ia_valid |= ATTR_UID;
     }
     if (v & MATTX_SETATTR_GID) {
-        newattrs.ia_gid = make_kgid(&init_user_ns, req->new_gid);
+        newattrs.ia_gid = make_kgid(&init_user_ns, a->new_gid);
         if (!gid_valid(newattrs.ia_gid))
             return -EINVAL;
         newattrs.ia_valid |= ATTR_GID;
@@ -11761,20 +11935,20 @@ static int mattx_vfs_notify_apply(const struct path *p, const struct mattx_vfs_s
     if (v & MATTX_SETATTR_ATIME) {
         newattrs.ia_valid |= ATTR_ATIME;
         if (v & MATTX_SETATTR_ATIME_SET) {
-            if (req->atime_nsec < 0 || req->atime_nsec >= NSEC_PER_SEC)
+            if (a->atime_nsec < 0 || a->atime_nsec >= NSEC_PER_SEC)
                 return -EINVAL;
-            newattrs.ia_atime.tv_sec = req->atime_sec;
-            newattrs.ia_atime.tv_nsec = req->atime_nsec;
+            newattrs.ia_atime.tv_sec = a->atime_sec;
+            newattrs.ia_atime.tv_nsec = a->atime_nsec;
             newattrs.ia_valid |= ATTR_ATIME_SET;
         }
     }
     if (v & MATTX_SETATTR_MTIME) {
         newattrs.ia_valid |= ATTR_MTIME;
         if (v & MATTX_SETATTR_MTIME_SET) {
-            if (req->mtime_nsec < 0 || req->mtime_nsec >= NSEC_PER_SEC)
+            if (a->mtime_nsec < 0 || a->mtime_nsec >= NSEC_PER_SEC)
                 return -EINVAL;
-            newattrs.ia_mtime.tv_sec = req->mtime_sec;
-            newattrs.ia_mtime.tv_nsec = req->mtime_nsec;
+            newattrs.ia_mtime.tv_sec = a->mtime_sec;
+            newattrs.ia_mtime.tv_nsec = a->mtime_nsec;
             newattrs.ia_valid |= ATTR_MTIME_SET;
         }
     }
@@ -11793,11 +11967,11 @@ static int mattx_vfs_notify_apply(const struct path *p, const struct mattx_vfs_s
         return err;
     inode_lock(inode);
     if (v & MATTX_SETATTR_MODE) {
-        newattrs.ia_mode = (req->new_mode & S_IALLUGO) | (inode->i_mode & ~S_IALLUGO);
+        newattrs.ia_mode = (a->new_mode & S_IALLUGO) | (inode->i_mode & ~S_IALLUGO);
         newattrs.ia_valid |= ATTR_MODE;
     }
-    mattx_dbg("[VFS] NOTIFY_CHANGE valid 0x%x (mode 0%o, uid %u, gid %u) on inode %lu\n", v, req->new_mode & S_IALLUGO,
-              req->new_uid, req->new_gid, inode->i_ino);
+    mattx_dbg("[VFS] NOTIFY_CHANGE valid 0x%x (mode 0%o, uid %u, gid %u) on inode %lu\n", v, a->new_mode & S_IALLUGO,
+              a->new_uid, a->new_gid, inode->i_ino);
     err = notify_change(mnt_idmap(p->mnt), dentry, &newattrs, NULL);
     inode_unlock(inode);
     mnt_drop_write(p->mnt);
@@ -11812,11 +11986,11 @@ static int mattx_vfs_setattr_apply(const struct mattx_vfs_setattr_req *req, bool
     struct path p;
     int err;
 
-    if (req->valid & ~MATTX_SETATTR_ALL)
+    if (req->a.valid & ~MATTX_SETATTR_ALL)
         return -EINVAL;
-    if ((req->valid & MATTX_SETATTR_SIZE) && req->size < 0)
+    if ((req->a.valid & MATTX_SETATTR_SIZE) && req->a.size < 0)
         return -EINVAL;
-    if (!req->valid)
+    if (!req->a.valid)
         return 0;
 
     if (wear_creds) {
@@ -11839,13 +12013,13 @@ static int mattx_vfs_setattr_apply(const struct mattx_vfs_setattr_req *req, bool
         err = kern_path(req->path, LOOKUP_FOLLOW, &p);
     }
     if (!err) {
-        if (req->valid & MATTX_SETATTR_SIZE) {
+        if (req->a.valid & MATTX_SETATTR_SIZE) {
             mattx_dbg("[VFS] TRUNCATE %s%.*s%s to %lld bytes\n", f ? "fd " : "'", f ? 0 : 255, f ? "" : req->path,
-                      f ? "" : "'", (long long)req->size);
-            err = vfs_truncate(&p, req->size);
+                      f ? "" : "'", (long long)req->a.size);
+            err = vfs_truncate(&p, req->a.size);
         }
-        if (!err && (req->valid & ~MATTX_SETATTR_SIZE))
-            err = mattx_vfs_notify_apply(&p, req);
+        if (!err && (req->a.valid & ~MATTX_SETATTR_SIZE))
+            err = mattx_vfs_notify_apply(&p, &req->a);
         path_put(&p);
     }
     if (f)
@@ -11860,42 +12034,42 @@ static int mattx_vfs_setattr_apply(const struct mattx_vfs_setattr_req *req, bool
 
 // --- Surrogate side ---
 // The struct iattr of the VFS becomes the valid mask of the message (see MATTX_SETATTR_*)
-static u32 mattx_setattr_valid_from_iattr(const struct iattr *attr, struct mattx_vfs_setattr_req *req)
+u32 mattx_setattr_valid_from_iattr(const struct iattr *attr, struct mattx_setattr_attrs *a)
 {
     unsigned int ia = attr->ia_valid;
     u32 v = 0;
 
     if (ia & ATTR_SIZE) {
         v |= MATTX_SETATTR_SIZE;
-        req->size = attr->ia_size;
+        a->size = attr->ia_size;
     }
     if (ia & ATTR_MODE) {
         v |= MATTX_SETATTR_MODE;
-        req->new_mode = attr->ia_mode;
+        a->new_mode = attr->ia_mode;
     }
     if (ia & ATTR_UID) {
         v |= MATTX_SETATTR_UID;
-        req->new_uid = from_kuid(&init_user_ns, attr->ia_uid);
+        a->new_uid = from_kuid(&init_user_ns, attr->ia_uid);
     }
     if (ia & ATTR_GID) {
         v |= MATTX_SETATTR_GID;
-        req->new_gid = from_kgid(&init_user_ns, attr->ia_gid);
+        a->new_gid = from_kgid(&init_user_ns, attr->ia_gid);
     }
     // ftruncate() carries "mtime = now" with the size: the truncate at the home node sets it, do not send it twice
     if ((ia & ATTR_ATIME) && ((ia & ATTR_ATIME_SET) || !(ia & ATTR_SIZE))) {
         v |= MATTX_SETATTR_ATIME;
         if (ia & ATTR_ATIME_SET) {
             v |= MATTX_SETATTR_ATIME_SET;
-            req->atime_sec = attr->ia_atime.tv_sec;
-            req->atime_nsec = attr->ia_atime.tv_nsec;
+            a->atime_sec = attr->ia_atime.tv_sec;
+            a->atime_nsec = attr->ia_atime.tv_nsec;
         }
     }
     if ((ia & ATTR_MTIME) && ((ia & ATTR_MTIME_SET) || !(ia & ATTR_SIZE))) {
         v |= MATTX_SETATTR_MTIME;
         if (ia & ATTR_MTIME_SET) {
             v |= MATTX_SETATTR_MTIME_SET;
-            req->mtime_sec = attr->ia_mtime.tv_sec;
-            req->mtime_nsec = attr->ia_mtime.tv_nsec;
+            a->mtime_sec = attr->ia_mtime.tv_sec;
+            a->mtime_nsec = attr->ia_mtime.tv_nsec;
         }
     }
     if ((v & (MATTX_SETATTR_ATIME | MATTX_SETATTR_MTIME)) && (ia & ATTR_TIMES_SET))
@@ -11912,6 +12086,7 @@ static u32 mattx_setattr_valid_from_iattr(const struct iattr *attr, struct mattx
         v = 0;
     return v;
 }
+EXPORT_SYMBOL(mattx_setattr_valid_from_iattr);
 
 int mattx_rpc_vfs_setattr(int node_id, int remote_fd, const char *path, const struct iattr *attr)
 {
@@ -11930,8 +12105,8 @@ int mattx_rpc_vfs_setattr(int node_id, int remote_fd, const char *path, const st
     req->remote_fd = remote_fd;
     req->uid = from_kuid(&init_user_ns, current_fsuid());
     req->gid = from_kgid(&init_user_ns, current_fsgid());
-    req->valid = mattx_setattr_valid_from_iattr(attr, req);
-    if (!req->valid) {                      // nothing for the home node (only times of "now" with a size, ctime ...)
+    req->a.valid = mattx_setattr_valid_from_iattr(attr, &req->a);
+    if (!req->a.valid) {                      // nothing for the home node (only times of "now" with a size, ctime ...)
         kfree(req);
         return 0;
     }
@@ -11957,7 +12132,7 @@ int mattx_rpc_vfs_setattr(int node_id, int remote_fd, const char *path, const st
     }
     req->req_id = t->req_id;
 
-    mattx_dbg("[VFS] SETATTR valid 0x%x (%s %d) on Node %d as req %u. Sleeping...\n", req->valid,
+    mattx_dbg("[VFS] SETATTR valid 0x%x (%s %d) on Node %d as req %u. Sleeping...\n", req->a.valid,
               remote_fd >= 0 ? "fd" : "path", remote_fd, node_id, t->req_id);
     if (mattx_comm_send(cluster_map[node_id], MATTX_MSG_VFS_SETATTR_REQ, req, sizeof(*req)) < 0)
         err = -EIO;
@@ -12007,7 +12182,7 @@ static void mattx_vfs_setattr_kworker(struct work_struct *work)
         abandoned = true;
         err = -EINTR;
     } else {
-        mattx_dbg("[VFS] SETATTR valid 0x%x (req %u) from Node %d (kworker)\n", req->valid, id, ctx->target_node);
+        mattx_dbg("[VFS] SETATTR valid 0x%x (req %u) from Node %d (kworker)\n", req->a.valid, id, ctx->target_node);
         err = mattx_vfs_setattr_apply(req, true);
         mattx_req_take_cancelled(ctx->target_node, 0, id);      // a CANCEL during the truncate is of no use any more
     }
@@ -12054,6 +12229,133 @@ static void handle_vfs_setattr_reply(struct mattx_link *link, struct mattx_heade
 
     if (!mattx_ticket_complete(hdr->sender_id, 0, (u32)reply->req_id, reply->error, NULL, 0))
         mattx_dbg("[VFS] SETATTR_REPLY req %llu: nobody waits for it any more\n", reply->req_id);
+}
+
+// --- Home side: ftruncate / fchmod / fchown / futimens of a Surrogate on a file of the Deputy (Ghost file) ---
+struct mattx_sys_fsetattr_kworker_ctx { struct work_struct work; struct mattx_sys_fsetattr_req req; int target_node; };
+
+static void mattx_sys_fsetattr_reply_send(int node, u32 orig_pid, u32 req_id, int error)
+{
+    struct mattx_sys_fsetattr_reply reply;
+    struct mattx_link *link = READ_ONCE(cluster_map[node]);
+
+    memset(&reply, 0, sizeof(reply));
+    reply.orig_pid = orig_pid;
+    reply.req_id = req_id;
+    reply.error = error;
+    if (link)
+        mattx_comm_send(link, MATTX_MSG_SYS_FSETATTR_REPLY, &reply, sizeof(reply));
+}
+
+/*
+ * The Deputy's own file is changed, the Deputy is NOT woken up. The size is cut with vfs_truncate() as the kworker
+ * (like for the real ftruncate() the OPEN FILE decides: it must be a regular file that is open for writing, the
+ * Surrogate's kernel has checked the mode of the Ghost file already, which carries the access mode of the open).
+ * Mode, owner and times go through notify_change() (mattx_vfs_notify_apply, like chmod_common / chown_common /
+ * do_utimes) wearing the DEPUTY's credentials: it is the Deputy's identity that must be allowed to do it (a chown
+ * of a non-owner fails with EPERM, as it would for the Deputy itself). Times that were not given explicitly are "now"
+ * of this node. A change under way cannot be aborted (like fsync): a CANCEL that arrives before it starts skips
+ * it (-EINTR), a later one is of no use. Exactly one reply.
+ */
+static void mattx_sys_fsetattr_kworker(struct work_struct *work)
+{
+    struct mattx_sys_fsetattr_kworker_ctx *ctx = container_of(work, struct mattx_sys_fsetattr_kworker_ctx, work);
+    struct mattx_sys_fsetattr_req *req = &ctx->req;
+    struct file *f;
+    bool abandoned = false;
+    int err = 0;
+
+    f = mattx_get_remote_file(req->orig_pid, req->fd);
+
+    if (!f) {
+        err = -EBADF;
+    } else if (mattx_req_take_cancelled(ctx->target_node, req->orig_pid, req->req_id)) {
+        mattx_dbg("[WORMHOLE] FSETATTR for FD %u (req %u) cancelled by the Surrogate before it started\n", req->fd, req->req_id);
+        err = -EINTR;
+    } else if (READ_ONCE(mattx_cancellable_stopping) || !READ_ONCE(cluster_map[ctx->target_node])) {
+        abandoned = true;
+        err = -EINTR;
+    } else if ((req->a.valid & ~MATTX_SETATTR_ALL) || ((req->a.valid & MATTX_SETATTR_SIZE) && req->a.size < 0)) {
+        err = -EINVAL;
+    } else {
+        mattx_dbg("[WORMHOLE] FSETATTR FD %u valid 0x%x (size %lld) (req %u) from Node %d (kworker)\n", req->fd, req->a.valid,
+                  (long long)req->a.size, req->req_id, ctx->target_node);
+
+        if (req->a.valid & MATTX_SETATTR_SIZE) {
+            if (S_ISDIR(file_inode(f)->i_mode))
+                err = -EISDIR;
+            else if (!S_ISREG(file_inode(f)->i_mode) || !(f->f_mode & FMODE_WRITE))
+                err = -EINVAL;
+            else
+                err = vfs_truncate(&f->f_path, req->a.size);
+        }
+        if (!err && (req->a.valid & ~MATTX_SETATTR_SIZE)) {
+            const struct cred *deputy_cred = NULL, *old_cred;
+            struct task_struct *deputy;
+
+            rcu_read_lock();
+            deputy = pid_task(find_vpid(req->orig_pid), PIDTYPE_PID);
+            if (deputy)
+                deputy_cred = get_cred(__task_cred(deputy));
+            rcu_read_unlock();
+
+            if (!deputy_cred) {
+                err = -ESRCH;           // no Deputy, no identity to act as
+            } else {
+                old_cred = override_creds(deputy_cred);
+                err = mattx_vfs_notify_apply(&f->f_path, &req->a);
+                revert_creds(old_cred);
+                put_cred(deputy_cred);
+            }
+        }
+        mattx_req_take_cancelled(ctx->target_node, req->orig_pid, req->req_id);     // a CANCEL during the change is of no use any more
+    }
+
+    if (abandoned) {
+        mattx_dbg("[WORMHOLE] FSETATTR (req %u): nobody left to answer, reply dropped\n", req->req_id);
+    } else {
+        mattx_dbg("[WORMHOLE] FSETATTR for FD %u (req %u) done: %d\n", req->fd, req->req_id, err);
+        mattx_sys_fsetattr_reply_send(ctx->target_node, req->orig_pid, req->req_id, err);
+    }
+
+    if (f)
+        fput(f);
+    kfree(ctx);
+    atomic_dec(&mattx_cancellable_inflight);
+}
+
+static void handle_sys_fsetattr_req(struct mattx_link *link, struct mattx_header *hdr, void *payload)
+{
+    struct mattx_sys_fsetattr_req *req = payload;
+    struct mattx_sys_fsetattr_kworker_ctx *ctx;
+
+    if (!payload || hdr->length < sizeof(*req)) return;
+    if (hdr->sender_id >= MAX_NODES || READ_ONCE(mattx_cancellable_stopping)) return;
+
+    ctx = kmalloc(sizeof(*ctx), GFP_ATOMIC);
+    if (!ctx) {
+        // Still answer: the Surrogate thread sleeps on this ticket
+        printk(KERN_ERR "MattX:[WORMHOLE] FSETATTR_REQ %u of PID %u: out of memory\n", req->req_id, req->orig_pid);
+        mattx_sys_fsetattr_reply_send(hdr->sender_id, req->orig_pid, req->req_id, -ENOMEM);
+        return;
+    }
+    INIT_WORK(&ctx->work, mattx_sys_fsetattr_kworker);
+    memcpy(&ctx->req, req, sizeof(*req));
+    ctx->target_node = hdr->sender_id;
+    atomic_inc(&mattx_cancellable_inflight);
+    mattx_queue_wait_work(&ctx->work);
+}
+
+// Surrogate side: the reply belongs to exactly one waiting thread (its ticket)
+static void handle_sys_fsetattr_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload)
+{
+    struct mattx_sys_fsetattr_reply *reply = payload;
+
+    if (!payload || hdr->length < sizeof(*reply)) return;
+
+    mattx_dbg("[RPC] Received FSETATTR_REPLY for Orig PID %u req %u. Error: %d\n", reply->orig_pid, reply->req_id, reply->error);
+    if (!mattx_ticket_complete(hdr->sender_id, reply->orig_pid, reply->req_id, reply->error, NULL, 0))
+        mattx_dbg("[RPC] FSETATTR_REPLY req %u: nobody waits for it any more, dropped\n", reply->req_id);
 }
 
 /*
@@ -12159,6 +12461,8 @@ void mattx_fileio_init_handlers(void) {
     mattx_register_handler(MATTX_MSG_SYS_FLOCK_REPLY, handle_sys_flock_reply);
     mattx_register_handler(MATTX_MSG_VFS_SETATTR_REQ, handle_vfs_setattr_req);
     mattx_register_handler(MATTX_MSG_VFS_SETATTR_REPLY, handle_vfs_setattr_reply);
+    mattx_register_handler(MATTX_MSG_SYS_FSETATTR_REQ, handle_sys_fsetattr_req);
+    mattx_register_handler(MATTX_MSG_SYS_FSETATTR_REPLY, handle_sys_fsetattr_reply);
     mattx_register_handler(MATTX_MSG_SYS_EPOLL_CREATE_REQ, handle_sys_epoll_create_req);
     mattx_register_handler(MATTX_MSG_SYS_EPOLL_CREATE_REPLY, handle_sys_epoll_create_reply);
     mattx_register_handler(MATTX_MSG_SYS_EPOLL_CTL_REQ, handle_sys_epoll_ctl_req);
@@ -12302,6 +12606,9 @@ void mattx_fileio_exit(void) {
     }
     export_count = 0;
     spin_unlock(&export_lock);
+
+    // 2b. The shared anonymous inode gets the kernel's own inode_operations back (ours leave with the module)
+    mattx_ghost_uninstall_iops();
 
     // 3. The master directory of the DSM and the pins of its segments
     mattx_dsm_pin_exit();

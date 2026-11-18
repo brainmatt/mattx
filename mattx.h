@@ -276,6 +276,8 @@ enum mattx_msg_type {
     MATTX_MSG_SYS_FLOCK_REPLY,
     MATTX_MSG_VFS_SETATTR_REQ,       // issue #67 (P3): truncate() / ftruncate() (later chmod, chown, utimes) of a MattXFS file, ticket based
     MATTX_MSG_VFS_SETATTR_REPLY,
+    MATTX_MSG_SYS_FSETATTR_REQ,      // issue #67 (P3): ftruncate / fchmod / fchown / futimens of a Surrogate on a Deputy file (Ghost file), ticket based
+    MATTX_MSG_SYS_FSETATTR_REPLY,
 };
 
 struct mattx_header {
@@ -507,6 +509,57 @@ struct mattx_sys_flock_req {
 };
 
 struct mattx_sys_flock_reply {
+    u32 orig_pid;
+    int error;
+    u32 req_id;                 // echo of the request's ticket id
+    u32 pad;
+};
+
+/*
+ * setattr of a MattXFS file (VFS_SETATTR, 0017a / 0017c) or of a Ghost file (SYS_FSETATTR, 0017d): truncate() /
+ * ftruncate(), chmod / chown / utimes. The file is named by the message around it. valid tells what to change, it mirrors the
+ * struct iattr of the VFS: SIZE, MODE (new_mode), UID / GID (new_uid / new_gid), ATIME / MTIME and, if the caller
+ * gave an explicit time (utimensat() with a time, not UTIME_NOW), ATIME_SET / MTIME_SET with atime_* / mtime_*:
+ * without them the HOME node's clock is used (no clock skew between the nodes). TIMES_SET makes the home node
+ * do the owner check of utimensat() with explicit times; KILL_* are the ATTR_KILL_* flags of chown(). An unknown
+ * bit is answered with -EINVAL. uid / gid: the home node wears the identity of the caller for the permission checks.
+ */
+#define MATTX_SETATTR_SIZE       0x001
+#define MATTX_SETATTR_MODE       0x002
+#define MATTX_SETATTR_UID        0x004
+#define MATTX_SETATTR_GID        0x008
+#define MATTX_SETATTR_ATIME      0x010
+#define MATTX_SETATTR_MTIME      0x020
+#define MATTX_SETATTR_ATIME_SET  0x040
+#define MATTX_SETATTR_MTIME_SET  0x080
+#define MATTX_SETATTR_TIMES_SET  0x100
+#define MATTX_SETATTR_KILL_SUID  0x200
+#define MATTX_SETATTR_KILL_SGID  0x400
+#define MATTX_SETATTR_KILL_PRIV  0x800
+#define MATTX_SETATTR_ALL        0xfff
+
+struct mattx_setattr_attrs {
+    u32 valid;              // MATTX_SETATTR_*
+    u32 new_mode;           // MATTX_SETATTR_MODE
+    u32 new_uid;            // MATTX_SETATTR_UID
+    u32 new_gid;            // MATTX_SETATTR_GID
+    s64 size;               // MATTX_SETATTR_SIZE (>= 0)
+    s64 atime_sec;          // MATTX_SETATTR_ATIME_SET
+    s64 atime_nsec;
+    s64 mtime_sec;          // MATTX_SETATTR_MTIME_SET
+    s64 mtime_nsec;
+};
+
+// ftruncate() / fchmod() / fchown() / futimens() on a Ghost file (issue #67, P3): the Deputy's real file is changed at the home node
+struct mattx_sys_fsetattr_req {
+    u32 orig_pid;
+    u32 fd;
+    u32 req_id;                 // ticket id, never 0
+    u32 pad;
+    struct mattx_setattr_attrs a;
+};
+
+struct mattx_sys_fsetattr_reply {
     u32 orig_pid;
     int error;
     u32 req_id;                 // echo of the request's ticket id
@@ -797,6 +850,8 @@ int mattx_ticket_wait(struct mattx_ticket *t, long timeout);
 // write() of a Surrogate thread to a Deputy file (issue #67, P2): chunks of MATTX_WRITE_CHUNK, one ticket each.
 // Bytes written or -errno. Raises SIGPIPE on -EPIPE, like write(2). Runs in the calling thread (task_work or fop).
 int mattx_wormhole_flock(u32 orig_pid, int home_node, u32 remote_fd, int cmd, int type);
+int mattx_wormhole_fsetattr(u32 orig_pid, int home_node, u32 remote_fd, const struct iattr *attr);
+u32 mattx_setattr_valid_from_iattr(const struct iattr *attr, struct mattx_setattr_attrs *a);
 ssize_t mattx_wormhole_write(u32 orig_pid, int home_node, u32 remote_fd, const char __user *ubuf, size_t count,
                               bool positional, loff_t pos);
 // fsync()/fdatasync() of a Surrogate thread on a Deputy file (issue #67, P2): one request, one ticket. 0 or -errno.
@@ -1487,44 +1542,13 @@ struct mattx_vfs_flock_reply {
     int pad;
 };
 
-/*
- * setattr of a MattXFS file (issue #67, P3): truncate() / ftruncate() (0017a), chmod / chown / utimes (0017c). The
- * file is the open file remote_fd or, if remote_fd is -1, the path. valid tells what to change, it mirrors the
- * struct iattr of the VFS: SIZE, MODE (new_mode), UID / GID (new_uid / new_gid), ATIME / MTIME and, if the caller
- * gave an explicit time (utimensat() with a time, not UTIME_NOW), ATIME_SET / MTIME_SET with atime_* / mtime_*:
- * without them the HOME node's clock is used (no clock skew between the nodes). TIMES_SET makes the home node
- * do the owner check of utimensat() with explicit times; KILL_* are the ATTR_KILL_* flags of chown(). An unknown
- * bit is answered with -EINVAL. uid / gid: the home node wears the identity of the caller for the permission checks.
- */
-#define MATTX_SETATTR_SIZE       0x001
-#define MATTX_SETATTR_MODE       0x002
-#define MATTX_SETATTR_UID        0x004
-#define MATTX_SETATTR_GID        0x008
-#define MATTX_SETATTR_ATIME      0x010
-#define MATTX_SETATTR_MTIME      0x020
-#define MATTX_SETATTR_ATIME_SET  0x040
-#define MATTX_SETATTR_MTIME_SET  0x080
-#define MATTX_SETATTR_TIMES_SET  0x100
-#define MATTX_SETATTR_KILL_SUID  0x200
-#define MATTX_SETATTR_KILL_SGID  0x400
-#define MATTX_SETATTR_KILL_PRIV  0x800
-#define MATTX_SETATTR_ALL        0xfff
-
 struct mattx_vfs_setattr_req {
     u64 req_id;
     s32 remote_fd;          // >= 0: the open file at the home node; -1: path
-    u32 valid;              // MATTX_SETATTR_*
     u32 uid;                // fsuid / fsgid of the caller
     u32 gid;
-    s64 size;               // MATTX_SETATTR_SIZE (>= 0)
-    u32 new_mode;           // MATTX_SETATTR_MODE
-    u32 new_uid;            // MATTX_SETATTR_UID
-    u32 new_gid;            // MATTX_SETATTR_GID
     u32 pad;
-    s64 atime_sec;          // MATTX_SETATTR_ATIME_SET
-    s64 atime_nsec;
-    s64 mtime_sec;
-    s64 mtime_nsec;
+    struct mattx_setattr_attrs a;
     char path[256];         // NUL terminated, used if remote_fd is -1
 };
 
@@ -2001,6 +2025,7 @@ void mattx_fileio_waiters_destroy(void); // rmmod: wait until they are gone (aft
 
 extern const struct file_operations mattx_fops; 
 extern const struct inode_operations mattx_iops;
+void mattx_ghost_install_iops(struct file *fake_file);     // the inode_operations of the Ghost files, see mattx_fileio.c
 
 // DSM single step mode 3
 void mattx_inject_dsm_cleanup(u32 orig_pid, int home_node, u32 shmid, unsigned long fault_addr, bool is_write);

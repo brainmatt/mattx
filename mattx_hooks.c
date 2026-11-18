@@ -1678,9 +1678,7 @@ static void mattx_rpc_worker(struct work_struct *work) {
 
                         if (!IS_ERR(fake_file) && surrogate->files) {
                             // Inject our custom inode_operations so we can catch fstat/getattr!
-                            if (fake_file->f_inode) {
-                                fake_file->f_inode->i_op = &mattx_iops;
-                            }
+                            mattx_ghost_install_iops(fake_file);
 
                             spin_lock(&surrogate->files->file_lock);
                             struct fdtable *fdt = files_fdtable(surrogate->files);
@@ -1954,8 +1952,7 @@ static void mattx_open_tw_fn(struct callback_head *cb) {
                 goto done;
             }
             // Inject our custom inode_operations so we can catch fstat/getattr!
-            if (fake_file->f_inode)
-                fake_file->f_inode->i_op = &mattx_iops;
+            mattx_ghost_install_iops(fake_file);
 
             local_fd = get_unused_fd_flags((tw->flags & O_CLOEXEC) ? O_CLOEXEC : 0);
             if (local_fd < 0) {
