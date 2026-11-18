@@ -37,6 +37,7 @@ MODULE_DESCRIPTION("MattX SSI - FS Module");
 // Forward declarations for the remote operations
 static const struct inode_operations mattxfs_remote_iops;
 static const struct inode_operations mattxfs_remote_file_iops;
+static const struct inode_operations mattxfs_remote_symlink_iops;
 static const struct file_operations mattxfs_remote_dir_fops;
 
 // 1: Path Building Magic ---
@@ -294,6 +295,10 @@ static struct inode *mattxfs_new_inode(struct super_block *sb, const struct ksta
         inode->i_op = &mattxfs_remote_iops;
         inode->i_fop = &mattxfs_remote_dir_fops;
         set_nlink(inode, 2);
+    } else if (S_ISLNK(stat->mode)) {
+        // A symlink is a symlink here too: the target is fetched when the VFS wants to follow it
+        inode->i_op = &mattxfs_remote_symlink_iops;
+        set_nlink(inode, 1);
     } else {
         // Give regular files the ability to be read and written! ---
         inode->i_op = &mattxfs_remote_file_iops;
@@ -314,7 +319,8 @@ static struct dentry *mattxfs_remote_lookup(struct inode *dir, struct dentry *de
     get_remote_path_from_dentry(dentry, path_buf, sizeof(path_buf));
 
     // Ask mattx.ko to fetch the file metadata over the network!
-    err = mattx_rpc_vfs_getattr(node_id, path_buf, &stat);
+    // lstat style: a symlink is a symlink (its target is read by ->get_link())
+    err = mattx_rpc_vfs_getattr_flags(node_id, path_buf, &stat, MATTX_GETATTR_NOFOLLOW);
 
     // A signal is no "file does not exist": no negative dentry, let the system call restart
     if (err == -ERESTARTSYS)
@@ -564,6 +570,98 @@ static int mattxfs_remote_rename(mattxfs_idmap_t *idmap, struct inode *old_dir, 
     return mattx_rpc_vfs_rename(old_node, old_buf, new_buf, flags);
 }
 
+/*
+ * Symbolic and hard links of /mattxfs (issue #67, P3, Track M). A symlink is a symlink on the Surrogate too (lookup no
+ * longer follows it at the home node): ->get_link() asks the home node for the text. The text is NOT translated: an
+ * absolute target is resolved by the Surrogate's own namespace, like on NFS. A hard link needs both names on one node.
+ */
+static const char *mattxfs_remote_get_link(struct dentry *dentry, struct inode *inode, struct delayed_call *done) {
+    char path_buf[256];
+    char *target;
+    int node_id, len;
+
+    if (!dentry)                    // RCU walk: we sleep
+        return ERR_PTR(-ECHILD);
+
+    target = kmalloc(256, GFP_KERNEL);
+    if (!target)
+        return ERR_PTR(-ENOMEM);
+
+    node_id = get_node_id_from_dentry(dentry);
+    get_remote_path_from_dentry(dentry, path_buf, sizeof(path_buf));
+    len = mattx_rpc_vfs_readlink(node_id, path_buf, target, 256);
+    mattx_dbg("[READLINK] %s on Node %d: %d\n", path_buf, node_id, len);
+    if (len < 0) {
+        kfree(target);
+        return ERR_PTR(len);
+    }
+    target[len] = '\0';
+    set_delayed_call(done, kfree_link, target);
+    return target;
+}
+
+static const struct inode_operations mattxfs_remote_symlink_iops = {
+    .get_link       = mattxfs_remote_get_link,
+};
+
+static int mattxfs_remote_symlink(mattxfs_idmap_t *idmap, struct inode *dir, struct dentry *dentry, const char *target) {
+    char path_buf[256];
+    struct kstat st = {};
+    struct inode *inode;
+    int node_id = get_node_id_from_dentry(dentry);
+    int err;
+
+    get_remote_path_from_dentry(dentry, path_buf, sizeof(path_buf));
+    mattx_dbg("[SYMLINK] %s -> %s on Node %d\n", path_buf, target, node_id);
+
+    err = mattx_rpc_vfs_symlink(node_id, target, path_buf);
+    if (err)
+        return err;
+
+    if (mattx_rpc_vfs_getattr_flags(node_id, path_buf, &st, MATTX_GETATTR_NOFOLLOW) || !S_ISLNK(st.mode)) {
+        // The home node made it but did not tell us how it looks: our best guess
+        st.ino = get_next_ino();
+        st.mode = S_IFLNK | 0777;
+        st.size = strlen(target);
+        st.uid = current_fsuid();
+        st.gid = current_fsgid();
+        ktime_get_real_ts64(&st.atime);
+        st.mtime = st.atime;
+        st.ctime = st.atime;
+    }
+    inode = mattxfs_new_inode(dir->i_sb, &st);
+    if (!inode)
+        return -ENOMEM;
+    d_instantiate(dentry, inode);
+    return 0;
+}
+
+static int mattxfs_remote_link(struct dentry *old_dentry, struct inode *dir, struct dentry *new_dentry) {
+    char old_buf[256], new_buf[256];
+    struct inode *inode = d_inode(old_dentry);
+    int old_node = get_node_id_from_dentry(old_dentry);
+    int new_node = get_node_id_from_dentry(new_dentry);
+    int err;
+
+    if (old_node != new_node)
+        return -EXDEV;
+
+    get_remote_path_from_dentry(old_dentry, old_buf, sizeof(old_buf));
+    get_remote_path_from_dentry(new_dentry, new_buf, sizeof(new_buf));
+    mattx_dbg("[LINK] %s -> %s on Node %d\n", new_buf, old_buf, old_node);
+
+    err = mattx_rpc_vfs_link(old_node, old_buf, new_buf);
+    if (err)
+        return err;
+
+    // The new name is the same inode (like any local filesystem)
+    inode_set_ctime_current(inode);
+    inc_nlink(inode);
+    ihold(inode);
+    d_instantiate(new_dentry, inode);
+    return 0;
+}
+
 static const struct inode_operations mattxfs_remote_iops = {
     .lookup         = mattxfs_remote_lookup,  
     .create         = mattxfs_remote_create, // Allow file creation!
@@ -571,6 +669,8 @@ static const struct inode_operations mattxfs_remote_iops = {
     .mkdir          = mattxfs_remote_mkdir,
     .rmdir          = mattxfs_remote_rmdir,
     .rename         = mattxfs_remote_rename,
+    .symlink        = mattxfs_remote_symlink,
+    .link           = mattxfs_remote_link,
 };
 
 

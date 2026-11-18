@@ -9761,7 +9761,7 @@ static bool mattx_filldir(struct dir_context *ctx, const char *name, int namlen,
 
 
 // --- API FOR MATTXFS.KO ---
-int mattx_rpc_vfs_getattr(int node_id, const char *path, struct kstat *stat_out) {
+int mattx_rpc_vfs_getattr_flags(int node_id, const char *path, struct kstat *stat_out, u32 flags) {
     int i, slot = -1;
     u64 req_id;
     struct mattx_vfs_getattr_req req;
@@ -9780,7 +9780,7 @@ int mattx_rpc_vfs_getattr(int node_id, const char *path, struct kstat *stat_out)
         }
 
         struct path local_path;
-        int err = kern_path(path, LOOKUP_FOLLOW, &local_path);
+        int err = kern_path(path, (flags & MATTX_GETATTR_NOFOLLOW) ? 0 : LOOKUP_FOLLOW, &local_path);
         if (!err) {
             err = vfs_getattr(&local_path, stat_out, STATX_BASIC_STATS, AT_STATX_SYNC_AS_STAT);
             path_put(&local_path);
@@ -9813,7 +9813,9 @@ int mattx_rpc_vfs_getattr(int node_id, const char *path, struct kstat *stat_out)
     if (slot == -1) return -EBUSY;
 
     // 2. Send the request
+    memset(&req, 0, sizeof(req));
     req.req_id = req_id;
+    req.flags = flags;
     strscpy_pad(req.path, path, sizeof(req.path));
     mattx_comm_send(cluster_map[node_id], MATTX_MSG_VFS_GETATTR_REQ, &req, sizeof(req));
 
@@ -9832,6 +9834,12 @@ int mattx_rpc_vfs_getattr(int node_id, const char *path, struct kstat *stat_out)
     spin_unlock(&vfs_rpc_lock);
 
     return err;
+}
+EXPORT_SYMBOL(mattx_rpc_vfs_getattr_flags);
+
+// stat(): a symlink is followed
+int mattx_rpc_vfs_getattr(int node_id, const char *path, struct kstat *stat_out) {
+    return mattx_rpc_vfs_getattr_flags(node_id, path, stat_out, 0);
 }
 EXPORT_SYMBOL(mattx_rpc_vfs_getattr);
 
@@ -10388,7 +10396,7 @@ static void handle_vfs_getattr_req(struct mattx_link *link, struct mattx_header 
         reply.req_id = req->req_id;
 
         // Safely look up the file on the local Ext4 disk
-        err = kern_path(req->path, LOOKUP_FOLLOW, &path);
+        err = kern_path(req->path, (req->flags & MATTX_GETATTR_NOFOLLOW) ? 0 : LOOKUP_FOLLOW, &path);
         if (!err) {
             err = vfs_getattr(&path, &stat, STATX_BASIC_STATS, AT_STATX_SYNC_AS_STAT);
             if (!err) {
@@ -12424,17 +12432,32 @@ static void mattx_vfs_status_reply_send(int node, u32 msg, u64 req_id, int error
  * end_creating_path() replace kern_path_create() / done_path_create() (directory locking centralised). The 6.19 branch
  * follows the kernel's own do_mkdirat(); it was written from the commit series, not compiled against 6.19 / 7.0 here.
  */
+// The start / end of every creation at the home node (mkdir, symlink, link): the parent is locked and the write access taken
+static struct dentry *mattx_vfs_creat_start(const char *path, struct path *parent, unsigned int lookup_flags)
+{
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 19, 0)
+    return start_creating_path(AT_FDCWD, path, parent, lookup_flags);
+#else
+    return kern_path_create(AT_FDCWD, path, parent, lookup_flags);
+#endif
+}
+
+static void mattx_vfs_creat_end(struct path *parent, struct dentry *dentry)
+{
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 19, 0)
+    end_creating_path(parent, dentry);
+#else
+    done_path_create(parent, dentry);
+#endif
+}
+
 static int mattx_vfs_mkdir_apply(const char *path, umode_t mode)
 {
     struct path parent;
     struct dentry *dentry;
     int err;
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 19, 0)
-    dentry = start_creating_path(AT_FDCWD, path, &parent, LOOKUP_DIRECTORY);
-#else
-    dentry = kern_path_create(AT_FDCWD, path, &parent, LOOKUP_DIRECTORY);
-#endif
+    dentry = mattx_vfs_creat_start(path, &parent, LOOKUP_DIRECTORY);
     if (IS_ERR(dentry))
         return PTR_ERR(dentry);
 
@@ -12445,11 +12468,7 @@ static int mattx_vfs_mkdir_apply(const char *path, umode_t mode)
     err = vfs_mkdir(mnt_idmap(parent.mnt), d_inode(parent.dentry), dentry, mode);
 #endif
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 19, 0)
-    end_creating_path(&parent, dentry);
-#else
-    done_path_create(&parent, dentry);
-#endif
+    mattx_vfs_creat_end(&parent, dentry);
     return err;
 }
 
@@ -12888,6 +12907,426 @@ static void handle_vfs_rename_reply(struct mattx_link *link, struct mattx_header
     mattx_vfs_status_reply_common(hdr, payload, "VFS_RENAME");
 }
 
+// ---- symlink ----
+// The home node does not look at the target: it is a string (it may even point to nothing)
+static int mattx_vfs_symlink_apply(const char *target, const char *linkpath)
+{
+    struct path parent;
+    struct dentry *dentry;
+    int err;
+
+    dentry = mattx_vfs_creat_start(linkpath, &parent, 0);
+    if (IS_ERR(dentry))
+        return PTR_ERR(dentry);
+
+    err = vfs_symlink(mnt_idmap(parent.mnt), d_inode(parent.dentry), dentry, target);
+
+    mattx_vfs_creat_end(&parent, dentry);
+    return err;
+}
+
+int mattx_rpc_vfs_symlink(int node_id, const char *target, const char *linkpath)
+{
+    struct mattx_vfs_symlink_req *req;
+    int err;
+
+    if (strlen(target) >= sizeof(req->target) || strlen(linkpath) >= sizeof(req->linkpath))
+        return -ENAMETOOLONG;
+
+    if (node_id == my_node_id) {
+        mattx_dbg("[VFS] SYMLINK '%s' -> '%s' (local)\n", linkpath, target);
+        return mattx_vfs_symlink_apply(target, linkpath);
+    }
+
+    req = kzalloc(sizeof(*req), GFP_KERNEL);
+    if (!req)
+        return -ENOMEM;
+    req->uid = from_kuid(&init_user_ns, current_fsuid());
+    req->gid = from_kgid(&init_user_ns, current_fsgid());
+    strscpy(req->target, target, sizeof(req->target));
+    strscpy(req->linkpath, linkpath, sizeof(req->linkpath));
+
+    err = mattx_vfs_rpc_sync(node_id, MATTX_MSG_VFS_SYMLINK_REQ, req, sizeof(*req), "SYMLINK");
+    kfree(req);
+    return err;
+}
+EXPORT_SYMBOL(mattx_rpc_vfs_symlink);
+
+struct mattx_vfs_symlink_kworker_ctx { struct work_struct work; struct mattx_vfs_symlink_req req; int target_node; };
+
+static void mattx_vfs_symlink_kworker(struct work_struct *work)
+{
+    struct mattx_vfs_symlink_kworker_ctx *ctx = container_of(work, struct mattx_vfs_symlink_kworker_ctx, work);
+    struct mattx_vfs_symlink_req *req = &ctx->req;
+    bool abandoned = false;
+    int err;
+
+    req->target[sizeof(req->target) - 1] = '\0';
+    req->linkpath[sizeof(req->linkpath) - 1] = '\0';
+
+    if (mattx_req_take_cancelled(ctx->target_node, 0, (u32)req->req_id)) {
+        mattx_dbg("[VFS] SYMLINK (req %llu) cancelled by the Surrogate before it started, skipped\n", req->req_id);
+        err = -EINTR;
+    } else if (READ_ONCE(mattx_cancellable_stopping) || !READ_ONCE(cluster_map[ctx->target_node])) {
+        abandoned = true;
+        err = -EINTR;
+    } else {
+        struct cred *cred = mattx_vfs_user_cred(req->uid, req->gid);
+
+        if (!cred) {
+            err = -ENOMEM;
+        } else {
+            const struct cred *old_cred = override_creds(cred);
+
+            mattx_dbg("[VFS] SYMLINK '%s' -> '%s' (req %llu) from Node %d (kworker)\n", req->linkpath, req->target, req->req_id, ctx->target_node);
+            err = mattx_vfs_symlink_apply(req->target, req->linkpath);
+            revert_creds(old_cred);
+            put_cred(cred);
+        }
+        mattx_req_take_cancelled(ctx->target_node, 0, (u32)req->req_id);       // a CANCEL during the operation is of no use any more
+    }
+
+    if (abandoned) {
+        mattx_dbg("[VFS] SYMLINK (req %llu): nobody left to answer, reply dropped\n", req->req_id);
+    } else {
+        mattx_dbg("[VFS] SYMLINK (req %llu) done: %d\n", req->req_id, err);
+        mattx_vfs_status_reply_send(ctx->target_node, MATTX_MSG_VFS_SYMLINK_REPLY, req->req_id, err);
+    }
+
+    kfree(ctx);
+    atomic_dec(&mattx_cancellable_inflight);
+}
+
+static void handle_vfs_symlink_req(struct mattx_link *link, struct mattx_header *hdr, void *payload)
+{
+    struct mattx_vfs_symlink_req *req = payload;
+    struct mattx_vfs_symlink_kworker_ctx *ctx;
+
+    if (!payload || hdr->length < sizeof(*req)) return;
+    if (hdr->sender_id >= MAX_NODES || READ_ONCE(mattx_cancellable_stopping)) return;
+
+    ctx = kmalloc(sizeof(*ctx), GFP_ATOMIC);
+    if (!ctx) {
+        printk(KERN_ERR "MattX:[VFS] SYMLINK_REQ %llu: out of memory\n", req->req_id);
+        mattx_vfs_status_reply_send(hdr->sender_id, MATTX_MSG_VFS_SYMLINK_REPLY, req->req_id, -ENOMEM);
+        return;
+    }
+    INIT_WORK(&ctx->work, mattx_vfs_symlink_kworker);
+    memcpy(&ctx->req, req, sizeof(*req));
+    ctx->target_node = hdr->sender_id;
+    atomic_inc(&mattx_cancellable_inflight);
+    mattx_queue_wait_work(&ctx->work);
+}
+
+static void handle_vfs_symlink_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload)
+{
+    mattx_vfs_status_reply_common(hdr, payload, "VFS_SYMLINK");
+}
+
+// ---- link ----
+static int mattx_vfs_link_apply(const char *oldpath, const char *newpath)
+{
+    struct path old, parent;
+    struct dentry *dentry;
+    int err;
+
+    err = kern_path(oldpath, 0, &old);              // like link(2): a symlink is linked itself
+    if (err)
+        return err;
+
+    dentry = mattx_vfs_creat_start(newpath, &parent, 0);
+    if (IS_ERR(dentry)) {
+        err = PTR_ERR(dentry);
+        goto out_old;
+    }
+
+    err = -EXDEV;
+    if (old.mnt == parent.mnt)
+        err = vfs_link(old.dentry, mnt_idmap(parent.mnt), d_inode(parent.dentry), dentry, NULL);
+
+    mattx_vfs_creat_end(&parent, dentry);
+out_old:
+    path_put(&old);
+    return err;
+}
+
+int mattx_rpc_vfs_link(int node_id, const char *oldpath, const char *newpath)
+{
+    struct mattx_vfs_link_req *req;
+    int err;
+
+    if (strlen(oldpath) >= sizeof(req->oldpath) || strlen(newpath) >= sizeof(req->newpath))
+        return -ENAMETOOLONG;
+
+    if (node_id == my_node_id) {
+        mattx_dbg("[VFS] LINK '%s' -> '%s' (local)\n", newpath, oldpath);
+        return mattx_vfs_link_apply(oldpath, newpath);
+    }
+
+    req = kzalloc(sizeof(*req), GFP_KERNEL);
+    if (!req)
+        return -ENOMEM;
+    req->uid = from_kuid(&init_user_ns, current_fsuid());
+    req->gid = from_kgid(&init_user_ns, current_fsgid());
+    strscpy(req->oldpath, oldpath, sizeof(req->oldpath));
+    strscpy(req->newpath, newpath, sizeof(req->newpath));
+
+    err = mattx_vfs_rpc_sync(node_id, MATTX_MSG_VFS_LINK_REQ, req, sizeof(*req), "LINK");
+    kfree(req);
+    return err;
+}
+EXPORT_SYMBOL(mattx_rpc_vfs_link);
+
+struct mattx_vfs_link_kworker_ctx { struct work_struct work; struct mattx_vfs_link_req req; int target_node; };
+
+static void mattx_vfs_link_kworker(struct work_struct *work)
+{
+    struct mattx_vfs_link_kworker_ctx *ctx = container_of(work, struct mattx_vfs_link_kworker_ctx, work);
+    struct mattx_vfs_link_req *req = &ctx->req;
+    bool abandoned = false;
+    int err;
+
+    req->oldpath[sizeof(req->oldpath) - 1] = '\0';
+    req->newpath[sizeof(req->newpath) - 1] = '\0';
+
+    if (mattx_req_take_cancelled(ctx->target_node, 0, (u32)req->req_id)) {
+        mattx_dbg("[VFS] LINK (req %llu) cancelled by the Surrogate before it started, skipped\n", req->req_id);
+        err = -EINTR;
+    } else if (READ_ONCE(mattx_cancellable_stopping) || !READ_ONCE(cluster_map[ctx->target_node])) {
+        abandoned = true;
+        err = -EINTR;
+    } else {
+        struct cred *cred = mattx_vfs_user_cred(req->uid, req->gid);
+
+        if (!cred) {
+            err = -ENOMEM;
+        } else {
+            const struct cred *old_cred = override_creds(cred);
+
+            mattx_dbg("[VFS] LINK '%s' -> '%s' (req %llu) from Node %d (kworker)\n", req->newpath, req->oldpath, req->req_id, ctx->target_node);
+            err = mattx_vfs_link_apply(req->oldpath, req->newpath);
+            revert_creds(old_cred);
+            put_cred(cred);
+        }
+        mattx_req_take_cancelled(ctx->target_node, 0, (u32)req->req_id);       // a CANCEL during the operation is of no use any more
+    }
+
+    if (abandoned) {
+        mattx_dbg("[VFS] LINK (req %llu): nobody left to answer, reply dropped\n", req->req_id);
+    } else {
+        mattx_dbg("[VFS] LINK (req %llu) done: %d\n", req->req_id, err);
+        mattx_vfs_status_reply_send(ctx->target_node, MATTX_MSG_VFS_LINK_REPLY, req->req_id, err);
+    }
+
+    kfree(ctx);
+    atomic_dec(&mattx_cancellable_inflight);
+}
+
+static void handle_vfs_link_req(struct mattx_link *link, struct mattx_header *hdr, void *payload)
+{
+    struct mattx_vfs_link_req *req = payload;
+    struct mattx_vfs_link_kworker_ctx *ctx;
+
+    if (!payload || hdr->length < sizeof(*req)) return;
+    if (hdr->sender_id >= MAX_NODES || READ_ONCE(mattx_cancellable_stopping)) return;
+
+    ctx = kmalloc(sizeof(*ctx), GFP_ATOMIC);
+    if (!ctx) {
+        printk(KERN_ERR "MattX:[VFS] LINK_REQ %llu: out of memory\n", req->req_id);
+        mattx_vfs_status_reply_send(hdr->sender_id, MATTX_MSG_VFS_LINK_REPLY, req->req_id, -ENOMEM);
+        return;
+    }
+    INIT_WORK(&ctx->work, mattx_vfs_link_kworker);
+    memcpy(&ctx->req, req, sizeof(*req));
+    ctx->target_node = hdr->sender_id;
+    atomic_inc(&mattx_cancellable_inflight);
+    mattx_queue_wait_work(&ctx->work);
+}
+
+static void handle_vfs_link_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload)
+{
+    mattx_vfs_status_reply_common(hdr, payload, "VFS_LINK");
+}
+
+// ---- readlink: the target of a symlink; the only one of the three that answers with data ----
+static int mattx_vfs_readlink_apply(const char *path, char *buf, size_t size)
+{
+    struct path p;
+    DEFINE_DELAYED_CALL(done);
+    const char *link;
+    size_t len;
+    int err;
+
+    err = kern_path(path, 0, &p);                   // the link itself
+    if (err)
+        return err;
+
+    if (!d_is_symlink(p.dentry)) {
+        err = -EINVAL;
+        goto out;
+    }
+    link = vfs_get_link(p.dentry, &done);
+    if (IS_ERR(link)) {
+        err = PTR_ERR(link);
+        goto out;
+    }
+    len = strlen(link);
+    if (len >= size) {
+        err = -ENAMETOOLONG;
+    } else {
+        memcpy(buf, link, len);
+        err = (int)len;
+    }
+    do_delayed_call(&done);
+out:
+    path_put(&p);
+    return err;
+}
+
+// Returns the length of the target (no NUL) or -errno; buf is at least 256 bytes
+int mattx_rpc_vfs_readlink(int node_id, const char *path, char *buf, size_t size)
+{
+    struct mattx_vfs_readlink_req *req;
+    struct mattx_ticket *t;
+    int err;
+
+    if (strlen(path) >= sizeof(req->path))
+        return -ENAMETOOLONG;
+
+    if (node_id == my_node_id) {
+        mattx_dbg("[VFS] READLINK '%s' (local)\n", path);
+        return mattx_vfs_readlink_apply(path, buf, size);
+    }
+
+    if (node_id < 0 || node_id >= MAX_NODES || !READ_ONCE(cluster_map[node_id]))
+        return -ENOTCONN;
+
+    req = kzalloc(sizeof(*req), GFP_KERNEL);
+    if (!req)
+        return -ENOMEM;
+    strscpy(req->path, path, sizeof(req->path));
+
+    t = mattx_ticket_add(0, node_id, sizeof(((struct mattx_vfs_readlink_reply *)0)->target));
+    if (!t) {
+        kfree(req);
+        return -ENOMEM;
+    }
+    req->req_id = t->req_id;
+
+    mattx_dbg("[VFS] READLINK '%s' on Node %d as req %u. Sleeping...\n", path, node_id, t->req_id);
+    if (mattx_comm_send(cluster_map[node_id], MATTX_MSG_VFS_READLINK_REQ, req, sizeof(*req)) < 0)
+        err = -EIO;
+    else if (mattx_ticket_wait(t, MAX_SCHEDULE_TIMEOUT))
+        err = -ERESTARTSYS;     // readlink changes nothing: the restart simply asks again
+    else
+        err = (int)t->retval;
+
+    if (err >= 0) {             // retval is the length, the target is the payload
+        if (!t->data || (size_t)err > t->data_len || (size_t)err >= size) {
+            err = -EIO;
+        } else {
+            memcpy(buf, t->data, err);
+        }
+    }
+    mattx_dbg("[VFS] READLINK '%s' on Node %d (req %u) woke up: %d\n", path, node_id, t->req_id, err);
+    mattx_ticket_del(t);
+    kfree(req);
+    return err;
+}
+EXPORT_SYMBOL(mattx_rpc_vfs_readlink);
+
+struct mattx_vfs_readlink_kworker_ctx { struct work_struct work; struct mattx_vfs_readlink_req req; int target_node; };
+
+static void mattx_vfs_readlink_send(int node, u64 req_id, int error, const char *target, int len)
+{
+    struct mattx_vfs_readlink_reply *reply;
+    struct mattx_link *link = READ_ONCE(cluster_map[node]);
+
+    if (!link)
+        return;
+    reply = kzalloc(sizeof(*reply), GFP_KERNEL);
+    if (!reply)
+        return;
+    reply->req_id = req_id;
+    reply->error = error < 0 ? error : len;
+    if (error >= 0 && len > 0) {
+        reply->len = len;
+        memcpy(reply->target, target, len);
+    }
+    mattx_comm_send(link, MATTX_MSG_VFS_READLINK_REPLY, reply, sizeof(*reply));
+    kfree(reply);
+}
+
+static void mattx_vfs_readlink_kworker(struct work_struct *work)
+{
+    struct mattx_vfs_readlink_kworker_ctx *ctx = container_of(work, struct mattx_vfs_readlink_kworker_ctx, work);
+    struct mattx_vfs_readlink_req *req = &ctx->req;
+    char target[sizeof(((struct mattx_vfs_readlink_reply *)0)->target)];
+    bool abandoned = false;
+    int err;
+
+    req->path[sizeof(req->path) - 1] = '\0';
+
+    if (mattx_req_take_cancelled(ctx->target_node, 0, (u32)req->req_id)) {
+        mattx_dbg("[VFS] READLINK (req %llu) cancelled by the Surrogate before it started, skipped\n", req->req_id);
+        err = -EINTR;
+    } else if (READ_ONCE(mattx_cancellable_stopping) || !READ_ONCE(cluster_map[ctx->target_node])) {
+        abandoned = true;
+        err = -EINTR;
+    } else {
+        mattx_dbg("[VFS] READLINK '%s' (req %llu) from Node %d (kworker)\n", req->path, req->req_id, ctx->target_node);
+        err = mattx_vfs_readlink_apply(req->path, target, sizeof(target));
+        mattx_req_take_cancelled(ctx->target_node, 0, (u32)req->req_id);
+    }
+
+    if (abandoned) {
+        mattx_dbg("[VFS] READLINK (req %llu): nobody left to answer, reply dropped\n", req->req_id);
+    } else {
+        mattx_dbg("[VFS] READLINK (req %llu) done: %d\n", req->req_id, err);
+        mattx_vfs_readlink_send(ctx->target_node, req->req_id, err, target, err);
+    }
+
+    kfree(ctx);
+    atomic_dec(&mattx_cancellable_inflight);
+}
+
+static void handle_vfs_readlink_req(struct mattx_link *link, struct mattx_header *hdr, void *payload)
+{
+    struct mattx_vfs_readlink_req *req = payload;
+    struct mattx_vfs_readlink_kworker_ctx *ctx;
+
+    if (!payload || hdr->length < sizeof(*req)) return;
+    if (hdr->sender_id >= MAX_NODES || READ_ONCE(mattx_cancellable_stopping)) return;
+
+    ctx = kmalloc(sizeof(*ctx), GFP_ATOMIC);
+    if (!ctx) {
+        printk(KERN_ERR "MattX:[VFS] READLINK_REQ %llu: out of memory\n", req->req_id);
+        mattx_vfs_readlink_send(hdr->sender_id, req->req_id, -ENOMEM, NULL, 0);
+        return;
+    }
+    INIT_WORK(&ctx->work, mattx_vfs_readlink_kworker);
+    memcpy(&ctx->req, req, sizeof(*req));
+    ctx->target_node = hdr->sender_id;
+    atomic_inc(&mattx_cancellable_inflight);
+    mattx_queue_wait_work(&ctx->work);
+}
+
+static void handle_vfs_readlink_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload)
+{
+    struct mattx_vfs_readlink_reply *reply = payload;
+
+    if (!payload || hdr->length < sizeof(*reply)) return;
+
+    mattx_dbg("[RPC] Received VFS_READLINK_REPLY req %llu. Result: %d\n", reply->req_id, reply->error);
+    if (reply->error >= 0 && reply->len > sizeof(reply->target)) {
+        mattx_ticket_complete(hdr->sender_id, 0, (u32)reply->req_id, -EIO, NULL, 0);
+        return;
+    }
+    if (!mattx_ticket_complete(hdr->sender_id, 0, (u32)reply->req_id, reply->error,
+                               reply->error >= 0 ? reply->target : NULL, reply->error >= 0 ? reply->len : 0))
+        mattx_dbg("[RPC] VFS_READLINK_REPLY req %llu: nobody waits for it any more, dropped\n", reply->req_id);
+}
+
 /*
  * A node is gone (its socket died, or it is disconnected / replaced / unloaded): every file it had open here goes
  * with it. Without this the slots of a crashed Surrogate stayed forever, and with them whatever the files hold:
@@ -12999,6 +13438,12 @@ void mattx_fileio_init_handlers(void) {
     mattx_register_handler(MATTX_MSG_VFS_RMDIR_REPLY, handle_vfs_rmdir_reply);
     mattx_register_handler(MATTX_MSG_VFS_RENAME_REQ, handle_vfs_rename_req);
     mattx_register_handler(MATTX_MSG_VFS_RENAME_REPLY, handle_vfs_rename_reply);
+    mattx_register_handler(MATTX_MSG_VFS_SYMLINK_REQ, handle_vfs_symlink_req);
+    mattx_register_handler(MATTX_MSG_VFS_SYMLINK_REPLY, handle_vfs_symlink_reply);
+    mattx_register_handler(MATTX_MSG_VFS_LINK_REQ, handle_vfs_link_req);
+    mattx_register_handler(MATTX_MSG_VFS_LINK_REPLY, handle_vfs_link_reply);
+    mattx_register_handler(MATTX_MSG_VFS_READLINK_REQ, handle_vfs_readlink_req);
+    mattx_register_handler(MATTX_MSG_VFS_READLINK_REPLY, handle_vfs_readlink_reply);
     mattx_register_handler(MATTX_MSG_SYS_EPOLL_CREATE_REQ, handle_sys_epoll_create_req);
     mattx_register_handler(MATTX_MSG_SYS_EPOLL_CREATE_REPLY, handle_sys_epoll_create_reply);
     mattx_register_handler(MATTX_MSG_SYS_EPOLL_CTL_REQ, handle_sys_epoll_ctl_req);

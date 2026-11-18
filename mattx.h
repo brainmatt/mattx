@@ -284,6 +284,12 @@ enum mattx_msg_type {
     MATTX_MSG_VFS_RMDIR_REPLY,
     MATTX_MSG_VFS_RENAME_REQ,        // issue #67 (P3, Track M): rename() on /mattxfs, ticket based
     MATTX_MSG_VFS_RENAME_REPLY,
+    MATTX_MSG_VFS_SYMLINK_REQ,       // issue #67 (P3, Track M): symlink() on /mattxfs, ticket based
+    MATTX_MSG_VFS_SYMLINK_REPLY,
+    MATTX_MSG_VFS_LINK_REQ,          // issue #67 (P3, Track M): link() on /mattxfs, ticket based
+    MATTX_MSG_VFS_LINK_REPLY,
+    MATTX_MSG_VFS_READLINK_REQ,      // issue #67 (P3, Track M): the target of a symlink of /mattxfs, ticket based
+    MATTX_MSG_VFS_READLINK_REPLY,
 };
 
 struct mattx_header {
@@ -1408,8 +1414,12 @@ struct mattx_export_info {
     bool is_growing_gang; // The Gang Grower Flag!
 };
 
+#define MATTX_GETATTR_NOFOLLOW  0x1     // lstat(): a symlink is reported itself, not its target
+
 struct mattx_vfs_getattr_req {
     u64 req_id;
+    u32 flags;              // MATTX_GETATTR_*
+    u32 pad;
     char path[256];
 };
 
@@ -1593,6 +1603,34 @@ struct mattx_vfs_rename_req {
     u32 pad;
     char oldpath[256];      // both names are on the same node, NUL terminated
     char newpath[256];
+};
+
+struct mattx_vfs_symlink_req {
+    u64 req_id;
+    u32 uid;
+    u32 gid;
+    char target[256];       // what the link says, NUL terminated (never looked at by the home node)
+    char linkpath[256];     // the new name
+};
+
+struct mattx_vfs_link_req {
+    u64 req_id;
+    u32 uid;
+    u32 gid;
+    char oldpath[256];      // the existing file (not followed if it is a symlink: like link(2))
+    char newpath[256];      // the new name, on the same node
+};
+
+struct mattx_vfs_readlink_req {
+    u64 req_id;
+    char path[256];
+};
+
+struct mattx_vfs_readlink_reply {
+    u64 req_id;
+    int error;
+    u32 len;                // bytes of target (no NUL)
+    char target[256];
 };
 
 struct mattx_vfs_status_reply {
@@ -2080,6 +2118,10 @@ void mattx_schedule_vm1_sync(pid_t pid, u32 shmid, unsigned long offset, bool is
 // API for MattXFS ---
 int mattx_get_active_nodes(int *node_array, int max_nodes);
 int mattx_rpc_vfs_getattr(int node_id, const char *path, struct kstat *stat_out);
+int mattx_rpc_vfs_getattr_flags(int node_id, const char *path, struct kstat *stat_out, u32 flags);       // MATTX_GETATTR_*
+int mattx_rpc_vfs_symlink(int node_id, const char *target, const char *linkpath);                      // MattXFS .symlink
+int mattx_rpc_vfs_link(int node_id, const char *oldpath, const char *newpath);                         // MattXFS .link
+int mattx_rpc_vfs_readlink(int node_id, const char *path, char *buf, size_t size);                     // MattXFS .get_link (returns the length)
 int mattx_rpc_vfs_readdir(int node_id, const char *path, u64 *offset, struct mattx_dirent *entries, u32 *out_count);
 int mattx_rpc_vfs_open(int node_id, const char *path, int flags, int mode, int *remote_fd);
 ssize_t mattx_rpc_vfs_read(int node_id, int remote_fd, void *buf, size_t count, loff_t *pos);
