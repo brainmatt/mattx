@@ -1488,17 +1488,27 @@ struct mattx_vfs_flock_reply {
 };
 
 /*
- * truncate() / ftruncate() of a MattXFS file (issue #67, P3). The file is the open file remote_fd (ftruncate) or, if
- * remote_fd is -1, the path (truncate). valid tells what to change: only MATTX_SETATTR_SIZE is carried today, the
- * other members are reserved for chmod / chown / utimes so the layout does not have to change again; an unknown bit
- * is answered with -EINVAL. uid / gid: the home node wears the identity of the caller for the permission checks.
+ * setattr of a MattXFS file (issue #67, P3): truncate() / ftruncate() (0017a), chmod / chown / utimes (0017c). The
+ * file is the open file remote_fd or, if remote_fd is -1, the path. valid tells what to change, it mirrors the
+ * struct iattr of the VFS: SIZE, MODE (new_mode), UID / GID (new_uid / new_gid), ATIME / MTIME and, if the caller
+ * gave an explicit time (utimensat() with a time, not UTIME_NOW), ATIME_SET / MTIME_SET with atime_* / mtime_*:
+ * without them the HOME node's clock is used (no clock skew between the nodes). TIMES_SET makes the home node
+ * do the owner check of utimensat() with explicit times; KILL_* are the ATTR_KILL_* flags of chown(). An unknown
+ * bit is answered with -EINVAL. uid / gid: the home node wears the identity of the caller for the permission checks.
  */
-#define MATTX_SETATTR_SIZE   0x01
-#define MATTX_SETATTR_MODE   0x02       // reserved
-#define MATTX_SETATTR_UID    0x04       // reserved
-#define MATTX_SETATTR_GID    0x08       // reserved
-#define MATTX_SETATTR_ATIME  0x10       // reserved
-#define MATTX_SETATTR_MTIME  0x20       // reserved
+#define MATTX_SETATTR_SIZE       0x001
+#define MATTX_SETATTR_MODE       0x002
+#define MATTX_SETATTR_UID        0x004
+#define MATTX_SETATTR_GID        0x008
+#define MATTX_SETATTR_ATIME      0x010
+#define MATTX_SETATTR_MTIME      0x020
+#define MATTX_SETATTR_ATIME_SET  0x040
+#define MATTX_SETATTR_MTIME_SET  0x080
+#define MATTX_SETATTR_TIMES_SET  0x100
+#define MATTX_SETATTR_KILL_SUID  0x200
+#define MATTX_SETATTR_KILL_SGID  0x400
+#define MATTX_SETATTR_KILL_PRIV  0x800
+#define MATTX_SETATTR_ALL        0xfff
 
 struct mattx_vfs_setattr_req {
     u64 req_id;
@@ -1507,11 +1517,11 @@ struct mattx_vfs_setattr_req {
     u32 uid;                // fsuid / fsgid of the caller
     u32 gid;
     s64 size;               // MATTX_SETATTR_SIZE (>= 0)
-    u32 new_mode;           // reserved
-    u32 new_uid;            // reserved
-    u32 new_gid;            // reserved
+    u32 new_mode;           // MATTX_SETATTR_MODE
+    u32 new_uid;            // MATTX_SETATTR_UID
+    u32 new_gid;            // MATTX_SETATTR_GID
     u32 pad;
-    s64 atime_sec;          // reserved
+    s64 atime_sec;          // MATTX_SETATTR_ATIME_SET
     s64 atime_nsec;
     s64 mtime_sec;
     s64 mtime_nsec;
@@ -2012,7 +2022,7 @@ int mattx_rpc_vfs_fsync(int node_id, int remote_fd, loff_t start, loff_t end, in
 int mattx_rpc_vfs_lock(int node_id, int remote_fd, int cmd, struct file_lock *fl);    // MattXFS .lock
 int mattx_rpc_vfs_flock(int node_id, int remote_fd, int cmd, struct file_lock *fl);   // MattXFS .flock
 int mattx_rpc_vfs_unlink(int node_id, const char *path);
-int mattx_rpc_vfs_truncate(int node_id, int remote_fd, const char *path, loff_t size);   // MattXFS .setattr (ATTR_SIZE)
+int mattx_rpc_vfs_setattr(int node_id, int remote_fd, const char *path, const struct iattr *attr);   // MattXFS .setattr
 
 #endif // MATTX_H
 

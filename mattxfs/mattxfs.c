@@ -406,6 +406,7 @@ static int mattxfs_remote_getattr(struct user_namespace *idmap, const struct pat
             mattx_dbg("[GETATTR] %s on Node %d: size %lld (cached %lld)\n", path_buf, node_id,
                       (long long)remote.size, (long long)i_size_read(inode));
             i_size_write(inode, remote.size);
+            inode->i_mode = (inode->i_mode & S_IFMT) | (remote.mode & ~S_IFMT);     // chmod of anybody
             inode->i_blocks = remote.blocks;
             inode->i_uid = remote.uid;
             inode->i_gid = remote.gid;
@@ -420,11 +421,12 @@ static int mattxfs_remote_getattr(struct user_namespace *idmap, const struct pat
 }
 
 /*
- * truncate() / ftruncate() of a remote file (issue #67, P3). Without a .setattr the kernel's simple_setattr() only
- * resized this node's local inode: the call returned 0 and the file at the home node stayed as it was. The size is
- * cut at the home node FIRST; only when that worked the local inode follows. Every other attribute (mode, owner,
- * times) is still only recorded locally, as before (it will be forwarded in a later step).
- * ftruncate() comes with the open file (ATTR_FILE): its remote FD is used, truncate() is by path.
+ * setattr of a remote file (issue #67, P3): truncate() / ftruncate() (0017a), chmod / chown / utimes (0017c).
+ * Without a .setattr the kernel's simple_setattr() only changed this node's local inode: the call returned 0 and the
+ * file at the home node stayed as it was (and the next stat() brought the old values back). The change is made at
+ * the home node FIRST (the permission checks of the caller's identity are done there, the node's own clock gives
+ * "now"); only when that worked the local inode follows. ftruncate() comes with the open file (ATTR_FILE): its
+ * remote FD is used; everything else is by path.
  */
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
 static int mattxfs_remote_setattr(struct mnt_idmap *idmap, struct dentry *dentry, struct iattr *attr) {
@@ -432,35 +434,34 @@ static int mattxfs_remote_setattr(struct mnt_idmap *idmap, struct dentry *dentry
 static int mattxfs_remote_setattr(struct user_namespace *idmap, struct dentry *dentry, struct iattr *attr) {
 #endif
     struct inode *inode = d_inode(dentry);
+    struct mattxfs_file_info *fi = NULL;
+    char path_buf[256];
+    int node_id, remote_fd = -1;
     int err;
 
     err = setattr_prepare(idmap, dentry, attr);
     if (err)
         return err;
 
-    if (attr->ia_valid & ATTR_SIZE) {
-        struct mattxfs_file_info *fi = NULL;
-        char path_buf[256];
-        int node_id, remote_fd = -1;
-
-        if ((attr->ia_valid & ATTR_FILE) && attr->ia_file && attr->ia_file->f_op == &mattxfs_remote_file_fops)
-            fi = attr->ia_file->private_data;
-        if (fi) {
-            node_id = fi->node_id;
-            remote_fd = fi->remote_fd;
-            path_buf[0] = '\0';
-        } else {
-            node_id = get_node_id_from_dentry(dentry);
-            get_remote_path_from_dentry(dentry, path_buf, sizeof(path_buf));
-        }
-
-        mattx_dbg("[TRUNCATE] %s to %lld bytes on Node %d\n", fi ? "ftruncate" : path_buf, (long long)attr->ia_size, node_id);
-        err = mattx_rpc_vfs_truncate(node_id, remote_fd, path_buf, attr->ia_size);
-        if (err)
-            return err;
-        truncate_setsize(inode, attr->ia_size);
+    if ((attr->ia_valid & ATTR_FILE) && attr->ia_file && attr->ia_file->f_op == &mattxfs_remote_file_fops)
+        fi = attr->ia_file->private_data;
+    if (fi) {
+        node_id = fi->node_id;
+        remote_fd = fi->remote_fd;
+        path_buf[0] = '\0';
+    } else {
+        node_id = get_node_id_from_dentry(dentry);
+        get_remote_path_from_dentry(dentry, path_buf, sizeof(path_buf));
     }
 
+    mattx_dbg("[SETATTR] %s valid 0x%x (size %lld) on Node %d\n", fi ? "fd" : path_buf, attr->ia_valid,
+              (long long)attr->ia_size, node_id);
+    err = mattx_rpc_vfs_setattr(node_id, remote_fd, path_buf, attr);
+    if (err)
+        return err;
+
+    if (attr->ia_valid & ATTR_SIZE)
+        truncate_setsize(inode, attr->ia_size);
     setattr_copy(idmap, inode, attr);
     mark_inode_dirty(inode);
     return 0;

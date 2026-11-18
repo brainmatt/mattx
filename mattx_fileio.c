@@ -11732,6 +11732,78 @@ static struct cred *mattx_vfs_user_cred(u32 uid, u32 gid)
     return cred;
 }
 
+/*
+ * chmod / chown / utimes at the home node: the same kernel calls as chmod_common(), chown_common() and
+ * do_utimes_path(): mnt_want_write, inode lock, notify_change() (permission checks of the caller's identity,
+ * security hook, ctime). Times that were not given explicitly are "now" of THIS node. No delegation handling (a
+ * delegation break would show as -EWOULDBLOCK).
+ */
+static int mattx_vfs_notify_apply(const struct path *p, const struct mattx_vfs_setattr_req *req)
+{
+    struct dentry *dentry = p->dentry;
+    struct inode *inode = d_inode(dentry);
+    struct iattr newattrs = {};
+    u32 v = req->valid;
+    int err;
+
+    if (v & MATTX_SETATTR_UID) {
+        newattrs.ia_uid = make_kuid(&init_user_ns, req->new_uid);
+        if (!uid_valid(newattrs.ia_uid))
+            return -EINVAL;
+        newattrs.ia_valid |= ATTR_UID;
+    }
+    if (v & MATTX_SETATTR_GID) {
+        newattrs.ia_gid = make_kgid(&init_user_ns, req->new_gid);
+        if (!gid_valid(newattrs.ia_gid))
+            return -EINVAL;
+        newattrs.ia_valid |= ATTR_GID;
+    }
+    if (v & MATTX_SETATTR_ATIME) {
+        newattrs.ia_valid |= ATTR_ATIME;
+        if (v & MATTX_SETATTR_ATIME_SET) {
+            if (req->atime_nsec < 0 || req->atime_nsec >= NSEC_PER_SEC)
+                return -EINVAL;
+            newattrs.ia_atime.tv_sec = req->atime_sec;
+            newattrs.ia_atime.tv_nsec = req->atime_nsec;
+            newattrs.ia_valid |= ATTR_ATIME_SET;
+        }
+    }
+    if (v & MATTX_SETATTR_MTIME) {
+        newattrs.ia_valid |= ATTR_MTIME;
+        if (v & MATTX_SETATTR_MTIME_SET) {
+            if (req->mtime_nsec < 0 || req->mtime_nsec >= NSEC_PER_SEC)
+                return -EINVAL;
+            newattrs.ia_mtime.tv_sec = req->mtime_sec;
+            newattrs.ia_mtime.tv_nsec = req->mtime_nsec;
+            newattrs.ia_valid |= ATTR_MTIME_SET;
+        }
+    }
+    if (v & MATTX_SETATTR_TIMES_SET)
+        newattrs.ia_valid |= ATTR_TIMES_SET;
+    if (v & MATTX_SETATTR_KILL_SUID)
+        newattrs.ia_valid |= ATTR_KILL_SUID;
+    if (v & MATTX_SETATTR_KILL_SGID)
+        newattrs.ia_valid |= ATTR_KILL_SGID;
+    if (v & MATTX_SETATTR_KILL_PRIV)
+        newattrs.ia_valid |= ATTR_KILL_PRIV;
+    newattrs.ia_valid |= ATTR_CTIME;
+
+    err = mnt_want_write(p->mnt);
+    if (err)
+        return err;
+    inode_lock(inode);
+    if (v & MATTX_SETATTR_MODE) {
+        newattrs.ia_mode = (req->new_mode & S_IALLUGO) | (inode->i_mode & ~S_IALLUGO);
+        newattrs.ia_valid |= ATTR_MODE;
+    }
+    mattx_dbg("[VFS] NOTIFY_CHANGE valid 0x%x (mode 0%o, uid %u, gid %u) on inode %lu\n", v, req->new_mode & S_IALLUGO,
+              req->new_uid, req->new_gid, inode->i_ino);
+    err = notify_change(mnt_idmap(p->mnt), dentry, &newattrs, NULL);
+    inode_unlock(inode);
+    mnt_drop_write(p->mnt);
+    return err;
+}
+
 static int mattx_vfs_setattr_apply(const struct mattx_vfs_setattr_req *req, bool wear_creds)
 {
     const struct cred *old_cred = NULL;
@@ -11740,8 +11812,12 @@ static int mattx_vfs_setattr_apply(const struct mattx_vfs_setattr_req *req, bool
     struct path p;
     int err;
 
-    if ((req->valid & ~MATTX_SETATTR_SIZE) || !(req->valid & MATTX_SETATTR_SIZE) || req->size < 0)
+    if (req->valid & ~MATTX_SETATTR_ALL)
         return -EINVAL;
+    if ((req->valid & MATTX_SETATTR_SIZE) && req->size < 0)
+        return -EINVAL;
+    if (!req->valid)
+        return 0;
 
     if (wear_creds) {
         cred = mattx_vfs_user_cred(req->uid, req->gid);
@@ -11763,9 +11839,13 @@ static int mattx_vfs_setattr_apply(const struct mattx_vfs_setattr_req *req, bool
         err = kern_path(req->path, LOOKUP_FOLLOW, &p);
     }
     if (!err) {
-        mattx_dbg("[VFS] TRUNCATE %s%.*s%s to %lld bytes\n", f ? "fd " : "'", f ? 0 : 255, f ? "" : req->path,
-                  f ? "" : "'", (long long)req->size);
-        err = vfs_truncate(&p, req->size);
+        if (req->valid & MATTX_SETATTR_SIZE) {
+            mattx_dbg("[VFS] TRUNCATE %s%.*s%s to %lld bytes\n", f ? "fd " : "'", f ? 0 : 255, f ? "" : req->path,
+                      f ? "" : "'", (long long)req->size);
+            err = vfs_truncate(&p, req->size);
+        }
+        if (!err && (req->valid & ~MATTX_SETATTR_SIZE))
+            err = mattx_vfs_notify_apply(&p, req);
         path_put(&p);
     }
     if (f)
@@ -11779,13 +11859,67 @@ static int mattx_vfs_setattr_apply(const struct mattx_vfs_setattr_req *req, bool
 }
 
 // --- Surrogate side ---
-int mattx_rpc_vfs_truncate(int node_id, int remote_fd, const char *path, loff_t size)
+// The struct iattr of the VFS becomes the valid mask of the message (see MATTX_SETATTR_*)
+static u32 mattx_setattr_valid_from_iattr(const struct iattr *attr, struct mattx_vfs_setattr_req *req)
+{
+    unsigned int ia = attr->ia_valid;
+    u32 v = 0;
+
+    if (ia & ATTR_SIZE) {
+        v |= MATTX_SETATTR_SIZE;
+        req->size = attr->ia_size;
+    }
+    if (ia & ATTR_MODE) {
+        v |= MATTX_SETATTR_MODE;
+        req->new_mode = attr->ia_mode;
+    }
+    if (ia & ATTR_UID) {
+        v |= MATTX_SETATTR_UID;
+        req->new_uid = from_kuid(&init_user_ns, attr->ia_uid);
+    }
+    if (ia & ATTR_GID) {
+        v |= MATTX_SETATTR_GID;
+        req->new_gid = from_kgid(&init_user_ns, attr->ia_gid);
+    }
+    // ftruncate() carries "mtime = now" with the size: the truncate at the home node sets it, do not send it twice
+    if ((ia & ATTR_ATIME) && ((ia & ATTR_ATIME_SET) || !(ia & ATTR_SIZE))) {
+        v |= MATTX_SETATTR_ATIME;
+        if (ia & ATTR_ATIME_SET) {
+            v |= MATTX_SETATTR_ATIME_SET;
+            req->atime_sec = attr->ia_atime.tv_sec;
+            req->atime_nsec = attr->ia_atime.tv_nsec;
+        }
+    }
+    if ((ia & ATTR_MTIME) && ((ia & ATTR_MTIME_SET) || !(ia & ATTR_SIZE))) {
+        v |= MATTX_SETATTR_MTIME;
+        if (ia & ATTR_MTIME_SET) {
+            v |= MATTX_SETATTR_MTIME_SET;
+            req->mtime_sec = attr->ia_mtime.tv_sec;
+            req->mtime_nsec = attr->ia_mtime.tv_nsec;
+        }
+    }
+    if ((v & (MATTX_SETATTR_ATIME | MATTX_SETATTR_MTIME)) && (ia & ATTR_TIMES_SET))
+        v |= MATTX_SETATTR_TIMES_SET;
+    if (ia & ATTR_KILL_SUID)
+        v |= MATTX_SETATTR_KILL_SUID;
+    if (ia & ATTR_KILL_SGID)
+        v |= MATTX_SETATTR_KILL_SGID;
+    if (ia & ATTR_KILL_PRIV)
+        v |= MATTX_SETATTR_KILL_PRIV;
+    // KILL_* alone (nothing to change) is not worth a request
+    if (!(v & (MATTX_SETATTR_SIZE | MATTX_SETATTR_MODE | MATTX_SETATTR_UID | MATTX_SETATTR_GID |
+               MATTX_SETATTR_ATIME | MATTX_SETATTR_MTIME)))
+        v = 0;
+    return v;
+}
+
+int mattx_rpc_vfs_setattr(int node_id, int remote_fd, const char *path, const struct iattr *attr)
 {
     struct mattx_vfs_setattr_req *req;
     struct mattx_ticket *t;
     int err;
 
-    if (size < 0)
+    if ((attr->ia_valid & ATTR_SIZE) && attr->ia_size < 0)
         return -EINVAL;
     if (remote_fd < 0 && strlen(path) >= sizeof(req->path))
         return -ENAMETOOLONG;
@@ -11794,10 +11928,13 @@ int mattx_rpc_vfs_truncate(int node_id, int remote_fd, const char *path, loff_t 
     if (!req)
         return -ENOMEM;
     req->remote_fd = remote_fd;
-    req->valid = MATTX_SETATTR_SIZE;
-    req->size = size;
     req->uid = from_kuid(&init_user_ns, current_fsuid());
     req->gid = from_kgid(&init_user_ns, current_fsgid());
+    req->valid = mattx_setattr_valid_from_iattr(attr, req);
+    if (!req->valid) {                      // nothing for the home node (only times of "now" with a size, ctime ...)
+        kfree(req);
+        return 0;
+    }
     if (remote_fd < 0)
         strscpy(req->path, path, sizeof(req->path));
 
@@ -11820,19 +11957,19 @@ int mattx_rpc_vfs_truncate(int node_id, int remote_fd, const char *path, loff_t 
     }
     req->req_id = t->req_id;
 
-    mattx_dbg("[VFS] TRUNCATE to %lld bytes (%s %d) on Node %d as req %u. Sleeping...\n", (long long)size,
+    mattx_dbg("[VFS] SETATTR valid 0x%x (%s %d) on Node %d as req %u. Sleeping...\n", req->valid,
               remote_fd >= 0 ? "fd" : "path", remote_fd, node_id, t->req_id);
     if (mattx_comm_send(cluster_map[node_id], MATTX_MSG_VFS_SETATTR_REQ, req, sizeof(*req)) < 0)
         err = -EIO;
     else if (mattx_ticket_wait(t, MAX_SCHEDULE_TIMEOUT))
-        err = -ERESTARTSYS;     // no final answer: restart the system call (truncating to the same size twice is harmless)
+        err = -ERESTARTSYS;     // no final answer: restart the system call (all of these changes are idempotent)
     else
         err = (int)t->retval;
     mattx_ticket_del(t);
     kfree(req);
     return err;
 }
-EXPORT_SYMBOL(mattx_rpc_vfs_truncate);
+EXPORT_SYMBOL(mattx_rpc_vfs_setattr);
 
 // --- Home side: a flat kworker, never the receiver kthread ---
 struct mattx_vfs_setattr_kworker_ctx { struct work_struct work; struct mattx_vfs_setattr_req req; int target_node; };
@@ -11908,7 +12045,7 @@ static void handle_vfs_setattr_req(struct mattx_link *link, struct mattx_header 
     mattx_queue_wait_work(&ctx->work);
 }
 
-// Surrogate side: the request id is the ticket id of the thread that waits (see mattx_rpc_vfs_truncate())
+// Surrogate side: the request id is the ticket id of the thread that waits (see mattx_rpc_vfs_setattr())
 static void handle_vfs_setattr_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload)
 {
     struct mattx_vfs_setattr_reply *reply = payload;
