@@ -25,6 +25,7 @@
 #include <linux/fs.h>
 #include <linux/pagemap.h>
 #include <linux/version.h>
+#include <linux/falloc.h>
 #include <linux/fs_context.h>
 #include "../mattx.h" 
 
@@ -221,6 +222,36 @@ static int mattxfs_remote_file_flock(struct file *file, int cmd, struct file_loc
     return mattx_rpc_vfs_flock(fi->node_id, fi->remote_fd, cmd, fl);
 }
 
+/*
+ * fallocate() of a remote file (issue #67, P3, Track M): the home node does it on its open file (the home filesystem
+ * decides which modes it knows: EOPNOTSUPP like on a local disk). MattXFS reads and writes go over the wire, there is no
+ * page cache here to invalidate; only the cached size follows (fstat asks the home node anyway, see getattr).
+ */
+static long mattxfs_remote_file_fallocate(struct file *file, int mode, loff_t offset, loff_t len) {
+    struct mattxfs_file_info *fi = file->private_data;
+    struct inode *inode = file_inode(file);
+    loff_t size;
+    long err;
+
+    if (!fi) return -EIO;
+
+    mattx_dbg("[FALLOCATE] fd %d mode 0x%x off %lld len %lld on Node %d\n", fi->remote_fd, mode,
+              (long long)offset, (long long)len, fi->node_id);
+    err = mattx_rpc_vfs_fallocate(fi->node_id, fi->remote_fd, mode, offset, len);
+    if (err)
+        return err;
+
+    size = i_size_read(inode);
+    if (mode & FALLOC_FL_COLLAPSE_RANGE)
+        size = size > len ? size - len : 0;
+    else if (mode & FALLOC_FL_INSERT_RANGE)
+        size += len;
+    else if (!(mode & FALLOC_FL_KEEP_SIZE) && offset + len > size)
+        size = offset + len;
+    i_size_write(inode, size);
+    return 0;
+}
+
 // Wire them up!
 static const struct file_operations mattxfs_remote_file_fops = {
     .open    = mattxfs_remote_file_open,
@@ -229,6 +260,7 @@ static const struct file_operations mattxfs_remote_file_fops = {
     .release = mattxfs_remote_file_release,
     .llseek  = mattxfs_remote_file_llseek,
     .fsync   = mattxfs_remote_file_fsync,
+    .fallocate = mattxfs_remote_file_fallocate,
     .lock    = mattxfs_remote_file_lock,
     .flock   = mattxfs_remote_file_flock,
 };

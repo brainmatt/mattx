@@ -290,6 +290,10 @@ enum mattx_msg_type {
     MATTX_MSG_VFS_LINK_REPLY,
     MATTX_MSG_VFS_READLINK_REQ,      // issue #67 (P3, Track M): the target of a symlink of /mattxfs, ticket based
     MATTX_MSG_VFS_READLINK_REPLY,
+    MATTX_MSG_VFS_FALLOCATE_REQ,     // issue #67 (P3, Track M): fallocate() on a MattXFS file, ticket based
+    MATTX_MSG_VFS_FALLOCATE_REPLY,
+    MATTX_MSG_SYS_FALLOCATE_REQ,     // issue #67 (P3, Track M): fallocate() of a Surrogate on a Deputy file (Ghost file), ticket based
+    MATTX_MSG_SYS_FALLOCATE_REPLY,
 };
 
 struct mattx_header {
@@ -572,6 +576,23 @@ struct mattx_sys_fsetattr_req {
 };
 
 struct mattx_sys_fsetattr_reply {
+    u32 orig_pid;
+    int error;
+    u32 req_id;                 // echo of the request's ticket id
+    u32 pad;
+};
+
+// fallocate() on a Ghost file (issue #67, P3): done on the Deputy's real file at the home node, the mode goes through unchanged
+struct mattx_sys_fallocate_req {
+    u32 orig_pid;
+    u32 fd;
+    u32 req_id;                 // ticket id, never 0
+    u32 mode;                   // FALLOC_FL_*
+    s64 offset;
+    s64 len;
+};
+
+struct mattx_sys_fallocate_reply {
     u32 orig_pid;
     int error;
     u32 req_id;                 // echo of the request's ticket id
@@ -863,6 +884,7 @@ int mattx_ticket_wait(struct mattx_ticket *t, long timeout);
 // Bytes written or -errno. Raises SIGPIPE on -EPIPE, like write(2). Runs in the calling thread (task_work or fop).
 int mattx_wormhole_flock(u32 orig_pid, int home_node, u32 remote_fd, int cmd, int type);
 int mattx_wormhole_fsetattr(u32 orig_pid, int home_node, u32 remote_fd, const struct iattr *attr);
+int mattx_wormhole_fallocate(u32 orig_pid, int home_node, u32 remote_fd, int mode, loff_t offset, loff_t len);
 u32 mattx_setattr_valid_from_iattr(const struct iattr *attr, struct mattx_setattr_attrs *a);
 ssize_t mattx_wormhole_write(u32 orig_pid, int home_node, u32 remote_fd, const char __user *ubuf, size_t count,
                               bool positional, loff_t pos);
@@ -1633,6 +1655,17 @@ struct mattx_vfs_readlink_reply {
     char target[256];
 };
 
+// fallocate() of an open MattXFS file: the mode (FALLOC_FL_*) goes through unchanged, the home filesystem decides what it can do
+struct mattx_vfs_fallocate_req {
+    u64 req_id;
+    s32 remote_fd;
+    u32 uid;
+    u32 gid;
+    u32 mode;
+    s64 offset;
+    s64 len;
+};
+
 struct mattx_vfs_status_reply {
     u64 req_id;
     int error;
@@ -2121,6 +2154,7 @@ int mattx_rpc_vfs_getattr(int node_id, const char *path, struct kstat *stat_out)
 int mattx_rpc_vfs_getattr_flags(int node_id, const char *path, struct kstat *stat_out, u32 flags);       // MATTX_GETATTR_*
 int mattx_rpc_vfs_symlink(int node_id, const char *target, const char *linkpath);                      // MattXFS .symlink
 int mattx_rpc_vfs_link(int node_id, const char *oldpath, const char *newpath);                         // MattXFS .link
+int mattx_rpc_vfs_fallocate(int node_id, int remote_fd, int mode, loff_t offset, loff_t len);                // MattXFS .fallocate
 int mattx_rpc_vfs_readlink(int node_id, const char *path, char *buf, size_t size);                     // MattXFS .get_link (returns the length)
 int mattx_rpc_vfs_readdir(int node_id, const char *path, u64 *offset, struct mattx_dirent *entries, u32 *out_count);
 int mattx_rpc_vfs_open(int node_id, const char *path, int flags, int mode, int *remote_fd);

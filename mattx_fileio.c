@@ -874,6 +874,7 @@ static int mfs_open_owner[MAX_FDS];
 static DEFINE_SPINLOCK(mfs_file_lock);
 
 #include <linux/version.h>
+#include <linux/falloc.h>
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
 typedef struct mnt_idmap mattx_idmap_t;
@@ -1325,6 +1326,57 @@ int mattx_wormhole_fsetattr(u32 orig_pid, int home_node, u32 remote_fd, const st
 }
 EXPORT_SYMBOL(mattx_wormhole_fsetattr);
 
+/*
+ * FALLOCATE (Surrogate side, issue #67, P3): fallocate() / posix_fallocate() of a Ghost file. The thread waits on its own
+ * ticket. COLLAPSE_RANGE / INSERT_RANGE cannot be done twice: interrupted they return -EINTR (the application must look),
+ * every other mode restarts the system call with -ERESTARTSYS.
+ */
+int mattx_wormhole_fallocate(u32 orig_pid, int home_node, u32 remote_fd, int mode, loff_t offset, loff_t len)
+{
+    struct mattx_sys_fallocate_req req;
+    struct mattx_ticket *t;
+    struct mattx_link *link;
+    int ret;
+
+    if (home_node < 0 || home_node >= MAX_NODES) return -EIO;
+    link = READ_ONCE(cluster_map[home_node]);
+    if (!link) return -EIO;
+
+    t = mattx_ticket_add(orig_pid, home_node, 0);
+    if (!t) return -ENOMEM;
+
+    memset(&req, 0, sizeof(req));
+    req.orig_pid = orig_pid;
+    req.fd = remote_fd;
+    req.req_id = t->req_id;
+    req.mode = mode;
+    req.offset = offset;
+    req.len = len;
+
+    mattx_dbg("[WORMHOLE] Surrogate %d requesting FALLOCATE mode 0x%x off %lld len %lld for FD %u (req %u). Sleeping...\n",
+              current->pid, mode, (long long)offset, (long long)len, remote_fd, t->req_id);
+
+    if (mattx_comm_send(link, MATTX_MSG_SYS_FALLOCATE_REQ, &req, sizeof(req)) < 0)
+        ret = -EIO;
+    else if (mattx_ticket_wait(t, MAX_SCHEDULE_TIMEOUT))
+        ret = (mode & (FALLOC_FL_COLLAPSE_RANGE | FALLOC_FL_INSERT_RANGE)) ? -EINTR : -ERESTARTSYS;
+    else
+        ret = (int)t->retval;
+
+    mattx_dbg("[WORMHOLE] Surrogate %d woke up! FALLOCATE result: %d (req %u).\n", current->pid, ret, req.req_id);
+    mattx_ticket_del(t);
+    return ret;
+}
+EXPORT_SYMBOL(mattx_wormhole_fallocate);
+
+static long mattx_fake_fallocate(struct file *file, int mode, loff_t offset, loff_t len)
+{
+    struct mattx_fake_fd_info *fd_info = file->private_data;
+
+    if (!fd_info) return -EIO;
+    return mattx_wormhole_fallocate(fd_info->orig_pid, fd_info->home_node, fd_info->remote_fd, mode, offset, len);
+}
+
 static int mattx_fake_flock(struct file *file, int cmd, struct file_lock *fl)
 {
     struct mattx_fake_fd_info *fd_info = file->private_data;
@@ -1620,6 +1672,7 @@ static __poll_t mattx_fake_poll(struct file *file, struct poll_table_struct *wai
 const struct file_operations mattx_fops = {
     .llseek = mattx_fake_llseek,
     .fsync = mattx_fake_fsync,
+    .fallocate = mattx_fake_fallocate,
     .flock = mattx_fake_flock,
     .read = mattx_fake_read,
     .write = mattx_fake_write,
@@ -12366,6 +12419,116 @@ static void handle_sys_fsetattr_reply(struct mattx_link *link, struct mattx_head
         mattx_dbg("[RPC] FSETATTR_REPLY req %u: nobody waits for it any more, dropped\n", reply->req_id);
 }
 
+// --- Home side: fallocate of a Surrogate on a file of the Deputy (Ghost file) ---
+struct mattx_sys_fallocate_kworker_ctx { struct work_struct work; struct mattx_sys_fallocate_req req; int target_node; };
+
+static void mattx_sys_fallocate_reply_send(int node, u32 orig_pid, u32 req_id, int error)
+{
+    struct mattx_sys_fallocate_reply reply;
+    struct mattx_link *link = READ_ONCE(cluster_map[node]);
+
+    memset(&reply, 0, sizeof(reply));
+    reply.orig_pid = orig_pid;
+    reply.req_id = req_id;
+    reply.error = error;
+    if (link)
+        mattx_comm_send(link, MATTX_MSG_SYS_FALLOCATE_REPLY, &reply, sizeof(reply));
+}
+
+/*
+ * The Deputy's own file gets the space, the Deputy is NOT woken up. vfs_fallocate() checks the open file itself (writable,
+ * regular, the mode, immutable / append only) and is run wearing the DEPUTY's credentials (security hooks). A fallocate
+ * under way cannot be aborted: a CANCEL that arrives before it starts skips it (-EINTR), a later one is of no use. Exactly one reply.
+ */
+static void mattx_sys_fallocate_kworker(struct work_struct *work)
+{
+    struct mattx_sys_fallocate_kworker_ctx *ctx = container_of(work, struct mattx_sys_fallocate_kworker_ctx, work);
+    struct mattx_sys_fallocate_req *req = &ctx->req;
+    struct file *f;
+    bool abandoned = false;
+    int err = 0;
+
+    f = mattx_get_remote_file(req->orig_pid, req->fd);
+
+    if (!f) {
+        err = -EBADF;
+    } else if (mattx_req_take_cancelled(ctx->target_node, req->orig_pid, req->req_id)) {
+        mattx_dbg("[WORMHOLE] FALLOCATE for FD %u (req %u) cancelled by the Surrogate before it started\n", req->fd, req->req_id);
+        err = -EINTR;
+    } else if (READ_ONCE(mattx_cancellable_stopping) || !READ_ONCE(cluster_map[ctx->target_node])) {
+        abandoned = true;
+        err = -EINTR;
+    } else {
+        const struct cred *deputy_cred = NULL, *old_cred;
+        struct task_struct *deputy;
+
+        mattx_dbg("[WORMHOLE] FALLOCATE FD %u mode 0x%x off %lld len %lld (req %u) from Node %d (kworker)\n", req->fd, req->mode,
+                  (long long)req->offset, (long long)req->len, req->req_id, ctx->target_node);
+
+        rcu_read_lock();
+        deputy = pid_task(find_vpid(req->orig_pid), PIDTYPE_PID);
+        if (deputy)
+            deputy_cred = get_cred(__task_cred(deputy));
+        rcu_read_unlock();
+
+        if (!deputy_cred) {
+            err = -ESRCH;           // no Deputy, no identity to act as
+        } else {
+            old_cred = override_creds(deputy_cred);
+            err = vfs_fallocate(f, req->mode, req->offset, req->len);
+            revert_creds(old_cred);
+            put_cred(deputy_cred);
+        }
+        mattx_req_take_cancelled(ctx->target_node, req->orig_pid, req->req_id);     // a CANCEL during the fallocate is of no use any more
+    }
+
+    if (abandoned) {
+        mattx_dbg("[WORMHOLE] FALLOCATE (req %u): nobody left to answer, reply dropped\n", req->req_id);
+    } else {
+        mattx_dbg("[WORMHOLE] FALLOCATE for FD %u (req %u) done: %d\n", req->fd, req->req_id, err);
+        mattx_sys_fallocate_reply_send(ctx->target_node, req->orig_pid, req->req_id, err);
+    }
+
+    if (f)
+        fput(f);
+    kfree(ctx);
+    atomic_dec(&mattx_cancellable_inflight);
+}
+
+static void handle_sys_fallocate_req(struct mattx_link *link, struct mattx_header *hdr, void *payload)
+{
+    struct mattx_sys_fallocate_req *req = payload;
+    struct mattx_sys_fallocate_kworker_ctx *ctx;
+
+    if (!payload || hdr->length < sizeof(*req)) return;
+    if (hdr->sender_id >= MAX_NODES || READ_ONCE(mattx_cancellable_stopping)) return;
+
+    ctx = kmalloc(sizeof(*ctx), GFP_ATOMIC);
+    if (!ctx) {
+        // Still answer: the Surrogate thread sleeps on this ticket
+        printk(KERN_ERR "MattX:[WORMHOLE] FALLOCATE_REQ %u of PID %u: out of memory\n", req->req_id, req->orig_pid);
+        mattx_sys_fallocate_reply_send(hdr->sender_id, req->orig_pid, req->req_id, -ENOMEM);
+        return;
+    }
+    INIT_WORK(&ctx->work, mattx_sys_fallocate_kworker);
+    memcpy(&ctx->req, req, sizeof(*req));
+    ctx->target_node = hdr->sender_id;
+    atomic_inc(&mattx_cancellable_inflight);
+    mattx_queue_wait_work(&ctx->work);
+}
+
+// Surrogate side: the reply belongs to exactly one waiting thread (its ticket)
+static void handle_sys_fallocate_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload)
+{
+    struct mattx_sys_fallocate_reply *reply = payload;
+
+    if (!payload || hdr->length < sizeof(*reply)) return;
+
+    mattx_dbg("[RPC] Received FALLOCATE_REPLY for Orig PID %u req %u. Error: %d\n", reply->orig_pid, reply->req_id, reply->error);
+    if (!mattx_ticket_complete(hdr->sender_id, reply->orig_pid, reply->req_id, reply->error, NULL, 0))
+        mattx_dbg("[RPC] FALLOCATE_REPLY req %u: nobody waits for it any more, dropped\n", reply->req_id);
+}
+
 /*
  * DIRECTORY OPERATIONS of MattXFS (issue #67, P3, Track M). The directory inode of MattXFS only had .lookup, .create
  * and .unlink: mkdir and rmdir were refused by the VFS. The operation is run at the home node through the VFS (the
@@ -13327,6 +13490,127 @@ static void handle_vfs_readlink_reply(struct mattx_link *link, struct mattx_head
         mattx_dbg("[RPC] VFS_READLINK_REPLY req %llu: nobody waits for it any more, dropped\n", reply->req_id);
 }
 
+// ---- fallocate of an open MattXFS file ----
+/*
+ * COLLAPSE_RANGE / INSERT_RANGE are not idempotent: an interrupted wait cannot restart them (the home node may have done
+ * it already), the application gets EINTR and must look. The other modes (allocate, keep size, punch, zero, unshare)
+ * can be done twice with the same result, so the system call is simply restarted.
+ */
+static bool mattx_falloc_restartable(int mode)
+{
+    return !(mode & (FALLOC_FL_COLLAPSE_RANGE | FALLOC_FL_INSERT_RANGE));
+}
+
+int mattx_rpc_vfs_fallocate(int node_id, int remote_fd, int mode, loff_t offset, loff_t len)
+{
+    struct mattx_vfs_fallocate_req *req;
+    int err;
+
+    // The home node's own MattXFS mount: the same kernel call in the caller's thread
+    if (node_id == my_node_id) {
+        struct file *f = mattx_vfs_slot_get(remote_fd);
+
+        if (!f)
+            return -EBADF;
+        mattx_dbg("[VFS] FALLOCATE fd %d mode 0x%x off %lld len %lld (local)\n", remote_fd, mode, (long long)offset, (long long)len);
+        err = vfs_fallocate(f, mode, offset, len);
+        fput(f);
+        return err;
+    }
+
+    req = kzalloc(sizeof(*req), GFP_KERNEL);
+    if (!req)
+        return -ENOMEM;
+    req->remote_fd = remote_fd;
+    req->uid = from_kuid(&init_user_ns, current_fsuid());
+    req->gid = from_kgid(&init_user_ns, current_fsgid());
+    req->mode = mode;
+    req->offset = offset;
+    req->len = len;
+
+    err = mattx_vfs_rpc_sync(node_id, MATTX_MSG_VFS_FALLOCATE_REQ, req, sizeof(*req), "FALLOCATE");
+    kfree(req);
+    if (err == -ERESTARTSYS && !mattx_falloc_restartable(mode))
+        err = -EINTR;
+    return err;
+}
+EXPORT_SYMBOL(mattx_rpc_vfs_fallocate);
+
+struct mattx_vfs_fallocate_kworker_ctx { struct work_struct work; struct mattx_vfs_fallocate_req req; int target_node; };
+
+static void mattx_vfs_fallocate_kworker(struct work_struct *work)
+{
+    struct mattx_vfs_fallocate_kworker_ctx *ctx = container_of(work, struct mattx_vfs_fallocate_kworker_ctx, work);
+    struct mattx_vfs_fallocate_req *req = &ctx->req;
+    bool abandoned = false;
+    int err;
+
+    if (mattx_req_take_cancelled(ctx->target_node, 0, (u32)req->req_id)) {
+        mattx_dbg("[VFS] FALLOCATE (req %llu) cancelled by the Surrogate before it started, skipped\n", req->req_id);
+        err = -EINTR;
+    } else if (READ_ONCE(mattx_cancellable_stopping) || !READ_ONCE(cluster_map[ctx->target_node])) {
+        abandoned = true;
+        err = -EINTR;
+    } else {
+        struct cred *cred = mattx_vfs_user_cred(req->uid, req->gid);
+
+        if (!cred) {
+            err = -ENOMEM;
+        } else {
+            const struct cred *old_cred = override_creds(cred);
+            struct file *f = mattx_vfs_slot_get(req->remote_fd);
+
+            if (!f) {
+                err = -EBADF;
+            } else {
+                mattx_dbg("[VFS] FALLOCATE fd %d mode 0x%x off %lld len %lld (req %llu) from Node %d (kworker)\n", req->remote_fd,
+                          req->mode, (long long)req->offset, (long long)req->len, req->req_id, ctx->target_node);
+                err = vfs_fallocate(f, req->mode, req->offset, req->len);
+                fput(f);
+            }
+            revert_creds(old_cred);
+            put_cred(cred);
+        }
+        mattx_req_take_cancelled(ctx->target_node, 0, (u32)req->req_id);       // a CANCEL during the fallocate is of no use any more
+    }
+
+    if (abandoned) {
+        mattx_dbg("[VFS] FALLOCATE (req %llu): nobody left to answer, reply dropped\n", req->req_id);
+    } else {
+        mattx_dbg("[VFS] FALLOCATE (req %llu) done: %d\n", req->req_id, err);
+        mattx_vfs_status_reply_send(ctx->target_node, MATTX_MSG_VFS_FALLOCATE_REPLY, req->req_id, err);
+    }
+
+    kfree(ctx);
+    atomic_dec(&mattx_cancellable_inflight);
+}
+
+static void handle_vfs_fallocate_req(struct mattx_link *link, struct mattx_header *hdr, void *payload)
+{
+    struct mattx_vfs_fallocate_req *req = payload;
+    struct mattx_vfs_fallocate_kworker_ctx *ctx;
+
+    if (!payload || hdr->length < sizeof(*req)) return;
+    if (hdr->sender_id >= MAX_NODES || READ_ONCE(mattx_cancellable_stopping)) return;
+
+    ctx = kmalloc(sizeof(*ctx), GFP_ATOMIC);
+    if (!ctx) {
+        printk(KERN_ERR "MattX:[VFS] FALLOCATE_REQ %llu: out of memory\n", req->req_id);
+        mattx_vfs_status_reply_send(hdr->sender_id, MATTX_MSG_VFS_FALLOCATE_REPLY, req->req_id, -ENOMEM);
+        return;
+    }
+    INIT_WORK(&ctx->work, mattx_vfs_fallocate_kworker);
+    memcpy(&ctx->req, req, sizeof(*req));
+    ctx->target_node = hdr->sender_id;
+    atomic_inc(&mattx_cancellable_inflight);
+    mattx_queue_wait_work(&ctx->work);
+}
+
+static void handle_vfs_fallocate_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload)
+{
+    mattx_vfs_status_reply_common(hdr, payload, "VFS_FALLOCATE");
+}
+
 /*
  * A node is gone (its socket died, or it is disconnected / replaced / unloaded): every file it had open here goes
  * with it. Without this the slots of a crashed Surrogate stayed forever, and with them whatever the files hold:
@@ -13432,6 +13716,8 @@ void mattx_fileio_init_handlers(void) {
     mattx_register_handler(MATTX_MSG_VFS_SETATTR_REPLY, handle_vfs_setattr_reply);
     mattx_register_handler(MATTX_MSG_SYS_FSETATTR_REQ, handle_sys_fsetattr_req);
     mattx_register_handler(MATTX_MSG_SYS_FSETATTR_REPLY, handle_sys_fsetattr_reply);
+    mattx_register_handler(MATTX_MSG_SYS_FALLOCATE_REQ, handle_sys_fallocate_req);
+    mattx_register_handler(MATTX_MSG_SYS_FALLOCATE_REPLY, handle_sys_fallocate_reply);
     mattx_register_handler(MATTX_MSG_VFS_MKDIR_REQ, handle_vfs_mkdir_req);
     mattx_register_handler(MATTX_MSG_VFS_MKDIR_REPLY, handle_vfs_mkdir_reply);
     mattx_register_handler(MATTX_MSG_VFS_RMDIR_REQ, handle_vfs_rmdir_req);
@@ -13444,6 +13730,8 @@ void mattx_fileio_init_handlers(void) {
     mattx_register_handler(MATTX_MSG_VFS_LINK_REPLY, handle_vfs_link_reply);
     mattx_register_handler(MATTX_MSG_VFS_READLINK_REQ, handle_vfs_readlink_req);
     mattx_register_handler(MATTX_MSG_VFS_READLINK_REPLY, handle_vfs_readlink_reply);
+    mattx_register_handler(MATTX_MSG_VFS_FALLOCATE_REQ, handle_vfs_fallocate_req);
+    mattx_register_handler(MATTX_MSG_VFS_FALLOCATE_REPLY, handle_vfs_fallocate_reply);
     mattx_register_handler(MATTX_MSG_SYS_EPOLL_CREATE_REQ, handle_sys_epoll_create_req);
     mattx_register_handler(MATTX_MSG_SYS_EPOLL_CREATE_REPLY, handle_sys_epoll_create_reply);
     mattx_register_handler(MATTX_MSG_SYS_EPOLL_CTL_REQ, handle_sys_epoll_ctl_req);
