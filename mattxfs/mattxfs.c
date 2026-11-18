@@ -274,6 +274,35 @@ static int mattxfs_remote_iterate(struct file *file, struct dir_context *ctx) {
     return 0;
 }
 
+// The inode of a remote file / directory from the attributes the home node gave us (lookup(), mkdir() ...)
+static struct inode *mattxfs_new_inode(struct super_block *sb, const struct kstat *stat) {
+    struct inode *inode = new_inode(sb);
+
+    if (!inode) return NULL;
+
+    inode->i_ino = stat->ino;
+    inode->i_mode = stat->mode;
+    inode->i_size = stat->size;
+    inode->i_blocks = stat->blocks;
+    inode->i_uid = stat->uid;
+    inode->i_gid = stat->gid;
+    inode_set_atime_to_ts(inode, stat->atime);
+    inode_set_mtime_to_ts(inode, stat->mtime);
+    inode_set_ctime_to_ts(inode, stat->ctime);
+
+    if (S_ISDIR(stat->mode)) {
+        inode->i_op = &mattxfs_remote_iops;
+        inode->i_fop = &mattxfs_remote_dir_fops;
+        set_nlink(inode, 2);
+    } else {
+        // Give regular files the ability to be read and written! ---
+        inode->i_op = &mattxfs_remote_file_iops;
+        inode->i_fop = &mattxfs_remote_file_fops;
+        set_nlink(inode, 1);
+    }
+    return inode;
+}
+
 static struct dentry *mattxfs_remote_lookup(struct inode *dir, struct dentry *dentry, unsigned int flags) {
     char path_buf[256];
     struct kstat stat;
@@ -297,29 +326,8 @@ static struct dentry *mattxfs_remote_lookup(struct inode *dir, struct dentry *de
         return NULL; 
     }
 
-    inode = new_inode(dir->i_sb);
+    inode = mattxfs_new_inode(dir->i_sb, &stat);
     if (!inode) return ERR_PTR(-ENOMEM);
-
-    inode->i_ino = stat.ino;
-    inode->i_mode = stat.mode;
-    inode->i_size = stat.size;
-    inode->i_blocks = stat.blocks;
-    inode->i_uid = stat.uid;
-    inode->i_gid = stat.gid;
-    inode_set_atime_to_ts(inode, stat.atime);
-    inode_set_mtime_to_ts(inode, stat.mtime);
-    inode_set_ctime_to_ts(inode, stat.ctime);
-
-    if (S_ISDIR(stat.mode)) {
-        inode->i_op = &mattxfs_remote_iops;
-        inode->i_fop = &mattxfs_remote_dir_fops; 
-        set_nlink(inode, 2);
-    } else {
-        // Give regular files the ability to be read and written! ---
-        inode->i_op = &mattxfs_remote_file_iops;
-        inode->i_fop = &mattxfs_remote_file_fops;
-        set_nlink(inode, 1);
-    }
 
     d_add(dentry, inode);
     return NULL;
@@ -472,10 +480,97 @@ static const struct inode_operations mattxfs_remote_file_iops = {
     .setattr        = mattxfs_remote_setattr,
 };
 
+/*
+ * mkdir / rmdir of /mattxfs (issue #67, P3, Track M). Without them the VFS refused both. The home node makes the
+ * directory (or removes it) under the identity of the caller; the umask is applied by the VFS before it calls us, so
+ * the mode arrives final. The new inode comes from the attributes the home node reports for the new directory.
+ */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
+typedef struct mnt_idmap mattxfs_idmap_t;
+#else
+typedef struct user_namespace mattxfs_idmap_t;
+#endif
+
+static int mattxfs_do_mkdir(struct inode *dir, struct dentry *dentry, umode_t mode) {
+    char path_buf[256];
+    struct kstat st = {};
+    struct inode *inode;
+    int node_id = get_node_id_from_dentry(dentry);
+    int err;
+
+    get_remote_path_from_dentry(dentry, path_buf, sizeof(path_buf));
+    mattx_dbg("[MKDIR] %s mode 0%o on Node %d\n", path_buf, mode, node_id);
+
+    err = mattx_rpc_vfs_mkdir(node_id, path_buf, mode);
+    if (err)
+        return err;
+
+    if (mattx_rpc_vfs_getattr(node_id, path_buf, &st) || !S_ISDIR(st.mode)) {
+        // The home node made it but did not tell us how it looks: our best guess
+        st.ino = get_next_ino();
+        st.mode = S_IFDIR | (mode & S_IALLUGO);
+        st.uid = current_fsuid();
+        st.gid = current_fsgid();
+        ktime_get_real_ts64(&st.atime);
+        st.mtime = st.atime;
+        st.ctime = st.atime;
+    }
+    inode = mattxfs_new_inode(dir->i_sb, &st);
+    if (!inode)
+        return -ENOMEM;
+    d_instantiate(dentry, inode);
+    return 0;
+}
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 15, 0)
+// since 6.15 ->mkdir() returns a dentry: NULL = the one we were given is instantiated
+static struct dentry *mattxfs_remote_mkdir(mattxfs_idmap_t *idmap, struct inode *dir, struct dentry *dentry, umode_t mode) {
+    return ERR_PTR(mattxfs_do_mkdir(dir, dentry, mode));
+}
+#else
+static int mattxfs_remote_mkdir(mattxfs_idmap_t *idmap, struct inode *dir, struct dentry *dentry, umode_t mode) {
+    return mattxfs_do_mkdir(dir, dentry, mode);
+}
+#endif
+
+static int mattxfs_remote_rmdir(struct inode *dir, struct dentry *dentry) {
+    char path_buf[256];
+    int node_id = get_node_id_from_dentry(dentry);
+
+    get_remote_path_from_dentry(dentry, path_buf, sizeof(path_buf));
+    mattx_dbg("[RMDIR] %s on Node %d\n", path_buf, node_id);
+    return mattx_rpc_vfs_rmdir(node_id, path_buf);
+}
+
+/*
+ * rename of /mattxfs (issue #67, P3, Track M). Both names must live on the same node (else EXDEV, like two mounts): the
+ * home node does the real rename; the VFS moves the dentries afterwards (d_move / d_exchange) when we return 0.
+ * RENAME_NOREPLACE and RENAME_EXCHANGE are carried, RENAME_WHITEOUT is not supported.
+ */
+static int mattxfs_remote_rename(mattxfs_idmap_t *idmap, struct inode *old_dir, struct dentry *old_dentry,
+                                 struct inode *new_dir, struct dentry *new_dentry, unsigned int flags) {
+    char old_buf[256], new_buf[256];
+    int old_node = get_node_id_from_dentry(old_dentry);
+    int new_node = get_node_id_from_dentry(new_dentry);
+
+    if (flags & ~(RENAME_NOREPLACE | RENAME_EXCHANGE))
+        return -EINVAL;
+    if (old_node != new_node)
+        return -EXDEV;
+
+    get_remote_path_from_dentry(old_dentry, old_buf, sizeof(old_buf));
+    get_remote_path_from_dentry(new_dentry, new_buf, sizeof(new_buf));
+    mattx_dbg("[RENAME] %s -> %s flags 0x%x on Node %d\n", old_buf, new_buf, flags, old_node);
+    return mattx_rpc_vfs_rename(old_node, old_buf, new_buf, flags);
+}
+
 static const struct inode_operations mattxfs_remote_iops = {
     .lookup         = mattxfs_remote_lookup,  
     .create         = mattxfs_remote_create, // Allow file creation!
     .unlink         = mattxfs_remote_unlink, // NEW: Wire up the rm command!
+    .mkdir          = mattxfs_remote_mkdir,
+    .rmdir          = mattxfs_remote_rmdir,
+    .rename         = mattxfs_remote_rename,
 };
 
 

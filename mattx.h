@@ -278,6 +278,12 @@ enum mattx_msg_type {
     MATTX_MSG_VFS_SETATTR_REPLY,
     MATTX_MSG_SYS_FSETATTR_REQ,      // issue #67 (P3): ftruncate / fchmod / fchown / futimens of a Surrogate on a Deputy file (Ghost file), ticket based
     MATTX_MSG_SYS_FSETATTR_REPLY,
+    MATTX_MSG_VFS_MKDIR_REQ,         // issue #67 (P3, Track M): mkdir() on /mattxfs, ticket based
+    MATTX_MSG_VFS_MKDIR_REPLY,
+    MATTX_MSG_VFS_RMDIR_REQ,         // issue #67 (P3, Track M): rmdir() on /mattxfs, ticket based
+    MATTX_MSG_VFS_RMDIR_REPLY,
+    MATTX_MSG_VFS_RENAME_REQ,        // issue #67 (P3, Track M): rename() on /mattxfs, ticket based
+    MATTX_MSG_VFS_RENAME_REPLY,
 };
 
 struct mattx_header {
@@ -1558,6 +1564,43 @@ struct mattx_vfs_setattr_reply {
     int pad;
 };
 
+/*
+ * Directory operations of MattXFS (issue #67, P3, Track M): the home node runs the operation through the VFS while
+ * wearing the identity of the caller. Convention of all these requests: u64 req_id is the FIRST member (the ticket id,
+ * set by mattx_vfs_rpc_sync()); the answer of every one of them is a struct mattx_vfs_status_reply.
+ */
+struct mattx_vfs_mkdir_req {
+    u64 req_id;
+    u32 uid;                // fsuid / fsgid of the caller
+    u32 gid;
+    u32 mode;               // the umask is applied already (by the VFS of the Surrogate)
+    u32 pad;
+    char path[256];         // NUL terminated
+};
+
+struct mattx_vfs_rmdir_req {
+    u64 req_id;
+    u32 uid;
+    u32 gid;
+    char path[256];         // NUL terminated
+};
+
+struct mattx_vfs_rename_req {
+    u64 req_id;
+    u32 uid;
+    u32 gid;
+    u32 flags;              // RENAME_NOREPLACE / RENAME_EXCHANGE (nothing else is carried: RENAME_WHITEOUT is refused by the Surrogate)
+    u32 pad;
+    char oldpath[256];      // both names are on the same node, NUL terminated
+    char newpath[256];
+};
+
+struct mattx_vfs_status_reply {
+    u64 req_id;
+    int error;
+    int pad;
+};
+
 struct mattx_vfs_close_req {
     int remote_fd;
 };
@@ -2048,6 +2091,9 @@ int mattx_rpc_vfs_lock(int node_id, int remote_fd, int cmd, struct file_lock *fl
 int mattx_rpc_vfs_flock(int node_id, int remote_fd, int cmd, struct file_lock *fl);   // MattXFS .flock
 int mattx_rpc_vfs_unlink(int node_id, const char *path);
 int mattx_rpc_vfs_setattr(int node_id, int remote_fd, const char *path, const struct iattr *attr);   // MattXFS .setattr
+int mattx_rpc_vfs_mkdir(int node_id, const char *path, umode_t mode);                                  // MattXFS .mkdir
+int mattx_rpc_vfs_rmdir(int node_id, const char *path);                                                // MattXFS .rmdir
+int mattx_rpc_vfs_rename(int node_id, const char *oldpath, const char *newpath, unsigned int flags);   // MattXFS .rename
 
 #endif // MATTX_H
 

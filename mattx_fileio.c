@@ -12359,6 +12359,536 @@ static void handle_sys_fsetattr_reply(struct mattx_link *link, struct mattx_head
 }
 
 /*
+ * DIRECTORY OPERATIONS of MattXFS (issue #67, P3, Track M). The directory inode of MattXFS only had .lookup, .create
+ * and .unlink: mkdir and rmdir were refused by the VFS. The operation is run at the home node through the VFS (the
+ * same sequence as the kernel's own do_mkdirat() / do_rmdir()) while wearing the identity of the caller; a non-root
+ * caller does not keep the capabilities of the kworker. The LSM path hooks (security_path_mkdir ...) are not called,
+ * like for the unlink of MattXFS.
+ */
+
+// Surrogate side: one request, one ticket (the ticket id is the first member of every one of these requests)
+static int mattx_vfs_rpc_sync(int node_id, u32 msg, void *req, size_t len, const char *what)
+{
+    struct mattx_ticket *t;
+    int err;
+
+    if (node_id < 0 || node_id >= MAX_NODES || !READ_ONCE(cluster_map[node_id]))
+        return -ENOTCONN;
+
+    t = mattx_ticket_add(0, node_id, 0);
+    if (!t)
+        return -ENOMEM;
+    *(u64 *)req = t->req_id;
+
+    mattx_dbg("[VFS] %s on Node %d as req %u. Sleeping...\n", what, node_id, t->req_id);
+    if (mattx_comm_send(cluster_map[node_id], msg, req, len) < 0)
+        err = -EIO;
+    else if (mattx_ticket_wait(t, MAX_SCHEDULE_TIMEOUT))
+        err = -ERESTARTSYS;     // a signal: the operation may be done at the home node already (the restart then sees EEXIST / ENOENT)
+    else
+        err = (int)t->retval;
+    mattx_dbg("[VFS] %s on Node %d (req %u) woke up: %d\n", what, node_id, t->req_id, err);
+    mattx_ticket_del(t);
+    return err;
+}
+
+// Surrogate side: the reply belongs to exactly one waiting thread (its ticket)
+static void mattx_vfs_status_reply_common(struct mattx_header *hdr, void *payload, const char *what)
+{
+    struct mattx_vfs_status_reply *reply = payload;
+
+    if (!payload || hdr->length < sizeof(*reply)) return;
+
+    mattx_dbg("[RPC] Received %s_REPLY req %llu. Error: %d\n", what, reply->req_id, reply->error);
+    if (!mattx_ticket_complete(hdr->sender_id, 0, (u32)reply->req_id, reply->error, NULL, 0))
+        mattx_dbg("[RPC] %s_REPLY req %llu: nobody waits for it any more, dropped\n", what, reply->req_id);
+}
+
+// Home side: the answer
+static void mattx_vfs_status_reply_send(int node, u32 msg, u64 req_id, int error)
+{
+    struct mattx_vfs_status_reply reply;
+    struct mattx_link *link = READ_ONCE(cluster_map[node]);
+
+    memset(&reply, 0, sizeof(reply));
+    reply.req_id = req_id;
+    reply.error = error;
+    if (link)
+        mattx_comm_send(link, msg, &reply, sizeof(reply));
+}
+
+// ---- mkdir ----
+/*
+ * mkdir at this node. The creation sequence of the kernel changed twice: 6.15 vfs_mkdir() returns the dentry
+ * (the one the filesystem used, which may differ from the one passed in), 6.19 start_creating_path() /
+ * end_creating_path() replace kern_path_create() / done_path_create() (directory locking centralised). The 6.19 branch
+ * follows the kernel's own do_mkdirat(); it was written from the commit series, not compiled against 6.19 / 7.0 here.
+ */
+static int mattx_vfs_mkdir_apply(const char *path, umode_t mode)
+{
+    struct path parent;
+    struct dentry *dentry;
+    int err;
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 19, 0)
+    dentry = start_creating_path(AT_FDCWD, path, &parent, LOOKUP_DIRECTORY);
+#else
+    dentry = kern_path_create(AT_FDCWD, path, &parent, LOOKUP_DIRECTORY);
+#endif
+    if (IS_ERR(dentry))
+        return PTR_ERR(dentry);
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 15, 0)
+    dentry = vfs_mkdir(mnt_idmap(parent.mnt), d_inode(parent.dentry), dentry, mode);
+    err = PTR_ERR_OR_ZERO(dentry);
+#else
+    err = vfs_mkdir(mnt_idmap(parent.mnt), d_inode(parent.dentry), dentry, mode);
+#endif
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 19, 0)
+    end_creating_path(&parent, dentry);
+#else
+    done_path_create(&parent, dentry);
+#endif
+    return err;
+}
+
+int mattx_rpc_vfs_mkdir(int node_id, const char *path, umode_t mode)
+{
+    struct mattx_vfs_mkdir_req *req;
+    int err;
+
+    if (strlen(path) >= sizeof(req->path))
+        return -ENAMETOOLONG;
+
+    // The home node's own MattXFS mount: the same kernel calls in the caller's thread, with the caller's own identity
+    if (node_id == my_node_id) {
+        mattx_dbg("[VFS] MKDIR '%s' mode 0%o (local)\n", path, mode);
+        return mattx_vfs_mkdir_apply(path, mode);
+    }
+
+    req = kzalloc(sizeof(*req), GFP_KERNEL);
+    if (!req)
+        return -ENOMEM;
+    req->uid = from_kuid(&init_user_ns, current_fsuid());
+    req->gid = from_kgid(&init_user_ns, current_fsgid());
+    req->mode = mode;
+    strscpy(req->path, path, sizeof(req->path));
+
+    err = mattx_vfs_rpc_sync(node_id, MATTX_MSG_VFS_MKDIR_REQ, req, sizeof(*req), "MKDIR");
+    kfree(req);
+    return err;
+}
+EXPORT_SYMBOL(mattx_rpc_vfs_mkdir);
+
+struct mattx_vfs_mkdir_kworker_ctx { struct work_struct work; struct mattx_vfs_mkdir_req req; int target_node; };
+
+static void mattx_vfs_mkdir_kworker(struct work_struct *work)
+{
+    struct mattx_vfs_mkdir_kworker_ctx *ctx = container_of(work, struct mattx_vfs_mkdir_kworker_ctx, work);
+    struct mattx_vfs_mkdir_req *req = &ctx->req;
+    bool abandoned = false;
+    int err;
+
+    req->path[sizeof(req->path) - 1] = '\0';
+
+    if (mattx_req_take_cancelled(ctx->target_node, 0, (u32)req->req_id)) {
+        mattx_dbg("[VFS] MKDIR (req %llu) cancelled by the Surrogate before it started, skipped\n", req->req_id);
+        err = -EINTR;
+    } else if (READ_ONCE(mattx_cancellable_stopping) || !READ_ONCE(cluster_map[ctx->target_node])) {
+        abandoned = true;
+        err = -EINTR;
+    } else {
+        struct cred *cred = mattx_vfs_user_cred(req->uid, req->gid);
+
+        if (!cred) {
+            err = -ENOMEM;
+        } else {
+            const struct cred *old_cred = override_creds(cred);
+
+            mattx_dbg("[VFS] MKDIR '%s' mode 0%o (req %llu) from Node %d (kworker)\n", req->path, req->mode, req->req_id, ctx->target_node);
+            err = mattx_vfs_mkdir_apply(req->path, req->mode);
+            revert_creds(old_cred);
+            put_cred(cred);
+        }
+        mattx_req_take_cancelled(ctx->target_node, 0, (u32)req->req_id);       // a CANCEL during the mkdir is of no use any more
+    }
+
+    if (abandoned) {
+        mattx_dbg("[VFS] MKDIR (req %llu): nobody left to answer, reply dropped\n", req->req_id);
+    } else {
+        mattx_dbg("[VFS] MKDIR (req %llu) done: %d\n", req->req_id, err);
+        mattx_vfs_status_reply_send(ctx->target_node, MATTX_MSG_VFS_MKDIR_REPLY, req->req_id, err);
+    }
+
+    kfree(ctx);
+    atomic_dec(&mattx_cancellable_inflight);
+}
+
+static void handle_vfs_mkdir_req(struct mattx_link *link, struct mattx_header *hdr, void *payload)
+{
+    struct mattx_vfs_mkdir_req *req = payload;
+    struct mattx_vfs_mkdir_kworker_ctx *ctx;
+
+    if (!payload || hdr->length < sizeof(*req)) return;
+    if (hdr->sender_id >= MAX_NODES || READ_ONCE(mattx_cancellable_stopping)) return;
+
+    ctx = kmalloc(sizeof(*ctx), GFP_ATOMIC);
+    if (!ctx) {
+        // Still answer: the Surrogate thread sleeps on this request
+        printk(KERN_ERR "MattX:[VFS] MKDIR_REQ %llu: out of memory\n", req->req_id);
+        mattx_vfs_status_reply_send(hdr->sender_id, MATTX_MSG_VFS_MKDIR_REPLY, req->req_id, -ENOMEM);
+        return;
+    }
+    INIT_WORK(&ctx->work, mattx_vfs_mkdir_kworker);
+    memcpy(&ctx->req, req, sizeof(*req));
+    ctx->target_node = hdr->sender_id;
+    atomic_inc(&mattx_cancellable_inflight);
+    mattx_queue_wait_work(&ctx->work);
+}
+
+static void handle_vfs_mkdir_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload)
+{
+    mattx_vfs_status_reply_common(hdr, payload, "VFS_MKDIR");
+}
+
+// ---- rmdir ----
+// The same sequence as the unlink of MattXFS and the kernel's do_rmdir(): lookup of the victim, parent locked, vfs_rmdir()
+static int mattx_vfs_rmdir_apply(const char *path)
+{
+    struct path victim;
+    struct dentry *parent;
+    struct inode *dir;
+    int err;
+
+    err = kern_path(path, 0, &victim);
+    if (err)
+        return err;
+
+    parent = dget_parent(victim.dentry);
+    dir = d_inode(parent);
+
+    err = mnt_want_write(victim.mnt);
+    if (!err) {
+        inode_lock_nested(dir, I_MUTEX_PARENT);
+        // Double check that the directory was not moved while we were locking
+        if (victim.dentry->d_parent == parent && d_is_positive(victim.dentry))
+            err = vfs_rmdir(mnt_idmap(victim.mnt), dir, victim.dentry);
+        else
+            err = -ENOENT;
+        inode_unlock(dir);
+        mnt_drop_write(victim.mnt);
+    }
+    dput(parent);
+    path_put(&victim);
+    return err;
+}
+
+int mattx_rpc_vfs_rmdir(int node_id, const char *path)
+{
+    struct mattx_vfs_rmdir_req *req;
+    int err;
+
+    if (strlen(path) >= sizeof(req->path))
+        return -ENAMETOOLONG;
+
+    if (node_id == my_node_id) {
+        mattx_dbg("[VFS] RMDIR '%s' (local)\n", path);
+        return mattx_vfs_rmdir_apply(path);
+    }
+
+    req = kzalloc(sizeof(*req), GFP_KERNEL);
+    if (!req)
+        return -ENOMEM;
+    req->uid = from_kuid(&init_user_ns, current_fsuid());
+    req->gid = from_kgid(&init_user_ns, current_fsgid());
+    strscpy(req->path, path, sizeof(req->path));
+
+    err = mattx_vfs_rpc_sync(node_id, MATTX_MSG_VFS_RMDIR_REQ, req, sizeof(*req), "RMDIR");
+    kfree(req);
+    return err;
+}
+EXPORT_SYMBOL(mattx_rpc_vfs_rmdir);
+
+struct mattx_vfs_rmdir_kworker_ctx { struct work_struct work; struct mattx_vfs_rmdir_req req; int target_node; };
+
+static void mattx_vfs_rmdir_kworker(struct work_struct *work)
+{
+    struct mattx_vfs_rmdir_kworker_ctx *ctx = container_of(work, struct mattx_vfs_rmdir_kworker_ctx, work);
+    struct mattx_vfs_rmdir_req *req = &ctx->req;
+    bool abandoned = false;
+    int err;
+
+    req->path[sizeof(req->path) - 1] = '\0';
+
+    if (mattx_req_take_cancelled(ctx->target_node, 0, (u32)req->req_id)) {
+        mattx_dbg("[VFS] RMDIR (req %llu) cancelled by the Surrogate before it started, skipped\n", req->req_id);
+        err = -EINTR;
+    } else if (READ_ONCE(mattx_cancellable_stopping) || !READ_ONCE(cluster_map[ctx->target_node])) {
+        abandoned = true;
+        err = -EINTR;
+    } else {
+        struct cred *cred = mattx_vfs_user_cred(req->uid, req->gid);
+
+        if (!cred) {
+            err = -ENOMEM;
+        } else {
+            const struct cred *old_cred = override_creds(cred);
+
+            mattx_dbg("[VFS] RMDIR '%s' (req %llu) from Node %d (kworker)\n", req->path, req->req_id, ctx->target_node);
+            err = mattx_vfs_rmdir_apply(req->path);
+            revert_creds(old_cred);
+            put_cred(cred);
+        }
+        mattx_req_take_cancelled(ctx->target_node, 0, (u32)req->req_id);       // a CANCEL during the rmdir is of no use any more
+    }
+
+    if (abandoned) {
+        mattx_dbg("[VFS] RMDIR (req %llu): nobody left to answer, reply dropped\n", req->req_id);
+    } else {
+        mattx_dbg("[VFS] RMDIR (req %llu) done: %d\n", req->req_id, err);
+        mattx_vfs_status_reply_send(ctx->target_node, MATTX_MSG_VFS_RMDIR_REPLY, req->req_id, err);
+    }
+
+    kfree(ctx);
+    atomic_dec(&mattx_cancellable_inflight);
+}
+
+static void handle_vfs_rmdir_req(struct mattx_link *link, struct mattx_header *hdr, void *payload)
+{
+    struct mattx_vfs_rmdir_req *req = payload;
+    struct mattx_vfs_rmdir_kworker_ctx *ctx;
+
+    if (!payload || hdr->length < sizeof(*req)) return;
+    if (hdr->sender_id >= MAX_NODES || READ_ONCE(mattx_cancellable_stopping)) return;
+
+    ctx = kmalloc(sizeof(*ctx), GFP_ATOMIC);
+    if (!ctx) {
+        printk(KERN_ERR "MattX:[VFS] RMDIR_REQ %llu: out of memory\n", req->req_id);
+        mattx_vfs_status_reply_send(hdr->sender_id, MATTX_MSG_VFS_RMDIR_REPLY, req->req_id, -ENOMEM);
+        return;
+    }
+    INIT_WORK(&ctx->work, mattx_vfs_rmdir_kworker);
+    memcpy(&ctx->req, req, sizeof(*req));
+    ctx->target_node = hdr->sender_id;
+    atomic_inc(&mattx_cancellable_inflight);
+    mattx_queue_wait_work(&ctx->work);
+}
+
+static void handle_vfs_rmdir_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload)
+{
+    mattx_vfs_status_reply_common(hdr, payload, "VFS_RMDIR");
+}
+
+// ---- rename ----
+/*
+ * rename at this node: the sequence of the kernel's own do_renameat2() on two paths we already know are clean (they come
+ * from the dentries of MattXFS): the two parent directories, lock_rename(), the two names looked up below their parent,
+ * vfs_rename() with a struct renamedata (5.12+). Not compiled against 6.19 / 7.0 here: the kernel is moving this to
+ * start_renaming() (7.1); if lock_rename() / lookup_one_len() are gone there the compile will say so.
+ */
+static int mattx_vfs_rename_apply(const char *oldpath, const char *newpath, unsigned int flags)
+{
+    char odir[256], ndir[256];
+    const char *oname, *nname;
+    struct path op, np;
+    struct dentry *old_d, *new_d, *trap;
+    struct renamedata rd;
+    int err;
+
+    oname = strrchr(oldpath, '/');
+    nname = strrchr(newpath, '/');
+    if (!oname || !nname || !oname[1] || !nname[1])
+        return -EINVAL;
+
+    // The directory part ("/" stays "/")
+    strscpy(odir, oldpath, min_t(size_t, sizeof(odir), (size_t)(oname - oldpath) + 1));
+    strscpy(ndir, newpath, min_t(size_t, sizeof(ndir), (size_t)(nname - newpath) + 1));
+    if (!odir[0]) strscpy(odir, "/", sizeof(odir));
+    if (!ndir[0]) strscpy(ndir, "/", sizeof(ndir));
+    oname++;
+    nname++;
+
+    if (!strcmp(oname, ".") || !strcmp(oname, "..") || !strcmp(nname, ".") || !strcmp(nname, ".."))
+        return -EBUSY;
+
+    err = kern_path(odir, LOOKUP_DIRECTORY, &op);
+    if (err)
+        return err;
+    err = kern_path(ndir, LOOKUP_DIRECTORY, &np);
+    if (err)
+        goto put_old;
+
+    err = -EXDEV;
+    if (op.mnt != np.mnt)
+        goto put_new;
+
+    err = mnt_want_write(op.mnt);
+    if (err)
+        goto put_new;
+
+    trap = lock_rename(np.dentry, op.dentry);
+    if (IS_ERR(trap)) {
+        err = PTR_ERR(trap);
+        goto drop_write;
+    }
+
+    old_d = lookup_one_len(oname, op.dentry, strlen(oname));
+    err = PTR_ERR_OR_ZERO(old_d);
+    if (err)
+        goto unlock;
+    new_d = lookup_one_len(nname, np.dentry, strlen(nname));
+    err = PTR_ERR_OR_ZERO(new_d);
+    if (err)
+        goto put_old_d;
+
+    err = -ENOENT;
+    if (d_is_negative(old_d))
+        goto put_new_d;
+    err = -EINVAL;                                 // moving a directory into itself
+    if (old_d == trap)
+        goto put_new_d;
+    if (new_d == trap)                             // the target is an ancestor of the source
+        goto trap_err;
+    if (d_is_negative(new_d) && (flags & RENAME_EXCHANGE)) {
+        err = -ENOENT;
+        goto put_new_d;
+    }
+
+    memset(&rd, 0, sizeof(rd));
+    rd.old_dir = d_inode(op.dentry);
+    rd.old_dentry = old_d;
+    rd.new_dir = d_inode(np.dentry);
+    rd.new_dentry = new_d;
+    rd.flags = flags;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
+    rd.old_mnt_idmap = mnt_idmap(op.mnt);
+    rd.new_mnt_idmap = mnt_idmap(op.mnt);
+#else
+    rd.old_mnt_userns = mnt_user_ns(op.mnt);
+    rd.new_mnt_userns = mnt_user_ns(op.mnt);
+#endif
+    err = vfs_rename(&rd);
+    goto put_new_d;
+
+trap_err:
+    err = (flags & RENAME_EXCHANGE) ? -EINVAL : -ENOTEMPTY;
+put_new_d:
+    dput(new_d);
+put_old_d:
+    dput(old_d);
+unlock:
+    unlock_rename(np.dentry, op.dentry);
+drop_write:
+    mnt_drop_write(op.mnt);
+put_new:
+    path_put(&np);
+put_old:
+    path_put(&op);
+    return err;
+}
+
+int mattx_rpc_vfs_rename(int node_id, const char *oldpath, const char *newpath, unsigned int flags)
+{
+    struct mattx_vfs_rename_req *req;
+    int err;
+
+    if (strlen(oldpath) >= sizeof(req->oldpath) || strlen(newpath) >= sizeof(req->newpath))
+        return -ENAMETOOLONG;
+
+    if (node_id == my_node_id) {
+        mattx_dbg("[VFS] RENAME '%s' -> '%s' flags 0x%x (local)\n", oldpath, newpath, flags);
+        return mattx_vfs_rename_apply(oldpath, newpath, flags);
+    }
+
+    req = kzalloc(sizeof(*req), GFP_KERNEL);
+    if (!req)
+        return -ENOMEM;
+    req->uid = from_kuid(&init_user_ns, current_fsuid());
+    req->gid = from_kgid(&init_user_ns, current_fsgid());
+    req->flags = flags;
+    strscpy(req->oldpath, oldpath, sizeof(req->oldpath));
+    strscpy(req->newpath, newpath, sizeof(req->newpath));
+
+    err = mattx_vfs_rpc_sync(node_id, MATTX_MSG_VFS_RENAME_REQ, req, sizeof(*req), "RENAME");
+    kfree(req);
+    return err;
+}
+EXPORT_SYMBOL(mattx_rpc_vfs_rename);
+
+struct mattx_vfs_rename_kworker_ctx { struct work_struct work; struct mattx_vfs_rename_req req; int target_node; };
+
+static void mattx_vfs_rename_kworker(struct work_struct *work)
+{
+    struct mattx_vfs_rename_kworker_ctx *ctx = container_of(work, struct mattx_vfs_rename_kworker_ctx, work);
+    struct mattx_vfs_rename_req *req = &ctx->req;
+    bool abandoned = false;
+    int err;
+
+    req->oldpath[sizeof(req->oldpath) - 1] = '\0';
+    req->newpath[sizeof(req->newpath) - 1] = '\0';
+
+    if (mattx_req_take_cancelled(ctx->target_node, 0, (u32)req->req_id)) {
+        mattx_dbg("[VFS] RENAME (req %llu) cancelled by the Surrogate before it started, skipped\n", req->req_id);
+        err = -EINTR;
+    } else if (READ_ONCE(mattx_cancellable_stopping) || !READ_ONCE(cluster_map[ctx->target_node])) {
+        abandoned = true;
+        err = -EINTR;
+    } else {
+        struct cred *cred = mattx_vfs_user_cred(req->uid, req->gid);
+
+        if (!cred) {
+            err = -ENOMEM;
+        } else {
+            const struct cred *old_cred = override_creds(cred);
+
+            mattx_dbg("[VFS] RENAME '%s' -> '%s' flags 0x%x (req %llu) from Node %d (kworker)\n",
+                      req->oldpath, req->newpath, req->flags, req->req_id, ctx->target_node);
+            err = mattx_vfs_rename_apply(req->oldpath, req->newpath, req->flags & (RENAME_NOREPLACE | RENAME_EXCHANGE));
+            revert_creds(old_cred);
+            put_cred(cred);
+        }
+        mattx_req_take_cancelled(ctx->target_node, 0, (u32)req->req_id);       // a CANCEL during the rename is of no use any more
+    }
+
+    if (abandoned) {
+        mattx_dbg("[VFS] RENAME (req %llu): nobody left to answer, reply dropped\n", req->req_id);
+    } else {
+        mattx_dbg("[VFS] RENAME (req %llu) done: %d\n", req->req_id, err);
+        mattx_vfs_status_reply_send(ctx->target_node, MATTX_MSG_VFS_RENAME_REPLY, req->req_id, err);
+    }
+
+    kfree(ctx);
+    atomic_dec(&mattx_cancellable_inflight);
+}
+
+static void handle_vfs_rename_req(struct mattx_link *link, struct mattx_header *hdr, void *payload)
+{
+    struct mattx_vfs_rename_req *req = payload;
+    struct mattx_vfs_rename_kworker_ctx *ctx;
+
+    if (!payload || hdr->length < sizeof(*req)) return;
+    if (hdr->sender_id >= MAX_NODES || READ_ONCE(mattx_cancellable_stopping)) return;
+
+    ctx = kmalloc(sizeof(*ctx), GFP_ATOMIC);
+    if (!ctx) {
+        printk(KERN_ERR "MattX:[VFS] RENAME_REQ %llu: out of memory\n", req->req_id);
+        mattx_vfs_status_reply_send(hdr->sender_id, MATTX_MSG_VFS_RENAME_REPLY, req->req_id, -ENOMEM);
+        return;
+    }
+    INIT_WORK(&ctx->work, mattx_vfs_rename_kworker);
+    memcpy(&ctx->req, req, sizeof(*req));
+    ctx->target_node = hdr->sender_id;
+    atomic_inc(&mattx_cancellable_inflight);
+    mattx_queue_wait_work(&ctx->work);
+}
+
+static void handle_vfs_rename_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload)
+{
+    mattx_vfs_status_reply_common(hdr, payload, "VFS_RENAME");
+}
+
+/*
  * A node is gone (its socket died, or it is disconnected / replaced / unloaded): every file it had open here goes
  * with it. Without this the slots of a crashed Surrogate stayed forever, and with them whatever the files hold:
  * the file locks of issue #67 (P3) would wedge every other node. Dropping the slot reference is all it takes: the
@@ -12463,6 +12993,12 @@ void mattx_fileio_init_handlers(void) {
     mattx_register_handler(MATTX_MSG_VFS_SETATTR_REPLY, handle_vfs_setattr_reply);
     mattx_register_handler(MATTX_MSG_SYS_FSETATTR_REQ, handle_sys_fsetattr_req);
     mattx_register_handler(MATTX_MSG_SYS_FSETATTR_REPLY, handle_sys_fsetattr_reply);
+    mattx_register_handler(MATTX_MSG_VFS_MKDIR_REQ, handle_vfs_mkdir_req);
+    mattx_register_handler(MATTX_MSG_VFS_MKDIR_REPLY, handle_vfs_mkdir_reply);
+    mattx_register_handler(MATTX_MSG_VFS_RMDIR_REQ, handle_vfs_rmdir_req);
+    mattx_register_handler(MATTX_MSG_VFS_RMDIR_REPLY, handle_vfs_rmdir_reply);
+    mattx_register_handler(MATTX_MSG_VFS_RENAME_REQ, handle_vfs_rename_req);
+    mattx_register_handler(MATTX_MSG_VFS_RENAME_REPLY, handle_vfs_rename_reply);
     mattx_register_handler(MATTX_MSG_SYS_EPOLL_CREATE_REQ, handle_sys_epoll_create_req);
     mattx_register_handler(MATTX_MSG_SYS_EPOLL_CREATE_REPLY, handle_sys_epoll_create_reply);
     mattx_register_handler(MATTX_MSG_SYS_EPOLL_CTL_REQ, handle_sys_epoll_ctl_req);
