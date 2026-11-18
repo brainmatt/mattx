@@ -9644,10 +9644,10 @@ int mattx_rpc_vfs_getattr(int node_id, const char *path, struct kstat *stat_out)
     mattx_comm_send(cluster_map[node_id], MATTX_MSG_VFS_GETATTR_REQ, &req, sizeof(req));
 
     // 3. Sleep until the reply arrives!
-    wait_event_interruptible(vfs_rpc_registry[slot].wq, vfs_rpc_registry[slot].done);
+    int waited = wait_event_interruptible(vfs_rpc_registry[slot].wq, vfs_rpc_registry[slot].done);
 
-    // 4. Collect the results
-    int err = vfs_rpc_registry[slot].error;
+    // 4. Collect the results. A signal is not a result: the slot still holds whatever an earlier request left in it
+    int err = waited ? -ERESTARTSYS : vfs_rpc_registry[slot].error;
     if (err == 0 && stat_out) {
         *stat_out = vfs_rpc_registry[slot].stat;
     }
@@ -10225,6 +10225,13 @@ static void handle_vfs_getattr_req(struct mattx_link *link, struct mattx_header 
                 reply.uid = from_kuid_munged(current_user_ns(), stat.uid);
                 reply.gid = from_kgid_munged(current_user_ns(), stat.gid);
                 reply.nlink = stat.nlink;
+                reply.ino = stat.ino;
+                reply.atime_sec = stat.atime.tv_sec;
+                reply.atime_nsec = stat.atime.tv_nsec;
+                reply.mtime_sec = stat.mtime.tv_sec;
+                reply.mtime_nsec = stat.mtime.tv_nsec;
+                reply.ctime_sec = stat.ctime.tv_sec;
+                reply.ctime_nsec = stat.ctime.tv_nsec;
             }
             path_put(&path);
         }
@@ -10238,7 +10245,7 @@ static void handle_vfs_getattr_req(struct mattx_link *link, struct mattx_header 
 
 // Node 1 receives the reply and wakes up the sleeping MattXFS thread!
 static void handle_vfs_getattr_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
-    if (payload) {
+    if (payload && hdr->length >= sizeof(struct mattx_vfs_getattr_reply)) {
         struct mattx_vfs_getattr_reply *reply = payload;
         int i;
 
@@ -10254,6 +10261,13 @@ static void handle_vfs_getattr_reply(struct mattx_link *link, struct mattx_heade
                     vfs_rpc_registry[i].stat.uid = make_kuid(current_user_ns(), reply->uid);
                     vfs_rpc_registry[i].stat.gid = make_kgid(current_user_ns(), reply->gid);
                     vfs_rpc_registry[i].stat.nlink = reply->nlink;
+                    vfs_rpc_registry[i].stat.ino = reply->ino;
+                    vfs_rpc_registry[i].stat.atime.tv_sec = reply->atime_sec;
+                    vfs_rpc_registry[i].stat.atime.tv_nsec = reply->atime_nsec;
+                    vfs_rpc_registry[i].stat.mtime.tv_sec = reply->mtime_sec;
+                    vfs_rpc_registry[i].stat.mtime.tv_nsec = reply->mtime_nsec;
+                    vfs_rpc_registry[i].stat.ctime.tv_sec = reply->ctime_sec;
+                    vfs_rpc_registry[i].stat.ctime.tv_nsec = reply->ctime_nsec;
                 }
                 vfs_rpc_registry[i].done = true;
                 wake_up_interruptible(&vfs_rpc_registry[i].wq);

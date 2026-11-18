@@ -286,7 +286,11 @@ static struct dentry *mattxfs_remote_lookup(struct inode *dir, struct dentry *de
 
     // Ask mattx.ko to fetch the file metadata over the network!
     err = mattx_rpc_vfs_getattr(node_id, path_buf, &stat);
-    
+
+    // A signal is no "file does not exist": no negative dentry, let the system call restart
+    if (err == -ERESTARTSYS)
+        return ERR_PTR(err);
+
     if (err) {
         // Create a Negative Dentry! ---
         d_add(dentry, NULL);
@@ -302,7 +306,9 @@ static struct dentry *mattxfs_remote_lookup(struct inode *dir, struct dentry *de
     inode->i_blocks = stat.blocks;
     inode->i_uid = stat.uid;
     inode->i_gid = stat.gid;
-    simple_inode_init_ts(inode);
+    inode_set_atime_to_ts(inode, stat.atime);
+    inode_set_mtime_to_ts(inode, stat.mtime);
+    inode_set_ctime_to_ts(inode, stat.ctime);
 
     if (S_ISDIR(stat.mode)) {
         inode->i_op = &mattxfs_remote_iops;
@@ -367,6 +373,53 @@ static int mattxfs_remote_create(struct user_namespace *mnt_userns, struct inode
 }
 
 /*
+ * stat() / fstat() / statx() of a remote regular file (issue #67, P3). The inode is built once at lookup() (or is empty
+ * after create()), so size and times stayed at that moment: after a write (by anybody) and after ftruncate() the
+ * attributes were stale. Ask the home node (path based, the existing VFS_GETATTR) and refresh the inode with the answer.
+ * statx(AT_STATX_DONT_SYNC) is served from the cache. If the home node cannot answer (link down, file already
+ * unlinked while it is still open ...), the cached attributes are better than an error: fstat() keeps working.
+ * A signal is passed on (-ERESTARTSYS).
+ */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
+static int mattxfs_remote_getattr(struct mnt_idmap *idmap, const struct path *path, struct kstat *stat,
+                                  u32 request_mask, unsigned int query_flags) {
+#else
+static int mattxfs_remote_getattr(struct user_namespace *idmap, const struct path *path, struct kstat *stat,
+                                  u32 request_mask, unsigned int query_flags) {
+#endif
+    struct dentry *dentry = path->dentry;
+    struct inode *inode = d_inode(dentry);
+
+    if ((query_flags & AT_STATX_SYNC_TYPE) != AT_STATX_DONT_SYNC) {
+        struct kstat remote;
+        char path_buf[256];
+        int node_id = get_node_id_from_dentry(dentry);
+        int err;
+
+        get_remote_path_from_dentry(dentry, path_buf, sizeof(path_buf));
+        err = mattx_rpc_vfs_getattr(node_id, path_buf, &remote);
+        if (err == -ERESTARTSYS)
+            return err;
+        if (err) {
+            mattx_dbg("[GETATTR] %s on Node %d: home node says %d, cached attributes used\n", path_buf, node_id, err);
+        } else {
+            mattx_dbg("[GETATTR] %s on Node %d: size %lld (cached %lld)\n", path_buf, node_id,
+                      (long long)remote.size, (long long)i_size_read(inode));
+            i_size_write(inode, remote.size);
+            inode->i_blocks = remote.blocks;
+            inode->i_uid = remote.uid;
+            inode->i_gid = remote.gid;
+            inode_set_atime_to_ts(inode, remote.atime);
+            inode_set_mtime_to_ts(inode, remote.mtime);
+            inode_set_ctime_to_ts(inode, remote.ctime);
+        }
+    }
+
+    generic_fillattr(idmap, request_mask, inode, stat);
+    return 0;
+}
+
+/*
  * truncate() / ftruncate() of a remote file (issue #67, P3). Without a .setattr the kernel's simple_setattr() only
  * resized this node's local inode: the call returned 0 and the file at the home node stayed as it was. The size is
  * cut at the home node FIRST; only when that worked the local inode follows. Every other attribute (mode, owner,
@@ -414,6 +467,7 @@ static int mattxfs_remote_setattr(struct user_namespace *idmap, struct dentry *d
 }
 
 static const struct inode_operations mattxfs_remote_file_iops = {
+    .getattr        = mattxfs_remote_getattr,
     .setattr        = mattxfs_remote_setattr,
 };
 

@@ -1362,6 +1362,13 @@ struct mattx_vfs_getattr_reply {
     u32 uid;
     u32 gid;
     u32 nlink;
+    u64 ino;                // issue #67 (P3): inode number and times, so stat() of a MattXFS file is right
+    s64 atime_sec;
+    s64 atime_nsec;
+    s64 mtime_sec;
+    s64 mtime_nsec;
+    s64 ctime_sec;
+    s64 ctime_nsec;
 };
 
 struct mattx_dirent {
