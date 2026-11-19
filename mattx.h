@@ -298,6 +298,8 @@ enum mattx_msg_type {
     MATTX_MSG_SYS_UNLINKAT_REPLY,
     MATTX_MSG_SYS_MKDIRAT_REQ,       // issue #67 (P3, Track K): mkdir / mkdirat of a Surrogate (kprobe mode), Identity Theft, ticket based
     MATTX_MSG_SYS_MKDIRAT_REPLY,
+    MATTX_MSG_SYS_RENAMEAT2_REQ,     // issue #67 (P3, Track K): rename / renameat / renameat2 of a Surrogate (kprobe mode), Identity Theft, ticket based
+    MATTX_MSG_SYS_RENAMEAT2_REPLY,
 };
 
 struct mattx_header {
@@ -644,6 +646,32 @@ struct mattx_sys_mkdirat_req {
 };
 
 struct mattx_sys_mkdirat_reply {
+    u32 orig_pid;
+    int error;
+    u32 req_id;                 // echo of the request's ticket id
+    u32 pad;
+};
+
+/*
+ * rename() / renameat() / renameat2() of a Surrogate in kprobe mode (issue #67, P3, Track K): the home node runs the REAL
+ * renameat2() as the Deputy (Identity Theft): cwd, both directory FDs, permissions, sticky bit, RENAME_NOREPLACE /
+ * RENAME_EXCHANGE / RENAME_WHITEOUT and the errno are the kernel's. rename(a, b) is renameat2(AT_FDCWD, a, AT_FDCWD, b, 0) and
+ * renameat() has flags 0. paths[] holds the old name (oldlen bytes incl. NUL) immediately followed by the new name (newlen
+ * bytes incl. NUL), each 1 .. PATH_MAX. Each dirfd is the Deputy's FD (AT_FDCWD for an absolute path or the Deputy's cwd).
+ */
+struct mattx_sys_renameat2_req {
+    u32 orig_pid;
+    u32 req_id;                 // ticket id, never 0
+    s32 olddirfd;
+    s32 newdirfd;
+    u32 flags;                  // RENAME_*; an unknown bit is the kernel's -EINVAL
+    u32 oldlen;
+    u32 newlen;
+    u32 pad;
+    char paths[];               // old NUL new NUL, must stay the LAST member
+};
+
+struct mattx_sys_renameat2_reply {
     u32 orig_pid;
     int error;
     u32 req_id;                 // echo of the request's ticket id
@@ -2015,6 +2043,9 @@ extern mattx_sys_unlinkat_fn real_sys_unlinkat;
 
 typedef long (*mattx_sys_mkdirat_fn)(const struct pt_regs *regs);
 extern mattx_sys_mkdirat_fn real_sys_mkdirat;
+
+typedef long (*mattx_sys_renameat2_fn)(const struct pt_regs *regs);
+extern mattx_sys_renameat2_fn real_sys_renameat2;
 
 typedef long (*mattx_sys_faccessat2_fn)(const struct pt_regs *regs);
 extern mattx_sys_faccessat2_fn real_sys_faccessat2;

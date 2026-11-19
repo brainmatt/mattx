@@ -2705,6 +2705,260 @@ static int ret_handler_mkdir(struct kretprobe_instance *ri, struct pt_regs *regs
     return 0;
 }
 
+// --- RENAME HOOKS: rename / renameat / renameat2 (kprobe fallback, issue #67, P3, Track K) ---
+/*
+ * rename(a, b) is renameat2(AT_FDCWD, a, AT_FDCWD, b, 0) and renameat() is renameat2() with flags 0 in the kernel. Recipe of
+ * unlink / mkdir (0023b, 0024): three entry handlers save what the application passed and sabotage the OLD name, the shared
+ * return handler queues a task_work (own ticket, only this thread sleeps) that sends ONE request, SYS_RENAMEAT2 (both names,
+ * both directory FDs, the flags); the real renameat2() runs as the Deputy at the home node. None of the three was hooked before.
+ * Without the task_work resolver they stay native.
+ */
+struct rename_kretprobe_data {
+    const char __user *oldpath;
+    const char __user *newpath;
+    int olddfd;
+    int newdfd;
+    unsigned int flags;
+    bool armed;                     // the entry handler took the call (the old name was sabotaged)
+};
+
+static struct kretprobe renameat2_kprobe;
+static struct kretprobe renameat_kprobe;
+static struct kretprobe rename_kprobe;
+
+static bool mattx_rename_entry_wanted(struct rename_kretprobe_data *data)
+{
+    data->armed = false;
+    if (!is_guest_process(current->pid)) return false;
+    if (config_mattxfs_enabled) return false;
+    if (!config_migrate_file_io) return false;      // Local Breakout: the native call on the remote node's own filesystem
+    if (!real_task_work_add) return false;          // no way to sleep per thread: native
+    return true;
+}
+
+static int entry_handler_renameat2(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    struct rename_kretprobe_data *data = (struct rename_kretprobe_data *)ri->data;
+    struct pt_regs *sys_regs = SYSCALL_REGS(regs); // Unwrap!
+
+    if (!mattx_rename_entry_wanted(data)) return 0;
+
+    data->olddfd = (int)sys_regs->di;
+    data->oldpath = (const char __user *)sys_regs->si;
+    data->newdfd = (int)sys_regs->dx;
+    data->newpath = (const char __user *)sys_regs->r10;
+    data->flags = (unsigned int)sys_regs->r8;
+    data->armed = true;
+    sys_regs->si = 0; // Sabotage inner old name!
+
+    return 0;
+}
+
+static int entry_handler_renameat(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    struct rename_kretprobe_data *data = (struct rename_kretprobe_data *)ri->data;
+    struct pt_regs *sys_regs = SYSCALL_REGS(regs);
+
+    if (!mattx_rename_entry_wanted(data)) return 0;
+
+    data->olddfd = (int)sys_regs->di;
+    data->oldpath = (const char __user *)sys_regs->si;
+    data->newdfd = (int)sys_regs->dx;
+    data->newpath = (const char __user *)sys_regs->r10;
+    data->flags = 0;
+    data->armed = true;
+    sys_regs->si = 0;
+
+    return 0;
+}
+
+static int entry_handler_rename(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    struct rename_kretprobe_data *data = (struct rename_kretprobe_data *)ri->data;
+    struct pt_regs *sys_regs = SYSCALL_REGS(regs);
+
+    if (!mattx_rename_entry_wanted(data)) return 0;
+
+    data->olddfd = AT_FDCWD;
+    data->oldpath = (const char __user *)sys_regs->di;
+    data->newdfd = AT_FDCWD;
+    data->newpath = (const char __user *)sys_regs->si;
+    data->flags = 0;
+    data->armed = true;
+    sys_regs->di = 0;
+
+    return 0;
+}
+
+struct mattx_renameat2_tw {
+    struct callback_head cb;
+    u32 orig_pid;
+    int home_node;
+    const char __user *oldpath;     // read by the task_work: it runs in the thread's own process context
+    const char __user *newpath;
+    int olddfd;
+    int newdfd;
+    unsigned int flags;
+};
+
+static void mattx_renameat2_tw_fn(struct callback_head *cb) {
+    struct mattx_renameat2_tw *tw = container_of(cb, struct mattx_renameat2_tw, cb);
+    struct pt_regs *regs = task_pt_regs(current);
+    struct mattx_sys_renameat2_req *req = NULL;
+    struct mattx_ticket *t;
+    struct mattx_link *link;
+    char *oldp, *newp;
+    long ret = -EINTR;
+    long n;
+
+    if (fatal_signal_pending(current) || tw->home_node < 0 || tw->home_node >= MAX_NODES)
+        goto out;
+
+    link = READ_ONCE(cluster_map[tw->home_node]);
+    if (!link) {
+        ret = -EIO;
+        goto out;
+    }
+
+    req = kzalloc(sizeof(*req) + 2 * PATH_MAX, GFP_KERNEL);
+    if (!req) {
+        ret = -ENOMEM;
+        goto out;
+    }
+    oldp = req->paths;
+
+    // The old name first, then the new one: the errors come in the order of the kernel (getname() of both)
+    n = strncpy_from_user(oldp, tw->oldpath, PATH_MAX);
+    if (n < 0) {
+        ret = n;                                    // -EFAULT
+        goto out;
+    }
+    if (n == 0) {
+        ret = -ENOENT;
+        goto out;
+    }
+    if (n >= PATH_MAX) {                            // no NUL within PATH_MAX bytes: the kernel refuses it too
+        mattx_dbg("[RPC] Thread %d: rename old path is longer than %d bytes: -ENAMETOOLONG\n", current->pid, PATH_MAX - 1);
+        ret = -ENAMETOOLONG;
+        goto out;
+    }
+    req->oldlen = n + 1;                            // with the NUL
+
+    newp = req->paths + req->oldlen;
+    n = strncpy_from_user(newp, tw->newpath, PATH_MAX);
+    if (n < 0) {
+        ret = n;
+        goto out;
+    }
+    if (n == 0) {
+        ret = -ENOENT;
+        goto out;
+    }
+    if (n >= PATH_MAX) {
+        mattx_dbg("[RPC] Thread %d: rename new path is longer than %d bytes: -ENAMETOOLONG\n", current->pid, PATH_MAX - 1);
+        ret = -ENAMETOOLONG;
+        goto out;
+    }
+    req->newlen = n + 1;
+
+    req->olddirfd = AT_FDCWD;
+    req->newdirfd = AT_FDCWD;
+    if (oldp[0] != '/' && tw->olddfd != AT_FDCWD) {
+        // renameat(olddirfd, relative, ..): the home node needs the Deputy's FD behind our Ghost directory FD
+        ret = mattx_ghost_dirfd_remote(tw->olddfd, tw->home_node, tw->orig_pid, oldp, "renameat(old)", &req->olddirfd);
+        if (ret)
+            goto out;
+    }
+    if (newp[0] != '/' && tw->newdfd != AT_FDCWD) {
+        ret = mattx_ghost_dirfd_remote(tw->newdfd, tw->home_node, tw->orig_pid, newp, "renameat(new)", &req->newdirfd);
+        if (ret)
+            goto out;
+    }
+
+    t = mattx_ticket_add(tw->orig_pid, tw->home_node, 0);
+    if (!t) {
+        ret = -ENOMEM;
+        goto out;
+    }
+
+    req->orig_pid = tw->orig_pid;
+    req->req_id = t->req_id;
+    req->flags = tw->flags;
+
+    mattx_dbg("[RPC] Thread %d: renameat2(dirfd %d '%s' -> dirfd %d '%s', flags 0x%x) as req %u, sleeping on its own ticket...\n",
+              current->pid, req->olddirfd, oldp, req->newdirfd, newp, req->flags, t->req_id);
+
+    if (mattx_comm_send(link, MATTX_MSG_SYS_RENAMEAT2_REQ, req, sizeof(*req) + req->oldlen + req->newlen) < 0) {
+        // Never sleep for a reply to a request that was never sent
+        mattx_dbg("[RPC] Thread %d: RENAMEAT2_REQ send failed\n", current->pid);
+        ret = -EIO;
+        goto done;
+    }
+
+    // Interrupted (signal, freeze of a migration or recall)? The wait cancels the request and still hands back the
+    // real result if the home node had already done it; otherwise the system call is restarted.
+    if (mattx_ticket_wait(t, MAX_SCHEDULE_TIMEOUT) == 0)
+        ret = t->retval;
+    else
+        ret = -ERESTARTSYS;
+
+    mattx_dbg("[RPC] Thread %d: renameat2('%s' -> '%s') woke up: %ld (req %u)\n", current->pid, oldp, newp, ret, t->req_id);
+done:
+    mattx_ticket_del(t);
+out:
+    regs->ax = ret;
+    kfree(req);
+    kfree(tw);
+}
+
+static int ret_handler_rename(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    struct rename_kretprobe_data *data = (struct rename_kretprobe_data *)ri->data;
+    struct mattx_renameat2_tw *tw;
+    int home_node = -1;
+    u32 orig_pid = 0;
+    int i;
+
+    if (!data->armed) return 0;                 // not ours: the native result flows back
+
+    spin_lock(&guest_lock);
+    for (i = 0; i < guest_count; i++) {
+        if (guest_registry[i].local_pid == current->tgid) {
+            home_node = guest_registry[i].home_node;
+            orig_pid = guest_registry[i].orig_pid;
+            break;                              // the per-guest slot is not touched: this call has its own ticket
+        }
+    }
+    spin_unlock(&guest_lock);
+
+    if (home_node == -1 || !data->oldpath || !data->newpath) return 0;
+
+    // --- THE ATOMIC SHIELD ---
+    // If the process is dying (SIGKILL) or exiting, DO NOT freeze it!
+    if (fatal_signal_pending(current) || (current->flags & PF_EXITING)) {
+        mattx_dbg("[HOOK] Surrogate %s is dying. Aborting RPC.\n", current->comm);
+        return 0;
+    }
+
+    tw = kzalloc(sizeof(*tw), GFP_ATOMIC);
+    if (!tw) {
+        regs->ax = -ENOMEM;
+        return 0;
+    }
+    init_task_work(&tw->cb, mattx_renameat2_tw_fn);
+    tw->orig_pid = orig_pid;
+    tw->home_node = home_node;
+    tw->oldpath = data->oldpath;
+    tw->newpath = data->newpath;
+    tw->olddfd = data->olddfd;
+    tw->newdfd = data->newdfd;
+    tw->flags = data->flags;
+
+    mattx_dbg("[HOOK] Intercepted rename / renameat / renameat2 (flags 0x%x). Thread %d waits on its own ticket...\n", data->flags, current->pid);
+    // The sabotaged call returns -EFAULT; the task_work overwrites it with the real result.
+    regs->ax = -EINTR;
+
+    if (real_task_work_add(current, &tw->cb, TWA_RESUME))
+        kfree(tw);
+    return 0;
+}
+
 // --- SOCKET HOOK ---
 struct socket_kretprobe_data {
     int domain;
@@ -8895,6 +9149,42 @@ int mattx_hooks_init(void) {
     ret = mattx_register_kretprobe(&mkdir_kprobe);
     if (ret < 0) {
         printk(KERN_ERR "MattX: register_kretprobe failed for mkdir, returned %d\n", ret);
+    }
+
+    memset(&renameat2_kprobe, 0, sizeof(renameat2_kprobe));
+    renameat2_kprobe.kp.symbol_name = "__x64_sys_renameat2";
+    renameat2_kprobe.entry_handler = entry_handler_renameat2;
+    renameat2_kprobe.handler = ret_handler_rename;
+    renameat2_kprobe.data_size = sizeof(struct rename_kretprobe_data);
+    renameat2_kprobe.maxactive = 64;
+
+    ret = mattx_register_kretprobe(&renameat2_kprobe);
+    if (ret < 0) {
+        printk(KERN_ERR "MattX: register_kretprobe failed for renameat2, returned %d\n", ret);
+    }
+
+    memset(&renameat_kprobe, 0, sizeof(renameat_kprobe));
+    renameat_kprobe.kp.symbol_name = "__x64_sys_renameat";
+    renameat_kprobe.entry_handler = entry_handler_renameat;
+    renameat_kprobe.handler = ret_handler_rename;
+    renameat_kprobe.data_size = sizeof(struct rename_kretprobe_data);
+    renameat_kprobe.maxactive = 64;
+
+    ret = mattx_register_kretprobe(&renameat_kprobe);
+    if (ret < 0) {
+        printk(KERN_ERR "MattX: register_kretprobe failed for renameat, returned %d\n", ret);
+    }
+
+    memset(&rename_kprobe, 0, sizeof(rename_kprobe));
+    rename_kprobe.kp.symbol_name = "__x64_sys_rename";
+    rename_kprobe.entry_handler = entry_handler_rename;
+    rename_kprobe.handler = ret_handler_rename;
+    rename_kprobe.data_size = sizeof(struct rename_kretprobe_data);
+    rename_kprobe.maxactive = 64;
+
+    ret = mattx_register_kretprobe(&rename_kprobe);
+    if (ret < 0) {
+        printk(KERN_ERR "MattX: register_kretprobe failed for rename, returned %d\n", ret);
     }
 
     memset(&socket_kprobe, 0, sizeof(socket_kprobe));

@@ -784,9 +784,88 @@ static struct mutex *mattx_deputy_scratch_mutex(struct task_struct *deputy)
     return &mattx_deputy_scratch_lock[hash_32((u32)deputy->pid, ilog2(MATTX_DEPUTY_LOCKS))];
 }
 
-// --- THE IDENTITY THEFT HELPER ---
-static int mattx_execute_as_deputy(struct task_struct *deputy, long (*syscall_fn)(const struct pt_regs *), struct pt_regs *regs, const char *path, int path_reg, void *out_buf, size_t out_size, int buf_reg, int fd_to_map, int fd_reg) {
+/*
+ * The argument registers of an x86_64 system call, numbered like the existing callers do (1 = di, 2 = si, 3 = dx, 4 = r10,
+ * 5 = r8, 6 = r9): the helper below patches the user pointers / the FD it has made into the call's own register image.
+ */
+static void mattx_regs_set_arg(struct pt_regs *regs, int idx, unsigned long val)
+{
+    switch (idx) {
+    case 1: regs->di = val; break;
+    case 2: regs->si = val; break;
+    case 3: regs->dx = val; break;
+    case 4: regs->r10 = val; break;
+    case 5: regs->r8 = val; break;
+    case 6: regs->r9 = val; break;
+    }
+}
+
+/*
+ * THE MATTXFS FD IMPLANT: an FD >= 1000 is in the export registry, raw syscalls cannot see it. It is put temporarily into
+ * the Deputy's native FD table. Returns the temporary FD (and the file, holding the two references that the unimplant
+ * releases) or -errno.
+ */
+static int mattx_deputy_implant_fd(struct task_struct *deputy, int fd, struct file **mapped_out)
+{
+    struct file *mapped_file = mattx_get_remote_file(deputy->pid, fd);
+    int temp_fd = -1;
+
+    if (!mapped_file)
+        return -EBADF;
+
+    spin_lock(&deputy->files->file_lock);
+    {
+        struct fdtable *fdt = files_fdtable(deputy->files);
+        int j;
+
+        for (j = 3; j < fdt->max_fds; j++) {
+            if (!rcu_dereference_raw(fdt->fd[j])) {
+                rcu_assign_pointer(fdt->fd[j], mapped_file);
+                __set_bit(j, fdt->open_fds);
+                temp_fd = j;
+                break;
+            }
+        }
+    }
+    spin_unlock(&deputy->files->file_lock);
+
+    if (temp_fd < 0) {
+        fput(mapped_file);
+        return -EMFILE;
+    }
+    *mapped_out = mapped_file;
+    return temp_fd;
+}
+
+// Clean up the temporary implant!
+static void mattx_deputy_unimplant_fd(struct task_struct *deputy, int temp_fd, struct file *mapped_file)
+{
+    spin_lock(&deputy->files->file_lock);
+    {
+        struct fdtable *fdt = files_fdtable(deputy->files);
+
+        rcu_assign_pointer(fdt->fd[temp_fd], NULL);
+        __clear_bit(temp_fd, fdt->open_fds);
+    }
+    spin_unlock(&deputy->files->file_lock);
+    fput(mapped_file); // Release the FD table reference
+    fput(mapped_file); // Release the mattx_get_remote_file reference
+}
+
+/*
+ * --- THE IDENTITY THEFT HELPER --- (issue #67, P3: the general form)
+ * Two user paths (path / path2, for rename, link, symlink) and two directory FDs (fd_to_map / fd2_to_map, renameat) can be
+ * patched into the call; the scratchpad below the stopped Deputy's stack holds path at sp-8192, the out buffer at sp-4096
+ * and path2 at sp-12288. The registers are named by their argument index (mattx_regs_set_arg). path2 NULL and fd2_to_map < 1000
+ * make it the single-path form; mattx_execute_as_deputy() below is exactly that.
+ */
+static int mattx_execute_as_deputy_ex(struct task_struct *deputy, long (*syscall_fn)(const struct pt_regs *), struct pt_regs *regs,
+                                      const char *path, int path_reg, const char *path2, int path2_reg,
+                                      void *out_buf, size_t out_size, int buf_reg,
+                                      int fd_to_map, int fd_reg, int fd2_to_map, int fd2_reg) {
     int ret = -ESRCH;
+    int temp_fd = -1, temp_fd2 = -1;
+    struct file *mapped_file = NULL, *mapped_file2 = NULL;
     if (!deputy) return ret;
 
     mutex_lock(mattx_deputy_scratch_mutex(deputy));
@@ -803,75 +882,62 @@ static int mattx_execute_as_deputy(struct task_struct *deputy, long (*syscall_fn
     unsigned long scratchpad = task_pt_regs(deputy)->sp - 8192; 
     unsigned long path_ptr = scratchpad;
     unsigned long buf_ptr = scratchpad + 4096;
+    unsigned long path2_ptr = scratchpad - 4096;
 
     if (path) {
         if (copy_to_user((void __user *)path_ptr, path, strlen(path) + 1)) {
             ret = -EFAULT;
             goto out;
         }
-        if (path_reg == 1) regs->di = path_ptr;
-        else if (path_reg == 2) regs->si = path_ptr;
+        mattx_regs_set_arg(regs, path_reg, path_ptr);
     }
 
-    if (out_buf && out_size > 0) {
-        if (buf_reg == 1) regs->di = buf_ptr;
-        else if (buf_reg == 2) regs->si = buf_ptr;
-        else if (buf_reg == 3) regs->dx = buf_ptr;
+    if (path2) {
+        if (copy_to_user((void __user *)path2_ptr, path2, strlen(path2) + 1)) {
+            ret = -EFAULT;
+            goto out;
+        }
+        mattx_regs_set_arg(regs, path2_reg, path2_ptr);
     }
 
-    int temp_fd = -1;
-    struct file *mapped_file = NULL;
+    if (out_buf && out_size > 0)
+        mattx_regs_set_arg(regs, buf_reg, buf_ptr);
 
     // --- THE MATTXFS FD IMPLANT ---
     // If the FD is >= 1000, it's in the export registry. Raw syscalls can't see it!
     // We temporarily implant it into the Deputy's native FD table.
     if (fd_to_map >= 1000) {
-        mapped_file = mattx_get_remote_file(deputy->pid, fd_to_map);
-        if (mapped_file) {
-            spin_lock(&deputy->files->file_lock);
-            struct fdtable *fdt = files_fdtable(deputy->files);
-            for (int j = 3; j < fdt->max_fds; j++) {
-                if (!rcu_dereference_raw(fdt->fd[j])) {
-                    rcu_assign_pointer(fdt->fd[j], mapped_file);
-                    __set_bit(j, fdt->open_fds);
-                    temp_fd = j;
-                    break;
-                }
-            }
-            spin_unlock(&deputy->files->file_lock);
-            
-            if (temp_fd >= 0) {
-                if (fd_reg == 1) regs->di = temp_fd;
-                else if (fd_reg == 2) regs->si = temp_fd;
-            } else {
-                fput(mapped_file);
-                ret = -EMFILE;
-                goto out;
-            }
-        } else {
-            ret = -EBADF;
+        temp_fd = mattx_deputy_implant_fd(deputy, fd_to_map, &mapped_file);
+        if (temp_fd < 0) {
+            ret = temp_fd;
+            temp_fd = -1;
             goto out;
         }
+        mattx_regs_set_arg(regs, fd_reg, temp_fd);
+    }
+    if (fd2_to_map >= 1000) {
+        temp_fd2 = mattx_deputy_implant_fd(deputy, fd2_to_map, &mapped_file2);
+        if (temp_fd2 < 0) {
+            ret = temp_fd2;
+            temp_fd2 = -1;
+            goto unimplant;
+        }
+        mattx_regs_set_arg(regs, fd2_reg, temp_fd2);
     }
 
     ret = syscall_fn(regs);
-
-    // Clean up the temporary implant!
-    if (temp_fd >= 0) {
-        spin_lock(&deputy->files->file_lock);
-        struct fdtable *fdt = files_fdtable(deputy->files);
-        rcu_assign_pointer(fdt->fd[temp_fd], NULL);
-        __clear_bit(temp_fd, fdt->open_fds);
-        spin_unlock(&deputy->files->file_lock);
-        fput(mapped_file); // Release the FD table reference
-        fput(mapped_file); // Release the mattx_get_remote_file reference
-    }
 
     if (ret >= 0 && out_buf && out_size > 0) {
         if (copy_from_user(out_buf, (void __user *)buf_ptr, out_size)) {
             mattx_dbg("[KWORKER] Warning: Failed to read out_buf from scratchpad!\n");
         }
     }
+
+unimplant:
+    if (temp_fd2 >= 0)
+        mattx_deputy_unimplant_fd(deputy, temp_fd2, mapped_file2);
+    if (temp_fd >= 0)
+        mattx_deputy_unimplant_fd(deputy, temp_fd, mapped_file);
 
 out:
     current->fs = old_fs;
@@ -881,6 +947,12 @@ out:
 
     mutex_unlock(mattx_deputy_scratch_mutex(deputy));
     return ret;
+}
+
+// The single path / single FD form that every caller before the two-path calls uses
+static int mattx_execute_as_deputy(struct task_struct *deputy, long (*syscall_fn)(const struct pt_regs *), struct pt_regs *regs, const char *path, int path_reg, void *out_buf, size_t out_size, int buf_reg, int fd_to_map, int fd_reg) {
+    return mattx_execute_as_deputy_ex(deputy, syscall_fn, regs, path, path_reg, NULL, 0, out_buf, out_size, buf_reg,
+                                      fd_to_map, fd_reg, -1, 0);
 }
 
 
@@ -12782,6 +12854,130 @@ static void handle_sys_mkdirat_reply(struct mattx_link *link, struct mattx_heade
         mattx_dbg("[RPC] MKDIRAT_REPLY req %u: nobody waits for it any more, dropped\n", reply->req_id);
 }
 
+// --- Home side: rename / renameat / renameat2 of a Surrogate (kprobe mode), by Identity Theft ---
+// The request is the tail of the context (flexible paths): it must stay the LAST member
+struct mattx_renameat2_kworker_ctx { struct work_struct work; int target_node; struct mattx_sys_renameat2_req req; };
+
+static void mattx_renameat2_reply_send(int node, u32 orig_pid, u32 req_id, int error)
+{
+    struct mattx_sys_renameat2_reply reply;
+    struct mattx_link *link = READ_ONCE(cluster_map[node]);
+
+    memset(&reply, 0, sizeof(reply));
+    reply.orig_pid = orig_pid;
+    reply.req_id = req_id;
+    reply.error = error;
+    if (link)
+        mattx_comm_send(link, MATTX_MSG_SYS_RENAMEAT2_REPLY, &reply, sizeof(reply));
+}
+
+/*
+ * The REAL renameat2() runs as the Deputy (mattx_execute_as_deputy_ex: its fs, files and credentials, two paths and two
+ * directory FDs patched in; the Deputy is NOT woken up). A call under way cannot be aborted (short): a CANCEL that arrives
+ * before it starts skips it (-EINTR), a later one is of no use and consumed; the real result is sent. Exactly one reply.
+ */
+static void mattx_renameat2_kworker(struct work_struct *work)
+{
+    struct mattx_renameat2_kworker_ctx *ctx = container_of(work, struct mattx_renameat2_kworker_ctx, work);
+    struct mattx_sys_renameat2_req *req = &ctx->req;
+    const char *oldpath = req->paths;
+    const char *newpath = req->paths + req->oldlen;
+    struct task_struct *deputy = NULL;
+    struct pt_regs regs;
+    bool abandoned = false;
+    int err;
+
+    if (mattx_req_take_cancelled(ctx->target_node, req->orig_pid, req->req_id)) {
+        mattx_dbg("[WORMHOLE] RENAMEAT2 '%s' -> '%s' (req %u) cancelled by the Surrogate before it started, skipped\n", oldpath, newpath, req->req_id);
+        err = -EINTR;
+    } else if (READ_ONCE(mattx_cancellable_stopping) || !READ_ONCE(cluster_map[ctx->target_node])) {
+        abandoned = true;
+        err = -EINTR;
+    } else {
+        mattx_dbg("[WORMHOLE] RENAMEAT2 dirfd %d '%s' -> dirfd %d '%s' flags 0x%x (req %u) from Node %d (kworker)\n", req->olddirfd,
+                  oldpath, req->newdirfd, newpath, req->flags, req->req_id, ctx->target_node);
+
+        rcu_read_lock();
+        deputy = pid_task(find_vpid(req->orig_pid), PIDTYPE_PID);
+        if (deputy)
+            get_task_struct(deputy);
+        rcu_read_unlock();
+
+        if (!deputy) {
+            err = -ESRCH;                       // no Deputy, no identity to act as
+        } else if (!real_sys_renameat2) {
+            err = -ENOSYS;
+        } else {
+            memset(&regs, 0, sizeof(regs));
+            regs.di = (unsigned long)(long)req->olddirfd;   // an FD >= 1000 is replaced by the helper (MattXFS export registry)
+            regs.dx = (unsigned long)(long)req->newdirfd;
+            regs.r8 = req->flags;
+            // renameat2(olddirfd = di, oldpath = si, newdirfd = dx, newpath = r10, flags = r8)
+            err = mattx_execute_as_deputy_ex(deputy, real_sys_renameat2, &regs, oldpath, 2, newpath, 4, NULL, 0, 0,
+                                             req->olddirfd, 1, req->newdirfd, 3);
+        }
+        if (deputy)
+            put_task_struct(deputy);
+        mattx_req_take_cancelled(ctx->target_node, req->orig_pid, req->req_id);     // a CANCEL during the rename is of no use any more
+    }
+
+    if (abandoned) {
+        mattx_dbg("[WORMHOLE] RENAMEAT2 (req %u): nobody left to answer, reply dropped\n", req->req_id);
+    } else {
+        mattx_dbg("[WORMHOLE] RENAMEAT2 '%s' -> '%s' (req %u) done: %d\n", oldpath, newpath, req->req_id, err);
+        mattx_renameat2_reply_send(ctx->target_node, req->orig_pid, req->req_id, err);
+    }
+
+    kfree(ctx);
+    atomic_dec(&mattx_cancellable_inflight);
+}
+
+static void handle_sys_renameat2_req(struct mattx_link *link, struct mattx_header *hdr, void *payload)
+{
+    struct mattx_sys_renameat2_req *req = payload;
+    struct mattx_renameat2_kworker_ctx *ctx;
+    size_t tail;
+
+    if (!payload || hdr->length < sizeof(*req)) return;
+    if (hdr->sender_id >= MAX_NODES || READ_ONCE(mattx_cancellable_stopping)) return;
+
+    // The paths are the tail of the request: two names of 1 .. PATH_MAX bytes, each NUL terminated, all of it inside the message
+    if (req->oldlen < 1 || req->oldlen > PATH_MAX || req->newlen < 1 || req->newlen > PATH_MAX ||
+        hdr->length < sizeof(*req) + (size_t)req->oldlen + req->newlen ||
+        req->paths[req->oldlen - 1] != '\0' || req->paths[req->oldlen + req->newlen - 1] != '\0') {
+        printk(KERN_ERR "MattX:[RPC] RENAMEAT2_REQ %u of PID %u malformed (oldlen %u, newlen %u, message %u bytes)\n",
+               req->req_id, req->orig_pid, req->oldlen, req->newlen, hdr->length);
+        mattx_renameat2_reply_send(hdr->sender_id, req->orig_pid, req->req_id, -EINVAL);
+        return;
+    }
+    tail = (size_t)req->oldlen + req->newlen;
+
+    ctx = kmalloc(sizeof(*ctx) + tail, GFP_ATOMIC);
+    if (!ctx) {
+        // Still answer: the Surrogate thread sleeps on this ticket
+        printk(KERN_ERR "MattX:[RPC] RENAMEAT2_REQ %u of PID %u: out of memory\n", req->req_id, req->orig_pid);
+        mattx_renameat2_reply_send(hdr->sender_id, req->orig_pid, req->req_id, -ENOMEM);
+        return;
+    }
+    INIT_WORK(&ctx->work, mattx_renameat2_kworker);
+    memcpy(&ctx->req, req, sizeof(*req) + tail);
+    ctx->target_node = hdr->sender_id;
+    atomic_inc(&mattx_cancellable_inflight);
+    mattx_queue_wait_work(&ctx->work);
+}
+
+// Surrogate side: the reply belongs to exactly one waiting thread (its ticket)
+static void handle_sys_renameat2_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload)
+{
+    struct mattx_sys_renameat2_reply *reply = payload;
+
+    if (!payload || hdr->length < sizeof(*reply)) return;
+
+    mattx_dbg("[RPC] Received RENAMEAT2_REPLY for Orig PID %u req %u. Error: %d\n", reply->orig_pid, reply->req_id, reply->error);
+    if (!mattx_ticket_complete(hdr->sender_id, reply->orig_pid, reply->req_id, reply->error, NULL, 0))
+        mattx_dbg("[RPC] RENAMEAT2_REPLY req %u: nobody waits for it any more, dropped\n", reply->req_id);
+}
+
 /*
  * DIRECTORY OPERATIONS of MattXFS (issue #67, P3, Track M). The directory inode of MattXFS only had .lookup, .create
  * and .unlink: mkdir and rmdir were refused by the VFS. The operation is run at the home node through the VFS (the
@@ -14013,6 +14209,8 @@ void mattx_fileio_init_handlers(void) {
     mattx_register_handler(MATTX_MSG_SYS_UNLINKAT_REPLY, handle_sys_unlinkat_reply);
     mattx_register_handler(MATTX_MSG_SYS_MKDIRAT_REQ, handle_sys_mkdirat_req);
     mattx_register_handler(MATTX_MSG_SYS_MKDIRAT_REPLY, handle_sys_mkdirat_reply);
+    mattx_register_handler(MATTX_MSG_SYS_RENAMEAT2_REQ, handle_sys_renameat2_req);
+    mattx_register_handler(MATTX_MSG_SYS_RENAMEAT2_REPLY, handle_sys_renameat2_reply);
     mattx_register_handler(MATTX_MSG_VFS_MKDIR_REQ, handle_vfs_mkdir_req);
     mattx_register_handler(MATTX_MSG_VFS_MKDIR_REPLY, handle_vfs_mkdir_reply);
     mattx_register_handler(MATTX_MSG_VFS_RMDIR_REQ, handle_vfs_rmdir_req);
