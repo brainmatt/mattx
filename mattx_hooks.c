@@ -4256,6 +4256,499 @@ static int ret_handler_utimensat(struct kretprobe_instance *ri, struct pt_regs *
     return 0;
 }
 
+// --- CHDIR HOOKS: chdir (kprobe fallback, issue #67, P3, Track K) ---
+/*
+ * Every relative path call of a Surrogate is resolved at the home node against the DEPUTY's cwd (0015 .. 0027), so chdir() must
+ * change that one: it runs as the Deputy and the Surrogate keeps no cwd of its own. Recipe of unlink / mkdir / ..: the entry handler
+ * saves the path and sabotages it (di = 0), the return handler queues a task_work (own ticket, only this thread sleeps) that
+ * sends ONE request, SYS_CHDIR; the real chdir() runs as the Deputy at the home node. Not hooked before. Without the task_work
+ * resolver it stays native.
+ */
+struct chdir_kretprobe_data {
+    const char __user *path;
+
+    bool armed;                     // the entry handler took the call (the path was sabotaged)
+};
+
+static struct kretprobe chdir_kprobe;
+
+static bool mattx_chdir_entry_wanted(struct chdir_kretprobe_data *data)
+{
+    data->armed = false;
+    if (!is_guest_process(current->pid)) return false;
+    if (config_mattxfs_enabled) return false;
+    if (!config_migrate_file_io) return false;      // Local Breakout: the native call on the remote node's own filesystem
+    if (!real_task_work_add) return false;          // no way to sleep per thread: native
+    return true;
+}
+
+static int entry_handler_chdir(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    struct chdir_kretprobe_data *data = (struct chdir_kretprobe_data *)ri->data;
+    struct pt_regs *sys_regs = SYSCALL_REGS(regs); // Unwrap!
+
+    if (!mattx_chdir_entry_wanted(data)) return 0;
+
+    data->path = (const char __user *)sys_regs->di;
+    if (!data->path) return 0;      // NULL: the native call returns the kernel's own -EFAULT
+    data->armed = true;
+    sys_regs->di = 0; // Sabotage inner path!
+
+    return 0;
+}
+
+
+struct mattx_chdir_tw {
+    struct callback_head cb;
+    u32 orig_pid;
+    int home_node;
+    const char __user *path;        // read by the task_work: it runs in the thread's own process context
+
+};
+
+static void mattx_chdir_tw_fn(struct callback_head *cb) {
+    struct mattx_chdir_tw *tw = container_of(cb, struct mattx_chdir_tw, cb);
+    struct pt_regs *regs = task_pt_regs(current);
+    struct mattx_sys_chdir_req *req = NULL;
+    struct mattx_ticket *t;
+    struct mattx_link *link;
+    long ret = -EINTR;
+    long n;
+
+    if (fatal_signal_pending(current) || tw->home_node < 0 || tw->home_node >= MAX_NODES)
+        goto out;
+
+    link = READ_ONCE(cluster_map[tw->home_node]);
+    if (!link) {
+        ret = -EIO;
+        goto out;
+    }
+
+    req = kzalloc(sizeof(*req) + PATH_MAX, GFP_KERNEL);
+    if (!req) {
+        ret = -ENOMEM;
+        goto out;
+    }
+
+    n = strncpy_from_user(req->path, tw->path, PATH_MAX);
+    if (n < 0) {
+        ret = n;                                    // -EFAULT
+        goto out;
+    }
+    if (n == 0) {
+        ret = -ENOENT;
+        goto out;
+    }
+    if (n >= PATH_MAX) {                            // no NUL within PATH_MAX bytes: the kernel refuses it too
+        mattx_dbg("[RPC] Thread %d: chdir path is longer than %d bytes: -ENAMETOOLONG\n", current->pid, PATH_MAX - 1);
+        ret = -ENAMETOOLONG;
+        goto out;
+    }
+    req->pathlen = n + 1;                           // with the NUL
+
+    t = mattx_ticket_add(tw->orig_pid, tw->home_node, 0);
+    if (!t) {
+        ret = -ENOMEM;
+        goto out;
+    }
+
+    req->orig_pid = tw->orig_pid;
+    req->req_id = t->req_id;
+
+    mattx_dbg("[RPC] Thread %d: chdir('%s') as req %u, sleeping on its own ticket...\n",
+              current->pid, req->path, t->req_id);
+
+    if (mattx_comm_send(link, MATTX_MSG_SYS_CHDIR_REQ, req, sizeof(*req) + req->pathlen) < 0) {
+        // Never sleep for a reply to a request that was never sent
+        mattx_dbg("[RPC] Thread %d: CHDIR_REQ send failed\n", current->pid);
+        ret = -EIO;
+        goto done;
+    }
+
+    // Interrupted (signal, freeze of a migration or recall)? The wait cancels the request and still hands back the
+    // real result if the home node had already done it; otherwise the system call is restarted.
+    if (mattx_ticket_wait(t, MAX_SCHEDULE_TIMEOUT) == 0)
+        ret = t->retval;
+    else
+        ret = -ERESTARTSYS;
+
+    mattx_dbg("[RPC] Thread %d: chdir('%s') woke up: %ld (req %u)\n", current->pid, req->path, ret, t->req_id);
+done:
+    mattx_ticket_del(t);
+out:
+    regs->ax = ret;
+    kfree(req);
+    kfree(tw);
+}
+
+static int ret_handler_chdir(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    struct chdir_kretprobe_data *data = (struct chdir_kretprobe_data *)ri->data;
+    struct mattx_chdir_tw *tw;
+    int home_node = -1;
+    u32 orig_pid = 0;
+    int i;
+
+    if (!data->armed) return 0;                 // not ours: the native result flows back
+
+    spin_lock(&guest_lock);
+    for (i = 0; i < guest_count; i++) {
+        if (guest_registry[i].local_pid == current->tgid) {
+            home_node = guest_registry[i].home_node;
+            orig_pid = guest_registry[i].orig_pid;
+            break;                              // the per-guest slot is not touched: this call has its own ticket
+        }
+    }
+    spin_unlock(&guest_lock);
+
+    if (home_node == -1 || !data->path) return 0;
+
+    // --- THE ATOMIC SHIELD ---
+    // If the process is dying (SIGKILL) or exiting, DO NOT freeze it!
+    if (fatal_signal_pending(current) || (current->flags & PF_EXITING)) {
+        mattx_dbg("[HOOK] Surrogate %s is dying. Aborting RPC.\n", current->comm);
+        return 0;
+    }
+
+    tw = kzalloc(sizeof(*tw), GFP_ATOMIC);
+    if (!tw) {
+        regs->ax = -ENOMEM;
+        return 0;
+    }
+    init_task_work(&tw->cb, mattx_chdir_tw_fn);
+    tw->orig_pid = orig_pid;
+    tw->home_node = home_node;
+    tw->path = data->path;
+
+    mattx_dbg("[HOOK] Intercepted chdir. Thread %d waits on its own ticket...\n", current->pid);
+    // The sabotaged call returns an error; the task_work overwrites it with the real result.
+    regs->ax = -EINTR;
+
+    if (real_task_work_add(current, &tw->cb, TWA_RESUME))
+        kfree(tw);
+    return 0;
+}
+
+// --- FCHDIR HOOK (kprobe fallback, issue #67, P3, Track K, step 0028) ---
+/*
+ * fchdir(fd): the Deputy's cwd is the one every relative path RPC resolves against, so fchdir() runs as the Deputy. The entry
+ * handler saves the FD and sabotages it (fd = -1: the native call returns a harmless -EBADF), the return handler queues a
+ * task_work (own ticket, only this thread sleeps) that maps the Ghost FD to the Deputy's FD and sends ONE request, SYS_FCHDIR.
+ * A native (non-Ghost) FD is -EOPNOTSUPP: a native chdir() would bring the two cwds apart again. Without the task_work
+ * resolver it stays native.
+ */
+struct fchdir_kretprobe_data {
+    int fd;
+    bool armed;                     // the entry handler took the call (the FD was sabotaged)
+};
+
+static struct kretprobe fchdir_kprobe;
+
+static bool mattx_fchdir_entry_wanted(struct fchdir_kretprobe_data *data)
+{
+    data->armed = false;
+    if (!is_guest_process(current->pid)) return false;
+    if (config_mattxfs_enabled) return false;
+    if (!config_migrate_file_io) return false;      // Local Breakout: the native call on the remote node's own filesystem
+    if (!real_task_work_add) return false;          // no way to sleep per thread: native
+    return true;
+}
+
+static int entry_handler_fchdir(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    struct fchdir_kretprobe_data *data = (struct fchdir_kretprobe_data *)ri->data;
+    struct pt_regs *sys_regs = SYSCALL_REGS(regs); // Unwrap!
+
+    if (!mattx_fchdir_entry_wanted(data)) return 0;
+
+    data->fd = (int)sys_regs->di;
+    if (data->fd < 0) return 0;     // the native call returns the kernel's own -EBADF
+    data->armed = true;
+    sys_regs->di = (unsigned long)(long)-1; // Sabotage inner FD!
+
+    return 0;
+}
+
+struct mattx_fchdir_tw {
+    struct callback_head cb;
+    u32 orig_pid;
+    int home_node;
+    int fd;
+};
+
+static void mattx_fchdir_tw_fn(struct callback_head *cb) {
+    struct mattx_fchdir_tw *tw = container_of(cb, struct mattx_fchdir_tw, cb);
+    struct pt_regs *regs = task_pt_regs(current);
+    struct mattx_sys_fchdir_req *req = NULL;
+    struct mattx_ticket *t;
+    struct mattx_link *link;
+    long ret = -EINTR;
+
+    if (fatal_signal_pending(current) || tw->home_node < 0 || tw->home_node >= MAX_NODES)
+        goto out;
+
+    link = READ_ONCE(cluster_map[tw->home_node]);
+    if (!link) {
+        ret = -EIO;
+        goto out;
+    }
+
+    req = kzalloc(sizeof(*req), GFP_KERNEL);
+    if (!req) {
+        ret = -ENOMEM;
+        goto out;
+    }
+
+    // The home node needs the Deputy's FD behind our Ghost FD (a native FD is -EOPNOTSUPP)
+    ret = mattx_ghost_dirfd_remote(tw->fd, tw->home_node, tw->orig_pid, "", "fchdir", &req->fd);
+    if (ret)
+        goto out;
+
+    t = mattx_ticket_add(tw->orig_pid, tw->home_node, 0);
+    if (!t) {
+        ret = -ENOMEM;
+        goto out;
+    }
+
+    req->orig_pid = tw->orig_pid;
+    req->req_id = t->req_id;
+
+    mattx_dbg("[RPC] Thread %d: fchdir(fd %d -> Deputy FD %d) as req %u, sleeping on its own ticket...\n",
+              current->pid, tw->fd, req->fd, t->req_id);
+
+    if (mattx_comm_send(link, MATTX_MSG_SYS_FCHDIR_REQ, req, sizeof(*req)) < 0) {
+        // Never sleep for a reply to a request that was never sent
+        mattx_dbg("[RPC] Thread %d: FCHDIR_REQ send failed\n", current->pid);
+        ret = -EIO;
+        goto done;
+    }
+
+    // Interrupted (signal, freeze of a migration or recall)? The wait cancels the request and still hands back the
+    // real result if the home node had already done it; otherwise the system call is restarted.
+    if (mattx_ticket_wait(t, MAX_SCHEDULE_TIMEOUT) == 0)
+        ret = t->retval;
+    else
+        ret = -ERESTARTSYS;
+
+    mattx_dbg("[RPC] Thread %d: fchdir(fd %d) woke up: %ld (req %u)\n", current->pid, tw->fd, ret, t->req_id);
+done:
+    mattx_ticket_del(t);
+out:
+    regs->ax = ret;
+    kfree(req);
+    kfree(tw);
+}
+
+static int ret_handler_fchdir(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    struct fchdir_kretprobe_data *data = (struct fchdir_kretprobe_data *)ri->data;
+    struct mattx_fchdir_tw *tw;
+    int home_node = -1;
+    u32 orig_pid = 0;
+    int i;
+
+    if (!data->armed) return 0;                 // not ours: the native result flows back
+
+    spin_lock(&guest_lock);
+    for (i = 0; i < guest_count; i++) {
+        if (guest_registry[i].local_pid == current->tgid) {
+            home_node = guest_registry[i].home_node;
+            orig_pid = guest_registry[i].orig_pid;
+            break;                              // the per-guest slot is not touched: this call has its own ticket
+        }
+    }
+    spin_unlock(&guest_lock);
+
+    if (home_node == -1) return 0;
+
+    // --- THE ATOMIC SHIELD ---
+    // If the process is dying (SIGKILL) or exiting, DO NOT freeze it!
+    if (fatal_signal_pending(current) || (current->flags & PF_EXITING)) {
+        mattx_dbg("[HOOK] Surrogate %s is dying. Aborting RPC.\n", current->comm);
+        return 0;
+    }
+
+    tw = kzalloc(sizeof(*tw), GFP_ATOMIC);
+    if (!tw) {
+        regs->ax = -ENOMEM;
+        return 0;
+    }
+    init_task_work(&tw->cb, mattx_fchdir_tw_fn);
+    tw->orig_pid = orig_pid;
+    tw->home_node = home_node;
+    tw->fd = data->fd;
+
+    mattx_dbg("[HOOK] Intercepted fchdir. Thread %d waits on its own ticket...\n", current->pid);
+    // The sabotaged call returns -EBADF; the task_work overwrites it with the real result.
+    regs->ax = -EINTR;
+
+    if (real_task_work_add(current, &tw->cb, TWA_RESUME))
+        kfree(tw);
+    return 0;
+}
+
+// --- GETCWD HOOK (kprobe fallback, issue #67, P3, Track K, step 0028) ---
+/*
+ * getcwd(buf, size): the Deputy's cwd is the one every relative path RPC resolves against (and chdir() / fchdir() change), so
+ * getcwd() asks the Deputy. The entry handler saves buf and size and sabotages the size (size = 0: the native call returns a
+ * harmless -ERANGE and can never write to the user buffer), the return handler queues a task_work (own ticket, only this thread
+ * sleeps) that sends ONE request, SYS_GETCWD, and copies the answer into the application's buffer (in process context).
+ * A NULL buffer or size 0 stays native (-EFAULT / -ERANGE). Without the task_work resolver it stays native.
+ */
+struct getcwd_kretprobe_data {
+    char __user *buf;
+    unsigned long size;
+    bool armed;                     // the entry handler took the call (the size was sabotaged)
+};
+
+static struct kretprobe getcwd_kprobe;
+
+static bool mattx_getcwd_entry_wanted(struct getcwd_kretprobe_data *data)
+{
+    data->armed = false;
+    if (!is_guest_process(current->pid)) return false;
+    if (config_mattxfs_enabled) return false;
+    if (!config_migrate_file_io) return false;      // Local Breakout: the native call on the remote node's own filesystem
+    if (!real_task_work_add) return false;          // no way to sleep per thread: native
+    return true;
+}
+
+static int entry_handler_getcwd(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    struct getcwd_kretprobe_data *data = (struct getcwd_kretprobe_data *)ri->data;
+    struct pt_regs *sys_regs = SYSCALL_REGS(regs); // Unwrap!
+
+    if (!mattx_getcwd_entry_wanted(data)) return 0;
+
+    data->buf = (char __user *)sys_regs->di;
+    data->size = sys_regs->si;
+    if (!data->buf || !data->size) return 0;    // the native call returns the kernel's own -EFAULT / -ERANGE
+    data->armed = true;
+    sys_regs->si = 0; // Sabotage inner size!
+
+    return 0;
+}
+
+struct mattx_getcwd_tw {
+    struct callback_head cb;
+    u32 orig_pid;
+    int home_node;
+    char __user *buf;               // written by the task_work: it runs in the thread's own process context
+    unsigned long size;
+};
+
+static void mattx_getcwd_tw_fn(struct callback_head *cb) {
+    struct mattx_getcwd_tw *tw = container_of(cb, struct mattx_getcwd_tw, cb);
+    struct pt_regs *regs = task_pt_regs(current);
+    struct mattx_sys_getcwd_req *req = NULL;
+    struct mattx_ticket *t;
+    struct mattx_link *link;
+    long ret = -EINTR;
+
+    if (fatal_signal_pending(current) || tw->home_node < 0 || tw->home_node >= MAX_NODES)
+        goto out;
+
+    link = READ_ONCE(cluster_map[tw->home_node]);
+    if (!link) {
+        ret = -EIO;
+        goto out;
+    }
+
+    req = kzalloc(sizeof(*req), GFP_KERNEL);
+    if (!req) {
+        ret = -ENOMEM;
+        goto out;
+    }
+
+    // The ticket takes at most PATH_MAX bytes of payload: the cwd
+    t = mattx_ticket_add(tw->orig_pid, tw->home_node, PATH_MAX);
+    if (!t) {
+        ret = -ENOMEM;
+        goto out;
+    }
+
+    req->orig_pid = tw->orig_pid;
+    req->req_id = t->req_id;
+    req->size = min_t(unsigned long, tw->size, PATH_MAX);   // the real call answers -ERANGE if the cwd does not fit
+
+    mattx_dbg("[RPC] Thread %d: getcwd(size %lu -> %u) as req %u, sleeping on its own ticket...\n",
+              current->pid, tw->size, req->size, t->req_id);
+
+    if (mattx_comm_send(link, MATTX_MSG_SYS_GETCWD_REQ, req, sizeof(*req)) < 0) {
+        // Never sleep for a reply to a request that was never sent
+        mattx_dbg("[RPC] Thread %d: GETCWD_REQ send failed\n", current->pid);
+        ret = -EIO;
+        goto done;
+    }
+
+    // Interrupted (signal, freeze of a migration or recall)? The wait cancels the request and still hands back the
+    // real result if the home node had already done it; otherwise the system call is restarted.
+    if (mattx_ticket_wait(t, MAX_SCHEDULE_TIMEOUT)) {
+        ret = -ERESTARTSYS;
+        goto done;
+    }
+
+    ret = t->retval;
+    if (ret > 0) {
+        if (!t->data || (size_t)ret > t->data_len || (unsigned long)ret > tw->size)
+            ret = -EIO;
+        else if (copy_to_user(tw->buf, t->data, ret))
+            ret = -EFAULT;
+    }
+
+    mattx_dbg("[RPC] Thread %d: getcwd() woke up: %ld '%s' (req %u)\n", current->pid, ret,
+              (ret > 0 && t->data) ? (char *)t->data : "", t->req_id);
+done:
+    mattx_ticket_del(t);
+out:
+    regs->ax = ret;
+    kfree(req);
+    kfree(tw);
+}
+
+static int ret_handler_getcwd(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    struct getcwd_kretprobe_data *data = (struct getcwd_kretprobe_data *)ri->data;
+    struct mattx_getcwd_tw *tw;
+    int home_node = -1;
+    u32 orig_pid = 0;
+    int i;
+
+    if (!data->armed) return 0;                 // not ours: the native result flows back
+
+    spin_lock(&guest_lock);
+    for (i = 0; i < guest_count; i++) {
+        if (guest_registry[i].local_pid == current->tgid) {
+            home_node = guest_registry[i].home_node;
+            orig_pid = guest_registry[i].orig_pid;
+            break;                              // the per-guest slot is not touched: this call has its own ticket
+        }
+    }
+    spin_unlock(&guest_lock);
+
+    if (home_node == -1) return 0;
+
+    // --- THE ATOMIC SHIELD ---
+    // If the process is dying (SIGKILL) or exiting, DO NOT freeze it!
+    if (fatal_signal_pending(current) || (current->flags & PF_EXITING)) {
+        mattx_dbg("[HOOK] Surrogate %s is dying. Aborting RPC.\n", current->comm);
+        return 0;
+    }
+
+    tw = kzalloc(sizeof(*tw), GFP_ATOMIC);
+    if (!tw) {
+        regs->ax = -ENOMEM;
+        return 0;
+    }
+    init_task_work(&tw->cb, mattx_getcwd_tw_fn);
+    tw->orig_pid = orig_pid;
+    tw->home_node = home_node;
+    tw->buf = data->buf;
+    tw->size = data->size;
+
+    mattx_dbg("[HOOK] Intercepted getcwd. Thread %d waits on its own ticket...\n", current->pid);
+    // The sabotaged call returns -ERANGE; the task_work overwrites it with the real result.
+    regs->ax = -EINTR;
+
+    if (real_task_work_add(current, &tw->cb, TWA_RESUME))
+        kfree(tw);
+    return 0;
+}
+
 // --- SOCKET HOOK ---
 struct socket_kretprobe_data {
     int domain;
@@ -10626,6 +11119,42 @@ int mattx_hooks_init(void) {
     ret = mattx_register_kretprobe(&utimensat_kprobe);
     if (ret < 0) {
         printk(KERN_ERR "MattX: register_kretprobe failed for utimensat, returned %d\n", ret);
+    }
+
+    memset(&chdir_kprobe, 0, sizeof(chdir_kprobe));
+    chdir_kprobe.kp.symbol_name = "__x64_sys_chdir";
+    chdir_kprobe.entry_handler = entry_handler_chdir;
+    chdir_kprobe.handler = ret_handler_chdir;
+    chdir_kprobe.data_size = sizeof(struct chdir_kretprobe_data);
+    chdir_kprobe.maxactive = 64;
+
+    ret = mattx_register_kretprobe(&chdir_kprobe);
+    if (ret < 0) {
+        printk(KERN_ERR "MattX: register_kretprobe failed for chdir, returned %d\n", ret);
+    }
+
+    memset(&fchdir_kprobe, 0, sizeof(fchdir_kprobe));
+    fchdir_kprobe.kp.symbol_name = "__x64_sys_fchdir";
+    fchdir_kprobe.entry_handler = entry_handler_fchdir;
+    fchdir_kprobe.handler = ret_handler_fchdir;
+    fchdir_kprobe.data_size = sizeof(struct fchdir_kretprobe_data);
+    fchdir_kprobe.maxactive = 64;
+
+    ret = mattx_register_kretprobe(&fchdir_kprobe);
+    if (ret < 0) {
+        printk(KERN_ERR "MattX: register_kretprobe failed for fchdir, returned %d\n", ret);
+    }
+
+    memset(&getcwd_kprobe, 0, sizeof(getcwd_kprobe));
+    getcwd_kprobe.kp.symbol_name = "__x64_sys_getcwd";
+    getcwd_kprobe.entry_handler = entry_handler_getcwd;
+    getcwd_kprobe.handler = ret_handler_getcwd;
+    getcwd_kprobe.data_size = sizeof(struct getcwd_kretprobe_data);
+    getcwd_kprobe.maxactive = 64;
+
+    ret = mattx_register_kretprobe(&getcwd_kprobe);
+    if (ret < 0) {
+        printk(KERN_ERR "MattX: register_kretprobe failed for getcwd, returned %d\n", ret);
     }
 
     memset(&socket_kprobe, 0, sizeof(socket_kprobe));

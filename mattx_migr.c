@@ -70,6 +70,9 @@ mattx_sys_fchmodat_fn real_sys_fchmodat = NULL;
 mattx_sys_fchownat_fn real_sys_fchownat = NULL;
 mattx_sys_truncate_fn real_sys_truncate = NULL;
 mattx_sys_utimensat_fn real_sys_utimensat = NULL;
+mattx_sys_chdir_fn real_sys_chdir = NULL;
+mattx_sys_fchdir_fn real_sys_fchdir = NULL;
+mattx_sys_getcwd_fn real_sys_getcwd = NULL;
 mattx_sys_faccessat2_fn real_sys_faccessat2 = NULL;
 mattx_sys_readlink_fn real_sys_readlink = NULL;
 mattx_sys_readlinkat_fn real_sys_readlinkat = NULL;
@@ -368,6 +371,27 @@ static void mattx_resolve_hidden_symbols(void) {
     kp.symbol_name = "__x64_sys_utimensat";
     if (register_kprobe(&kp) == 0) {
         real_sys_utimensat = (mattx_sys_utimensat_fn)kp.addr;
+        unregister_kprobe(&kp);
+    }
+
+    memset(&kp, 0, sizeof(kp));
+    kp.symbol_name = "__x64_sys_chdir";
+    if (register_kprobe(&kp) == 0) {
+        real_sys_chdir = (mattx_sys_chdir_fn)kp.addr;
+        unregister_kprobe(&kp);
+    }
+
+    memset(&kp, 0, sizeof(kp));
+    kp.symbol_name = "__x64_sys_fchdir";
+    if (register_kprobe(&kp) == 0) {
+        real_sys_fchdir = (mattx_sys_fchdir_fn)kp.addr;
+        unregister_kprobe(&kp);
+    }
+
+    memset(&kp, 0, sizeof(kp));
+    kp.symbol_name = "__x64_sys_getcwd";
+    if (register_kprobe(&kp) == 0) {
+        real_sys_getcwd = (mattx_sys_getcwd_fn)kp.addr;
         unregister_kprobe(&kp);
     }
 

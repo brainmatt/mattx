@@ -312,6 +312,12 @@ enum mattx_msg_type {
     MATTX_MSG_SYS_TRUNCATE_REPLY,
     MATTX_MSG_SYS_UTIMENSAT_REQ,  // issue #67 (P3, Track K): utimensat of a Surrogate (kprobe mode), Identity Theft, ticket based
     MATTX_MSG_SYS_UTIMENSAT_REPLY,
+    MATTX_MSG_SYS_CHDIR_REQ,  // issue #67 (P3, Track K): chdir of a Surrogate (kprobe mode), Identity Theft, ticket based
+    MATTX_MSG_SYS_CHDIR_REPLY,
+    MATTX_MSG_SYS_FCHDIR_REQ,  // issue #67 (P3, Track K): fchdir of a Surrogate (kprobe mode), Identity Theft, ticket based
+    MATTX_MSG_SYS_FCHDIR_REPLY,
+    MATTX_MSG_SYS_GETCWD_REQ,  // issue #67 (P3, Track K): getcwd of a Surrogate (kprobe mode), Identity Theft, ticket based
+    MATTX_MSG_SYS_GETCWD_REPLY,
 };
 
 struct mattx_header {
@@ -833,6 +839,67 @@ struct mattx_sys_utimensat_reply {
     int error;
     u32 req_id;                 // echo of the request's ticket id
     u32 pad;
+};
+
+/*
+ * chdir() of a Surrogate in kprobe mode (issue #67, P3, Track K, step 0028): the home node runs the REAL chdir() as the Deputy
+ * (Identity Theft): current->fs is the Deputy's fs_struct during the call, so the DEPUTY's cwd changes (the one every relative
+ * path RPC resolves against); the Surrogate keeps no cwd of its own. Search permission, ENOTDIR, ELOOP and the errno are the
+ * kernel's. path is 1 .. PATH_MAX bytes with the NUL.
+ */
+struct mattx_sys_chdir_req {
+    u32 orig_pid;
+    u32 req_id;                 // ticket id, never 0
+    u32 pathlen;                // with the NUL, 1 .. PATH_MAX
+    u32 pad;
+    char path[];                // must stay the LAST member
+};
+
+struct mattx_sys_chdir_reply {
+    u32 orig_pid;
+    int error;
+    u32 req_id;                 // echo of the request's ticket id
+    u32 pad;
+};
+
+/*
+ * fchdir() of a Surrogate in kprobe mode (issue #67, P3, Track K, step 0028): the home node runs the REAL fchdir() as the Deputy
+ * (Identity Theft), so the DEPUTY's cwd changes. fd is the Deputy's FD behind the Surrogate's Ghost directory FD.
+ */
+struct mattx_sys_fchdir_req {
+    u32 orig_pid;
+    u32 req_id;                 // ticket id, never 0
+    s32 fd;
+    u32 pad;
+};
+
+struct mattx_sys_fchdir_reply {
+    u32 orig_pid;
+    int error;
+    u32 req_id;                 // echo of the request's ticket id
+    u32 pad;
+};
+
+/*
+ * getcwd() of a Surrogate in kprobe mode (issue #67, P3, Track K, step 0028): the home node runs the REAL getcwd() as the Deputy
+ * (Identity Theft) and answers with the DEPUTY's cwd, the one every relative path RPC resolves against (and the one chdir() /
+ * fchdir() of the Surrogate change). size is the application's buffer size, clamped to PATH_MAX by the Surrogate; the kernel's
+ * -ERANGE / -ENOENT (removed cwd) / "(unreachable)" rules are the real call's. The reply's error is the length INCLUDING the NUL
+ * (the real call's result) or -errno, the string itself is the tail (ticket payload).
+ */
+struct mattx_sys_getcwd_req {
+    u32 orig_pid;
+    u32 req_id;                 // ticket id, never 0
+    u32 size;                   // 1 .. PATH_MAX
+    u32 pad;
+};
+
+struct mattx_sys_getcwd_reply {
+    u32 orig_pid;
+    int error;                  // length incl. NUL, or -errno
+    u32 req_id;                 // echo of the request's ticket id
+    u32 pad;
+    char data[];                // the cwd, error bytes incl. the NUL when error > 0; must stay the LAST member
 };
 
 struct mattx_sys_socket_req {
@@ -2218,6 +2285,12 @@ typedef long (*mattx_sys_truncate_fn)(const struct pt_regs *regs);
 extern mattx_sys_truncate_fn real_sys_truncate;
 typedef long (*mattx_sys_utimensat_fn)(const struct pt_regs *regs);
 extern mattx_sys_utimensat_fn real_sys_utimensat;
+typedef long (*mattx_sys_chdir_fn)(const struct pt_regs *regs);
+extern mattx_sys_chdir_fn real_sys_chdir;
+typedef long (*mattx_sys_fchdir_fn)(const struct pt_regs *regs);
+extern mattx_sys_fchdir_fn real_sys_fchdir;
+typedef long (*mattx_sys_getcwd_fn)(const struct pt_regs *regs);
+extern mattx_sys_getcwd_fn real_sys_getcwd;
 
 typedef long (*mattx_sys_faccessat2_fn)(const struct pt_regs *regs);
 extern mattx_sys_faccessat2_fn real_sys_faccessat2;

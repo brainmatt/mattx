@@ -13718,6 +13718,369 @@ static void handle_sys_utimensat_reply(struct mattx_link *link, struct mattx_hea
         mattx_dbg("[RPC] UTIMENSAT_REPLY req %u: nobody waits for it any more, dropped\n", reply->req_id);
 }
 
+// --- Home side: chdir of a Surrogate (kprobe mode), by Identity Theft ---
+// The request is the tail of the context (flexible path): it must stay the LAST member
+struct mattx_chdir_kworker_ctx { struct work_struct work; int target_node; struct mattx_sys_chdir_req req; };
+
+static void mattx_chdir_reply_send(int node, u32 orig_pid, u32 req_id, int error)
+{
+    struct mattx_sys_chdir_reply reply;
+    struct mattx_link *link = READ_ONCE(cluster_map[node]);
+
+    memset(&reply, 0, sizeof(reply));
+    reply.orig_pid = orig_pid;
+    reply.req_id = req_id;
+    reply.error = error;
+    if (link)
+        mattx_comm_send(link, MATTX_MSG_SYS_CHDIR_REPLY, &reply, sizeof(reply));
+}
+
+/*
+ * The REAL chdir() runs as the Deputy (mattx_execute_as_deputy: its fs, files and credentials, the path patched in; the Deputy
+ * is NOT woken up). A call under way cannot be aborted (short): a CANCEL that arrives before it starts skips it (-EINTR), a
+ * later one is of no use and consumed; the real result is sent. Exactly one reply.
+ */
+static void mattx_chdir_kworker(struct work_struct *work)
+{
+    struct mattx_chdir_kworker_ctx *ctx = container_of(work, struct mattx_chdir_kworker_ctx, work);
+    struct mattx_sys_chdir_req *req = &ctx->req;
+    struct task_struct *deputy = NULL;
+    struct pt_regs regs;
+    bool abandoned = false;
+    int err;
+
+    if (mattx_req_take_cancelled(ctx->target_node, req->orig_pid, req->req_id)) {
+        mattx_dbg("[WORMHOLE] CHDIR '%s' (req %u) cancelled by the Surrogate before it started, skipped\n", req->path, req->req_id);
+        err = -EINTR;
+    } else if (READ_ONCE(mattx_cancellable_stopping) || !READ_ONCE(cluster_map[ctx->target_node])) {
+        abandoned = true;
+        err = -EINTR;
+    } else {
+        mattx_dbg("[WORMHOLE] CHDIR '%s' (req %u) from Node %d (kworker)\n", req->path, req->req_id, ctx->target_node);
+
+        rcu_read_lock();
+        deputy = pid_task(find_vpid(req->orig_pid), PIDTYPE_PID);
+        if (deputy)
+            get_task_struct(deputy);
+        rcu_read_unlock();
+
+        if (!deputy) {
+            err = -ESRCH;                       // no Deputy, no identity to act as
+        } else if (!real_sys_chdir) {
+            err = -ENOSYS;
+        } else {
+            memset(&regs, 0, sizeof(regs));
+            // chdir(path = di): current->fs is the Deputy's during the call, so its cwd is what changes
+            err = mattx_execute_as_deputy(deputy, real_sys_chdir, &regs, req->path, 1, NULL, 0, 0, -1, 0);
+        }
+        if (deputy)
+            put_task_struct(deputy);
+        mattx_req_take_cancelled(ctx->target_node, req->orig_pid, req->req_id);     // a CANCEL during the call is of no use any more
+    }
+
+    if (abandoned) {
+        mattx_dbg("[WORMHOLE] CHDIR (req %u): nobody left to answer, reply dropped\n", req->req_id);
+    } else {
+        mattx_dbg("[WORMHOLE] CHDIR '%s' (req %u) done: %d\n", req->path, req->req_id, err);
+        mattx_chdir_reply_send(ctx->target_node, req->orig_pid, req->req_id, err);
+    }
+
+    kfree(ctx);
+    atomic_dec(&mattx_cancellable_inflight);
+}
+
+static void handle_sys_chdir_req(struct mattx_link *link, struct mattx_header *hdr, void *payload)
+{
+    struct mattx_sys_chdir_req *req = payload;
+    struct mattx_chdir_kworker_ctx *ctx;
+
+    if (!payload || hdr->length < sizeof(*req)) return;
+    if (hdr->sender_id >= MAX_NODES || READ_ONCE(mattx_cancellable_stopping)) return;
+
+    // The path is the tail of the request: 1 .. PATH_MAX bytes, NUL terminated, all of it inside the message
+    if (req->pathlen < 1 || req->pathlen > PATH_MAX || hdr->length < sizeof(*req) + (size_t)req->pathlen ||
+        req->path[req->pathlen - 1] != '\0') {
+        printk(KERN_ERR "MattX:[RPC] CHDIR_REQ %u of PID %u malformed (pathlen %u, message %u bytes)\n",
+               req->req_id, req->orig_pid, req->pathlen, hdr->length);
+        mattx_chdir_reply_send(hdr->sender_id, req->orig_pid, req->req_id, -EINVAL);
+        return;
+    }
+
+    ctx = kmalloc(sizeof(*ctx) + req->pathlen, GFP_ATOMIC);
+    if (!ctx) {
+        // Still answer: the Surrogate thread sleeps on this ticket
+        printk(KERN_ERR "MattX:[RPC] CHDIR_REQ %u of PID %u: out of memory\n", req->req_id, req->orig_pid);
+        mattx_chdir_reply_send(hdr->sender_id, req->orig_pid, req->req_id, -ENOMEM);
+        return;
+    }
+    INIT_WORK(&ctx->work, mattx_chdir_kworker);
+    memcpy(&ctx->req, req, sizeof(*req) + req->pathlen);
+    ctx->target_node = hdr->sender_id;
+    atomic_inc(&mattx_cancellable_inflight);
+    mattx_queue_wait_work(&ctx->work);
+}
+
+// Surrogate side: the reply belongs to exactly one waiting thread (its ticket)
+static void handle_sys_chdir_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload)
+{
+    struct mattx_sys_chdir_reply *reply = payload;
+
+    if (!payload || hdr->length < sizeof(*reply)) return;
+
+    mattx_dbg("[RPC] Received CHDIR_REPLY for Orig PID %u req %u. Error: %d\n", reply->orig_pid, reply->req_id, reply->error);
+    if (!mattx_ticket_complete(hdr->sender_id, reply->orig_pid, reply->req_id, reply->error, NULL, 0))
+        mattx_dbg("[RPC] CHDIR_REPLY req %u: nobody waits for it any more, dropped\n", reply->req_id);
+}
+
+// --- Home side: fchdir of a Surrogate (kprobe mode), by Identity Theft ---
+struct mattx_fchdir_kworker_ctx { struct work_struct work; int target_node; struct mattx_sys_fchdir_req req; };
+
+static void mattx_fchdir_reply_send(int node, u32 orig_pid, u32 req_id, int error)
+{
+    struct mattx_sys_fchdir_reply reply;
+    struct mattx_link *link = READ_ONCE(cluster_map[node]);
+
+    memset(&reply, 0, sizeof(reply));
+    reply.orig_pid = orig_pid;
+    reply.req_id = req_id;
+    reply.error = error;
+    if (link)
+        mattx_comm_send(link, MATTX_MSG_SYS_FCHDIR_REPLY, &reply, sizeof(reply));
+}
+
+/*
+ * The REAL fchdir() runs as the Deputy (mattx_execute_as_deputy: its fs, files and credentials; the Deputy is NOT woken up), so
+ * the Deputy's cwd changes. A call under way cannot be aborted (short): a CANCEL that arrives before it starts skips it (-EINTR),
+ * a later one is of no use and consumed; the real result is sent. Exactly one reply.
+ */
+static void mattx_fchdir_kworker(struct work_struct *work)
+{
+    struct mattx_fchdir_kworker_ctx *ctx = container_of(work, struct mattx_fchdir_kworker_ctx, work);
+    struct mattx_sys_fchdir_req *req = &ctx->req;
+    struct task_struct *deputy = NULL;
+    struct pt_regs regs;
+    bool abandoned = false;
+    int err;
+
+    if (mattx_req_take_cancelled(ctx->target_node, req->orig_pid, req->req_id)) {
+        mattx_dbg("[WORMHOLE] FCHDIR fd %d (req %u) cancelled by the Surrogate before it started, skipped\n", req->fd, req->req_id);
+        err = -EINTR;
+    } else if (READ_ONCE(mattx_cancellable_stopping) || !READ_ONCE(cluster_map[ctx->target_node])) {
+        abandoned = true;
+        err = -EINTR;
+    } else {
+        mattx_dbg("[WORMHOLE] FCHDIR fd %d (req %u) from Node %d (kworker)\n", req->fd, req->req_id, ctx->target_node);
+
+        rcu_read_lock();
+        deputy = pid_task(find_vpid(req->orig_pid), PIDTYPE_PID);
+        if (deputy)
+            get_task_struct(deputy);
+        rcu_read_unlock();
+
+        if (!deputy) {
+            err = -ESRCH;                       // no Deputy, no identity to act as
+        } else if (!real_sys_fchdir) {
+            err = -ENOSYS;
+        } else {
+            memset(&regs, 0, sizeof(regs));
+            // fchdir(fd = di): an FD >= 1000 is replaced by the helper (MattXFS export registry)
+            regs.di = (unsigned long)(long)req->fd;
+            err = mattx_execute_as_deputy(deputy, real_sys_fchdir, &regs, NULL, 0, NULL, 0, 0, req->fd, 1);
+        }
+        if (deputy)
+            put_task_struct(deputy);
+        mattx_req_take_cancelled(ctx->target_node, req->orig_pid, req->req_id);     // a CANCEL during the call is of no use any more
+    }
+
+    if (abandoned) {
+        mattx_dbg("[WORMHOLE] FCHDIR (req %u): nobody left to answer, reply dropped\n", req->req_id);
+    } else {
+        mattx_dbg("[WORMHOLE] FCHDIR fd %d (req %u) done: %d\n", req->fd, req->req_id, err);
+        mattx_fchdir_reply_send(ctx->target_node, req->orig_pid, req->req_id, err);
+    }
+
+    kfree(ctx);
+    atomic_dec(&mattx_cancellable_inflight);
+}
+
+static void handle_sys_fchdir_req(struct mattx_link *link, struct mattx_header *hdr, void *payload)
+{
+    struct mattx_sys_fchdir_req *req = payload;
+    struct mattx_fchdir_kworker_ctx *ctx;
+
+    if (!payload || hdr->length < sizeof(*req)) return;
+    if (hdr->sender_id >= MAX_NODES || READ_ONCE(mattx_cancellable_stopping)) return;
+
+    ctx = kmalloc(sizeof(*ctx), GFP_ATOMIC);
+    if (!ctx) {
+        // Still answer: the Surrogate thread sleeps on this ticket
+        printk(KERN_ERR "MattX:[RPC] FCHDIR_REQ %u of PID %u: out of memory\n", req->req_id, req->orig_pid);
+        mattx_fchdir_reply_send(hdr->sender_id, req->orig_pid, req->req_id, -ENOMEM);
+        return;
+    }
+    INIT_WORK(&ctx->work, mattx_fchdir_kworker);
+    memcpy(&ctx->req, req, sizeof(*req));
+    ctx->target_node = hdr->sender_id;
+    atomic_inc(&mattx_cancellable_inflight);
+    mattx_queue_wait_work(&ctx->work);
+}
+
+// Surrogate side: the reply belongs to exactly one waiting thread (its ticket)
+static void handle_sys_fchdir_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload)
+{
+    struct mattx_sys_fchdir_reply *reply = payload;
+
+    if (!payload || hdr->length < sizeof(*reply)) return;
+
+    mattx_dbg("[RPC] Received FCHDIR_REPLY for Orig PID %u req %u. Error: %d\n", reply->orig_pid, reply->req_id, reply->error);
+    if (!mattx_ticket_complete(hdr->sender_id, reply->orig_pid, reply->req_id, reply->error, NULL, 0))
+        mattx_dbg("[RPC] FCHDIR_REPLY req %u: nobody waits for it any more, dropped\n", reply->req_id);
+}
+
+// --- Home side: getcwd of a Surrogate (kprobe mode), by Identity Theft ---
+struct mattx_getcwd_kworker_ctx { struct work_struct work; int target_node; struct mattx_sys_getcwd_req req; };
+
+// error > 0: that many bytes of data (the cwd incl. the NUL) follow the header. Only the kworker sends data (it may sleep);
+// the error answers of the request handler (which may run in atomic context) never allocate.
+static void mattx_getcwd_reply_send(int node, u32 orig_pid, u32 req_id, int error, const char *data)
+{
+    struct mattx_sys_getcwd_reply small;
+    struct mattx_sys_getcwd_reply *reply = NULL;
+    struct mattx_link *link = READ_ONCE(cluster_map[node]);
+    size_t len = (error > 0 && data) ? (size_t)error : 0;
+
+    if (!link)
+        return;
+    if (len)
+        reply = kzalloc(sizeof(*reply) + len, GFP_KERNEL);
+    if (!reply) {
+        // No data to carry (or no memory for it): the small form. Still answer: the Surrogate thread sleeps on this ticket
+        memset(&small, 0, sizeof(small));
+        small.orig_pid = orig_pid;
+        small.req_id = req_id;
+        small.error = len ? -ENOMEM : (error > 0 ? -EIO : error);
+        mattx_comm_send(link, MATTX_MSG_SYS_GETCWD_REPLY, &small, sizeof(small));
+        return;
+    }
+    reply->orig_pid = orig_pid;
+    reply->req_id = req_id;
+    reply->error = error;
+    memcpy(reply->data, data, len);
+    mattx_comm_send(link, MATTX_MSG_SYS_GETCWD_REPLY, reply, sizeof(*reply) + len);
+    kfree(reply);
+}
+
+/*
+ * The REAL getcwd() runs as the Deputy (mattx_execute_as_deputy: its fs, files and credentials; the Deputy is NOT woken up); the
+ * string lands on the Deputy's scratchpad and is copied back by the helper. A call under way cannot be aborted (short): a CANCEL
+ * that arrives before it starts skips it (-EINTR), a later one is of no use and consumed; the real result is sent. Exactly one reply.
+ */
+static void mattx_getcwd_kworker(struct work_struct *work)
+{
+    struct mattx_getcwd_kworker_ctx *ctx = container_of(work, struct mattx_getcwd_kworker_ctx, work);
+    struct mattx_sys_getcwd_req *req = &ctx->req;
+    struct task_struct *deputy = NULL;
+    struct pt_regs regs;
+    char *out = NULL;
+    bool abandoned = false;
+    int err;
+
+    if (mattx_req_take_cancelled(ctx->target_node, req->orig_pid, req->req_id)) {
+        mattx_dbg("[WORMHOLE] GETCWD size %u (req %u) cancelled by the Surrogate before it started, skipped\n", req->size, req->req_id);
+        err = -EINTR;
+    } else if (READ_ONCE(mattx_cancellable_stopping) || !READ_ONCE(cluster_map[ctx->target_node])) {
+        abandoned = true;
+        err = -EINTR;
+    } else {
+        mattx_dbg("[WORMHOLE] GETCWD size %u (req %u) from Node %d (kworker)\n", req->size, req->req_id, ctx->target_node);
+
+        rcu_read_lock();
+        deputy = pid_task(find_vpid(req->orig_pid), PIDTYPE_PID);
+        if (deputy)
+            get_task_struct(deputy);
+        rcu_read_unlock();
+
+        out = kzalloc(PATH_MAX, GFP_KERNEL);
+        if (!deputy) {
+            err = -ESRCH;                       // no Deputy, no identity to act as
+        } else if (!real_sys_getcwd) {
+            err = -ENOSYS;
+        } else if (!out) {
+            err = -ENOMEM;
+        } else {
+            memset(&regs, 0, sizeof(regs));
+            // getcwd(buf = di, size = si): the helper puts the buffer on the scratchpad and copies it back
+            regs.si = req->size;
+            err = mattx_execute_as_deputy(deputy, real_sys_getcwd, &regs, NULL, 0, out, req->size, 1, -1, 0);
+        }
+        if (deputy)
+            put_task_struct(deputy);
+        mattx_req_take_cancelled(ctx->target_node, req->orig_pid, req->req_id);     // a CANCEL during the call is of no use any more
+    }
+
+    if (abandoned) {
+        mattx_dbg("[WORMHOLE] GETCWD (req %u): nobody left to answer, reply dropped\n", req->req_id);
+    } else {
+        mattx_dbg("[WORMHOLE] GETCWD (req %u) done: %d '%s'\n", req->req_id, err, (err > 0 && out) ? out : "");
+        mattx_getcwd_reply_send(ctx->target_node, req->orig_pid, req->req_id, err, out);
+    }
+
+    kfree(out);
+    kfree(ctx);
+    atomic_dec(&mattx_cancellable_inflight);
+}
+
+static void handle_sys_getcwd_req(struct mattx_link *link, struct mattx_header *hdr, void *payload)
+{
+    struct mattx_sys_getcwd_req *req = payload;
+    struct mattx_getcwd_kworker_ctx *ctx;
+
+    if (!payload || hdr->length < sizeof(*req)) return;
+    if (hdr->sender_id >= MAX_NODES || READ_ONCE(mattx_cancellable_stopping)) return;
+
+    if (req->size < 1 || req->size > PATH_MAX) {
+        printk(KERN_ERR "MattX:[RPC] GETCWD_REQ %u of PID %u malformed (size %u)\n", req->req_id, req->orig_pid, req->size);
+        mattx_getcwd_reply_send(hdr->sender_id, req->orig_pid, req->req_id, -EINVAL, NULL);
+        return;
+    }
+
+    ctx = kmalloc(sizeof(*ctx), GFP_ATOMIC);
+    if (!ctx) {
+        // Still answer: the Surrogate thread sleeps on this ticket
+        printk(KERN_ERR "MattX:[RPC] GETCWD_REQ %u of PID %u: out of memory\n", req->req_id, req->orig_pid);
+        mattx_getcwd_reply_send(hdr->sender_id, req->orig_pid, req->req_id, -ENOMEM, NULL);
+        return;
+    }
+    INIT_WORK(&ctx->work, mattx_getcwd_kworker);
+    memcpy(&ctx->req, req, sizeof(*req));
+    ctx->target_node = hdr->sender_id;
+    atomic_inc(&mattx_cancellable_inflight);
+    mattx_queue_wait_work(&ctx->work);
+}
+
+// Surrogate side: the reply belongs to exactly one waiting thread (its ticket); the cwd is the ticket's payload
+static void handle_sys_getcwd_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload)
+{
+    struct mattx_sys_getcwd_reply *reply = payload;
+    long err;
+    size_t len = 0;
+
+    if (!payload || hdr->length < sizeof(*reply)) return;
+
+    err = reply->error;
+    if (err > 0) {
+        len = err;
+        if (len > PATH_MAX || hdr->length < sizeof(*reply) + len) {
+            err = -EIO;                         // a malformed reply: never read past the message
+            len = 0;
+        }
+    }
+
+    mattx_dbg("[RPC] Received GETCWD_REPLY for Orig PID %u req %u. Result: %ld\n", reply->orig_pid, reply->req_id, err);
+    if (!mattx_ticket_complete(hdr->sender_id, reply->orig_pid, reply->req_id, err, len ? reply->data : NULL, len))
+        mattx_dbg("[RPC] GETCWD_REPLY req %u: nobody waits for it any more, dropped\n", reply->req_id);
+}
+
 /*
  * DIRECTORY OPERATIONS of MattXFS (issue #67, P3, Track M). The directory inode of MattXFS only had .lookup, .create
  * and .unlink: mkdir and rmdir were refused by the VFS. The operation is run at the home node through the VFS (the
@@ -14963,6 +15326,12 @@ void mattx_fileio_init_handlers(void) {
     mattx_register_handler(MATTX_MSG_SYS_TRUNCATE_REPLY, handle_sys_truncate_reply);
     mattx_register_handler(MATTX_MSG_SYS_UTIMENSAT_REQ, handle_sys_utimensat_req);
     mattx_register_handler(MATTX_MSG_SYS_UTIMENSAT_REPLY, handle_sys_utimensat_reply);
+    mattx_register_handler(MATTX_MSG_SYS_CHDIR_REQ, handle_sys_chdir_req);
+    mattx_register_handler(MATTX_MSG_SYS_CHDIR_REPLY, handle_sys_chdir_reply);
+    mattx_register_handler(MATTX_MSG_SYS_FCHDIR_REQ, handle_sys_fchdir_req);
+    mattx_register_handler(MATTX_MSG_SYS_FCHDIR_REPLY, handle_sys_fchdir_reply);
+    mattx_register_handler(MATTX_MSG_SYS_GETCWD_REQ, handle_sys_getcwd_req);
+    mattx_register_handler(MATTX_MSG_SYS_GETCWD_REPLY, handle_sys_getcwd_reply);
     mattx_register_handler(MATTX_MSG_VFS_MKDIR_REQ, handle_vfs_mkdir_req);
     mattx_register_handler(MATTX_MSG_VFS_MKDIR_REPLY, handle_vfs_mkdir_reply);
     mattx_register_handler(MATTX_MSG_VFS_RMDIR_REQ, handle_vfs_rmdir_req);
