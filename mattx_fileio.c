@@ -769,10 +769,28 @@ static void mattx_revert_creds(const struct cred *old_cred, struct cred *new_cre
 }
 
 
+/*
+ * The scratchpad of mattx_execute_as_deputy() is ONE area below the stopped Deputy's stack: orig_pid is per PROCESS, so two
+ * Surrogate threads of one process (two kworkers, one Deputy) used the same path / buffer area at the same time and
+ * overwrote each other's path before the real syscall ran: harmless for stat, destructive for unlink / rename (issue #67,
+ * P3, K-F4). One mutex per Deputy would need a place in every Deputy; a small hashed array (by the Deputy's pid) serialises the
+ * borrowed section of the SAME Deputy and lets different Deputies run in parallel (a collision of two Deputies only waits).
+ */
+#define MATTX_DEPUTY_LOCKS 64
+static struct mutex mattx_deputy_scratch_lock[MATTX_DEPUTY_LOCKS];
+
+static struct mutex *mattx_deputy_scratch_mutex(struct task_struct *deputy)
+{
+    return &mattx_deputy_scratch_lock[hash_32((u32)deputy->pid, ilog2(MATTX_DEPUTY_LOCKS))];
+}
+
 // --- THE IDENTITY THEFT HELPER ---
 static int mattx_execute_as_deputy(struct task_struct *deputy, long (*syscall_fn)(const struct pt_regs *), struct pt_regs *regs, const char *path, int path_reg, void *out_buf, size_t out_size, int buf_reg, int fd_to_map, int fd_reg) {
     int ret = -ESRCH;
     if (!deputy) return ret;
+
+    mutex_lock(mattx_deputy_scratch_mutex(deputy));
+    mattx_dbg("[KWORKER] Identity Theft of Deputy %d: scratchpad locked\n", deputy->pid);
 
     kthread_use_mm(deputy->mm);
     struct fs_struct *old_fs = current->fs;
@@ -861,6 +879,7 @@ out:
     revert_creds(old_cred);
     kthread_unuse_mm(deputy->mm);
 
+    mutex_unlock(mattx_deputy_scratch_mutex(deputy));
     return ret;
 }
 
@@ -875,6 +894,8 @@ static DEFINE_SPINLOCK(mfs_file_lock);
 
 #include <linux/version.h>
 #include <linux/falloc.h>
+#include <linux/hash.h>
+#include <linux/log2.h>
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
 typedef struct mnt_idmap mattx_idmap_t;
@@ -12529,6 +12550,122 @@ static void handle_sys_fallocate_reply(struct mattx_link *link, struct mattx_hea
         mattx_dbg("[RPC] FALLOCATE_REPLY req %u: nobody waits for it any more, dropped\n", reply->req_id);
 }
 
+// --- Home side: unlink / unlinkat / rmdir of a Surrogate (kprobe mode), by Identity Theft ---
+// The request is the tail of the context (flexible path): it must stay the LAST member
+struct mattx_unlinkat_kworker_ctx { struct work_struct work; int target_node; struct mattx_sys_unlinkat_req req; };
+
+static void mattx_unlinkat_reply_send(int node, u32 orig_pid, u32 req_id, int error)
+{
+    struct mattx_sys_unlinkat_reply reply;
+    struct mattx_link *link = READ_ONCE(cluster_map[node]);
+
+    memset(&reply, 0, sizeof(reply));
+    reply.orig_pid = orig_pid;
+    reply.req_id = req_id;
+    reply.error = error;
+    if (link)
+        mattx_comm_send(link, MATTX_MSG_SYS_UNLINKAT_REPLY, &reply, sizeof(reply));
+}
+
+/*
+ * The REAL unlinkat() runs as the Deputy (mattx_execute_as_deputy: its fs, files and credentials, the Deputy is NOT woken
+ * up). A call under way cannot be aborted (short, like fsync): a CANCEL that arrives before it starts skips it (-EINTR), a
+ * later one is of no use and consumed; the real result is sent. Exactly one reply.
+ */
+static void mattx_unlinkat_kworker(struct work_struct *work)
+{
+    struct mattx_unlinkat_kworker_ctx *ctx = container_of(work, struct mattx_unlinkat_kworker_ctx, work);
+    struct mattx_sys_unlinkat_req *req = &ctx->req;
+    struct task_struct *deputy = NULL;
+    struct pt_regs regs;
+    bool abandoned = false;
+    int err;
+
+    if (mattx_req_take_cancelled(ctx->target_node, req->orig_pid, req->req_id)) {
+        mattx_dbg("[WORMHOLE] UNLINKAT '%s' (req %u) cancelled by the Surrogate before it started, skipped\n", req->path, req->req_id);
+        err = -EINTR;
+    } else if (READ_ONCE(mattx_cancellable_stopping) || !READ_ONCE(cluster_map[ctx->target_node])) {
+        abandoned = true;
+        err = -EINTR;
+    } else {
+        mattx_dbg("[WORMHOLE] UNLINKAT dirfd %d '%s' flags 0x%x (req %u) from Node %d (kworker)\n", req->dirfd, req->path,
+                  req->flags, req->req_id, ctx->target_node);
+
+        rcu_read_lock();
+        deputy = pid_task(find_vpid(req->orig_pid), PIDTYPE_PID);
+        if (deputy)
+            get_task_struct(deputy);
+        rcu_read_unlock();
+
+        if (!deputy) {
+            err = -ESRCH;                       // no Deputy, no identity to act as
+        } else if (!real_sys_unlinkat) {
+            err = -ENOSYS;
+        } else {
+            memset(&regs, 0, sizeof(regs));
+            regs.di = (unsigned long)(long)req->dirfd;      // an FD >= 1000 is replaced by the helper (MattXFS export registry)
+            regs.dx = req->flags;
+            err = mattx_execute_as_deputy(deputy, real_sys_unlinkat, &regs, req->path, 2, NULL, 0, 0, req->dirfd, 1);
+        }
+        if (deputy)
+            put_task_struct(deputy);
+        mattx_req_take_cancelled(ctx->target_node, req->orig_pid, req->req_id);     // a CANCEL during the unlink is of no use any more
+    }
+
+    if (abandoned) {
+        mattx_dbg("[WORMHOLE] UNLINKAT (req %u): nobody left to answer, reply dropped\n", req->req_id);
+    } else {
+        mattx_dbg("[WORMHOLE] UNLINKAT '%s' (req %u) done: %d\n", req->path, req->req_id, err);
+        mattx_unlinkat_reply_send(ctx->target_node, req->orig_pid, req->req_id, err);
+    }
+
+    kfree(ctx);
+    atomic_dec(&mattx_cancellable_inflight);
+}
+
+static void handle_sys_unlinkat_req(struct mattx_link *link, struct mattx_header *hdr, void *payload)
+{
+    struct mattx_sys_unlinkat_req *req = payload;
+    struct mattx_unlinkat_kworker_ctx *ctx;
+
+    if (!payload || hdr->length < sizeof(*req)) return;
+    if (hdr->sender_id >= MAX_NODES || READ_ONCE(mattx_cancellable_stopping)) return;
+
+    // The path is the tail of the request: 1 .. PATH_MAX bytes, NUL terminated, all of it inside the message
+    if (req->pathlen < 1 || req->pathlen > PATH_MAX || hdr->length < sizeof(*req) + req->pathlen ||
+        req->path[req->pathlen - 1] != '\0') {
+        printk(KERN_ERR "MattX:[RPC] UNLINKAT_REQ %u of PID %u malformed (pathlen %u, message %u bytes)\n",
+               req->req_id, req->orig_pid, req->pathlen, hdr->length);
+        mattx_unlinkat_reply_send(hdr->sender_id, req->orig_pid, req->req_id, -EINVAL);
+        return;
+    }
+
+    ctx = kmalloc(sizeof(*ctx) + req->pathlen, GFP_ATOMIC);
+    if (!ctx) {
+        // Still answer: the Surrogate thread sleeps on this ticket
+        printk(KERN_ERR "MattX:[RPC] UNLINKAT_REQ %u of PID %u: out of memory\n", req->req_id, req->orig_pid);
+        mattx_unlinkat_reply_send(hdr->sender_id, req->orig_pid, req->req_id, -ENOMEM);
+        return;
+    }
+    INIT_WORK(&ctx->work, mattx_unlinkat_kworker);
+    memcpy(&ctx->req, req, sizeof(*req) + req->pathlen);
+    ctx->target_node = hdr->sender_id;
+    atomic_inc(&mattx_cancellable_inflight);
+    mattx_queue_wait_work(&ctx->work);
+}
+
+// Surrogate side: the reply belongs to exactly one waiting thread (its ticket)
+static void handle_sys_unlinkat_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload)
+{
+    struct mattx_sys_unlinkat_reply *reply = payload;
+
+    if (!payload || hdr->length < sizeof(*reply)) return;
+
+    mattx_dbg("[RPC] Received UNLINKAT_REPLY for Orig PID %u req %u. Error: %d\n", reply->orig_pid, reply->req_id, reply->error);
+    if (!mattx_ticket_complete(hdr->sender_id, reply->orig_pid, reply->req_id, reply->error, NULL, 0))
+        mattx_dbg("[RPC] UNLINKAT_REPLY req %u: nobody waits for it any more, dropped\n", reply->req_id);
+}
+
 /*
  * DIRECTORY OPERATIONS of MattXFS (issue #67, P3, Track M). The directory inode of MattXFS only had .lookup, .create
  * and .unlink: mkdir and rmdir were refused by the VFS. The operation is run at the home node through the VFS (the
@@ -13680,6 +13817,11 @@ void mattx_vfs_node_gone(int node_id)
 }
 
 void mattx_fileio_init_handlers(void) {
+    int lk;
+
+    for (lk = 0; lk < MATTX_DEPUTY_LOCKS; lk++)
+        mutex_init(&mattx_deputy_scratch_lock[lk]);
+
     mattx_unloading = false;
     mattx_dsm_txn_init();
     mattx_dsm_wq = alloc_ordered_workqueue("mattx_dsm", WQ_MEM_RECLAIM);
@@ -13751,6 +13893,8 @@ void mattx_fileio_init_handlers(void) {
     mattx_register_handler(MATTX_MSG_SYS_FSETATTR_REPLY, handle_sys_fsetattr_reply);
     mattx_register_handler(MATTX_MSG_SYS_FALLOCATE_REQ, handle_sys_fallocate_req);
     mattx_register_handler(MATTX_MSG_SYS_FALLOCATE_REPLY, handle_sys_fallocate_reply);
+    mattx_register_handler(MATTX_MSG_SYS_UNLINKAT_REQ, handle_sys_unlinkat_req);
+    mattx_register_handler(MATTX_MSG_SYS_UNLINKAT_REPLY, handle_sys_unlinkat_reply);
     mattx_register_handler(MATTX_MSG_VFS_MKDIR_REQ, handle_vfs_mkdir_req);
     mattx_register_handler(MATTX_MSG_VFS_MKDIR_REPLY, handle_vfs_mkdir_reply);
     mattx_register_handler(MATTX_MSG_VFS_RMDIR_REQ, handle_vfs_rmdir_req);

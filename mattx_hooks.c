@@ -2198,30 +2198,202 @@ static int ret_handler_dup(struct kretprobe_instance *ri, struct pt_regs *regs) 
     return 0;
 }
 
-// --- UNLINK HOOK ---
-struct unlinkat_kretprobe_data {
+// --- UNLINK HOOKS: unlink / unlinkat / rmdir (kprobe fallback, issue #67, P3, Track K) ---
+/*
+ * The three system calls are ONE operation in the kernel: unlink(p) is unlinkat(AT_FDCWD, p, 0) and rmdir(p) is
+ * unlinkat(AT_FDCWD, p, AT_REMOVEDIR). The three entry handlers save what the application passed and sabotage the
+ * inner path; the shared return handler queues a task_work (the open() pattern: only this thread sleeps, on its own
+ * ticket, and the result goes into the saved registers) that sends ONE request, SYS_UNLINKAT, to the home node, where
+ * the real unlinkat() runs as the Deputy. The old way (freeze the group, per-guest slot) stays only as the fallback of
+ * unlinkat when the task_work resolver is missing; unlink and rmdir are then left native.
+ */
+struct unlink_kretprobe_data {
     const char __user *pathname;
+    int dfd;
+    int flags;
+    bool armed;                     // the entry handler took the call (the inner path was sabotaged)
+    bool legacy_unlinkat;           // the call was unlinkat()
 };
 
 static struct kretprobe unlinkat_kprobe;
+static struct kretprobe unlink_kprobe;
+static struct kretprobe rmdir_kprobe;
+
+// Common start: is this one ours? (a Surrogate, kprobe mode, file I/O routed to the home node)
+static bool mattx_unlink_entry_wanted(struct unlink_kretprobe_data *data)
+{
+    data->armed = false;
+    data->legacy_unlinkat = false;
+    if (!is_guest_process(current->pid)) return false;
+    if (config_mattxfs_enabled) return false;
+    if (!config_migrate_file_io) return false;      // Local Breakout: the native call on the remote node's own filesystem
+    return true;
+}
 
 static int entry_handler_unlinkat(struct kretprobe_instance *ri, struct pt_regs *regs) {
-    pid_t my_pid = current->pid;
-    struct unlinkat_kretprobe_data *data = (struct unlinkat_kretprobe_data *)ri->data;
+    struct unlink_kretprobe_data *data = (struct unlink_kretprobe_data *)ri->data;
     struct pt_regs *sys_regs = SYSCALL_REGS(regs); // Unwrap!
 
-    if (!is_guest_process(my_pid)) return 0; 
-    if (config_mattxfs_enabled) return 0; 
+    if (!mattx_unlink_entry_wanted(data)) return 0;
 
+    data->dfd = (int)sys_regs->di;
     data->pathname = (const char __user *)sys_regs->si;
+    data->flags = (int)sys_regs->dx;
+    data->legacy_unlinkat = true;
+    data->armed = true;
     sys_regs->si = 0; // Sabotage inner pathname!
 
     return 0;
 }
 
-static int ret_handler_unlinkat(struct kretprobe_instance *ri, struct pt_regs *regs) {
+static int entry_handler_unlink(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    struct unlink_kretprobe_data *data = (struct unlink_kretprobe_data *)ri->data;
+    struct pt_regs *sys_regs = SYSCALL_REGS(regs);
+
+    if (!mattx_unlink_entry_wanted(data)) return 0;
+    if (!real_task_work_add) return 0;              // no legacy way for this one: native
+
+    data->dfd = AT_FDCWD;
+    data->pathname = (const char __user *)sys_regs->di;
+    data->flags = 0;
+    data->armed = true;
+    sys_regs->di = 0;
+
+    return 0;
+}
+
+static int entry_handler_rmdir(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    struct unlink_kretprobe_data *data = (struct unlink_kretprobe_data *)ri->data;
+    struct pt_regs *sys_regs = SYSCALL_REGS(regs);
+
+    if (!mattx_unlink_entry_wanted(data)) return 0;
+    if (!real_task_work_add) return 0;
+
+    data->dfd = AT_FDCWD;
+    data->pathname = (const char __user *)sys_regs->di;
+    data->flags = AT_REMOVEDIR;
+    data->armed = true;
+    sys_regs->di = 0;
+
+    return 0;
+}
+
+struct mattx_unlinkat_tw {
+    struct callback_head cb;
+    u32 orig_pid;
+    int home_node;
+    const char __user *path;        // read by the task_work: it runs in the thread's own process context
+    int dfd;
+    int flags;
+};
+
+static void mattx_unlinkat_tw_fn(struct callback_head *cb) {
+    struct mattx_unlinkat_tw *tw = container_of(cb, struct mattx_unlinkat_tw, cb);
+    struct pt_regs *regs = task_pt_regs(current);
+    struct mattx_sys_unlinkat_req *req = NULL;
+    struct mattx_ticket *t;
+    struct mattx_link *link;
+    long ret = -EINTR;
+    long n;
+
+    if (fatal_signal_pending(current) || tw->home_node < 0 || tw->home_node >= MAX_NODES)
+        goto out;
+
+    link = READ_ONCE(cluster_map[tw->home_node]);
+    if (!link) {
+        ret = -EIO;
+        goto out;
+    }
+
+    req = kzalloc(sizeof(*req) + PATH_MAX, GFP_KERNEL);
+    if (!req) {
+        ret = -ENOMEM;
+        goto out;
+    }
+
+    n = strncpy_from_user(req->path, tw->path, PATH_MAX);
+    if (n < 0) {
+        ret = n;                                    // -EFAULT
+        goto out;
+    }
+    if (n == 0) {
+        ret = -ENOENT;
+        goto out;
+    }
+    if (n >= PATH_MAX) {                            // no NUL within PATH_MAX bytes: the kernel refuses it too
+        mattx_dbg("[RPC] Thread %d: unlink path is longer than %d bytes: -ENAMETOOLONG\n", current->pid, PATH_MAX - 1);
+        ret = -ENAMETOOLONG;
+        goto out;
+    }
+    req->pathlen = n + 1;                           // with the NUL
+    req->dirfd = AT_FDCWD;
+    if (req->path[0] != '/' && tw->dfd != AT_FDCWD) {
+        // unlinkat(dirfd, relative): the home node needs the Deputy's FD behind our Ghost directory FD
+        struct mattx_fake_fd_info *dir_info = NULL;
+        struct file *dirf = tw->dfd >= 0 ? fget(tw->dfd) : NULL;
+
+        if (!dirf) {
+            ret = -EBADF;
+            goto out;
+        }
+        if (dirf->f_op == &mattx_fops)
+            dir_info = dirf->private_data;
+        if (!dir_info) {
+            // A native FD of the Surrogate cannot be named at the home node
+            mattx_dbg("[RPC] Thread %d: unlinkat(dirfd=%d, '%s'): the directory is not a Ghost FD: -EOPNOTSUPP\n", current->pid, tw->dfd, req->path);
+            fput(dirf);
+            ret = -EOPNOTSUPP;
+            goto out;
+        }
+        if (dir_info->home_node != tw->home_node || dir_info->orig_pid != tw->orig_pid) {
+            fput(dirf);
+            ret = -EBADF;
+            goto out;
+        }
+        req->dirfd = dir_info->remote_fd;
+        mattx_dbg("[RPC] Thread %d: unlinkat(dirfd=%d -> Deputy FD %d, '%s')\n", current->pid, tw->dfd, req->dirfd, req->path);
+        fput(dirf);
+    }
+
+    t = mattx_ticket_add(tw->orig_pid, tw->home_node, 0);
+    if (!t) {
+        ret = -ENOMEM;
+        goto out;
+    }
+
+    req->orig_pid = tw->orig_pid;
+    req->req_id = t->req_id;
+    req->flags = tw->flags;
+
+    mattx_dbg("[RPC] Thread %d: unlinkat(dirfd %d, '%s', flags 0x%x) as req %u, sleeping on its own ticket...\n", current->pid,
+              req->dirfd, req->path, req->flags, t->req_id);
+
+    if (mattx_comm_send(link, MATTX_MSG_SYS_UNLINKAT_REQ, req, sizeof(*req) + req->pathlen) < 0) {
+        // Never sleep for a reply to a request that was never sent
+        mattx_dbg("[RPC] Thread %d: UNLINKAT_REQ send failed\n", current->pid);
+        ret = -EIO;
+        goto done;
+    }
+
+    // Interrupted (signal, freeze of a migration or recall)? The wait cancels the request and still hands back the
+    // real result if the home node had already done it; otherwise the system call is restarted.
+    if (mattx_ticket_wait(t, MAX_SCHEDULE_TIMEOUT) == 0)
+        ret = t->retval;
+    else
+        ret = -ERESTARTSYS;
+
+    mattx_dbg("[RPC] Thread %d: unlinkat('%s') woke up: %ld (req %u)\n", current->pid, req->path, ret, t->req_id);
+done:
+    mattx_ticket_del(t);
+out:
+    regs->ax = ret;
+    kfree(req);
+    kfree(tw);
+}
+
+static int mattx_unlinkat_legacy_ret(struct kretprobe_instance *ri, struct pt_regs *regs) {
     pid_t my_pid = current->pid;
-    struct unlinkat_kretprobe_data *data = (struct unlinkat_kretprobe_data *)ri->data;
+    struct unlink_kretprobe_data *data = (struct unlink_kretprobe_data *)ri->data;
     char filename[256] = {0};
     int home_node = -1;
     u32 orig_pid = 0;
@@ -2268,6 +2440,64 @@ static int ret_handler_unlinkat(struct kretprobe_instance *ri, struct pt_regs *r
     }
     return 0;
 }
+
+static int ret_handler_unlink(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    struct unlink_kretprobe_data *data = (struct unlink_kretprobe_data *)ri->data;
+    int home_node = -1;
+    u32 orig_pid = 0;
+    int i;
+
+    if (!data->armed) return 0;                 // not ours: the native result flows back
+
+    if (real_task_work_add) {
+        struct mattx_unlinkat_tw *tw;
+
+        spin_lock(&guest_lock);
+        for (i = 0; i < guest_count; i++) {
+            if (guest_registry[i].local_pid == current->tgid) {
+                home_node = guest_registry[i].home_node;
+                orig_pid = guest_registry[i].orig_pid;
+                break;                          // the per-guest slot is not touched: this call has its own ticket
+            }
+        }
+        spin_unlock(&guest_lock);
+
+        if (home_node == -1 || !data->pathname) return 0;
+
+        // --- THE ATOMIC SHIELD ---
+        // If the process is dying (SIGKILL) or exiting, DO NOT freeze it!
+        if (fatal_signal_pending(current) || (current->flags & PF_EXITING)) {
+            mattx_dbg("[HOOK] Surrogate %s is dying. Aborting RPC.\n", current->comm);
+            return 0;
+        }
+
+        tw = kzalloc(sizeof(*tw), GFP_ATOMIC);
+        if (!tw) {
+            regs->ax = -ENOMEM;
+            return 0;
+        }
+        init_task_work(&tw->cb, mattx_unlinkat_tw_fn);
+        tw->orig_pid = orig_pid;
+        tw->home_node = home_node;
+        tw->path = data->pathname;
+        tw->dfd = data->dfd;
+        tw->flags = data->flags;
+
+        mattx_dbg("[HOOK] Intercepted unlink / unlinkat / rmdir (flags 0x%x). Thread %d waits on its own ticket...\n", data->flags, current->pid);
+        // The sabotaged call returns -EFAULT; the task_work overwrites it with the real result.
+        regs->ax = -EINTR;
+
+        if (real_task_work_add(current, &tw->cb, TWA_RESUME))
+            kfree(tw);
+        return 0;
+    }
+
+    // No task_work resolver: unlinkat() keeps the old way (freeze the group, the rpc worker polls the per-guest slot)
+    if (data->legacy_unlinkat)
+        return mattx_unlinkat_legacy_ret(ri, regs);
+    return 0;
+}
+
 
 
 // --- SOCKET HOOK ---
@@ -8405,13 +8635,37 @@ int mattx_hooks_init(void) {
     memset(&unlinkat_kprobe, 0, sizeof(unlinkat_kprobe));
     unlinkat_kprobe.kp.symbol_name = "__x64_sys_unlinkat";
     unlinkat_kprobe.entry_handler = entry_handler_unlinkat;
-    unlinkat_kprobe.handler = ret_handler_unlinkat;
-    unlinkat_kprobe.data_size = sizeof(struct unlinkat_kretprobe_data);
+    unlinkat_kprobe.handler = ret_handler_unlink;
+    unlinkat_kprobe.data_size = sizeof(struct unlink_kretprobe_data);
     unlinkat_kprobe.maxactive = 64;
 
     ret = mattx_register_kretprobe(&unlinkat_kprobe);
     if (ret < 0) {
         printk(KERN_ERR "MattX: register_kretprobe failed for unlinkat, returned %d\n", ret);
+    }
+
+    memset(&unlink_kprobe, 0, sizeof(unlink_kprobe));
+    unlink_kprobe.kp.symbol_name = "__x64_sys_unlink";
+    unlink_kprobe.entry_handler = entry_handler_unlink;
+    unlink_kprobe.handler = ret_handler_unlink;
+    unlink_kprobe.data_size = sizeof(struct unlink_kretprobe_data);
+    unlink_kprobe.maxactive = 64;
+
+    ret = mattx_register_kretprobe(&unlink_kprobe);
+    if (ret < 0) {
+        printk(KERN_ERR "MattX: register_kretprobe failed for unlink, returned %d\n", ret);
+    }
+
+    memset(&rmdir_kprobe, 0, sizeof(rmdir_kprobe));
+    rmdir_kprobe.kp.symbol_name = "__x64_sys_rmdir";
+    rmdir_kprobe.entry_handler = entry_handler_rmdir;
+    rmdir_kprobe.handler = ret_handler_unlink;
+    rmdir_kprobe.data_size = sizeof(struct unlink_kretprobe_data);
+    rmdir_kprobe.maxactive = 64;
+
+    ret = mattx_register_kretprobe(&rmdir_kprobe);
+    if (ret < 0) {
+        printk(KERN_ERR "MattX: register_kretprobe failed for rmdir, returned %d\n", ret);
     }
 
     memset(&socket_kprobe, 0, sizeof(socket_kprobe));

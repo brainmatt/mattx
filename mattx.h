@@ -294,6 +294,8 @@ enum mattx_msg_type {
     MATTX_MSG_VFS_FALLOCATE_REPLY,
     MATTX_MSG_SYS_FALLOCATE_REQ,     // issue #67 (P3, Track M): fallocate() of a Surrogate on a Deputy file (Ghost file), ticket based
     MATTX_MSG_SYS_FALLOCATE_REPLY,
+    MATTX_MSG_SYS_UNLINKAT_REQ,      // issue #67 (P3, Track K): unlink / unlinkat / rmdir of a Surrogate (kprobe mode), Identity Theft, ticket based
+    MATTX_MSG_SYS_UNLINKAT_REPLY,
 };
 
 struct mattx_header {
@@ -593,6 +595,30 @@ struct mattx_sys_fallocate_req {
 };
 
 struct mattx_sys_fallocate_reply {
+    u32 orig_pid;
+    int error;
+    u32 req_id;                 // echo of the request's ticket id
+    u32 pad;
+};
+
+/*
+ * unlink() / unlinkat() / rmdir() of a Surrogate in kprobe mode (issue #67, P3, Track K): the home node runs the REAL
+ * unlinkat() as the Deputy (Identity Theft), so cwd, dirfd, permissions, sticky bit and the errno are the kernel's.
+ * unlink(p) is unlinkat(AT_FDCWD, p, 0) and rmdir(p) is unlinkat(AT_FDCWD, p, AT_REMOVEDIR) in the kernel itself:
+ * the Surrogate sends all three as this one request. dirfd is the Deputy's FD (the Surrogate maps its Ghost directory
+ * FD), AT_FDCWD for an absolute path or the Deputy's cwd. The path is the tail, same rules as the open request.
+ */
+struct mattx_sys_unlinkat_req {
+    u32 orig_pid;
+    u32 req_id;                 // ticket id, never 0
+    s32 dirfd;
+    u32 flags;                  // 0 or AT_REMOVEDIR (anything else is the kernel's -EINVAL)
+    u32 pathlen;                // bytes of path[] including the NUL: 1 .. PATH_MAX
+    u32 pad;
+    char path[];                // NUL terminated, must stay the LAST member
+};
+
+struct mattx_sys_unlinkat_reply {
     u32 orig_pid;
     int error;
     u32 req_id;                 // echo of the request's ticket id
@@ -1958,6 +1984,9 @@ extern mattx_sys_fstatfs_fn real_sys_fstatfs;
 
 typedef long (*mattx_sys_newfstatat_fn)(const struct pt_regs *regs);
 extern mattx_sys_newfstatat_fn real_sys_newfstatat;
+
+typedef long (*mattx_sys_unlinkat_fn)(const struct pt_regs *regs);
+extern mattx_sys_unlinkat_fn real_sys_unlinkat;
 
 typedef long (*mattx_sys_faccessat2_fn)(const struct pt_regs *regs);
 extern mattx_sys_faccessat2_fn real_sys_faccessat2;
