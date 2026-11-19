@@ -2278,6 +2278,35 @@ static int entry_handler_rmdir(struct kretprobe_instance *ri, struct pt_regs *re
     return 0;
 }
 
+/*
+ * The directory FD of a relative name (unlinkat, mkdirat, ... of a Surrogate, kprobe mode): the home node needs the Deputy's
+ * FD behind our Ghost directory FD (same rules as openat, 0015b). A native FD of the Surrogate cannot be named at the home
+ * node (-EOPNOTSUPP), a Ghost of another node / process is -EBADF. 0 and *remote_fd set on success.
+ */
+static int mattx_ghost_dirfd_remote(int dfd, int home_node, u32 orig_pid, const char *name, const char *what, int *remote_fd)
+{
+    struct mattx_fake_fd_info *dir_info = NULL;
+    struct file *dirf = dfd >= 0 ? fget(dfd) : NULL;
+
+    if (!dirf)
+        return -EBADF;
+    if (dirf->f_op == &mattx_fops)
+        dir_info = dirf->private_data;
+    if (!dir_info) {
+        mattx_dbg("[RPC] Thread %d: %s(dirfd=%d, '%s'): the directory is not a Ghost FD: -EOPNOTSUPP\n", current->pid, what, dfd, name);
+        fput(dirf);
+        return -EOPNOTSUPP;
+    }
+    if (dir_info->home_node != home_node || dir_info->orig_pid != orig_pid) {
+        fput(dirf);
+        return -EBADF;
+    }
+    *remote_fd = dir_info->remote_fd;
+    mattx_dbg("[RPC] Thread %d: %s(dirfd=%d -> Deputy FD %d, '%s')\n", current->pid, what, dfd, *remote_fd, name);
+    fput(dirf);
+    return 0;
+}
+
 struct mattx_unlinkat_tw {
     struct callback_head cb;
     u32 orig_pid;
@@ -2329,30 +2358,9 @@ static void mattx_unlinkat_tw_fn(struct callback_head *cb) {
     req->dirfd = AT_FDCWD;
     if (req->path[0] != '/' && tw->dfd != AT_FDCWD) {
         // unlinkat(dirfd, relative): the home node needs the Deputy's FD behind our Ghost directory FD
-        struct mattx_fake_fd_info *dir_info = NULL;
-        struct file *dirf = tw->dfd >= 0 ? fget(tw->dfd) : NULL;
-
-        if (!dirf) {
-            ret = -EBADF;
+        ret = mattx_ghost_dirfd_remote(tw->dfd, tw->home_node, tw->orig_pid, req->path, "unlinkat", &req->dirfd);
+        if (ret)
             goto out;
-        }
-        if (dirf->f_op == &mattx_fops)
-            dir_info = dirf->private_data;
-        if (!dir_info) {
-            // A native FD of the Surrogate cannot be named at the home node
-            mattx_dbg("[RPC] Thread %d: unlinkat(dirfd=%d, '%s'): the directory is not a Ghost FD: -EOPNOTSUPP\n", current->pid, tw->dfd, req->path);
-            fput(dirf);
-            ret = -EOPNOTSUPP;
-            goto out;
-        }
-        if (dir_info->home_node != tw->home_node || dir_info->orig_pid != tw->orig_pid) {
-            fput(dirf);
-            ret = -EBADF;
-            goto out;
-        }
-        req->dirfd = dir_info->remote_fd;
-        mattx_dbg("[RPC] Thread %d: unlinkat(dirfd=%d -> Deputy FD %d, '%s')\n", current->pid, tw->dfd, req->dirfd, req->path);
-        fput(dirf);
     }
 
     t = mattx_ticket_add(tw->orig_pid, tw->home_node, 0);
@@ -2498,7 +2506,204 @@ static int ret_handler_unlink(struct kretprobe_instance *ri, struct pt_regs *reg
     return 0;
 }
 
+// --- MKDIR HOOKS: mkdir / mkdirat (kprobe fallback, issue #67, P3, Track K) ---
+/*
+ * mkdir(p, m) is mkdirat(AT_FDCWD, p, m) in the kernel. Same recipe as unlink (0023b): the entry handlers save what the
+ * application passed and sabotage the inner path, the shared return handler queues a task_work (own ticket, only this thread
+ * sleeps) that sends ONE request, SYS_MKDIRAT; the real mkdirat() runs as the Deputy at the home node (its umask, cwd,
+ * credentials). Both calls were not hooked before (they ran on the Surrogate's hollow filesystem). Without the task_work
+ * resolver they stay native.
+ */
+struct mkdir_kretprobe_data {
+    const char __user *pathname;
+    int dfd;
+    umode_t mode;
+    bool armed;                     // the entry handler took the call (the inner path was sabotaged)
+};
 
+static struct kretprobe mkdirat_kprobe;
+static struct kretprobe mkdir_kprobe;
+
+static bool mattx_mkdir_entry_wanted(struct mkdir_kretprobe_data *data)
+{
+    data->armed = false;
+    if (!is_guest_process(current->pid)) return false;
+    if (config_mattxfs_enabled) return false;
+    if (!config_migrate_file_io) return false;      // Local Breakout: the native call on the remote node's own filesystem
+    if (!real_task_work_add) return false;          // no way to sleep per thread: native
+    return true;
+}
+
+static int entry_handler_mkdirat(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    struct mkdir_kretprobe_data *data = (struct mkdir_kretprobe_data *)ri->data;
+    struct pt_regs *sys_regs = SYSCALL_REGS(regs); // Unwrap!
+
+    if (!mattx_mkdir_entry_wanted(data)) return 0;
+
+    data->dfd = (int)sys_regs->di;
+    data->pathname = (const char __user *)sys_regs->si;
+    data->mode = (umode_t)sys_regs->dx;
+    data->armed = true;
+    sys_regs->si = 0; // Sabotage inner pathname!
+
+    return 0;
+}
+
+static int entry_handler_mkdir(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    struct mkdir_kretprobe_data *data = (struct mkdir_kretprobe_data *)ri->data;
+    struct pt_regs *sys_regs = SYSCALL_REGS(regs);
+
+    if (!mattx_mkdir_entry_wanted(data)) return 0;
+
+    data->dfd = AT_FDCWD;
+    data->pathname = (const char __user *)sys_regs->di;
+    data->mode = (umode_t)sys_regs->si;
+    data->armed = true;
+    sys_regs->di = 0;
+
+    return 0;
+}
+
+struct mattx_mkdirat_tw {
+    struct callback_head cb;
+    u32 orig_pid;
+    int home_node;
+    const char __user *path;        // read by the task_work: it runs in the thread's own process context
+    int dfd;
+    umode_t mode;
+};
+
+static void mattx_mkdirat_tw_fn(struct callback_head *cb) {
+    struct mattx_mkdirat_tw *tw = container_of(cb, struct mattx_mkdirat_tw, cb);
+    struct pt_regs *regs = task_pt_regs(current);
+    struct mattx_sys_mkdirat_req *req = NULL;
+    struct mattx_ticket *t;
+    struct mattx_link *link;
+    long ret = -EINTR;
+    long n;
+
+    if (fatal_signal_pending(current) || tw->home_node < 0 || tw->home_node >= MAX_NODES)
+        goto out;
+
+    link = READ_ONCE(cluster_map[tw->home_node]);
+    if (!link) {
+        ret = -EIO;
+        goto out;
+    }
+
+    req = kzalloc(sizeof(*req) + PATH_MAX, GFP_KERNEL);
+    if (!req) {
+        ret = -ENOMEM;
+        goto out;
+    }
+
+    n = strncpy_from_user(req->path, tw->path, PATH_MAX);
+    if (n < 0) {
+        ret = n;                                    // -EFAULT
+        goto out;
+    }
+    if (n == 0) {
+        ret = -ENOENT;
+        goto out;
+    }
+    if (n >= PATH_MAX) {                            // no NUL within PATH_MAX bytes: the kernel refuses it too
+        mattx_dbg("[RPC] Thread %d: mkdir path is longer than %d bytes: -ENAMETOOLONG\n", current->pid, PATH_MAX - 1);
+        ret = -ENAMETOOLONG;
+        goto out;
+    }
+    req->pathlen = n + 1;                           // with the NUL
+    req->dirfd = AT_FDCWD;
+    if (req->path[0] != '/' && tw->dfd != AT_FDCWD) {
+        // mkdirat(dirfd, relative): the home node needs the Deputy's FD behind our Ghost directory FD
+        ret = mattx_ghost_dirfd_remote(tw->dfd, tw->home_node, tw->orig_pid, req->path, "mkdirat", &req->dirfd);
+        if (ret)
+            goto out;
+    }
+
+    t = mattx_ticket_add(tw->orig_pid, tw->home_node, 0);
+    if (!t) {
+        ret = -ENOMEM;
+        goto out;
+    }
+
+    req->orig_pid = tw->orig_pid;
+    req->req_id = t->req_id;
+    req->mode = tw->mode;
+
+    mattx_dbg("[RPC] Thread %d: mkdirat(dirfd %d, '%s', mode 0%o) as req %u, sleeping on its own ticket...\n", current->pid,
+              req->dirfd, req->path, req->mode, t->req_id);
+
+    if (mattx_comm_send(link, MATTX_MSG_SYS_MKDIRAT_REQ, req, sizeof(*req) + req->pathlen) < 0) {
+        // Never sleep for a reply to a request that was never sent
+        mattx_dbg("[RPC] Thread %d: MKDIRAT_REQ send failed\n", current->pid);
+        ret = -EIO;
+        goto done;
+    }
+
+    // Interrupted (signal, freeze of a migration or recall)? The wait cancels the request and still hands back the
+    // real result if the home node had already done it; otherwise the system call is restarted.
+    if (mattx_ticket_wait(t, MAX_SCHEDULE_TIMEOUT) == 0)
+        ret = t->retval;
+    else
+        ret = -ERESTARTSYS;
+
+    mattx_dbg("[RPC] Thread %d: mkdirat('%s') woke up: %ld (req %u)\n", current->pid, req->path, ret, t->req_id);
+done:
+    mattx_ticket_del(t);
+out:
+    regs->ax = ret;
+    kfree(req);
+    kfree(tw);
+}
+
+static int ret_handler_mkdir(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    struct mkdir_kretprobe_data *data = (struct mkdir_kretprobe_data *)ri->data;
+    struct mattx_mkdirat_tw *tw;
+    int home_node = -1;
+    u32 orig_pid = 0;
+    int i;
+
+    if (!data->armed) return 0;                 // not ours: the native result flows back
+
+    spin_lock(&guest_lock);
+    for (i = 0; i < guest_count; i++) {
+        if (guest_registry[i].local_pid == current->tgid) {
+            home_node = guest_registry[i].home_node;
+            orig_pid = guest_registry[i].orig_pid;
+            break;                              // the per-guest slot is not touched: this call has its own ticket
+        }
+    }
+    spin_unlock(&guest_lock);
+
+    if (home_node == -1 || !data->pathname) return 0;
+
+    // --- THE ATOMIC SHIELD ---
+    // If the process is dying (SIGKILL) or exiting, DO NOT freeze it!
+    if (fatal_signal_pending(current) || (current->flags & PF_EXITING)) {
+        mattx_dbg("[HOOK] Surrogate %s is dying. Aborting RPC.\n", current->comm);
+        return 0;
+    }
+
+    tw = kzalloc(sizeof(*tw), GFP_ATOMIC);
+    if (!tw) {
+        regs->ax = -ENOMEM;
+        return 0;
+    }
+    init_task_work(&tw->cb, mattx_mkdirat_tw_fn);
+    tw->orig_pid = orig_pid;
+    tw->home_node = home_node;
+    tw->path = data->pathname;
+    tw->dfd = data->dfd;
+    tw->mode = data->mode;
+
+    mattx_dbg("[HOOK] Intercepted mkdir / mkdirat (mode 0%o). Thread %d waits on its own ticket...\n", data->mode, current->pid);
+    // The sabotaged call returns -EFAULT; the task_work overwrites it with the real result.
+    regs->ax = -EINTR;
+
+    if (real_task_work_add(current, &tw->cb, TWA_RESUME))
+        kfree(tw);
+    return 0;
+}
 
 // --- SOCKET HOOK ---
 struct socket_kretprobe_data {
@@ -8666,6 +8871,30 @@ int mattx_hooks_init(void) {
     ret = mattx_register_kretprobe(&rmdir_kprobe);
     if (ret < 0) {
         printk(KERN_ERR "MattX: register_kretprobe failed for rmdir, returned %d\n", ret);
+    }
+
+    memset(&mkdirat_kprobe, 0, sizeof(mkdirat_kprobe));
+    mkdirat_kprobe.kp.symbol_name = "__x64_sys_mkdirat";
+    mkdirat_kprobe.entry_handler = entry_handler_mkdirat;
+    mkdirat_kprobe.handler = ret_handler_mkdir;
+    mkdirat_kprobe.data_size = sizeof(struct mkdir_kretprobe_data);
+    mkdirat_kprobe.maxactive = 64;
+
+    ret = mattx_register_kretprobe(&mkdirat_kprobe);
+    if (ret < 0) {
+        printk(KERN_ERR "MattX: register_kretprobe failed for mkdirat, returned %d\n", ret);
+    }
+
+    memset(&mkdir_kprobe, 0, sizeof(mkdir_kprobe));
+    mkdir_kprobe.kp.symbol_name = "__x64_sys_mkdir";
+    mkdir_kprobe.entry_handler = entry_handler_mkdir;
+    mkdir_kprobe.handler = ret_handler_mkdir;
+    mkdir_kprobe.data_size = sizeof(struct mkdir_kretprobe_data);
+    mkdir_kprobe.maxactive = 64;
+
+    ret = mattx_register_kretprobe(&mkdir_kprobe);
+    if (ret < 0) {
+        printk(KERN_ERR "MattX: register_kretprobe failed for mkdir, returned %d\n", ret);
     }
 
     memset(&socket_kprobe, 0, sizeof(socket_kprobe));

@@ -296,6 +296,8 @@ enum mattx_msg_type {
     MATTX_MSG_SYS_FALLOCATE_REPLY,
     MATTX_MSG_SYS_UNLINKAT_REQ,      // issue #67 (P3, Track K): unlink / unlinkat / rmdir of a Surrogate (kprobe mode), Identity Theft, ticket based
     MATTX_MSG_SYS_UNLINKAT_REPLY,
+    MATTX_MSG_SYS_MKDIRAT_REQ,       // issue #67 (P3, Track K): mkdir / mkdirat of a Surrogate (kprobe mode), Identity Theft, ticket based
+    MATTX_MSG_SYS_MKDIRAT_REPLY,
 };
 
 struct mattx_header {
@@ -619,6 +621,29 @@ struct mattx_sys_unlinkat_req {
 };
 
 struct mattx_sys_unlinkat_reply {
+    u32 orig_pid;
+    int error;
+    u32 req_id;                 // echo of the request's ticket id
+    u32 pad;
+};
+
+/*
+ * mkdir() / mkdirat() of a Surrogate in kprobe mode (issue #67, P3, Track K): the home node runs the REAL mkdirat() as the
+ * Deputy (Identity Theft), so the Deputy's umask, cwd, credentials and the errno are the kernel's. mkdir(p, m) is
+ * mkdirat(AT_FDCWD, p, m) in the kernel itself. mode is what the application passed (the umask is applied at the home node).
+ * dirfd and path: same rules as the unlinkat request.
+ */
+struct mattx_sys_mkdirat_req {
+    u32 orig_pid;
+    u32 req_id;                 // ticket id, never 0
+    s32 dirfd;
+    u32 mode;
+    u32 pathlen;                // bytes of path[] including the NUL: 1 .. PATH_MAX
+    u32 pad;
+    char path[];                // NUL terminated, must stay the LAST member
+};
+
+struct mattx_sys_mkdirat_reply {
     u32 orig_pid;
     int error;
     u32 req_id;                 // echo of the request's ticket id
@@ -1987,6 +2012,9 @@ extern mattx_sys_newfstatat_fn real_sys_newfstatat;
 
 typedef long (*mattx_sys_unlinkat_fn)(const struct pt_regs *regs);
 extern mattx_sys_unlinkat_fn real_sys_unlinkat;
+
+typedef long (*mattx_sys_mkdirat_fn)(const struct pt_regs *regs);
+extern mattx_sys_mkdirat_fn real_sys_mkdirat;
 
 typedef long (*mattx_sys_faccessat2_fn)(const struct pt_regs *regs);
 extern mattx_sys_faccessat2_fn real_sys_faccessat2;
