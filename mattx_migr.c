@@ -65,6 +65,11 @@ mattx_sys_mkdirat_fn real_sys_mkdirat = NULL;
 mattx_sys_renameat2_fn real_sys_renameat2 = NULL;
 mattx_sys_linkat_fn real_sys_linkat = NULL;
 mattx_sys_symlinkat_fn real_sys_symlinkat = NULL;
+mattx_sys_fchmodat2_fn real_sys_fchmodat2 = NULL;
+mattx_sys_fchmodat_fn real_sys_fchmodat = NULL;
+mattx_sys_fchownat_fn real_sys_fchownat = NULL;
+mattx_sys_truncate_fn real_sys_truncate = NULL;
+mattx_sys_utimensat_fn real_sys_utimensat = NULL;
 mattx_sys_faccessat2_fn real_sys_faccessat2 = NULL;
 mattx_sys_readlink_fn real_sys_readlink = NULL;
 mattx_sys_readlinkat_fn real_sys_readlinkat = NULL;
@@ -328,6 +333,41 @@ static void mattx_resolve_hidden_symbols(void) {
     kp.symbol_name = "__x64_sys_symlinkat";
     if (register_kprobe(&kp) == 0) {
         real_sys_symlinkat = (mattx_sys_symlinkat_fn)kp.addr;
+        unregister_kprobe(&kp);
+    }
+
+    memset(&kp, 0, sizeof(kp));
+    kp.symbol_name = "__x64_sys_fchmodat2";
+    if (register_kprobe(&kp) == 0) {
+        real_sys_fchmodat2 = (mattx_sys_fchmodat2_fn)kp.addr;
+        unregister_kprobe(&kp);
+    }
+
+    memset(&kp, 0, sizeof(kp));
+    kp.symbol_name = "__x64_sys_fchmodat";
+    if (register_kprobe(&kp) == 0) {
+        real_sys_fchmodat = (mattx_sys_fchmodat_fn)kp.addr;
+        unregister_kprobe(&kp);
+    }
+
+    memset(&kp, 0, sizeof(kp));
+    kp.symbol_name = "__x64_sys_fchownat";
+    if (register_kprobe(&kp) == 0) {
+        real_sys_fchownat = (mattx_sys_fchownat_fn)kp.addr;
+        unregister_kprobe(&kp);
+    }
+
+    memset(&kp, 0, sizeof(kp));
+    kp.symbol_name = "__x64_sys_truncate";
+    if (register_kprobe(&kp) == 0) {
+        real_sys_truncate = (mattx_sys_truncate_fn)kp.addr;
+        unregister_kprobe(&kp);
+    }
+
+    memset(&kp, 0, sizeof(kp));
+    kp.symbol_name = "__x64_sys_utimensat";
+    if (register_kprobe(&kp) == 0) {
+        real_sys_utimensat = (mattx_sys_utimensat_fn)kp.addr;
         unregister_kprobe(&kp);
     }
 

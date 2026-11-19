@@ -3414,6 +3414,848 @@ static int ret_handler_symlink(struct kretprobe_instance *ri, struct pt_regs *re
     return 0;
 }
 
+// --- CHMOD HOOKS: chmod / fchmodat / fchmodat2 (kprobe fallback, issue #67, P3, Track K) ---
+/*
+ * chmod(p, m) is fchmodat2(AT_FDCWD, p, m, 0) and fchmodat(d, p, m) is fchmodat2(d, p, m, 0) in the kernel. Recipe of unlink / mkdir /
+ * rename / link: three entry handlers save what the application passed and sabotage the path (si / di = 0), the shared return
+ * handler queues a task_work (own ticket, only this thread sleeps) that sends ONE request, SYS_FCHMODAT2 (path, dirfd, mode,
+ * flags); the real fchmodat2() runs as the Deputy at the home node. Neither call was hooked before. Without the task_work
+ * resolver they stay native.
+ */
+struct chmod_kretprobe_data {
+    const char __user *path;
+    int dfd;
+    unsigned int mode;
+    unsigned int flags;
+    bool armed;                     // the entry handler took the call (the path was sabotaged)
+};
+
+static struct kretprobe fchmodat2_kprobe;
+static struct kretprobe fchmodat_kprobe;
+static struct kretprobe chmod_kprobe;
+
+static bool mattx_chmod_entry_wanted(struct chmod_kretprobe_data *data)
+{
+    data->armed = false;
+    if (!is_guest_process(current->pid)) return false;
+    if (config_mattxfs_enabled) return false;
+    if (!config_migrate_file_io) return false;      // Local Breakout: the native call on the remote node's own filesystem
+    if (!real_task_work_add) return false;          // no way to sleep per thread: native
+    return true;
+}
+
+static int entry_handler_fchmodat2(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    struct chmod_kretprobe_data *data = (struct chmod_kretprobe_data *)ri->data;
+    struct pt_regs *sys_regs = SYSCALL_REGS(regs); // Unwrap!
+
+    if (!mattx_chmod_entry_wanted(data)) return 0;
+
+    data->dfd = (int)sys_regs->di;
+    data->path = (const char __user *)sys_regs->si;
+    data->mode = (unsigned int)sys_regs->dx;
+    data->flags = (unsigned int)sys_regs->r10;
+    if (!data->path) return 0;      // NULL: the native call returns the kernel's own -EFAULT
+    data->armed = true;
+    sys_regs->si = 0; // Sabotage inner path!
+    if (data->flags & AT_EMPTY_PATH)
+        sys_regs->di = (unsigned long)(long)-1;     // never let a kernel read "no path" as "the dirfd itself"
+
+    return 0;
+}
+
+static int entry_handler_fchmodat(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    struct chmod_kretprobe_data *data = (struct chmod_kretprobe_data *)ri->data;
+    struct pt_regs *sys_regs = SYSCALL_REGS(regs); // Unwrap!
+
+    if (!mattx_chmod_entry_wanted(data)) return 0;
+
+    data->dfd = (int)sys_regs->di;
+    data->path = (const char __user *)sys_regs->si;
+    data->mode = (unsigned int)sys_regs->dx;
+    data->flags = 0;
+    if (!data->path) return 0;      // NULL: the native call returns the kernel's own -EFAULT
+    data->armed = true;
+    sys_regs->si = 0; // Sabotage inner path!
+
+    return 0;
+}
+
+static int entry_handler_chmod(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    struct chmod_kretprobe_data *data = (struct chmod_kretprobe_data *)ri->data;
+    struct pt_regs *sys_regs = SYSCALL_REGS(regs); // Unwrap!
+
+    if (!mattx_chmod_entry_wanted(data)) return 0;
+
+    data->dfd = AT_FDCWD;
+    data->path = (const char __user *)sys_regs->di;
+    data->mode = (unsigned int)sys_regs->si;
+    data->flags = 0;
+    if (!data->path) return 0;      // NULL: the native call returns the kernel's own -EFAULT
+    data->armed = true;
+    sys_regs->di = 0; // Sabotage inner path!
+
+    return 0;
+}
+
+
+struct mattx_chmod_tw {
+    struct callback_head cb;
+    u32 orig_pid;
+    int home_node;
+    const char __user *path;        // read by the task_work: it runs in the thread's own process context
+    int dfd;
+    unsigned int mode;
+    unsigned int flags;
+};
+
+static void mattx_chmod_tw_fn(struct callback_head *cb) {
+    struct mattx_chmod_tw *tw = container_of(cb, struct mattx_chmod_tw, cb);
+    struct pt_regs *regs = task_pt_regs(current);
+    struct mattx_sys_fchmodat2_req *req = NULL;
+    struct mattx_ticket *t;
+    struct mattx_link *link;
+    long ret = -EINTR;
+    long n;
+
+    if (fatal_signal_pending(current) || tw->home_node < 0 || tw->home_node >= MAX_NODES)
+        goto out;
+
+    link = READ_ONCE(cluster_map[tw->home_node]);
+    if (!link) {
+        ret = -EIO;
+        goto out;
+    }
+
+    req = kzalloc(sizeof(*req) + PATH_MAX, GFP_KERNEL);
+    if (!req) {
+        ret = -ENOMEM;
+        goto out;
+    }
+
+    n = strncpy_from_user(req->path, tw->path, PATH_MAX);
+    if (n < 0) {
+        ret = n;                                    // -EFAULT
+        goto out;
+    }
+    if (n == 0 && !(tw->flags & AT_EMPTY_PATH)) {     // an empty name is only valid with AT_EMPTY_PATH: it names the dirfd itself
+        ret = -ENOENT;
+        goto out;
+    }
+    if (n >= PATH_MAX) {                            // no NUL within PATH_MAX bytes: the kernel refuses it too
+        mattx_dbg("[RPC] Thread %d: chmod path is longer than %d bytes: -ENAMETOOLONG\n", current->pid, PATH_MAX - 1);
+        ret = -ENAMETOOLONG;
+        goto out;
+    }
+    req->pathlen = n + 1;                           // with the NUL
+
+    req->dirfd = AT_FDCWD;
+    if (req->path[0] != '/' && tw->dfd != AT_FDCWD) {
+        // fchmodat2(dirfd, relative, ..): the home node needs the Deputy's FD behind our Ghost directory FD
+        ret = mattx_ghost_dirfd_remote(tw->dfd, tw->home_node, tw->orig_pid, req->path, "fchmodat2", &req->dirfd);
+        if (ret)
+            goto out;
+    }
+
+    t = mattx_ticket_add(tw->orig_pid, tw->home_node, 0);
+    if (!t) {
+        ret = -ENOMEM;
+        goto out;
+    }
+
+    req->orig_pid = tw->orig_pid;
+    req->req_id = t->req_id;
+    req->mode = tw->mode;
+    req->flags = tw->flags;
+
+    mattx_dbg("[RPC] Thread %d: fchmodat2(dirfd %d '%s', mode 0%o, flags 0x%x) as req %u, sleeping on its own ticket...\n",
+              current->pid, req->dirfd, req->path, req->mode, req->flags, t->req_id);
+
+    if (mattx_comm_send(link, MATTX_MSG_SYS_FCHMODAT2_REQ, req, sizeof(*req) + req->pathlen) < 0) {
+        // Never sleep for a reply to a request that was never sent
+        mattx_dbg("[RPC] Thread %d: FCHMODAT2_REQ send failed\n", current->pid);
+        ret = -EIO;
+        goto done;
+    }
+
+    // Interrupted (signal, freeze of a migration or recall)? The wait cancels the request and still hands back the
+    // real result if the home node had already done it; otherwise the system call is restarted.
+    if (mattx_ticket_wait(t, MAX_SCHEDULE_TIMEOUT) == 0)
+        ret = t->retval;
+    else
+        ret = -ERESTARTSYS;
+
+    mattx_dbg("[RPC] Thread %d: fchmodat2('%s') woke up: %ld (req %u)\n", current->pid, req->path, ret, t->req_id);
+done:
+    mattx_ticket_del(t);
+out:
+    regs->ax = ret;
+    kfree(req);
+    kfree(tw);
+}
+
+static int ret_handler_chmod(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    struct chmod_kretprobe_data *data = (struct chmod_kretprobe_data *)ri->data;
+    struct mattx_chmod_tw *tw;
+    int home_node = -1;
+    u32 orig_pid = 0;
+    int i;
+
+    if (!data->armed) return 0;                 // not ours: the native result flows back
+
+    spin_lock(&guest_lock);
+    for (i = 0; i < guest_count; i++) {
+        if (guest_registry[i].local_pid == current->tgid) {
+            home_node = guest_registry[i].home_node;
+            orig_pid = guest_registry[i].orig_pid;
+            break;                              // the per-guest slot is not touched: this call has its own ticket
+        }
+    }
+    spin_unlock(&guest_lock);
+
+    if (home_node == -1 || !data->path) return 0;
+
+    // --- THE ATOMIC SHIELD ---
+    // If the process is dying (SIGKILL) or exiting, DO NOT freeze it!
+    if (fatal_signal_pending(current) || (current->flags & PF_EXITING)) {
+        mattx_dbg("[HOOK] Surrogate %s is dying. Aborting RPC.\n", current->comm);
+        return 0;
+    }
+
+    tw = kzalloc(sizeof(*tw), GFP_ATOMIC);
+    if (!tw) {
+        regs->ax = -ENOMEM;
+        return 0;
+    }
+    init_task_work(&tw->cb, mattx_chmod_tw_fn);
+    tw->orig_pid = orig_pid;
+    tw->home_node = home_node;
+    tw->path = data->path;
+    tw->dfd = data->dfd;
+    tw->mode = data->mode;
+    tw->flags = data->flags;
+
+    mattx_dbg("[HOOK] Intercepted chmod / fchmodat / fchmodat2. Thread %d waits on its own ticket...\n", current->pid);
+    // The sabotaged call returns an error; the task_work overwrites it with the real result.
+    regs->ax = -EINTR;
+
+    if (real_task_work_add(current, &tw->cb, TWA_RESUME))
+        kfree(tw);
+    return 0;
+}
+
+// --- CHOWN HOOKS: chown / lchown / fchownat (kprobe fallback, issue #67, P3, Track K) ---
+/*
+ * chown(p, u, g) is fchownat(AT_FDCWD, p, u, g, 0) and lchown() is the same with AT_SYMLINK_NOFOLLOW in the kernel. Recipe of unlink /
+ * mkdir / rename / link / chmod: three entry handlers save what the application passed and sabotage the path (si / di = 0), the
+ * shared return handler queues a task_work (own ticket, only this thread sleeps) that sends ONE request, SYS_FCHOWNAT (path,
+ * dirfd, uid, gid, flags); the real fchownat() runs as the Deputy at the home node. Neither call was hooked before. Without the
+ * task_work resolver they stay native.
+ */
+struct chown_kretprobe_data {
+    const char __user *path;
+    int dfd;
+    unsigned int uid;
+    unsigned int gid;
+    unsigned int flags;
+    bool armed;                     // the entry handler took the call (the path was sabotaged)
+};
+
+static struct kretprobe fchownat_kprobe;
+static struct kretprobe chown_kprobe;
+static struct kretprobe lchown_kprobe;
+
+static bool mattx_chown_entry_wanted(struct chown_kretprobe_data *data)
+{
+    data->armed = false;
+    if (!is_guest_process(current->pid)) return false;
+    if (config_mattxfs_enabled) return false;
+    if (!config_migrate_file_io) return false;      // Local Breakout: the native call on the remote node's own filesystem
+    if (!real_task_work_add) return false;          // no way to sleep per thread: native
+    return true;
+}
+
+static int entry_handler_fchownat(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    struct chown_kretprobe_data *data = (struct chown_kretprobe_data *)ri->data;
+    struct pt_regs *sys_regs = SYSCALL_REGS(regs); // Unwrap!
+
+    if (!mattx_chown_entry_wanted(data)) return 0;
+
+    data->dfd = (int)sys_regs->di;
+    data->path = (const char __user *)sys_regs->si;
+    data->uid = (unsigned int)sys_regs->dx;
+    data->gid = (unsigned int)sys_regs->r10;
+    data->flags = (unsigned int)sys_regs->r8;
+    if (!data->path) return 0;      // NULL: the native call returns the kernel's own -EFAULT
+    data->armed = true;
+    sys_regs->si = 0; // Sabotage inner path!
+    if (data->flags & AT_EMPTY_PATH)
+        sys_regs->di = (unsigned long)(long)-1;     // never let a kernel read "no path" as "the dirfd itself"
+
+    return 0;
+}
+
+static int entry_handler_chown(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    struct chown_kretprobe_data *data = (struct chown_kretprobe_data *)ri->data;
+    struct pt_regs *sys_regs = SYSCALL_REGS(regs); // Unwrap!
+
+    if (!mattx_chown_entry_wanted(data)) return 0;
+
+    data->dfd = AT_FDCWD;
+    data->path = (const char __user *)sys_regs->di;
+    data->uid = (unsigned int)sys_regs->si;
+    data->gid = (unsigned int)sys_regs->dx;
+    data->flags = 0;
+    if (!data->path) return 0;      // NULL: the native call returns the kernel's own -EFAULT
+    data->armed = true;
+    sys_regs->di = 0; // Sabotage inner path!
+
+    return 0;
+}
+
+static int entry_handler_lchown(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    struct chown_kretprobe_data *data = (struct chown_kretprobe_data *)ri->data;
+    struct pt_regs *sys_regs = SYSCALL_REGS(regs); // Unwrap!
+
+    if (!mattx_chown_entry_wanted(data)) return 0;
+
+    data->dfd = AT_FDCWD;
+    data->path = (const char __user *)sys_regs->di;
+    data->uid = (unsigned int)sys_regs->si;
+    data->gid = (unsigned int)sys_regs->dx;
+    data->flags = AT_SYMLINK_NOFOLLOW;
+    if (!data->path) return 0;      // NULL: the native call returns the kernel's own -EFAULT
+    data->armed = true;
+    sys_regs->di = 0; // Sabotage inner path!
+
+    return 0;
+}
+
+
+struct mattx_chown_tw {
+    struct callback_head cb;
+    u32 orig_pid;
+    int home_node;
+    const char __user *path;        // read by the task_work: it runs in the thread's own process context
+    int dfd;
+    unsigned int uid;
+    unsigned int gid;
+    unsigned int flags;
+};
+
+static void mattx_chown_tw_fn(struct callback_head *cb) {
+    struct mattx_chown_tw *tw = container_of(cb, struct mattx_chown_tw, cb);
+    struct pt_regs *regs = task_pt_regs(current);
+    struct mattx_sys_fchownat_req *req = NULL;
+    struct mattx_ticket *t;
+    struct mattx_link *link;
+    long ret = -EINTR;
+    long n;
+
+    if (fatal_signal_pending(current) || tw->home_node < 0 || tw->home_node >= MAX_NODES)
+        goto out;
+
+    link = READ_ONCE(cluster_map[tw->home_node]);
+    if (!link) {
+        ret = -EIO;
+        goto out;
+    }
+
+    req = kzalloc(sizeof(*req) + PATH_MAX, GFP_KERNEL);
+    if (!req) {
+        ret = -ENOMEM;
+        goto out;
+    }
+
+    n = strncpy_from_user(req->path, tw->path, PATH_MAX);
+    if (n < 0) {
+        ret = n;                                    // -EFAULT
+        goto out;
+    }
+    if (n == 0 && !(tw->flags & AT_EMPTY_PATH)) {     // an empty name is only valid with AT_EMPTY_PATH: it names the dirfd itself
+        ret = -ENOENT;
+        goto out;
+    }
+    if (n >= PATH_MAX) {                            // no NUL within PATH_MAX bytes: the kernel refuses it too
+        mattx_dbg("[RPC] Thread %d: chown path is longer than %d bytes: -ENAMETOOLONG\n", current->pid, PATH_MAX - 1);
+        ret = -ENAMETOOLONG;
+        goto out;
+    }
+    req->pathlen = n + 1;                           // with the NUL
+
+    req->dirfd = AT_FDCWD;
+    if (req->path[0] != '/' && tw->dfd != AT_FDCWD) {
+        // fchownat(dirfd, relative, ..): the home node needs the Deputy's FD behind our Ghost directory FD
+        ret = mattx_ghost_dirfd_remote(tw->dfd, tw->home_node, tw->orig_pid, req->path, "fchownat", &req->dirfd);
+        if (ret)
+            goto out;
+    }
+
+    t = mattx_ticket_add(tw->orig_pid, tw->home_node, 0);
+    if (!t) {
+        ret = -ENOMEM;
+        goto out;
+    }
+
+    req->orig_pid = tw->orig_pid;
+    req->req_id = t->req_id;
+    req->uid = tw->uid;
+    req->gid = tw->gid;
+    req->flags = tw->flags;
+
+    mattx_dbg("[RPC] Thread %d: fchownat(dirfd %d '%s', uid %u, gid %u, flags 0x%x) as req %u, sleeping on its own ticket...\n",
+              current->pid, req->dirfd, req->path, req->uid, req->gid, req->flags, t->req_id);
+
+    if (mattx_comm_send(link, MATTX_MSG_SYS_FCHOWNAT_REQ, req, sizeof(*req) + req->pathlen) < 0) {
+        // Never sleep for a reply to a request that was never sent
+        mattx_dbg("[RPC] Thread %d: FCHOWNAT_REQ send failed\n", current->pid);
+        ret = -EIO;
+        goto done;
+    }
+
+    // Interrupted (signal, freeze of a migration or recall)? The wait cancels the request and still hands back the
+    // real result if the home node had already done it; otherwise the system call is restarted.
+    if (mattx_ticket_wait(t, MAX_SCHEDULE_TIMEOUT) == 0)
+        ret = t->retval;
+    else
+        ret = -ERESTARTSYS;
+
+    mattx_dbg("[RPC] Thread %d: fchownat('%s') woke up: %ld (req %u)\n", current->pid, req->path, ret, t->req_id);
+done:
+    mattx_ticket_del(t);
+out:
+    regs->ax = ret;
+    kfree(req);
+    kfree(tw);
+}
+
+static int ret_handler_chown(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    struct chown_kretprobe_data *data = (struct chown_kretprobe_data *)ri->data;
+    struct mattx_chown_tw *tw;
+    int home_node = -1;
+    u32 orig_pid = 0;
+    int i;
+
+    if (!data->armed) return 0;                 // not ours: the native result flows back
+
+    spin_lock(&guest_lock);
+    for (i = 0; i < guest_count; i++) {
+        if (guest_registry[i].local_pid == current->tgid) {
+            home_node = guest_registry[i].home_node;
+            orig_pid = guest_registry[i].orig_pid;
+            break;                              // the per-guest slot is not touched: this call has its own ticket
+        }
+    }
+    spin_unlock(&guest_lock);
+
+    if (home_node == -1 || !data->path) return 0;
+
+    // --- THE ATOMIC SHIELD ---
+    // If the process is dying (SIGKILL) or exiting, DO NOT freeze it!
+    if (fatal_signal_pending(current) || (current->flags & PF_EXITING)) {
+        mattx_dbg("[HOOK] Surrogate %s is dying. Aborting RPC.\n", current->comm);
+        return 0;
+    }
+
+    tw = kzalloc(sizeof(*tw), GFP_ATOMIC);
+    if (!tw) {
+        regs->ax = -ENOMEM;
+        return 0;
+    }
+    init_task_work(&tw->cb, mattx_chown_tw_fn);
+    tw->orig_pid = orig_pid;
+    tw->home_node = home_node;
+    tw->path = data->path;
+    tw->dfd = data->dfd;
+    tw->uid = data->uid;
+    tw->gid = data->gid;
+    tw->flags = data->flags;
+
+    mattx_dbg("[HOOK] Intercepted chown / lchown / fchownat. Thread %d waits on its own ticket...\n", current->pid);
+    // The sabotaged call returns an error; the task_work overwrites it with the real result.
+    regs->ax = -EINTR;
+
+    if (real_task_work_add(current, &tw->cb, TWA_RESUME))
+        kfree(tw);
+    return 0;
+}
+
+// --- TRUNCATE HOOKS: truncate (kprobe fallback, issue #67, P3, Track K) ---
+/*
+ * Recipe of unlink / mkdir / rename / link / chmod / chown: one entry handler saves the path and the length and sabotages the path
+ * (di = 0), the return handler queues a task_work (own ticket, only this thread sleeps) that sends ONE request, SYS_TRUNCATE
+ * (path, length); the real truncate() runs as the Deputy at the home node. ftruncate() of a Ghost FD is not this: it goes through
+ * SYS_FSETATTR. Not hooked before. Without the task_work resolver it stays native.
+ */
+struct truncate_kretprobe_data {
+    const char __user *path;
+    long length;
+    bool armed;                     // the entry handler took the call (the path was sabotaged)
+};
+
+static struct kretprobe truncate_kprobe;
+
+static bool mattx_truncate_entry_wanted(struct truncate_kretprobe_data *data)
+{
+    data->armed = false;
+    if (!is_guest_process(current->pid)) return false;
+    if (config_mattxfs_enabled) return false;
+    if (!config_migrate_file_io) return false;      // Local Breakout: the native call on the remote node's own filesystem
+    if (!real_task_work_add) return false;          // no way to sleep per thread: native
+    return true;
+}
+
+static int entry_handler_truncate(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    struct truncate_kretprobe_data *data = (struct truncate_kretprobe_data *)ri->data;
+    struct pt_regs *sys_regs = SYSCALL_REGS(regs); // Unwrap!
+
+    if (!mattx_truncate_entry_wanted(data)) return 0;
+
+    data->path = (const char __user *)sys_regs->di;
+    data->length = (long)sys_regs->si;
+    if (!data->path) return 0;      // NULL: the native call returns the kernel's own -EFAULT
+    data->armed = true;
+    sys_regs->di = 0; // Sabotage inner path!
+
+    return 0;
+}
+
+
+struct mattx_truncate_tw {
+    struct callback_head cb;
+    u32 orig_pid;
+    int home_node;
+    const char __user *path;        // read by the task_work: it runs in the thread's own process context
+    long length;
+};
+
+static void mattx_truncate_tw_fn(struct callback_head *cb) {
+    struct mattx_truncate_tw *tw = container_of(cb, struct mattx_truncate_tw, cb);
+    struct pt_regs *regs = task_pt_regs(current);
+    struct mattx_sys_truncate_req *req = NULL;
+    struct mattx_ticket *t;
+    struct mattx_link *link;
+    long ret = -EINTR;
+    long n;
+
+    if (fatal_signal_pending(current) || tw->home_node < 0 || tw->home_node >= MAX_NODES)
+        goto out;
+
+    link = READ_ONCE(cluster_map[tw->home_node]);
+    if (!link) {
+        ret = -EIO;
+        goto out;
+    }
+
+    req = kzalloc(sizeof(*req) + PATH_MAX, GFP_KERNEL);
+    if (!req) {
+        ret = -ENOMEM;
+        goto out;
+    }
+
+    n = strncpy_from_user(req->path, tw->path, PATH_MAX);
+    if (n < 0) {
+        ret = n;                                    // -EFAULT
+        goto out;
+    }
+    if (n == 0) {
+        ret = -ENOENT;
+        goto out;
+    }
+    if (n >= PATH_MAX) {                            // no NUL within PATH_MAX bytes: the kernel refuses it too
+        mattx_dbg("[RPC] Thread %d: truncate path is longer than %d bytes: -ENAMETOOLONG\n", current->pid, PATH_MAX - 1);
+        ret = -ENAMETOOLONG;
+        goto out;
+    }
+    req->pathlen = n + 1;                           // with the NUL
+
+    t = mattx_ticket_add(tw->orig_pid, tw->home_node, 0);
+    if (!t) {
+        ret = -ENOMEM;
+        goto out;
+    }
+
+    req->orig_pid = tw->orig_pid;
+    req->req_id = t->req_id;
+    req->length = tw->length;
+
+    mattx_dbg("[RPC] Thread %d: truncate('%s', length %lld) as req %u, sleeping on its own ticket...\n",
+              current->pid, req->path, (long long)req->length, t->req_id);
+
+    if (mattx_comm_send(link, MATTX_MSG_SYS_TRUNCATE_REQ, req, sizeof(*req) + req->pathlen) < 0) {
+        // Never sleep for a reply to a request that was never sent
+        mattx_dbg("[RPC] Thread %d: TRUNCATE_REQ send failed\n", current->pid);
+        ret = -EIO;
+        goto done;
+    }
+
+    // Interrupted (signal, freeze of a migration or recall)? The wait cancels the request and still hands back the
+    // real result if the home node had already done it; otherwise the system call is restarted.
+    if (mattx_ticket_wait(t, MAX_SCHEDULE_TIMEOUT) == 0)
+        ret = t->retval;
+    else
+        ret = -ERESTARTSYS;
+
+    mattx_dbg("[RPC] Thread %d: truncate('%s') woke up: %ld (req %u)\n", current->pid, req->path, ret, t->req_id);
+done:
+    mattx_ticket_del(t);
+out:
+    regs->ax = ret;
+    kfree(req);
+    kfree(tw);
+}
+
+static int ret_handler_truncate(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    struct truncate_kretprobe_data *data = (struct truncate_kretprobe_data *)ri->data;
+    struct mattx_truncate_tw *tw;
+    int home_node = -1;
+    u32 orig_pid = 0;
+    int i;
+
+    if (!data->armed) return 0;                 // not ours: the native result flows back
+
+    spin_lock(&guest_lock);
+    for (i = 0; i < guest_count; i++) {
+        if (guest_registry[i].local_pid == current->tgid) {
+            home_node = guest_registry[i].home_node;
+            orig_pid = guest_registry[i].orig_pid;
+            break;                              // the per-guest slot is not touched: this call has its own ticket
+        }
+    }
+    spin_unlock(&guest_lock);
+
+    if (home_node == -1 || !data->path) return 0;
+
+    // --- THE ATOMIC SHIELD ---
+    // If the process is dying (SIGKILL) or exiting, DO NOT freeze it!
+    if (fatal_signal_pending(current) || (current->flags & PF_EXITING)) {
+        mattx_dbg("[HOOK] Surrogate %s is dying. Aborting RPC.\n", current->comm);
+        return 0;
+    }
+
+    tw = kzalloc(sizeof(*tw), GFP_ATOMIC);
+    if (!tw) {
+        regs->ax = -ENOMEM;
+        return 0;
+    }
+    init_task_work(&tw->cb, mattx_truncate_tw_fn);
+    tw->orig_pid = orig_pid;
+    tw->home_node = home_node;
+    tw->path = data->path;
+    tw->length = data->length;
+
+    mattx_dbg("[HOOK] Intercepted truncate. Thread %d waits on its own ticket...\n", current->pid);
+    // The sabotaged call returns an error; the task_work overwrites it with the real result.
+    regs->ax = -EINTR;
+
+    if (real_task_work_add(current, &tw->cb, TWA_RESUME))
+        kfree(tw);
+    return 0;
+}
+
+// --- UTIMENSAT HOOKS: utimensat (kprobe fallback, issue #67, P3, Track K) ---
+/*
+ * Recipe of unlink / mkdir / rename / link / chmod / chown / truncate: one entry handler saves the arguments and sabotages the call
+ * (path = 0 AND dirfd = -1: with a NULL path the kernel would take the call for futimens() of the dirfd), the return handler
+ * queues a task_work (own ticket, only this thread sleeps) that reads the path AND the two timespecs from the application's
+ * memory and sends ONE request, SYS_UTIMENSAT; the real utimensat() runs as the Deputy at the home node, the timespecs are put
+ * on its scratchpad by the helper. A NULL path (futimens) stays native. Without the task_work resolver it stays native.
+ * Not covered yet: the legacy utimes() / utime() / futimesat() (glibc uses utimensat() for them on current systems).
+ */
+struct utimensat_kretprobe_data {
+    const char __user *path;
+    int dfd;
+    const void __user *times;
+    unsigned int flags;
+    bool armed;                     // the entry handler took the call (the path was sabotaged)
+};
+
+static struct kretprobe utimensat_kprobe;
+
+static bool mattx_utimensat_entry_wanted(struct utimensat_kretprobe_data *data)
+{
+    data->armed = false;
+    if (!is_guest_process(current->pid)) return false;
+    if (config_mattxfs_enabled) return false;
+    if (!config_migrate_file_io) return false;      // Local Breakout: the native call on the remote node's own filesystem
+    if (!real_task_work_add) return false;          // no way to sleep per thread: native
+    return true;
+}
+
+static int entry_handler_utimensat(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    struct utimensat_kretprobe_data *data = (struct utimensat_kretprobe_data *)ri->data;
+    struct pt_regs *sys_regs = SYSCALL_REGS(regs); // Unwrap!
+
+    if (!mattx_utimensat_entry_wanted(data)) return 0;
+
+    data->dfd = (int)sys_regs->di;
+    data->path = (const char __user *)sys_regs->si;
+    data->times = (const void __user *)sys_regs->dx;
+    data->flags = (unsigned int)sys_regs->r10;
+    // utimensat(fd, NULL, ..) is futimens(): the FD itself, not ours (a Ghost FD goes through SYS_FSETATTR); and NULL is
+    // the kernel's own -EFAULT for the rest
+    if (!data->path) return 0;
+    data->armed = true;
+    // A NULL path would turn the sabotaged call into futimens() of the dirfd: so the dirfd goes bad too (-EBADF, harmless)
+    sys_regs->si = 0;
+    sys_regs->di = (unsigned long)(long)-1;
+
+    return 0;
+}
+
+
+struct mattx_utimensat_tw {
+    struct callback_head cb;
+    u32 orig_pid;
+    int home_node;
+    const char __user *path;        // read by the task_work: it runs in the thread's own process context
+    int dfd;
+    const void __user *times;      // read by the task_work too
+    unsigned int flags;
+};
+
+static void mattx_utimensat_tw_fn(struct callback_head *cb) {
+    struct mattx_utimensat_tw *tw = container_of(cb, struct mattx_utimensat_tw, cb);
+    struct pt_regs *regs = task_pt_regs(current);
+    struct mattx_sys_utimensat_req *req = NULL;
+    struct mattx_ticket *t;
+    struct mattx_link *link;
+    long ret = -EINTR;
+    long n;
+
+    if (fatal_signal_pending(current) || tw->home_node < 0 || tw->home_node >= MAX_NODES)
+        goto out;
+
+    link = READ_ONCE(cluster_map[tw->home_node]);
+    if (!link) {
+        ret = -EIO;
+        goto out;
+    }
+
+    req = kzalloc(sizeof(*req) + PATH_MAX, GFP_KERNEL);
+    if (!req) {
+        ret = -ENOMEM;
+        goto out;
+    }
+
+    // The times first: the kernel copies them before it looks at the path (-EFAULT)
+    if (tw->times) {
+        if (copy_from_user(req->times, tw->times, sizeof(req->times))) {
+            ret = -EFAULT;
+            goto out;
+        }
+        req->has_times = 1;
+    }
+
+    n = strncpy_from_user(req->path, tw->path, PATH_MAX);
+    if (n < 0) {
+        ret = n;                                    // -EFAULT
+        goto out;
+    }
+    if (n == 0 && !(tw->flags & AT_EMPTY_PATH)) {     // an empty name is only valid with AT_EMPTY_PATH: it names the dirfd itself
+        ret = -ENOENT;
+        goto out;
+    }
+    if (n >= PATH_MAX) {                            // no NUL within PATH_MAX bytes: the kernel refuses it too
+        mattx_dbg("[RPC] Thread %d: utimensat path is longer than %d bytes: -ENAMETOOLONG\n", current->pid, PATH_MAX - 1);
+        ret = -ENAMETOOLONG;
+        goto out;
+    }
+    req->pathlen = n + 1;                           // with the NUL
+
+    req->dirfd = AT_FDCWD;
+    if (req->path[0] != '/' && tw->dfd != AT_FDCWD) {
+        // utimensat(dirfd, relative, ..): the home node needs the Deputy's FD behind our Ghost directory FD
+        ret = mattx_ghost_dirfd_remote(tw->dfd, tw->home_node, tw->orig_pid, req->path, "utimensat", &req->dirfd);
+        if (ret)
+            goto out;
+    }
+
+    t = mattx_ticket_add(tw->orig_pid, tw->home_node, 0);
+    if (!t) {
+        ret = -ENOMEM;
+        goto out;
+    }
+
+    req->orig_pid = tw->orig_pid;
+    req->req_id = t->req_id;
+    req->flags = tw->flags;
+
+    mattx_dbg("[RPC] Thread %d: utimensat(dirfd %d '%s', times %s, flags 0x%x) as req %u, sleeping on its own ticket...\n",
+              current->pid, req->dirfd, req->path, req->has_times ? "given" : "now", req->flags, t->req_id);
+
+    if (mattx_comm_send(link, MATTX_MSG_SYS_UTIMENSAT_REQ, req, sizeof(*req) + req->pathlen) < 0) {
+        // Never sleep for a reply to a request that was never sent
+        mattx_dbg("[RPC] Thread %d: UTIMENSAT_REQ send failed\n", current->pid);
+        ret = -EIO;
+        goto done;
+    }
+
+    // Interrupted (signal, freeze of a migration or recall)? The wait cancels the request and still hands back the
+    // real result if the home node had already done it; otherwise the system call is restarted.
+    if (mattx_ticket_wait(t, MAX_SCHEDULE_TIMEOUT) == 0)
+        ret = t->retval;
+    else
+        ret = -ERESTARTSYS;
+
+    mattx_dbg("[RPC] Thread %d: utimensat('%s') woke up: %ld (req %u)\n", current->pid, req->path, ret, t->req_id);
+done:
+    mattx_ticket_del(t);
+out:
+    regs->ax = ret;
+    kfree(req);
+    kfree(tw);
+}
+
+static int ret_handler_utimensat(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    struct utimensat_kretprobe_data *data = (struct utimensat_kretprobe_data *)ri->data;
+    struct mattx_utimensat_tw *tw;
+    int home_node = -1;
+    u32 orig_pid = 0;
+    int i;
+
+    if (!data->armed) return 0;                 // not ours: the native result flows back
+
+    spin_lock(&guest_lock);
+    for (i = 0; i < guest_count; i++) {
+        if (guest_registry[i].local_pid == current->tgid) {
+            home_node = guest_registry[i].home_node;
+            orig_pid = guest_registry[i].orig_pid;
+            break;                              // the per-guest slot is not touched: this call has its own ticket
+        }
+    }
+    spin_unlock(&guest_lock);
+
+    if (home_node == -1 || !data->path) return 0;
+
+    // --- THE ATOMIC SHIELD ---
+    // If the process is dying (SIGKILL) or exiting, DO NOT freeze it!
+    if (fatal_signal_pending(current) || (current->flags & PF_EXITING)) {
+        mattx_dbg("[HOOK] Surrogate %s is dying. Aborting RPC.\n", current->comm);
+        return 0;
+    }
+
+    tw = kzalloc(sizeof(*tw), GFP_ATOMIC);
+    if (!tw) {
+        regs->ax = -ENOMEM;
+        return 0;
+    }
+    init_task_work(&tw->cb, mattx_utimensat_tw_fn);
+    tw->orig_pid = orig_pid;
+    tw->home_node = home_node;
+    tw->path = data->path;
+    tw->dfd = data->dfd;
+    tw->times = data->times;
+    tw->flags = data->flags;
+
+    mattx_dbg("[HOOK] Intercepted utimensat. Thread %d waits on its own ticket...\n", current->pid);
+    // The sabotaged call returns an error; the task_work overwrites it with the real result.
+    regs->ax = -EINTR;
+
+    if (real_task_work_add(current, &tw->cb, TWA_RESUME))
+        kfree(tw);
+    return 0;
+}
+
 // --- SOCKET HOOK ---
 struct socket_kretprobe_data {
     int domain;
@@ -9688,6 +10530,102 @@ int mattx_hooks_init(void) {
     ret = mattx_register_kretprobe(&symlink_kprobe);
     if (ret < 0) {
         printk(KERN_ERR "MattX: register_kretprobe failed for symlink, returned %d\n", ret);
+    }
+
+    memset(&fchmodat2_kprobe, 0, sizeof(fchmodat2_kprobe));
+    fchmodat2_kprobe.kp.symbol_name = "__x64_sys_fchmodat2";
+    fchmodat2_kprobe.entry_handler = entry_handler_fchmodat2;
+    fchmodat2_kprobe.handler = ret_handler_chmod;
+    fchmodat2_kprobe.data_size = sizeof(struct chmod_kretprobe_data);
+    fchmodat2_kprobe.maxactive = 64;
+
+    ret = mattx_register_kretprobe(&fchmodat2_kprobe);
+    if (ret < 0) {
+        printk(KERN_ERR "MattX: register_kretprobe failed for fchmodat2, returned %d\n", ret);
+    }
+
+    memset(&fchmodat_kprobe, 0, sizeof(fchmodat_kprobe));
+    fchmodat_kprobe.kp.symbol_name = "__x64_sys_fchmodat";
+    fchmodat_kprobe.entry_handler = entry_handler_fchmodat;
+    fchmodat_kprobe.handler = ret_handler_chmod;
+    fchmodat_kprobe.data_size = sizeof(struct chmod_kretprobe_data);
+    fchmodat_kprobe.maxactive = 64;
+
+    ret = mattx_register_kretprobe(&fchmodat_kprobe);
+    if (ret < 0) {
+        printk(KERN_ERR "MattX: register_kretprobe failed for fchmodat, returned %d\n", ret);
+    }
+
+    memset(&chmod_kprobe, 0, sizeof(chmod_kprobe));
+    chmod_kprobe.kp.symbol_name = "__x64_sys_chmod";
+    chmod_kprobe.entry_handler = entry_handler_chmod;
+    chmod_kprobe.handler = ret_handler_chmod;
+    chmod_kprobe.data_size = sizeof(struct chmod_kretprobe_data);
+    chmod_kprobe.maxactive = 64;
+
+    ret = mattx_register_kretprobe(&chmod_kprobe);
+    if (ret < 0) {
+        printk(KERN_ERR "MattX: register_kretprobe failed for chmod, returned %d\n", ret);
+    }
+
+    memset(&fchownat_kprobe, 0, sizeof(fchownat_kprobe));
+    fchownat_kprobe.kp.symbol_name = "__x64_sys_fchownat";
+    fchownat_kprobe.entry_handler = entry_handler_fchownat;
+    fchownat_kprobe.handler = ret_handler_chown;
+    fchownat_kprobe.data_size = sizeof(struct chown_kretprobe_data);
+    fchownat_kprobe.maxactive = 64;
+
+    ret = mattx_register_kretprobe(&fchownat_kprobe);
+    if (ret < 0) {
+        printk(KERN_ERR "MattX: register_kretprobe failed for fchownat, returned %d\n", ret);
+    }
+
+    memset(&chown_kprobe, 0, sizeof(chown_kprobe));
+    chown_kprobe.kp.symbol_name = "__x64_sys_chown";
+    chown_kprobe.entry_handler = entry_handler_chown;
+    chown_kprobe.handler = ret_handler_chown;
+    chown_kprobe.data_size = sizeof(struct chown_kretprobe_data);
+    chown_kprobe.maxactive = 64;
+
+    ret = mattx_register_kretprobe(&chown_kprobe);
+    if (ret < 0) {
+        printk(KERN_ERR "MattX: register_kretprobe failed for chown, returned %d\n", ret);
+    }
+
+    memset(&lchown_kprobe, 0, sizeof(lchown_kprobe));
+    lchown_kprobe.kp.symbol_name = "__x64_sys_lchown";
+    lchown_kprobe.entry_handler = entry_handler_lchown;
+    lchown_kprobe.handler = ret_handler_chown;
+    lchown_kprobe.data_size = sizeof(struct chown_kretprobe_data);
+    lchown_kprobe.maxactive = 64;
+
+    ret = mattx_register_kretprobe(&lchown_kprobe);
+    if (ret < 0) {
+        printk(KERN_ERR "MattX: register_kretprobe failed for lchown, returned %d\n", ret);
+    }
+
+    memset(&truncate_kprobe, 0, sizeof(truncate_kprobe));
+    truncate_kprobe.kp.symbol_name = "__x64_sys_truncate";
+    truncate_kprobe.entry_handler = entry_handler_truncate;
+    truncate_kprobe.handler = ret_handler_truncate;
+    truncate_kprobe.data_size = sizeof(struct truncate_kretprobe_data);
+    truncate_kprobe.maxactive = 64;
+
+    ret = mattx_register_kretprobe(&truncate_kprobe);
+    if (ret < 0) {
+        printk(KERN_ERR "MattX: register_kretprobe failed for truncate, returned %d\n", ret);
+    }
+
+    memset(&utimensat_kprobe, 0, sizeof(utimensat_kprobe));
+    utimensat_kprobe.kp.symbol_name = "__x64_sys_utimensat";
+    utimensat_kprobe.entry_handler = entry_handler_utimensat;
+    utimensat_kprobe.handler = ret_handler_utimensat;
+    utimensat_kprobe.data_size = sizeof(struct utimensat_kretprobe_data);
+    utimensat_kprobe.maxactive = 64;
+
+    ret = mattx_register_kretprobe(&utimensat_kprobe);
+    if (ret < 0) {
+        printk(KERN_ERR "MattX: register_kretprobe failed for utimensat, returned %d\n", ret);
     }
 
     memset(&socket_kprobe, 0, sizeof(socket_kprobe));

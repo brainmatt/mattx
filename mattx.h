@@ -304,6 +304,14 @@ enum mattx_msg_type {
     MATTX_MSG_SYS_LINKAT_REPLY,
     MATTX_MSG_SYS_SYMLINKAT_REQ,  // issue #67 (P3, Track K): symlink / symlinkat of a Surrogate (kprobe mode), Identity Theft, ticket based
     MATTX_MSG_SYS_SYMLINKAT_REPLY,
+    MATTX_MSG_SYS_FCHMODAT2_REQ,  // issue #67 (P3, Track K): chmod / fchmodat / fchmodat2 of a Surrogate (kprobe mode), Identity Theft, ticket based
+    MATTX_MSG_SYS_FCHMODAT2_REPLY,
+    MATTX_MSG_SYS_FCHOWNAT_REQ,  // issue #67 (P3, Track K): chown / lchown / fchownat of a Surrogate (kprobe mode), Identity Theft, ticket based
+    MATTX_MSG_SYS_FCHOWNAT_REPLY,
+    MATTX_MSG_SYS_TRUNCATE_REQ,  // issue #67 (P3, Track K): truncate of a Surrogate (kprobe mode), Identity Theft, ticket based
+    MATTX_MSG_SYS_TRUNCATE_REPLY,
+    MATTX_MSG_SYS_UTIMENSAT_REQ,  // issue #67 (P3, Track K): utimensat of a Surrogate (kprobe mode), Identity Theft, ticket based
+    MATTX_MSG_SYS_UTIMENSAT_REPLY,
 };
 
 struct mattx_header {
@@ -727,6 +735,100 @@ struct mattx_sys_symlinkat_req {
 };
 
 struct mattx_sys_symlinkat_reply {
+    u32 orig_pid;
+    int error;
+    u32 req_id;                 // echo of the request's ticket id
+    u32 pad;
+};
+
+/*
+ * chmod() / fchmodat() / fchmodat2() of a Surrogate in kprobe mode (issue #67, P3, Track K): the home node runs the REAL
+ * fchmodat2() as the Deputy (Identity Theft): cwd, dirfd, permissions, the setuid/setgid rules and the errno are the kernel's.
+ * chmod(p, m) is fchmodat2(AT_FDCWD, p, m, 0) and fchmodat(d, p, m) is fchmodat2(d, p, m, 0) in the kernel itself. flags is
+ * AT_SYMLINK_NOFOLLOW / AT_EMPTY_PATH (an unknown bit is the kernel's -EINVAL); the dirfd is the Deputy's FD or AT_FDCWD.
+ */
+struct mattx_sys_fchmodat2_req {
+    u32 orig_pid;
+    u32 req_id;                 // ticket id, never 0
+    s32 dirfd;
+    u32 mode;
+    u32 flags;
+    u32 pathlen;                // with the NUL, 1 .. PATH_MAX
+    char path[];                // must stay the LAST member
+};
+
+struct mattx_sys_fchmodat2_reply {
+    u32 orig_pid;
+    int error;
+    u32 req_id;                 // echo of the request's ticket id
+    u32 pad;
+};
+
+/*
+ * chown() / lchown() / fchownat() of a Surrogate in kprobe mode (issue #67, P3, Track K): the home node runs the REAL fchownat()
+ * as the Deputy (Identity Theft): cwd, dirfd, CAP_CHOWN of the Deputy's credentials, the setuid clearing and the errno are the
+ * kernel's. chown(p, u, g) is fchownat(AT_FDCWD, p, u, g, 0) and lchown() has AT_SYMLINK_NOFOLLOW in the kernel itself. uid and
+ * gid are passed as they come (-1 = unchanged, 0xffffffff). flags is AT_SYMLINK_NOFOLLOW / AT_EMPTY_PATH (an unknown bit is the
+ * kernel's -EINVAL); the dirfd is the Deputy's FD or AT_FDCWD.
+ */
+struct mattx_sys_fchownat_req {
+    u32 orig_pid;
+    u32 req_id;                 // ticket id, never 0
+    s32 dirfd;
+    u32 uid;
+    u32 gid;
+    u32 flags;
+    u32 pathlen;                // with the NUL, 1 .. PATH_MAX
+    char path[];                // must stay the LAST member
+};
+
+struct mattx_sys_fchownat_reply {
+    u32 orig_pid;
+    int error;
+    u32 req_id;                 // echo of the request's ticket id
+    u32 pad;
+};
+
+/*
+ * truncate() (by path) of a Surrogate in kprobe mode (issue #67, P3, Track K): the home node runs the REAL truncate() as the
+ * Deputy (Identity Theft): cwd, write permission, immutable / append-only and the errno are the
+ * kernel's. A negative length is the kernel's -EINVAL. (ftruncate() on a Ghost FD is a different path: SYS_FSETATTR.)
+ */
+struct mattx_sys_truncate_req {
+    u32 orig_pid;
+    u32 req_id;                 // ticket id, never 0
+    s64 length;
+    u32 pathlen;                // with the NUL, 1 .. PATH_MAX
+    u32 pad;
+    char path[];                // must stay the LAST member
+};
+
+struct mattx_sys_truncate_reply {
+    u32 orig_pid;
+    int error;
+    u32 req_id;                 // echo of the request's ticket id
+    u32 pad;
+};
+
+/*
+ * utimensat() of a Surrogate in kprobe mode (issue #67, P3, Track K): the home node runs the REAL utimensat() as the Deputy
+ * (Identity Theft): cwd, dirfd, ownership / write permission (UTIME_NOW needs less than an explicit time), UTIME_NOW / UTIME_OMIT,
+ * AT_SYMLINK_NOFOLLOW / AT_EMPTY_PATH and the errno are the kernel's. times[] holds the two struct __kernel_timespec of the
+ * application by value (atime sec, atime nsec, mtime sec, mtime nsec) when has_times is 1; 0 means times == NULL (both now).
+ * The path is NOT NULL here: utimensat(fd, NULL, ..) is futimens() and is not ours.
+ */
+struct mattx_sys_utimensat_req {
+    u32 orig_pid;
+    u32 req_id;                 // ticket id, never 0
+    s32 dirfd;
+    u32 flags;
+    u32 has_times;              // 0: the application passed times == NULL
+    u32 pathlen;                // with the NUL, 1 .. PATH_MAX
+    s64 times[4];               // atime sec, atime nsec, mtime sec, mtime nsec (two struct __kernel_timespec)
+    char path[];                // must stay the LAST member
+};
+
+struct mattx_sys_utimensat_reply {
     u32 orig_pid;
     int error;
     u32 req_id;                 // echo of the request's ticket id
@@ -2106,6 +2208,16 @@ typedef long (*mattx_sys_linkat_fn)(const struct pt_regs *regs);
 extern mattx_sys_linkat_fn real_sys_linkat;
 typedef long (*mattx_sys_symlinkat_fn)(const struct pt_regs *regs);
 extern mattx_sys_symlinkat_fn real_sys_symlinkat;
+typedef long (*mattx_sys_fchmodat2_fn)(const struct pt_regs *regs);
+extern mattx_sys_fchmodat2_fn real_sys_fchmodat2;
+typedef long (*mattx_sys_fchmodat_fn)(const struct pt_regs *regs);
+extern mattx_sys_fchmodat_fn real_sys_fchmodat;
+typedef long (*mattx_sys_fchownat_fn)(const struct pt_regs *regs);
+extern mattx_sys_fchownat_fn real_sys_fchownat;
+typedef long (*mattx_sys_truncate_fn)(const struct pt_regs *regs);
+extern mattx_sys_truncate_fn real_sys_truncate;
+typedef long (*mattx_sys_utimensat_fn)(const struct pt_regs *regs);
+extern mattx_sys_utimensat_fn real_sys_utimensat;
 
 typedef long (*mattx_sys_faccessat2_fn)(const struct pt_regs *regs);
 extern mattx_sys_faccessat2_fn real_sys_faccessat2;

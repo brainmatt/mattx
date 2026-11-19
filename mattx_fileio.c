@@ -859,10 +859,11 @@ static void mattx_deputy_unimplant_fd(struct task_struct *deputy, int temp_fd, s
  * and path2 at sp-12288. The registers are named by their argument index (mattx_regs_set_arg). path2 NULL and fd2_to_map < 1000
  * make it the single-path form; mattx_execute_as_deputy() below is exactly that.
  */
-static int mattx_execute_as_deputy_ex(struct task_struct *deputy, long (*syscall_fn)(const struct pt_regs *), struct pt_regs *regs,
-                                      const char *path, int path_reg, const char *path2, int path2_reg,
-                                      void *out_buf, size_t out_size, int buf_reg,
-                                      int fd_to_map, int fd_reg, int fd2_to_map, int fd2_reg) {
+static int mattx_execute_as_deputy_full(struct task_struct *deputy, long (*syscall_fn)(const struct pt_regs *), struct pt_regs *regs,
+                                        const char *path, int path_reg, const char *path2, int path2_reg,
+                                        void *out_buf, size_t out_size, int buf_reg,
+                                        int fd_to_map, int fd_reg, int fd2_to_map, int fd2_reg,
+                                        const void *in_buf, size_t in_size, int in_reg) {
     int ret = -ESRCH;
     int temp_fd = -1, temp_fd2 = -1;
     struct file *mapped_file = NULL, *mapped_file2 = NULL;
@@ -898,6 +899,20 @@ static int mattx_execute_as_deputy_ex(struct task_struct *deputy, long (*syscall
             goto out;
         }
         mattx_regs_set_arg(regs, path2_reg, path2_ptr);
+    }
+
+    // An INPUT blob (utimensat: the two timespecs) goes into the slot of path2 and is passed by pointer in register in_reg:
+    // a call has either a second path or an input blob, never both. in_size is at most 4096 bytes.
+    if (in_buf && in_size > 0) {
+        if (path2 || in_size > 4096) {
+            ret = -EINVAL;
+            goto out;
+        }
+        if (copy_to_user((void __user *)path2_ptr, in_buf, in_size)) {
+            ret = -EFAULT;
+            goto out;
+        }
+        mattx_regs_set_arg(regs, in_reg, path2_ptr);
     }
 
     if (out_buf && out_size > 0)
@@ -947,6 +962,15 @@ out:
 
     mutex_unlock(mattx_deputy_scratch_mutex(deputy));
     return ret;
+}
+
+// The two paths / two FDs form (rename, link, symlink): no input blob
+static int mattx_execute_as_deputy_ex(struct task_struct *deputy, long (*syscall_fn)(const struct pt_regs *), struct pt_regs *regs,
+                                      const char *path, int path_reg, const char *path2, int path2_reg,
+                                      void *out_buf, size_t out_size, int buf_reg,
+                                      int fd_to_map, int fd_reg, int fd2_to_map, int fd2_reg) {
+    return mattx_execute_as_deputy_full(deputy, syscall_fn, regs, path, path_reg, path2, path2_reg, out_buf, out_size, buf_reg,
+                                        fd_to_map, fd_reg, fd2_to_map, fd2_reg, NULL, 0, 0);
 }
 
 // The single path / single FD form that every caller before the two-path calls uses
@@ -13224,6 +13248,476 @@ static void handle_sys_symlinkat_reply(struct mattx_link *link, struct mattx_hea
         mattx_dbg("[RPC] SYMLINKAT_REPLY req %u: nobody waits for it any more, dropped\n", reply->req_id);
 }
 
+// --- Home side: chmod / fchmodat / fchmodat2 of a Surrogate (kprobe mode), by Identity Theft ---
+// The request is the tail of the context (flexible path): it must stay the LAST member
+struct mattx_fchmodat2_kworker_ctx { struct work_struct work; int target_node; struct mattx_sys_fchmodat2_req req; };
+
+static void mattx_fchmodat2_reply_send(int node, u32 orig_pid, u32 req_id, int error)
+{
+    struct mattx_sys_fchmodat2_reply reply;
+    struct mattx_link *link = READ_ONCE(cluster_map[node]);
+
+    memset(&reply, 0, sizeof(reply));
+    reply.orig_pid = orig_pid;
+    reply.req_id = req_id;
+    reply.error = error;
+    if (link)
+        mattx_comm_send(link, MATTX_MSG_SYS_FCHMODAT2_REPLY, &reply, sizeof(reply));
+}
+
+/*
+ * The REAL fchmodat2() runs as the Deputy (mattx_execute_as_deputy: its fs, files and credentials, the path patched in; the Deputy
+ * is NOT woken up). A call under way cannot be aborted (short): a CANCEL that arrives before it starts skips it (-EINTR), a
+ * later one is of no use and consumed; the real result is sent. Exactly one reply.
+ */
+static void mattx_fchmodat2_kworker(struct work_struct *work)
+{
+    struct mattx_fchmodat2_kworker_ctx *ctx = container_of(work, struct mattx_fchmodat2_kworker_ctx, work);
+    struct mattx_sys_fchmodat2_req *req = &ctx->req;
+    struct task_struct *deputy = NULL;
+    struct pt_regs regs;
+    bool abandoned = false;
+    int err;
+
+    if (mattx_req_take_cancelled(ctx->target_node, req->orig_pid, req->req_id)) {
+        mattx_dbg("[WORMHOLE] FCHMODAT2 '%s' (req %u) cancelled by the Surrogate before it started, skipped\n", req->path, req->req_id);
+        err = -EINTR;
+    } else if (READ_ONCE(mattx_cancellable_stopping) || !READ_ONCE(cluster_map[ctx->target_node])) {
+        abandoned = true;
+        err = -EINTR;
+    } else {
+        mattx_dbg("[WORMHOLE] FCHMODAT2 dirfd %d '%s' mode 0%o flags 0x%x (req %u) from Node %d (kworker)\n", req->dirfd, req->path, req->mode, req->flags, req->req_id, ctx->target_node);
+
+        rcu_read_lock();
+        deputy = pid_task(find_vpid(req->orig_pid), PIDTYPE_PID);
+        if (deputy)
+            get_task_struct(deputy);
+        rcu_read_unlock();
+
+        if (!deputy) {
+            err = -ESRCH;                       // no Deputy, no identity to act as
+        } else if (!(real_sys_fchmodat2 || (req->flags == 0 && real_sys_fchmodat))) {
+            err = -ENOSYS;
+        } else {
+            memset(&regs, 0, sizeof(regs));
+            // fchmodat2(dirfd = di, path = si, mode = dx, flags = r10); an FD >= 1000 is replaced by the helper (MattXFS export registry)
+            regs.di = (unsigned long)(long)req->dirfd;
+            regs.dx = req->mode;
+            regs.r10 = req->flags;
+            err = mattx_execute_as_deputy(deputy, real_sys_fchmodat2 ? real_sys_fchmodat2 : real_sys_fchmodat, &regs,
+                                          req->path, 2, NULL, 0, 0, req->dirfd, 1);
+        }
+        if (deputy)
+            put_task_struct(deputy);
+        mattx_req_take_cancelled(ctx->target_node, req->orig_pid, req->req_id);     // a CANCEL during the call is of no use any more
+    }
+
+    if (abandoned) {
+        mattx_dbg("[WORMHOLE] FCHMODAT2 (req %u): nobody left to answer, reply dropped\n", req->req_id);
+    } else {
+        mattx_dbg("[WORMHOLE] FCHMODAT2 '%s' (req %u) done: %d\n", req->path, req->req_id, err);
+        mattx_fchmodat2_reply_send(ctx->target_node, req->orig_pid, req->req_id, err);
+    }
+
+    kfree(ctx);
+    atomic_dec(&mattx_cancellable_inflight);
+}
+
+static void handle_sys_fchmodat2_req(struct mattx_link *link, struct mattx_header *hdr, void *payload)
+{
+    struct mattx_sys_fchmodat2_req *req = payload;
+    struct mattx_fchmodat2_kworker_ctx *ctx;
+
+    if (!payload || hdr->length < sizeof(*req)) return;
+    if (hdr->sender_id >= MAX_NODES || READ_ONCE(mattx_cancellable_stopping)) return;
+
+    // The path is the tail of the request: 1 .. PATH_MAX bytes, NUL terminated, all of it inside the message
+    if (req->pathlen < 1 || req->pathlen > PATH_MAX || hdr->length < sizeof(*req) + (size_t)req->pathlen ||
+        req->path[req->pathlen - 1] != '\0') {
+        printk(KERN_ERR "MattX:[RPC] FCHMODAT2_REQ %u of PID %u malformed (pathlen %u, message %u bytes)\n",
+               req->req_id, req->orig_pid, req->pathlen, hdr->length);
+        mattx_fchmodat2_reply_send(hdr->sender_id, req->orig_pid, req->req_id, -EINVAL);
+        return;
+    }
+
+    ctx = kmalloc(sizeof(*ctx) + req->pathlen, GFP_ATOMIC);
+    if (!ctx) {
+        // Still answer: the Surrogate thread sleeps on this ticket
+        printk(KERN_ERR "MattX:[RPC] FCHMODAT2_REQ %u of PID %u: out of memory\n", req->req_id, req->orig_pid);
+        mattx_fchmodat2_reply_send(hdr->sender_id, req->orig_pid, req->req_id, -ENOMEM);
+        return;
+    }
+    INIT_WORK(&ctx->work, mattx_fchmodat2_kworker);
+    memcpy(&ctx->req, req, sizeof(*req) + req->pathlen);
+    ctx->target_node = hdr->sender_id;
+    atomic_inc(&mattx_cancellable_inflight);
+    mattx_queue_wait_work(&ctx->work);
+}
+
+// Surrogate side: the reply belongs to exactly one waiting thread (its ticket)
+static void handle_sys_fchmodat2_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload)
+{
+    struct mattx_sys_fchmodat2_reply *reply = payload;
+
+    if (!payload || hdr->length < sizeof(*reply)) return;
+
+    mattx_dbg("[RPC] Received FCHMODAT2_REPLY for Orig PID %u req %u. Error: %d\n", reply->orig_pid, reply->req_id, reply->error);
+    if (!mattx_ticket_complete(hdr->sender_id, reply->orig_pid, reply->req_id, reply->error, NULL, 0))
+        mattx_dbg("[RPC] FCHMODAT2_REPLY req %u: nobody waits for it any more, dropped\n", reply->req_id);
+}
+
+// --- Home side: chown / lchown / fchownat of a Surrogate (kprobe mode), by Identity Theft ---
+// The request is the tail of the context (flexible path): it must stay the LAST member
+struct mattx_fchownat_kworker_ctx { struct work_struct work; int target_node; struct mattx_sys_fchownat_req req; };
+
+static void mattx_fchownat_reply_send(int node, u32 orig_pid, u32 req_id, int error)
+{
+    struct mattx_sys_fchownat_reply reply;
+    struct mattx_link *link = READ_ONCE(cluster_map[node]);
+
+    memset(&reply, 0, sizeof(reply));
+    reply.orig_pid = orig_pid;
+    reply.req_id = req_id;
+    reply.error = error;
+    if (link)
+        mattx_comm_send(link, MATTX_MSG_SYS_FCHOWNAT_REPLY, &reply, sizeof(reply));
+}
+
+/*
+ * The REAL fchownat() runs as the Deputy (mattx_execute_as_deputy: its fs, files and credentials, the path patched in; the Deputy
+ * is NOT woken up). A call under way cannot be aborted (short): a CANCEL that arrives before it starts skips it (-EINTR), a
+ * later one is of no use and consumed; the real result is sent. Exactly one reply.
+ */
+static void mattx_fchownat_kworker(struct work_struct *work)
+{
+    struct mattx_fchownat_kworker_ctx *ctx = container_of(work, struct mattx_fchownat_kworker_ctx, work);
+    struct mattx_sys_fchownat_req *req = &ctx->req;
+    struct task_struct *deputy = NULL;
+    struct pt_regs regs;
+    bool abandoned = false;
+    int err;
+
+    if (mattx_req_take_cancelled(ctx->target_node, req->orig_pid, req->req_id)) {
+        mattx_dbg("[WORMHOLE] FCHOWNAT '%s' (req %u) cancelled by the Surrogate before it started, skipped\n", req->path, req->req_id);
+        err = -EINTR;
+    } else if (READ_ONCE(mattx_cancellable_stopping) || !READ_ONCE(cluster_map[ctx->target_node])) {
+        abandoned = true;
+        err = -EINTR;
+    } else {
+        mattx_dbg("[WORMHOLE] FCHOWNAT dirfd %d '%s' uid %u gid %u flags 0x%x (req %u) from Node %d (kworker)\n", req->dirfd, req->path, req->uid, req->gid, req->flags, req->req_id, ctx->target_node);
+
+        rcu_read_lock();
+        deputy = pid_task(find_vpid(req->orig_pid), PIDTYPE_PID);
+        if (deputy)
+            get_task_struct(deputy);
+        rcu_read_unlock();
+
+        if (!deputy) {
+            err = -ESRCH;                       // no Deputy, no identity to act as
+        } else if (!real_sys_fchownat) {
+            err = -ENOSYS;
+        } else {
+            memset(&regs, 0, sizeof(regs));
+            // fchownat(dirfd = di, path = si, uid = dx, gid = r10, flags = r8); an FD >= 1000 is replaced by the helper (MattXFS export registry)
+            regs.di = (unsigned long)(long)req->dirfd;
+            regs.dx = req->uid;
+            regs.r10 = req->gid;
+            regs.r8 = req->flags;
+            err = mattx_execute_as_deputy(deputy, real_sys_fchownat, &regs, req->path, 2, NULL, 0, 0, req->dirfd, 1);
+        }
+        if (deputy)
+            put_task_struct(deputy);
+        mattx_req_take_cancelled(ctx->target_node, req->orig_pid, req->req_id);     // a CANCEL during the call is of no use any more
+    }
+
+    if (abandoned) {
+        mattx_dbg("[WORMHOLE] FCHOWNAT (req %u): nobody left to answer, reply dropped\n", req->req_id);
+    } else {
+        mattx_dbg("[WORMHOLE] FCHOWNAT '%s' (req %u) done: %d\n", req->path, req->req_id, err);
+        mattx_fchownat_reply_send(ctx->target_node, req->orig_pid, req->req_id, err);
+    }
+
+    kfree(ctx);
+    atomic_dec(&mattx_cancellable_inflight);
+}
+
+static void handle_sys_fchownat_req(struct mattx_link *link, struct mattx_header *hdr, void *payload)
+{
+    struct mattx_sys_fchownat_req *req = payload;
+    struct mattx_fchownat_kworker_ctx *ctx;
+
+    if (!payload || hdr->length < sizeof(*req)) return;
+    if (hdr->sender_id >= MAX_NODES || READ_ONCE(mattx_cancellable_stopping)) return;
+
+    // The path is the tail of the request: 1 .. PATH_MAX bytes, NUL terminated, all of it inside the message
+    if (req->pathlen < 1 || req->pathlen > PATH_MAX || hdr->length < sizeof(*req) + (size_t)req->pathlen ||
+        req->path[req->pathlen - 1] != '\0') {
+        printk(KERN_ERR "MattX:[RPC] FCHOWNAT_REQ %u of PID %u malformed (pathlen %u, message %u bytes)\n",
+               req->req_id, req->orig_pid, req->pathlen, hdr->length);
+        mattx_fchownat_reply_send(hdr->sender_id, req->orig_pid, req->req_id, -EINVAL);
+        return;
+    }
+
+    ctx = kmalloc(sizeof(*ctx) + req->pathlen, GFP_ATOMIC);
+    if (!ctx) {
+        // Still answer: the Surrogate thread sleeps on this ticket
+        printk(KERN_ERR "MattX:[RPC] FCHOWNAT_REQ %u of PID %u: out of memory\n", req->req_id, req->orig_pid);
+        mattx_fchownat_reply_send(hdr->sender_id, req->orig_pid, req->req_id, -ENOMEM);
+        return;
+    }
+    INIT_WORK(&ctx->work, mattx_fchownat_kworker);
+    memcpy(&ctx->req, req, sizeof(*req) + req->pathlen);
+    ctx->target_node = hdr->sender_id;
+    atomic_inc(&mattx_cancellable_inflight);
+    mattx_queue_wait_work(&ctx->work);
+}
+
+// Surrogate side: the reply belongs to exactly one waiting thread (its ticket)
+static void handle_sys_fchownat_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload)
+{
+    struct mattx_sys_fchownat_reply *reply = payload;
+
+    if (!payload || hdr->length < sizeof(*reply)) return;
+
+    mattx_dbg("[RPC] Received FCHOWNAT_REPLY for Orig PID %u req %u. Error: %d\n", reply->orig_pid, reply->req_id, reply->error);
+    if (!mattx_ticket_complete(hdr->sender_id, reply->orig_pid, reply->req_id, reply->error, NULL, 0))
+        mattx_dbg("[RPC] FCHOWNAT_REPLY req %u: nobody waits for it any more, dropped\n", reply->req_id);
+}
+
+// --- Home side: truncate of a Surrogate (kprobe mode), by Identity Theft ---
+// The request is the tail of the context (flexible path): it must stay the LAST member
+struct mattx_truncate_kworker_ctx { struct work_struct work; int target_node; struct mattx_sys_truncate_req req; };
+
+static void mattx_truncate_reply_send(int node, u32 orig_pid, u32 req_id, int error)
+{
+    struct mattx_sys_truncate_reply reply;
+    struct mattx_link *link = READ_ONCE(cluster_map[node]);
+
+    memset(&reply, 0, sizeof(reply));
+    reply.orig_pid = orig_pid;
+    reply.req_id = req_id;
+    reply.error = error;
+    if (link)
+        mattx_comm_send(link, MATTX_MSG_SYS_TRUNCATE_REPLY, &reply, sizeof(reply));
+}
+
+/*
+ * The REAL truncate() runs as the Deputy (mattx_execute_as_deputy: its fs, files and credentials, the path patched in; the Deputy
+ * is NOT woken up). A call under way cannot be aborted (short): a CANCEL that arrives before it starts skips it (-EINTR), a
+ * later one is of no use and consumed; the real result is sent. Exactly one reply.
+ */
+static void mattx_truncate_kworker(struct work_struct *work)
+{
+    struct mattx_truncate_kworker_ctx *ctx = container_of(work, struct mattx_truncate_kworker_ctx, work);
+    struct mattx_sys_truncate_req *req = &ctx->req;
+    struct task_struct *deputy = NULL;
+    struct pt_regs regs;
+    bool abandoned = false;
+    int err;
+
+    if (mattx_req_take_cancelled(ctx->target_node, req->orig_pid, req->req_id)) {
+        mattx_dbg("[WORMHOLE] TRUNCATE '%s' (req %u) cancelled by the Surrogate before it started, skipped\n", req->path, req->req_id);
+        err = -EINTR;
+    } else if (READ_ONCE(mattx_cancellable_stopping) || !READ_ONCE(cluster_map[ctx->target_node])) {
+        abandoned = true;
+        err = -EINTR;
+    } else {
+        mattx_dbg("[WORMHOLE] TRUNCATE '%s' length %lld (req %u) from Node %d (kworker)\n", req->path, (long long)req->length, req->req_id, ctx->target_node);
+
+        rcu_read_lock();
+        deputy = pid_task(find_vpid(req->orig_pid), PIDTYPE_PID);
+        if (deputy)
+            get_task_struct(deputy);
+        rcu_read_unlock();
+
+        if (!deputy) {
+            err = -ESRCH;                       // no Deputy, no identity to act as
+        } else if (!real_sys_truncate) {
+            err = -ENOSYS;
+        } else {
+            memset(&regs, 0, sizeof(regs));
+            // truncate(path = di, length = si)
+            regs.si = (unsigned long)req->length;
+            err = mattx_execute_as_deputy(deputy, real_sys_truncate, &regs, req->path, 1, NULL, 0, 0, -1, 0);
+        }
+        if (deputy)
+            put_task_struct(deputy);
+        mattx_req_take_cancelled(ctx->target_node, req->orig_pid, req->req_id);     // a CANCEL during the call is of no use any more
+    }
+
+    if (abandoned) {
+        mattx_dbg("[WORMHOLE] TRUNCATE (req %u): nobody left to answer, reply dropped\n", req->req_id);
+    } else {
+        mattx_dbg("[WORMHOLE] TRUNCATE '%s' (req %u) done: %d\n", req->path, req->req_id, err);
+        mattx_truncate_reply_send(ctx->target_node, req->orig_pid, req->req_id, err);
+    }
+
+    kfree(ctx);
+    atomic_dec(&mattx_cancellable_inflight);
+}
+
+static void handle_sys_truncate_req(struct mattx_link *link, struct mattx_header *hdr, void *payload)
+{
+    struct mattx_sys_truncate_req *req = payload;
+    struct mattx_truncate_kworker_ctx *ctx;
+
+    if (!payload || hdr->length < sizeof(*req)) return;
+    if (hdr->sender_id >= MAX_NODES || READ_ONCE(mattx_cancellable_stopping)) return;
+
+    // The path is the tail of the request: 1 .. PATH_MAX bytes, NUL terminated, all of it inside the message
+    if (req->pathlen < 1 || req->pathlen > PATH_MAX || hdr->length < sizeof(*req) + (size_t)req->pathlen ||
+        req->path[req->pathlen - 1] != '\0') {
+        printk(KERN_ERR "MattX:[RPC] TRUNCATE_REQ %u of PID %u malformed (pathlen %u, message %u bytes)\n",
+               req->req_id, req->orig_pid, req->pathlen, hdr->length);
+        mattx_truncate_reply_send(hdr->sender_id, req->orig_pid, req->req_id, -EINVAL);
+        return;
+    }
+
+    ctx = kmalloc(sizeof(*ctx) + req->pathlen, GFP_ATOMIC);
+    if (!ctx) {
+        // Still answer: the Surrogate thread sleeps on this ticket
+        printk(KERN_ERR "MattX:[RPC] TRUNCATE_REQ %u of PID %u: out of memory\n", req->req_id, req->orig_pid);
+        mattx_truncate_reply_send(hdr->sender_id, req->orig_pid, req->req_id, -ENOMEM);
+        return;
+    }
+    INIT_WORK(&ctx->work, mattx_truncate_kworker);
+    memcpy(&ctx->req, req, sizeof(*req) + req->pathlen);
+    ctx->target_node = hdr->sender_id;
+    atomic_inc(&mattx_cancellable_inflight);
+    mattx_queue_wait_work(&ctx->work);
+}
+
+// Surrogate side: the reply belongs to exactly one waiting thread (its ticket)
+static void handle_sys_truncate_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload)
+{
+    struct mattx_sys_truncate_reply *reply = payload;
+
+    if (!payload || hdr->length < sizeof(*reply)) return;
+
+    mattx_dbg("[RPC] Received TRUNCATE_REPLY for Orig PID %u req %u. Error: %d\n", reply->orig_pid, reply->req_id, reply->error);
+    if (!mattx_ticket_complete(hdr->sender_id, reply->orig_pid, reply->req_id, reply->error, NULL, 0))
+        mattx_dbg("[RPC] TRUNCATE_REPLY req %u: nobody waits for it any more, dropped\n", reply->req_id);
+}
+
+// --- Home side: utimensat of a Surrogate (kprobe mode), by Identity Theft ---
+// The request is the tail of the context (flexible path): it must stay the LAST member
+struct mattx_utimensat_kworker_ctx { struct work_struct work; int target_node; struct mattx_sys_utimensat_req req; };
+
+static void mattx_utimensat_reply_send(int node, u32 orig_pid, u32 req_id, int error)
+{
+    struct mattx_sys_utimensat_reply reply;
+    struct mattx_link *link = READ_ONCE(cluster_map[node]);
+
+    memset(&reply, 0, sizeof(reply));
+    reply.orig_pid = orig_pid;
+    reply.req_id = req_id;
+    reply.error = error;
+    if (link)
+        mattx_comm_send(link, MATTX_MSG_SYS_UTIMENSAT_REPLY, &reply, sizeof(reply));
+}
+
+/*
+ * The REAL utimensat() runs as the Deputy (mattx_execute_as_deputy: its fs, files and credentials, the path patched in; the Deputy
+ * is NOT woken up). A call under way cannot be aborted (short): a CANCEL that arrives before it starts skips it (-EINTR), a
+ * later one is of no use and consumed; the real result is sent. Exactly one reply.
+ */
+static void mattx_utimensat_kworker(struct work_struct *work)
+{
+    struct mattx_utimensat_kworker_ctx *ctx = container_of(work, struct mattx_utimensat_kworker_ctx, work);
+    struct mattx_sys_utimensat_req *req = &ctx->req;
+    struct task_struct *deputy = NULL;
+    struct pt_regs regs;
+    bool abandoned = false;
+    int err;
+
+    if (mattx_req_take_cancelled(ctx->target_node, req->orig_pid, req->req_id)) {
+        mattx_dbg("[WORMHOLE] UTIMENSAT '%s' (req %u) cancelled by the Surrogate before it started, skipped\n", req->path, req->req_id);
+        err = -EINTR;
+    } else if (READ_ONCE(mattx_cancellable_stopping) || !READ_ONCE(cluster_map[ctx->target_node])) {
+        abandoned = true;
+        err = -EINTR;
+    } else {
+        mattx_dbg("[WORMHOLE] UTIMENSAT dirfd %d '%s' times %s flags 0x%x (req %u) from Node %d (kworker)\n", req->dirfd, req->path, req->has_times ? "given" : "now", req->flags, req->req_id, ctx->target_node);
+
+        rcu_read_lock();
+        deputy = pid_task(find_vpid(req->orig_pid), PIDTYPE_PID);
+        if (deputy)
+            get_task_struct(deputy);
+        rcu_read_unlock();
+
+        if (!deputy) {
+            err = -ESRCH;                       // no Deputy, no identity to act as
+        } else if (!real_sys_utimensat) {
+            err = -ENOSYS;
+        } else {
+            memset(&regs, 0, sizeof(regs));
+            // utimensat(dirfd = di, path = si, times = dx, flags = r10): the timespecs are put on the scratchpad by the helper
+            regs.di = (unsigned long)(long)req->dirfd;
+            regs.r10 = req->flags;
+            err = mattx_execute_as_deputy_full(deputy, real_sys_utimensat, &regs, req->path, 2, NULL, 0, NULL, 0, 0,
+                                               req->dirfd, 1, -1, 0,
+                                               req->has_times ? (const void *)req->times : NULL,
+                                               req->has_times ? sizeof(req->times) : 0, 3);
+        }
+        if (deputy)
+            put_task_struct(deputy);
+        mattx_req_take_cancelled(ctx->target_node, req->orig_pid, req->req_id);     // a CANCEL during the call is of no use any more
+    }
+
+    if (abandoned) {
+        mattx_dbg("[WORMHOLE] UTIMENSAT (req %u): nobody left to answer, reply dropped\n", req->req_id);
+    } else {
+        mattx_dbg("[WORMHOLE] UTIMENSAT '%s' (req %u) done: %d\n", req->path, req->req_id, err);
+        mattx_utimensat_reply_send(ctx->target_node, req->orig_pid, req->req_id, err);
+    }
+
+    kfree(ctx);
+    atomic_dec(&mattx_cancellable_inflight);
+}
+
+static void handle_sys_utimensat_req(struct mattx_link *link, struct mattx_header *hdr, void *payload)
+{
+    struct mattx_sys_utimensat_req *req = payload;
+    struct mattx_utimensat_kworker_ctx *ctx;
+
+    if (!payload || hdr->length < sizeof(*req)) return;
+    if (hdr->sender_id >= MAX_NODES || READ_ONCE(mattx_cancellable_stopping)) return;
+
+    // The path is the tail of the request: 1 .. PATH_MAX bytes, NUL terminated, all of it inside the message
+    if (req->pathlen < 1 || req->pathlen > PATH_MAX || hdr->length < sizeof(*req) + (size_t)req->pathlen ||
+        req->path[req->pathlen - 1] != '\0') {
+        printk(KERN_ERR "MattX:[RPC] UTIMENSAT_REQ %u of PID %u malformed (pathlen %u, message %u bytes)\n",
+               req->req_id, req->orig_pid, req->pathlen, hdr->length);
+        mattx_utimensat_reply_send(hdr->sender_id, req->orig_pid, req->req_id, -EINVAL);
+        return;
+    }
+
+    ctx = kmalloc(sizeof(*ctx) + req->pathlen, GFP_ATOMIC);
+    if (!ctx) {
+        // Still answer: the Surrogate thread sleeps on this ticket
+        printk(KERN_ERR "MattX:[RPC] UTIMENSAT_REQ %u of PID %u: out of memory\n", req->req_id, req->orig_pid);
+        mattx_utimensat_reply_send(hdr->sender_id, req->orig_pid, req->req_id, -ENOMEM);
+        return;
+    }
+    INIT_WORK(&ctx->work, mattx_utimensat_kworker);
+    memcpy(&ctx->req, req, sizeof(*req) + req->pathlen);
+    ctx->target_node = hdr->sender_id;
+    atomic_inc(&mattx_cancellable_inflight);
+    mattx_queue_wait_work(&ctx->work);
+}
+
+// Surrogate side: the reply belongs to exactly one waiting thread (its ticket)
+static void handle_sys_utimensat_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload)
+{
+    struct mattx_sys_utimensat_reply *reply = payload;
+
+    if (!payload || hdr->length < sizeof(*reply)) return;
+
+    mattx_dbg("[RPC] Received UTIMENSAT_REPLY for Orig PID %u req %u. Error: %d\n", reply->orig_pid, reply->req_id, reply->error);
+    if (!mattx_ticket_complete(hdr->sender_id, reply->orig_pid, reply->req_id, reply->error, NULL, 0))
+        mattx_dbg("[RPC] UTIMENSAT_REPLY req %u: nobody waits for it any more, dropped\n", reply->req_id);
+}
+
 /*
  * DIRECTORY OPERATIONS of MattXFS (issue #67, P3, Track M). The directory inode of MattXFS only had .lookup, .create
  * and .unlink: mkdir and rmdir were refused by the VFS. The operation is run at the home node through the VFS (the
@@ -14461,6 +14955,14 @@ void mattx_fileio_init_handlers(void) {
     mattx_register_handler(MATTX_MSG_SYS_LINKAT_REPLY, handle_sys_linkat_reply);
     mattx_register_handler(MATTX_MSG_SYS_SYMLINKAT_REQ, handle_sys_symlinkat_req);
     mattx_register_handler(MATTX_MSG_SYS_SYMLINKAT_REPLY, handle_sys_symlinkat_reply);
+    mattx_register_handler(MATTX_MSG_SYS_FCHMODAT2_REQ, handle_sys_fchmodat2_req);
+    mattx_register_handler(MATTX_MSG_SYS_FCHMODAT2_REPLY, handle_sys_fchmodat2_reply);
+    mattx_register_handler(MATTX_MSG_SYS_FCHOWNAT_REQ, handle_sys_fchownat_req);
+    mattx_register_handler(MATTX_MSG_SYS_FCHOWNAT_REPLY, handle_sys_fchownat_reply);
+    mattx_register_handler(MATTX_MSG_SYS_TRUNCATE_REQ, handle_sys_truncate_req);
+    mattx_register_handler(MATTX_MSG_SYS_TRUNCATE_REPLY, handle_sys_truncate_reply);
+    mattx_register_handler(MATTX_MSG_SYS_UTIMENSAT_REQ, handle_sys_utimensat_req);
+    mattx_register_handler(MATTX_MSG_SYS_UTIMENSAT_REPLY, handle_sys_utimensat_reply);
     mattx_register_handler(MATTX_MSG_VFS_MKDIR_REQ, handle_vfs_mkdir_req);
     mattx_register_handler(MATTX_MSG_VFS_MKDIR_REPLY, handle_vfs_mkdir_reply);
     mattx_register_handler(MATTX_MSG_VFS_RMDIR_REQ, handle_vfs_rmdir_req);
