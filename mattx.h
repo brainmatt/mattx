@@ -300,6 +300,10 @@ enum mattx_msg_type {
     MATTX_MSG_SYS_MKDIRAT_REPLY,
     MATTX_MSG_SYS_RENAMEAT2_REQ,     // issue #67 (P3, Track K): rename / renameat / renameat2 of a Surrogate (kprobe mode), Identity Theft, ticket based
     MATTX_MSG_SYS_RENAMEAT2_REPLY,
+    MATTX_MSG_SYS_LINKAT_REQ,     // issue #67 (P3, Track K): link / linkat of a Surrogate (kprobe mode), Identity Theft, ticket based
+    MATTX_MSG_SYS_LINKAT_REPLY,
+    MATTX_MSG_SYS_SYMLINKAT_REQ,  // issue #67 (P3, Track K): symlink / symlinkat of a Surrogate (kprobe mode), Identity Theft, ticket based
+    MATTX_MSG_SYS_SYMLINKAT_REPLY,
 };
 
 struct mattx_header {
@@ -672,6 +676,57 @@ struct mattx_sys_renameat2_req {
 };
 
 struct mattx_sys_renameat2_reply {
+    u32 orig_pid;
+    int error;
+    u32 req_id;                 // echo of the request's ticket id
+    u32 pad;
+};
+
+/*
+ * link() / linkat() of a Surrogate in kprobe mode (issue #67, P3, Track K): the home node runs the REAL linkat() as the Deputy
+ * (Identity Theft): cwd, both directory FDs, permissions, protected_hardlinks, AT_SYMLINK_FOLLOW / AT_EMPTY_PATH and the
+ * errno are the kernel's. link(a, b) is linkat(AT_FDCWD, a, AT_FDCWD, b, 0) in the kernel itself. paths[] holds the old name
+ * (oldlen bytes incl. NUL; a single NUL is the empty name of AT_EMPTY_PATH) immediately followed by the new name (newlen bytes
+ * incl. NUL), each 1 .. PATH_MAX. Each dirfd is the Deputy's FD (AT_FDCWD for an absolute path or the Deputy's cwd).
+ */
+struct mattx_sys_linkat_req {
+    u32 orig_pid;
+    u32 req_id;                 // ticket id, never 0
+    s32 olddirfd;
+    s32 newdirfd;
+    u32 flags;                  // AT_SYMLINK_FOLLOW / AT_EMPTY_PATH; an unknown bit is the kernel's -EINVAL
+    u32 oldlen;
+    u32 newlen;
+    u32 pad;
+    char paths[];               // old NUL new NUL, must stay the LAST member
+};
+
+struct mattx_sys_linkat_reply {
+    u32 orig_pid;
+    int error;
+    u32 req_id;                 // echo of the request's ticket id
+    u32 pad;
+};
+
+/*
+ * symlink() / symlinkat() of a Surrogate in kprobe mode (issue #67, P3, Track K): the home node runs the REAL symlinkat() as
+ * the Deputy (Identity Theft). symlink(t, l) is symlinkat(t, AT_FDCWD, l) in the kernel itself. paths[] holds the TARGET
+ * (targetlen bytes incl. NUL, 1 .. PATH_MAX) immediately followed by the link name (linklen bytes incl. NUL, 1 .. PATH_MAX).
+ * The target is only stored, never resolved and never mapped: it is the application's string, byte for byte (a relative
+ * target stays relative to the directory of the link). Only the link name has a directory FD (newdirfd, the Deputy's FD or
+ * AT_FDCWD for an absolute link name or the Deputy's cwd).
+ */
+struct mattx_sys_symlinkat_req {
+    u32 orig_pid;
+    u32 req_id;                 // ticket id, never 0
+    s32 newdirfd;
+    u32 targetlen;
+    u32 linklen;
+    u32 pad;
+    char paths[];               // target NUL linkname NUL, must stay the LAST member
+};
+
+struct mattx_sys_symlinkat_reply {
     u32 orig_pid;
     int error;
     u32 req_id;                 // echo of the request's ticket id
@@ -2046,6 +2101,11 @@ extern mattx_sys_mkdirat_fn real_sys_mkdirat;
 
 typedef long (*mattx_sys_renameat2_fn)(const struct pt_regs *regs);
 extern mattx_sys_renameat2_fn real_sys_renameat2;
+
+typedef long (*mattx_sys_linkat_fn)(const struct pt_regs *regs);
+extern mattx_sys_linkat_fn real_sys_linkat;
+typedef long (*mattx_sys_symlinkat_fn)(const struct pt_regs *regs);
+extern mattx_sys_symlinkat_fn real_sys_symlinkat;
 
 typedef long (*mattx_sys_faccessat2_fn)(const struct pt_regs *regs);
 extern mattx_sys_faccessat2_fn real_sys_faccessat2;

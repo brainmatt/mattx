@@ -63,6 +63,8 @@ mattx_sys_newfstatat_fn real_sys_newfstatat = NULL;
 mattx_sys_unlinkat_fn real_sys_unlinkat = NULL;
 mattx_sys_mkdirat_fn real_sys_mkdirat = NULL;
 mattx_sys_renameat2_fn real_sys_renameat2 = NULL;
+mattx_sys_linkat_fn real_sys_linkat = NULL;
+mattx_sys_symlinkat_fn real_sys_symlinkat = NULL;
 mattx_sys_faccessat2_fn real_sys_faccessat2 = NULL;
 mattx_sys_readlink_fn real_sys_readlink = NULL;
 mattx_sys_readlinkat_fn real_sys_readlinkat = NULL;
@@ -312,6 +314,20 @@ static void mattx_resolve_hidden_symbols(void) {
     kp.symbol_name = "__x64_sys_renameat2";
     if (register_kprobe(&kp) == 0) {
         real_sys_renameat2 = (mattx_sys_renameat2_fn)kp.addr;
+        unregister_kprobe(&kp);
+    }
+
+    memset(&kp, 0, sizeof(kp));
+    kp.symbol_name = "__x64_sys_linkat";
+    if (register_kprobe(&kp) == 0) {
+        real_sys_linkat = (mattx_sys_linkat_fn)kp.addr;
+        unregister_kprobe(&kp);
+    }
+
+    memset(&kp, 0, sizeof(kp));
+    kp.symbol_name = "__x64_sys_symlinkat";
+    if (register_kprobe(&kp) == 0) {
+        real_sys_symlinkat = (mattx_sys_symlinkat_fn)kp.addr;
         unregister_kprobe(&kp);
     }
 

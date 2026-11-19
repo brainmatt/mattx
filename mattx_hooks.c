@@ -2959,6 +2959,461 @@ static int ret_handler_rename(struct kretprobe_instance *ri, struct pt_regs *reg
     return 0;
 }
 
+// --- LINK HOOKS: link / linkat (kprobe fallback, issue #67, P3, Track K) ---
+/*
+ * link(a, b) is linkat(AT_FDCWD, a, AT_FDCWD, b, 0) in the kernel. Recipe of unlink / mkdir / rename (0023b .. 0025b): two entry
+ * handlers save what the application passed and sabotage the OLD name, the shared return handler queues a task_work (own
+ * ticket, only this thread sleeps) that sends ONE request, SYS_LINKAT (both names, both directory FDs, the flags); the real
+ * linkat() runs as the Deputy at the home node. Neither call was hooked before.
+ * Without the task_work resolver they stay native.
+ */
+struct link_kretprobe_data {
+    const char __user *oldpath;
+    const char __user *newpath;
+    int olddfd;
+    int newdfd;
+    unsigned int flags;
+    bool armed;                     // the entry handler took the call (the old name was sabotaged)
+};
+
+static struct kretprobe linkat_kprobe;
+static struct kretprobe link_kprobe;
+
+static bool mattx_link_entry_wanted(struct link_kretprobe_data *data)
+{
+    data->armed = false;
+    if (!is_guest_process(current->pid)) return false;
+    if (config_mattxfs_enabled) return false;
+    if (!config_migrate_file_io) return false;      // Local Breakout: the native call on the remote node's own filesystem
+    if (!real_task_work_add) return false;          // no way to sleep per thread: native
+    return true;
+}
+
+static int entry_handler_linkat(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    struct link_kretprobe_data *data = (struct link_kretprobe_data *)ri->data;
+    struct pt_regs *sys_regs = SYSCALL_REGS(regs); // Unwrap!
+
+    if (!mattx_link_entry_wanted(data)) return 0;
+
+    data->olddfd = (int)sys_regs->di;
+    data->oldpath = (const char __user *)sys_regs->si;
+    data->newdfd = (int)sys_regs->dx;
+    data->newpath = (const char __user *)sys_regs->r10;
+    data->flags = (unsigned int)sys_regs->r8;
+    data->armed = true;
+    sys_regs->si = 0; // Sabotage inner old name!
+
+    return 0;
+}
+
+static int entry_handler_link(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    struct link_kretprobe_data *data = (struct link_kretprobe_data *)ri->data;
+    struct pt_regs *sys_regs = SYSCALL_REGS(regs);
+
+    if (!mattx_link_entry_wanted(data)) return 0;
+
+    data->olddfd = AT_FDCWD;
+    data->oldpath = (const char __user *)sys_regs->di;
+    data->newdfd = AT_FDCWD;
+    data->newpath = (const char __user *)sys_regs->si;
+    data->flags = 0;
+    data->armed = true;
+    sys_regs->di = 0;
+
+    return 0;
+}
+
+struct mattx_linkat_tw {
+    struct callback_head cb;
+    u32 orig_pid;
+    int home_node;
+    const char __user *oldpath;     // read by the task_work: it runs in the thread's own process context
+    const char __user *newpath;
+    int olddfd;
+    int newdfd;
+    unsigned int flags;
+};
+
+static void mattx_linkat_tw_fn(struct callback_head *cb) {
+    struct mattx_linkat_tw *tw = container_of(cb, struct mattx_linkat_tw, cb);
+    struct pt_regs *regs = task_pt_regs(current);
+    struct mattx_sys_linkat_req *req = NULL;
+    struct mattx_ticket *t;
+    struct mattx_link *link;
+    char *oldp, *newp;
+    long ret = -EINTR;
+    long n;
+
+    if (fatal_signal_pending(current) || tw->home_node < 0 || tw->home_node >= MAX_NODES)
+        goto out;
+
+    link = READ_ONCE(cluster_map[tw->home_node]);
+    if (!link) {
+        ret = -EIO;
+        goto out;
+    }
+
+    req = kzalloc(sizeof(*req) + 2 * PATH_MAX, GFP_KERNEL);
+    if (!req) {
+        ret = -ENOMEM;
+        goto out;
+    }
+    oldp = req->paths;
+
+    // The old name first, then the new one: the errors come in the order of the kernel (getname() of both)
+    n = strncpy_from_user(oldp, tw->oldpath, PATH_MAX);
+    if (n < 0) {
+        ret = n;                                    // -EFAULT
+        goto out;
+    }
+    if (n == 0 && !(tw->flags & AT_EMPTY_PATH)) {     // linkat(AT_EMPTY_PATH): an empty OLD name names the dirfd itself
+        ret = -ENOENT;
+        goto out;
+    }
+    if (n >= PATH_MAX) {                            // no NUL within PATH_MAX bytes: the kernel refuses it too
+        mattx_dbg("[RPC] Thread %d: link old path is longer than %d bytes: -ENAMETOOLONG\n", current->pid, PATH_MAX - 1);
+        ret = -ENAMETOOLONG;
+        goto out;
+    }
+    req->oldlen = n + 1;                            // with the NUL
+
+    newp = req->paths + req->oldlen;
+    n = strncpy_from_user(newp, tw->newpath, PATH_MAX);
+    if (n < 0) {
+        ret = n;
+        goto out;
+    }
+    if (n == 0) {
+        ret = -ENOENT;
+        goto out;
+    }
+    if (n >= PATH_MAX) {
+        mattx_dbg("[RPC] Thread %d: link new path is longer than %d bytes: -ENAMETOOLONG\n", current->pid, PATH_MAX - 1);
+        ret = -ENAMETOOLONG;
+        goto out;
+    }
+    req->newlen = n + 1;
+
+    req->olddirfd = AT_FDCWD;
+    req->newdirfd = AT_FDCWD;
+    if (oldp[0] != '/' && tw->olddfd != AT_FDCWD) {
+        // linkat(olddirfd, relative, ..): the home node needs the Deputy's FD behind our Ghost directory FD
+        ret = mattx_ghost_dirfd_remote(tw->olddfd, tw->home_node, tw->orig_pid, oldp, "linkat(old)", &req->olddirfd);
+        if (ret)
+            goto out;
+    }
+    if (newp[0] != '/' && tw->newdfd != AT_FDCWD) {
+        ret = mattx_ghost_dirfd_remote(tw->newdfd, tw->home_node, tw->orig_pid, newp, "linkat(new)", &req->newdirfd);
+        if (ret)
+            goto out;
+    }
+
+    t = mattx_ticket_add(tw->orig_pid, tw->home_node, 0);
+    if (!t) {
+        ret = -ENOMEM;
+        goto out;
+    }
+
+    req->orig_pid = tw->orig_pid;
+    req->req_id = t->req_id;
+    req->flags = tw->flags;
+
+    mattx_dbg("[RPC] Thread %d: linkat(dirfd %d '%s' -> dirfd %d '%s', flags 0x%x) as req %u, sleeping on its own ticket...\n",
+              current->pid, req->olddirfd, oldp, req->newdirfd, newp, req->flags, t->req_id);
+
+    if (mattx_comm_send(link, MATTX_MSG_SYS_LINKAT_REQ, req, sizeof(*req) + req->oldlen + req->newlen) < 0) {
+        // Never sleep for a reply to a request that was never sent
+        mattx_dbg("[RPC] Thread %d: LINKAT_REQ send failed\n", current->pid);
+        ret = -EIO;
+        goto done;
+    }
+
+    // Interrupted (signal, freeze of a migration or recall)? The wait cancels the request and still hands back the
+    // real result if the home node had already done it; otherwise the system call is restarted.
+    if (mattx_ticket_wait(t, MAX_SCHEDULE_TIMEOUT) == 0)
+        ret = t->retval;
+    else
+        ret = -ERESTARTSYS;
+
+    mattx_dbg("[RPC] Thread %d: linkat('%s' -> '%s') woke up: %ld (req %u)\n", current->pid, oldp, newp, ret, t->req_id);
+done:
+    mattx_ticket_del(t);
+out:
+    regs->ax = ret;
+    kfree(req);
+    kfree(tw);
+}
+
+static int ret_handler_link(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    struct link_kretprobe_data *data = (struct link_kretprobe_data *)ri->data;
+    struct mattx_linkat_tw *tw;
+    int home_node = -1;
+    u32 orig_pid = 0;
+    int i;
+
+    if (!data->armed) return 0;                 // not ours: the native result flows back
+
+    spin_lock(&guest_lock);
+    for (i = 0; i < guest_count; i++) {
+        if (guest_registry[i].local_pid == current->tgid) {
+            home_node = guest_registry[i].home_node;
+            orig_pid = guest_registry[i].orig_pid;
+            break;                              // the per-guest slot is not touched: this call has its own ticket
+        }
+    }
+    spin_unlock(&guest_lock);
+
+    if (home_node == -1 || !data->oldpath || !data->newpath) return 0;
+
+    // --- THE ATOMIC SHIELD ---
+    // If the process is dying (SIGKILL) or exiting, DO NOT freeze it!
+    if (fatal_signal_pending(current) || (current->flags & PF_EXITING)) {
+        mattx_dbg("[HOOK] Surrogate %s is dying. Aborting RPC.\n", current->comm);
+        return 0;
+    }
+
+    tw = kzalloc(sizeof(*tw), GFP_ATOMIC);
+    if (!tw) {
+        regs->ax = -ENOMEM;
+        return 0;
+    }
+    init_task_work(&tw->cb, mattx_linkat_tw_fn);
+    tw->orig_pid = orig_pid;
+    tw->home_node = home_node;
+    tw->oldpath = data->oldpath;
+    tw->newpath = data->newpath;
+    tw->olddfd = data->olddfd;
+    tw->newdfd = data->newdfd;
+    tw->flags = data->flags;
+
+    mattx_dbg("[HOOK] Intercepted link / linkat (flags 0x%x). Thread %d waits on its own ticket...\n", data->flags, current->pid);
+    // The sabotaged call returns -EFAULT; the task_work overwrites it with the real result.
+    regs->ax = -EINTR;
+
+    if (real_task_work_add(current, &tw->cb, TWA_RESUME))
+        kfree(tw);
+    return 0;
+}
+
+// --- SYMLINK HOOKS: symlink / symlinkat (kprobe fallback, issue #67, P3, Track K) ---
+/*
+ * symlink(t, l) is symlinkat(t, AT_FDCWD, l) in the kernel. Recipe of unlink / mkdir / rename / link: two entry handlers save
+ * what the application passed and sabotage the first user pointer (the TARGET: di = 0), the shared return handler queues a
+ * task_work (own ticket, only this thread sleeps) that sends ONE request, SYS_SYMLINKAT (target, link name, directory FD of
+ * the link name); the real symlinkat() runs as the Deputy at the home node. The target is never mapped nor resolved: it is
+ * the application's string. Only the link name has a directory FD. Without the task_work resolver they stay native.
+ */
+struct symlink_kretprobe_data {
+    const char __user *target;
+    const char __user *linkpath;
+    int newdfd;
+    bool armed;                     // the entry handler took the call (the target was sabotaged)
+};
+
+static struct kretprobe symlinkat_kprobe;
+static struct kretprobe symlink_kprobe;
+
+static bool mattx_symlink_entry_wanted(struct symlink_kretprobe_data *data)
+{
+    data->armed = false;
+    if (!is_guest_process(current->pid)) return false;
+    if (config_mattxfs_enabled) return false;
+    if (!config_migrate_file_io) return false;      // Local Breakout: the native call on the remote node's own filesystem
+    if (!real_task_work_add) return false;          // no way to sleep per thread: native
+    return true;
+}
+
+static int entry_handler_symlinkat(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    struct symlink_kretprobe_data *data = (struct symlink_kretprobe_data *)ri->data;
+    struct pt_regs *sys_regs = SYSCALL_REGS(regs); // Unwrap!
+
+    if (!mattx_symlink_entry_wanted(data)) return 0;
+
+    data->target = (const char __user *)sys_regs->di;
+    data->newdfd = (int)sys_regs->si;
+    data->linkpath = (const char __user *)sys_regs->dx;
+    data->armed = true;
+    sys_regs->di = 0; // Sabotage inner target!
+
+    return 0;
+}
+
+static int entry_handler_symlink(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    struct symlink_kretprobe_data *data = (struct symlink_kretprobe_data *)ri->data;
+    struct pt_regs *sys_regs = SYSCALL_REGS(regs);
+
+    if (!mattx_symlink_entry_wanted(data)) return 0;
+
+    data->target = (const char __user *)sys_regs->di;
+    data->newdfd = AT_FDCWD;
+    data->linkpath = (const char __user *)sys_regs->si;
+    data->armed = true;
+    sys_regs->di = 0;
+
+    return 0;
+}
+
+struct mattx_symlinkat_tw {
+    struct callback_head cb;
+    u32 orig_pid;
+    int home_node;
+    const char __user *target;      // read by the task_work: it runs in the thread's own process context
+    const char __user *linkpath;
+    int newdfd;
+};
+
+static void mattx_symlinkat_tw_fn(struct callback_head *cb) {
+    struct mattx_symlinkat_tw *tw = container_of(cb, struct mattx_symlinkat_tw, cb);
+    struct pt_regs *regs = task_pt_regs(current);
+    struct mattx_sys_symlinkat_req *req = NULL;
+    struct mattx_ticket *t;
+    struct mattx_link *link;
+    char *targetp, *linkp;
+    long ret = -EINTR;
+    long n;
+
+    if (fatal_signal_pending(current) || tw->home_node < 0 || tw->home_node >= MAX_NODES)
+        goto out;
+
+    link = READ_ONCE(cluster_map[tw->home_node]);
+    if (!link) {
+        ret = -EIO;
+        goto out;
+    }
+
+    req = kzalloc(sizeof(*req) + 2 * PATH_MAX, GFP_KERNEL);
+    if (!req) {
+        ret = -ENOMEM;
+        goto out;
+    }
+    targetp = req->paths;
+
+    // The target first, then the link name: the errors come in the order of the kernel (getname() of both)
+    n = strncpy_from_user(targetp, tw->target, PATH_MAX);
+    if (n < 0) {
+        ret = n;                                    // -EFAULT
+        goto out;
+    }
+    if (n == 0) {
+        ret = -ENOENT;                              // symlink("", ..) is refused by the kernel
+        goto out;
+    }
+    if (n >= PATH_MAX) {                            // no NUL within PATH_MAX bytes: the kernel refuses it too
+        mattx_dbg("[RPC] Thread %d: symlink target is longer than %d bytes: -ENAMETOOLONG\n", current->pid, PATH_MAX - 1);
+        ret = -ENAMETOOLONG;
+        goto out;
+    }
+    req->targetlen = n + 1;                         // with the NUL
+
+    linkp = req->paths + req->targetlen;
+    n = strncpy_from_user(linkp, tw->linkpath, PATH_MAX);
+    if (n < 0) {
+        ret = n;
+        goto out;
+    }
+    if (n == 0) {
+        ret = -ENOENT;
+        goto out;
+    }
+    if (n >= PATH_MAX) {
+        mattx_dbg("[RPC] Thread %d: symlink name is longer than %d bytes: -ENAMETOOLONG\n", current->pid, PATH_MAX - 1);
+        ret = -ENAMETOOLONG;
+        goto out;
+    }
+    req->linklen = n + 1;
+
+    req->newdirfd = AT_FDCWD;
+    if (linkp[0] != '/' && tw->newdfd != AT_FDCWD) {
+        // symlinkat(target, newdirfd, relative): the home node needs the Deputy's FD behind our Ghost directory FD
+        ret = mattx_ghost_dirfd_remote(tw->newdfd, tw->home_node, tw->orig_pid, linkp, "symlinkat", &req->newdirfd);
+        if (ret)
+            goto out;
+    }
+
+    t = mattx_ticket_add(tw->orig_pid, tw->home_node, 0);
+    if (!t) {
+        ret = -ENOMEM;
+        goto out;
+    }
+
+    req->orig_pid = tw->orig_pid;
+    req->req_id = t->req_id;
+
+    mattx_dbg("[RPC] Thread %d: symlinkat('%s' in dirfd %d -> target '%s') as req %u, sleeping on its own ticket...\n",
+              current->pid, linkp, req->newdirfd, targetp, t->req_id);
+
+    if (mattx_comm_send(link, MATTX_MSG_SYS_SYMLINKAT_REQ, req, sizeof(*req) + req->targetlen + req->linklen) < 0) {
+        // Never sleep for a reply to a request that was never sent
+        mattx_dbg("[RPC] Thread %d: SYMLINKAT_REQ send failed\n", current->pid);
+        ret = -EIO;
+        goto done;
+    }
+
+    // Interrupted (signal, freeze of a migration or recall)? The wait cancels the request and still hands back the
+    // real result if the home node had already done it; otherwise the system call is restarted.
+    if (mattx_ticket_wait(t, MAX_SCHEDULE_TIMEOUT) == 0)
+        ret = t->retval;
+    else
+        ret = -ERESTARTSYS;
+
+    mattx_dbg("[RPC] Thread %d: symlinkat('%s' -> '%s') woke up: %ld (req %u)\n", current->pid, linkp, targetp, ret, t->req_id);
+done:
+    mattx_ticket_del(t);
+out:
+    regs->ax = ret;
+    kfree(req);
+    kfree(tw);
+}
+
+static int ret_handler_symlink(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    struct symlink_kretprobe_data *data = (struct symlink_kretprobe_data *)ri->data;
+    struct mattx_symlinkat_tw *tw;
+    int home_node = -1;
+    u32 orig_pid = 0;
+    int i;
+
+    if (!data->armed) return 0;                 // not ours: the native result flows back
+
+    spin_lock(&guest_lock);
+    for (i = 0; i < guest_count; i++) {
+        if (guest_registry[i].local_pid == current->tgid) {
+            home_node = guest_registry[i].home_node;
+            orig_pid = guest_registry[i].orig_pid;
+            break;                              // the per-guest slot is not touched: this call has its own ticket
+        }
+    }
+    spin_unlock(&guest_lock);
+
+    if (home_node == -1 || !data->target || !data->linkpath) return 0;
+
+    // --- THE ATOMIC SHIELD ---
+    // If the process is dying (SIGKILL) or exiting, DO NOT freeze it!
+    if (fatal_signal_pending(current) || (current->flags & PF_EXITING)) {
+        mattx_dbg("[HOOK] Surrogate %s is dying. Aborting RPC.\n", current->comm);
+        return 0;
+    }
+
+    tw = kzalloc(sizeof(*tw), GFP_ATOMIC);
+    if (!tw) {
+        regs->ax = -ENOMEM;
+        return 0;
+    }
+    init_task_work(&tw->cb, mattx_symlinkat_tw_fn);
+    tw->orig_pid = orig_pid;
+    tw->home_node = home_node;
+    tw->target = data->target;
+    tw->linkpath = data->linkpath;
+    tw->newdfd = data->newdfd;
+
+    mattx_dbg("[HOOK] Intercepted symlink / symlinkat. Thread %d waits on its own ticket...\n", current->pid);
+    // The sabotaged call returns -EFAULT; the task_work overwrites it with the real result.
+    regs->ax = -EINTR;
+
+    if (real_task_work_add(current, &tw->cb, TWA_RESUME))
+        kfree(tw);
+    return 0;
+}
+
 // --- SOCKET HOOK ---
 struct socket_kretprobe_data {
     int domain;
@@ -9185,6 +9640,54 @@ int mattx_hooks_init(void) {
     ret = mattx_register_kretprobe(&rename_kprobe);
     if (ret < 0) {
         printk(KERN_ERR "MattX: register_kretprobe failed for rename, returned %d\n", ret);
+    }
+
+    memset(&linkat_kprobe, 0, sizeof(linkat_kprobe));
+    linkat_kprobe.kp.symbol_name = "__x64_sys_linkat";
+    linkat_kprobe.entry_handler = entry_handler_linkat;
+    linkat_kprobe.handler = ret_handler_link;
+    linkat_kprobe.data_size = sizeof(struct link_kretprobe_data);
+    linkat_kprobe.maxactive = 64;
+
+    ret = mattx_register_kretprobe(&linkat_kprobe);
+    if (ret < 0) {
+        printk(KERN_ERR "MattX: register_kretprobe failed for linkat, returned %d\n", ret);
+    }
+
+    memset(&link_kprobe, 0, sizeof(link_kprobe));
+    link_kprobe.kp.symbol_name = "__x64_sys_link";
+    link_kprobe.entry_handler = entry_handler_link;
+    link_kprobe.handler = ret_handler_link;
+    link_kprobe.data_size = sizeof(struct link_kretprobe_data);
+    link_kprobe.maxactive = 64;
+
+    ret = mattx_register_kretprobe(&link_kprobe);
+    if (ret < 0) {
+        printk(KERN_ERR "MattX: register_kretprobe failed for link, returned %d\n", ret);
+    }
+
+    memset(&symlinkat_kprobe, 0, sizeof(symlinkat_kprobe));
+    symlinkat_kprobe.kp.symbol_name = "__x64_sys_symlinkat";
+    symlinkat_kprobe.entry_handler = entry_handler_symlinkat;
+    symlinkat_kprobe.handler = ret_handler_symlink;
+    symlinkat_kprobe.data_size = sizeof(struct symlink_kretprobe_data);
+    symlinkat_kprobe.maxactive = 64;
+
+    ret = mattx_register_kretprobe(&symlinkat_kprobe);
+    if (ret < 0) {
+        printk(KERN_ERR "MattX: register_kretprobe failed for symlinkat, returned %d\n", ret);
+    }
+
+    memset(&symlink_kprobe, 0, sizeof(symlink_kprobe));
+    symlink_kprobe.kp.symbol_name = "__x64_sys_symlink";
+    symlink_kprobe.entry_handler = entry_handler_symlink;
+    symlink_kprobe.handler = ret_handler_symlink;
+    symlink_kprobe.data_size = sizeof(struct symlink_kretprobe_data);
+    symlink_kprobe.maxactive = 64;
+
+    ret = mattx_register_kretprobe(&symlink_kprobe);
+    if (ret < 0) {
+        printk(KERN_ERR "MattX: register_kretprobe failed for symlink, returned %d\n", ret);
     }
 
     memset(&socket_kprobe, 0, sizeof(socket_kprobe));
