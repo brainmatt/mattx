@@ -1772,7 +1772,7 @@ struct mattx_dirent {
     u64 ino;
     u64 offset; // Track the offset of each specific file!
     u8 type;
-    char name[64]; 
+    char name[256];         // NAME_MAX + NUL: a longer name used to be cut at 63 bytes, and the cut name does not exist (ls: d?????????)
 };
 
 struct mattx_vfs_readdir_req {

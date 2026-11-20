@@ -9917,7 +9917,7 @@ static bool mattx_filldir(struct dir_context *ctx, const char *name, int namlen,
 
     if (reply->entry_count >= 20) return false; 
 
-    if (namlen > 63) namlen = 63; 
+    if (namlen > NAME_MAX) namlen = NAME_MAX;       // name[] holds NAME_MAX + NUL: a name is never cut (it would not exist any more)
     
     reply->entries[reply->entry_count].ino = ino;
     reply->entries[reply->entry_count].offset = offset; // FIXED: Save the offset!
@@ -10668,17 +10668,20 @@ static void handle_vfs_readdir_req(struct mattx_link *link, struct mattx_header 
 static void handle_vfs_readdir_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
     if (payload) {
         struct mattx_vfs_readdir_reply *reply = payload;
+        // The block holds 20 entries: never trust the count of the wire, and a short message (another build) is an error
+        bool short_msg = hdr->length < sizeof(*reply);
+        u32 count = short_msg ? 0 : min_t(u32, reply->entry_count, ARRAY_SIZE(reply->entries));
         int i;
 
         spin_lock(&vfs_rpc_lock);
         for (i = 0; i < MAX_VFS_RPC; i++) {
             if (vfs_rpc_registry[i].in_use && vfs_rpc_registry[i].req_id == reply->req_id) {
-                vfs_rpc_registry[i].error = reply->error;
-                if (reply->error == 0) {
+                vfs_rpc_registry[i].error = short_msg ? -EIO : reply->error;
+                if (!short_msg && reply->error == 0) {
                     vfs_rpc_registry[i].new_offset = reply->new_offset;
-                    vfs_rpc_registry[i].dirent_count = reply->entry_count;
-                    if (vfs_rpc_registry[i].dirents && reply->entry_count > 0) {
-                        memcpy(vfs_rpc_registry[i].dirents, reply->entries, reply->entry_count * sizeof(struct mattx_dirent));
+                    vfs_rpc_registry[i].dirent_count = count;
+                    if (vfs_rpc_registry[i].dirents && count > 0) {
+                        memcpy(vfs_rpc_registry[i].dirents, reply->entries, count * sizeof(struct mattx_dirent));
                     }
                 }
                 vfs_rpc_registry[i].done = true;

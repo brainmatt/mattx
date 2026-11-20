@@ -326,16 +326,17 @@ static struct inode *mattxfs_new_inode(struct super_block *sb, const struct ksta
     if (S_ISDIR(stat->mode)) {
         inode->i_op = &mattxfs_remote_iops;
         inode->i_fop = &mattxfs_remote_dir_fops;
-        set_nlink(inode, 2);
+        // The link count of the home node (2 + the number of subdirectories on ext4): find / du use "2" as "no subdirectories"
+        set_nlink(inode, stat->nlink >= 2 ? stat->nlink : 2);
     } else if (S_ISLNK(stat->mode)) {
         // A symlink is a symlink here too: the target is fetched when the VFS wants to follow it
         inode->i_op = &mattxfs_remote_symlink_iops;
-        set_nlink(inode, 1);
+        set_nlink(inode, stat->nlink ? stat->nlink : 1);
     } else {
         // Give regular files the ability to be read and written! ---
         inode->i_op = &mattxfs_remote_file_iops;
         inode->i_fop = &mattxfs_remote_file_fops;
-        set_nlink(inode, 1);
+        set_nlink(inode, stat->nlink ? stat->nlink : 1);        // hard links of the home node
     }
     return inode;
 }
@@ -459,6 +460,9 @@ static int mattxfs_remote_getattr(struct user_namespace *idmap, const struct pat
             inode_set_atime_to_ts(inode, remote.atime);
             inode_set_mtime_to_ts(inode, remote.mtime);
             inode_set_ctime_to_ts(inode, remote.ctime);
+            // mkdir / rmdir / link / unlink of anybody (never 0: that would make a live inode look unlinked)
+            if (remote.nlink > 0)
+                set_nlink(inode, remote.nlink);
         }
     }
 
@@ -696,6 +700,7 @@ static int mattxfs_remote_link(struct dentry *old_dentry, struct inode *dir, str
 
 static const struct inode_operations mattxfs_remote_iops = {
     .lookup         = mattxfs_remote_lookup,  
+    .getattr        = mattxfs_remote_getattr,   // stat() of a directory: size, times, owner and link count of the home node
     .create         = mattxfs_remote_create, // Allow file creation!
     .unlink         = mattxfs_remote_unlink, // NEW: Wire up the rm command!
     .mkdir          = mattxfs_remote_mkdir,
