@@ -44,6 +44,7 @@
 
 #include <sys/mount.h>  // For mount()
 #include <sys/stat.h>   // For mkdir()
+#include <limits.h>      // PATH_MAX
 #include <netlink/netlink.h>
 #include <netlink/genl/genl.h>
 #include <netlink/genl/ctrl.h>
@@ -112,7 +113,7 @@ struct mattx_migration_req {
     // the comment on monotonic_at_freeze there. The stub never reads this
     // field itself (only the kernel does, at Awakening), but it MUST be
     // present here in the same position so every field after it (comm,
-    // dfsa_dir, fd_count, open_fds, vma_count, mattxfs_enabled, vmas[])
+    // dfsa_dir, fd_count, open_fds, vma_count, mattxfs_enabled, local_libs, vmas[])
     // lands at the same offset the kernel used when it serialized this
     // struct -- otherwise the whole blueprint parses as garbage (observed:
     // vma_count decoding to garbage and EVERY subsequent mmap(MAP_FIXED)/
@@ -125,9 +126,67 @@ struct mattx_migration_req {
     uint32_t open_fds[MAX_FDS]; 
     uint32_t vma_count;
     uint8_t mattxfs_enabled;
+    uint8_t local_libs;     // MUST STAY IN SYNC with struct mattx_migration_req in mattx.h (packed: vmas[] follows)
     struct mattx_vma_info vmas[]; 
 } __attribute__((packed)); // <-- FORCE EXACT LAYOUT
 
+
+/*
+ * --- THE HPC FAST-PATH OF MATTXFS (LOCAL_LIBS) ---
+ * In MattXFS mode the Surrogate's whole root is the home node's tree served over the wire. MattXFS files cannot be mmap()ed,
+ * so a late dlopen() (pthread_cancel -> libgcc_s.so.1, NSS, iconv, Python extension modules ...) failed, and every library
+ * page-in of a lazily loaded library would have been a network round trip anyway. Like the kprobe mode (is_hpc_local_lib() in
+ * mattx_fileio.c: LOCAL_LIBS=true lets a Surrogate use ITS node's own libraries; all nodes have the same packages) the local
+ * library trees are bind-mounted over the MattXFS tree BEFORE the chroot: every system call (open, stat, access, readlink,
+ * getdents, execve, mmap ...) then sees them natively, no hook needed. /proc is mounted by the stub itself.
+ * KEEP THIS LIST IN SYNC with is_hpc_local_lib() in mattx_fileio.c.
+ */
+static const char *const hpc_local_paths[] = {
+    "/lib", "/lib64", "/usr/lib", "/usr/lib64", "/usr/share/locale", "/sys", "/etc/ld.so.cache",
+};
+
+static void bind_local_libs(const char *mfs_path)
+{
+    const int n = sizeof(hpc_local_paths) / sizeof(hpc_local_paths[0]);
+    char done[sizeof(hpc_local_paths) / sizeof(hpc_local_paths[0])][PATH_MAX];
+    int ndone = 0;
+
+    for (int i = 0; i < n; i++) {
+        char real[PATH_MAX], target[PATH_MAX + 256];
+        struct stat st;
+        int dup = 0;
+
+        // /lib and /lib64 are symlinks on usr-merged systems: bind the real directory once
+        if (!realpath(hpc_local_paths[i], real) || stat(real, &st) != 0) {
+            printf("MattX-Stub: HPC local libs: %s does not exist on this node, skipped\n", hpc_local_paths[i]);
+            continue;
+        }
+        if (!S_ISDIR(st.st_mode) && !S_ISREG(st.st_mode))
+            continue;
+        for (int j = 0; j < ndone; j++)
+            if (strcmp(done[j], real) == 0)
+                dup = 1;
+        if (dup)
+            continue;
+        memcpy(done[ndone], real, strlen(real) + 1);    // remember it, whatever happens below: no second try, no second message
+        ndone++;
+
+        snprintf(target, sizeof(target), "%s%s", mfs_path, real);
+
+        // Same trick as the DFSA bind mount: access() makes MattXFS send the lookup RPC to the home node, so the dentry
+        // we mount over exists. If the home node has no such path, there is nothing to cover.
+        if (access(target, F_OK) != 0) {
+            printf("MattX-Stub: HPC local libs: %s does not exist on the home node, skipped\n", real);
+            continue;
+        }
+
+        if (mount(real, target, NULL, MS_BIND | (S_ISDIR(st.st_mode) ? MS_REC : 0), NULL) == 0) {
+            printf("MattX-Stub: HPC local libs: bind mount %s -> %s\n", real, target);
+        } else {
+            perror("MattX-Stub: HPC local libs: bind mount failed (continuing with the remote file)");
+        }
+    }
+}
 
 static struct mattx_migration_req *received_req = NULL;
 
@@ -332,6 +391,12 @@ int main() {
                 }
             }
             // ---------------------------------------
+
+            // --- THE HPC FAST-PATH (LOCAL_LIBS of the home node): the local library trees over the MattXFS tree ---
+            if (received_req->local_libs)
+                bind_local_libs(mfs_path);
+            else
+                printf("MattX-Stub: LOCAL_LIBS is off: libraries come from the home node\n");
 
             if (chroot(mfs_path) == 0) {
                 // 4. Pivot into the new root!

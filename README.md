@@ -210,6 +210,7 @@ MATTXFS_ENABLED=true        # Set to true to enable MattXFS, false to disable
 DFSA_DIR=/mnt/shared        # Directory for Direct File System Access (DFSA) 
 ACCEPT_GUESTS=true          # Set to true to allow migrating processes to this node, false to disallow
 LOCAL_LIBS=true             # Set to true to use local libraries for migrated processes, false to use remote libraries
+# LOCAL_LIBS: kprobe mode opens the local libraries natively, MattXFS mode bind-mounts the local /lib, /usr/lib, ... into the namespace
 
 # Distributed Shared Memory (DSM) Cache Coherence Algorithm
 # 0 = Lazy Mode (Uncoherent, fast local caching, good for Read-Only)

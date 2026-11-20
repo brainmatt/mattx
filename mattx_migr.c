@@ -695,6 +695,7 @@ static void mattx_do_capture_and_send_state(struct task_struct *task, int target
     // Pass the Home Node and Feature Flag to the Stub! ---
     req->home_node = my_node_id;
     req->mattxfs_enabled = config_mattxfs_enabled ? 1 : 0;
+    req->local_libs = config_hpc_local_libs ? 1 : 0;      // MattXFS mode: the stub binds the local library trees (HPC fast path)
     // Pack the DFSA path into the Blueprint! ---
     strscpy_pad(req->dfsa_dir, config_dfsa_dir, sizeof(req->dfsa_dir));
 
@@ -955,6 +956,7 @@ static void mattx_do_capture_and_return_state(struct task_struct *task, u32 orig
     // Pass the Home Node and Feature Flag to the Stub! ---
     req->home_node = my_node_id;
     req->mattxfs_enabled = config_mattxfs_enabled ? 1 : 0;
+    req->local_libs = config_hpc_local_libs ? 1 : 0;      // MattXFS mode: the stub binds the local library trees (HPC fast path)
     // Pack the DFSA path into the Blueprint! ---
     strscpy_pad(req->dfsa_dir, config_dfsa_dir, sizeof(req->dfsa_dir));
 

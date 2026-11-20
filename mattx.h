@@ -414,6 +414,7 @@ struct mattx_migration_req {
     u32 open_fds[MAX_FDS]; 
     u32 vma_count;
     u8 mattxfs_enabled; 
+    u8 local_libs;          // LOCAL_LIBS of the home node: the stub bind-mounts the local library trees into the MattXFS namespace (HPC fast path)
     struct mattx_vma_info vmas[]; 
 } __attribute__((packed)); // <-- FORCE EXACT LAYOUT
 
