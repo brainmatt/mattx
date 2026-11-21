@@ -25,6 +25,7 @@
 #include <sys/socket.h> /* socket, connect */
 #include <netinet/in.h> /* struct sockaddr_in, struct sockaddr */
 #include <netdb.h> /* struct hostent, gethostbyname */
+#include <sys/time.h> /* struct timeval (socket timeouts) */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -246,6 +247,13 @@ void apply_move(Move m, const char* label) {
 
 
 
+#define POSTMOVE_TIMEOUT_SEC 2   /* max. wait for connect/send/recv with the web frontend */
+
+/*
+ * Best effort notification of the web frontend (httpserver on localhost:5003).
+ * Returns 0 on success, -1 if the frontend could not be reached or did not
+ * answer. A missing or stuck frontend must never block or crash the engine.
+ */
 int postmove(const char *move_str)
 {
     /* first what are we going to send and where are we going to send it? */
@@ -255,7 +263,9 @@ int postmove(const char *move_str)
 
     struct hostent *server;
     struct sockaddr_in serv_addr;
+    struct timeval tv;
     int sockfd, bytes, sent, received, total;
+    int rc = 0;
     char message[1024],response[4096];
 
     // if (argc < 2) { puts("Parameters: <move>"); exit(0); }
@@ -266,11 +276,24 @@ int postmove(const char *move_str)
 
     /* create the socket */
     sockfd = socket(AF_INET, SOCK_STREAM, 0);
-    if (sockfd < 0) log_action("ERROR opening socket");
+    if (sockfd < 0) {
+        log_action("ERROR opening socket (%s). Frontend not notified.", strerror(errno));
+        return -1;
+    }
+
+    /* never let a missing or stuck web frontend block the engine */
+    tv.tv_sec = POSTMOVE_TIMEOUT_SEC;
+    tv.tv_usec = 0;
+    setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(sockfd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
     /* lookup the ip address */
     server = gethostbyname(host);
-    if (server == NULL) log_action("ERROR no such host");
+    if (server == NULL) {
+        log_action("ERROR no such host. Frontend not notified.");
+        close(sockfd);
+        return -1;
+    }
 
     /* fill in the structure */
     memset(&serv_addr,0,sizeof(serv_addr));
@@ -279,16 +302,24 @@ int postmove(const char *move_str)
     memcpy(&serv_addr.sin_addr.s_addr,server->h_addr,server->h_length);
 
     /* connect the socket */
-    if (connect(sockfd,(struct sockaddr *)&serv_addr,sizeof(serv_addr)) < 0)
-        log_action("ERROR connecting");
+    if (connect(sockfd,(struct sockaddr *)&serv_addr,sizeof(serv_addr)) < 0) {
+        log_action("ERROR connecting (%s). Frontend not notified.", strerror(errno));
+        close(sockfd);
+        return -1;
+    }
 
-    /* send the request */
+    /* send the request (MSG_NOSIGNAL: a dead peer must not kill the engine with SIGPIPE) */
     total = strlen(message);
     sent = 0;
     do {
-        bytes = write(sockfd,message+sent,total-sent);
-        if (bytes < 0)
-            log_action("ERROR writing message to socket");
+        bytes = send(sockfd,message+sent,total-sent,MSG_NOSIGNAL);
+        if (bytes < 0) {
+            if (errno == EINTR)
+                continue;
+            log_action("ERROR writing message to socket (%s)", strerror(errno));
+            close(sockfd);
+            return -1;
+        }
         if (bytes == 0)
             break;
         sent+=bytes;
@@ -300,8 +331,13 @@ int postmove(const char *move_str)
     received = 0;
     do {
         bytes = read(sockfd,response+received,total-received);
-        if (bytes < 0)
-            log_action("ERROR reading response from socket");
+        if (bytes < 0) {
+            if (errno == EINTR)
+                continue;
+            log_action("ERROR reading response from socket (%s)", strerror(errno));
+            rc = -1;
+            break;
+        }
         if (bytes == 0)
             break;
         received+=bytes;
@@ -321,7 +357,7 @@ int postmove(const char *move_str)
     /* process response */
     printf("Response:\n%s\n",response);
 
-    return 0;
+    return rc;
 }
 
 
