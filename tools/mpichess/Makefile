@@ -24,15 +24,18 @@
 CC = mpicc
 CFLAGS = -O2 -Wall
 
-all: mpichess mpichess-client
+all: mpichess mpichess-queuing mpichess-client
 
 mpichess: mpichess.c mpichess.h
 	$(CC) $(CFLAGS) -o mpichess mpichess.c
+
+mpichess-queuing: mpichess-queuing.c mpichess.h
+	$(CC) $(CFLAGS) -o mpichess-queuing mpichess-queuing.c
 
 mpichess-client: mpichess-client.c mpichess.h
 	$(CC) $(CFLAGS) -o mpichess-client mpichess-client.c
 
 clean:
-	rm -f mpichess mpichess-client *.log *.btr
+	rm -f mpichess mpichess-queuing mpichess-client *.log *.btr
 
 
