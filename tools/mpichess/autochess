@@ -25,6 +25,6 @@
 RDMAV_FORK_SAFE=1
 export RDMAV_FORK_SAFE
 
-./chessbot | mpirun -host mobile ./mpichess
+./chessbot | mpirun -host localhost ./mpichess
 
 
