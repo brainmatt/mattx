@@ -22,8 +22,6 @@
 # Commercial licensing options are available upon request.
 #
 
-RDMAV_FORK_SAFE=1
-export RDMAV_FORK_SAFE
 
 ./chessbot | mpirun -host localhost ./mpichess
 
