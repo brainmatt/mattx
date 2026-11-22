@@ -34,7 +34,7 @@
 
 #define MSG_EVAL 1
 #define MSG_RESULT 2
-#define DEPTH 5
+#define DEPTH 6
 
 extern int my_tid; // Used to store the MPI Rank for logging
 
