@@ -14456,8 +14456,6 @@ static int mattx_vfs_rename_apply(const char *oldpath, const char *newpath, unsi
     char odir[256], ndir[256];
     const char *oname, *nname;
     struct path op, np;
-    struct dentry *old_d, *new_d, *trap;
-    struct renamedata rd;
     int err;
 
     oname = strrchr(oldpath, '/');
@@ -14491,6 +14489,34 @@ static int mattx_vfs_rename_apply(const char *oldpath, const char *newpath, unsi
     if (err)
         goto put_new;
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 0, 0)
+    /*
+     * start_renaming() (7.0 on; lock_rename() is no longer declared from 7.1) locks the two parents, looks up both names
+     * (a missing source is -ENOENT, a missing target is fine unless RENAME_EXCHANGE) and refuses the "ancestor" cases with
+     * the errnos of do_renameat2(); end_renaming() unlocks and drops the dentries.
+     */
+    {
+        struct renamedata rd = {
+            .mnt_idmap = mnt_idmap(op.mnt),
+            .old_parent = op.dentry,
+            .new_parent = np.dentry,
+            .flags = flags,
+        };
+        struct qstr old_q = QSTR_INIT(oname, strlen(oname));
+        struct qstr new_q = QSTR_INIT(nname, strlen(nname));
+
+        err = start_renaming(&rd, 0, &old_q, &new_q);
+        if (!err) {
+            err = vfs_rename(&rd);
+            end_renaming(&rd);
+        }
+    }
+    goto drop_write;
+#else
+    {
+    struct dentry *old_d, *new_d, *trap;
+    struct renamedata rd;
+
     trap = lock_rename(np.dentry, op.dentry);
     if (IS_ERR(trap)) {
         err = PTR_ERR(trap);
@@ -14523,11 +14549,6 @@ static int mattx_vfs_rename_apply(const char *oldpath, const char *newpath, unsi
     rd.old_dentry = old_d;
     rd.new_dentry = new_d;
     rd.flags = flags;
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 0, 0)
-    rd.old_parent = op.dentry;
-    rd.new_parent = np.dentry;
-    rd.mnt_idmap = mnt_idmap(op.mnt);
-#else
     rd.old_dir = d_inode(op.dentry);
     rd.new_dir = d_inode(np.dentry);
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
@@ -14536,7 +14557,6 @@ static int mattx_vfs_rename_apply(const char *oldpath, const char *newpath, unsi
 #else
     rd.old_mnt_userns = mnt_user_ns(op.mnt);
     rd.new_mnt_userns = mnt_user_ns(op.mnt);
-#endif
 #endif
     err = vfs_rename(&rd);
     goto put_new_d;
@@ -14549,6 +14569,8 @@ put_old_d:
     dput(old_d);
 unlock:
     unlock_rename(np.dentry, op.dentry);
+    }
+#endif
 drop_write:
     mnt_drop_write(op.mnt);
 put_new:
