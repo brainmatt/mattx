@@ -10416,7 +10416,15 @@ static int entry_handler_shmem_fault(struct kretprobe_instance *ri, struct pt_re
 // is invisible to it. This asks the same question again, when shmem_fault() is done and the folio is locked:
 // the pump changes the directory under the same folio lock (the folio fence in mattx_fileio.c), so the answer
 // is final until the PTE is installed.
-extern int config_mesi_mode;    // 0 = lazy, 1 = atomic (mattx_main.c)
+extern int config_mesi_mode;    // 0 = lazy, 1 = atomic, 2 = atomic + P3 (mattx_main.c)
+
+// The atomic engine (STEP E fault re-check, P2 write-notify) runs in MESI_MODE 1 AND 2: mode 2 is mode 1 plus the
+// acknowledged INVALIDATE of P3. Same condition as mattx_mesi_atomic() in mattx_fileio.c (static inline there).
+// Gating on "== 1" switched the write-notify off in mode 2 and re-opened the read-then-write hole (mattx#66).
+static inline bool mattx_hooks_mesi_atomic(void)
+{
+    return config_dsm_mode == 2 && config_mesi_mode >= 1;
+}
 
 static bool mattx_fault_sync_now(u32 shmid, unsigned long page_idx, bool is_write, u8 *state, int *nsharers)
 {
@@ -10450,7 +10458,7 @@ static int ret_handler_shmem_fault(struct kretprobe_instance *ri, struct pt_regs
     // STEP E (MESI_MODE=1): the directory as it is NOW, with the folio locked. A fault that was let through at
     // entry, but meanwhile met a fetch / write-acquire, takes the sync way instead of installing a PTE past the
     // directory (it would stay writable for good: the FAULT-RACE of dsmreadwritetest atomic)
-    if (!data->needs_sync && data->sysv && (regs->ax & VM_FAULT_LOCKED) && config_dsm_mode == 2 && config_mesi_mode == 1) {
+    if (!data->needs_sync && data->sysv && (regs->ax & VM_FAULT_LOCKED) && mattx_hooks_mesi_atomic()) {
         u8 st;
         int ns;
 
@@ -10541,7 +10549,7 @@ static vm_fault_t mattx_shm_page_mkwrite(struct vm_fault *vmf)
     }
 
     // Kernel threads (the pump, the sync workers) pass, like in the shmem_fault intercept
-    if (!(current->flags & PF_KTHREAD) && config_dsm_mode == 2 && config_mesi_mode == 1 &&
+    if (!(current->flags & PF_KTHREAD) && mattx_hooks_mesi_atomic() &&
         mattx_fault_sync_now(shmid, offset / PAGE_SIZE, true, &st, &ns)) {
         folio_unlock(folio);
         mattx_dbg("[MESI_VM1] Write-notify: PID %d Page %lu of SHMID %u: state=%u sharers=%d -> routed to the sync worker\n",
@@ -10637,7 +10645,7 @@ static void mattx_shm_arm_schedule(long ret)
 {
     struct mattx_shm_arm_work *w;
 
-    if (config_dsm_mode != 2 || config_mesi_mode != 1)
+    if (!mattx_hooks_mesi_atomic())
         return;
     if (IS_ERR_VALUE((unsigned long)ret) || (current->flags & (PF_KTHREAD | PF_EXITING)) || !current->mm)
         return;
@@ -11749,14 +11757,23 @@ int mattx_hooks_init(void) {
     ret = mattx_register_kretprobe(&shmem_fault_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for shmem_fault, returned %d\n", ret);
 
-    memset(&shmem_page_mkwrite_kprobe, 0, sizeof(shmem_page_mkwrite_kprobe));
-    shmem_page_mkwrite_kprobe.kp.symbol_name = "shmem_page_mkwrite";
-    shmem_page_mkwrite_kprobe.entry_handler = entry_handler_shmem_fault; // Reuse the exact same handler!
-    shmem_page_mkwrite_kprobe.handler = ret_handler_shmem_fault;         // Reuse the exact same handler!
-    shmem_page_mkwrite_kprobe.data_size = sizeof(struct shmem_fault_kretprobe_data);
-    shmem_page_mkwrite_kprobe.maxactive = 64;
-    ret = mattx_register_kretprobe(&shmem_page_mkwrite_kprobe);
-    if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for shmem_page_mkwrite, returned %d\n", ret);
+    // shmem_page_mkwrite() is a kernel symbol only on SOME kernels (not on 6.12, not on 7.0: register_kretprobe()
+    // returns -ENOENT there). Its absence is expected and no error: native writes to SHARED pages of VM1 are
+    // caught by the P2 write-notify (mattx_shm_vm_ops, armed after shmat()), which needs no kernel symbol.
+    // So look the symbol up first (kprobe address trick, like the other unexported symbols) and only hook it where
+    // it exists.
+    if (mattx_inotify_resolve_syscall("shmem_page_mkwrite")) {
+        memset(&shmem_page_mkwrite_kprobe, 0, sizeof(shmem_page_mkwrite_kprobe));
+        shmem_page_mkwrite_kprobe.kp.symbol_name = "shmem_page_mkwrite";
+        shmem_page_mkwrite_kprobe.entry_handler = entry_handler_shmem_fault; // Reuse the exact same handler!
+        shmem_page_mkwrite_kprobe.handler = ret_handler_shmem_fault;         // Reuse the exact same handler!
+        shmem_page_mkwrite_kprobe.data_size = sizeof(struct shmem_fault_kretprobe_data);
+        shmem_page_mkwrite_kprobe.maxactive = 64;
+        ret = mattx_register_kretprobe(&shmem_page_mkwrite_kprobe);
+        if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for shmem_page_mkwrite, returned %d\n", ret);
+    } else {
+        mattx_dbg("[HOOKS] shmem_page_mkwrite is not present on this kernel: native write-notify (P2) covers writes to SHARED pages\n");
+    }
 
 
     // --- Stale-deadline clock_nanosleep() fixup (mattx#20) ---
