@@ -14438,13 +14438,19 @@ static void handle_vfs_rmdir_reply(struct mattx_link *link, struct mattx_header 
  * longer exported after 7.0): that is the next step when the compile on 7.1 says so.
  */
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 0, 0)
-static struct dentry *mattx_vfs_lookup_one(struct path *dir, const char *name)
-{
-    struct qstr this = QSTR_INIT(name, strlen(name));
 
-    return lookup_one(mnt_idmap(dir->mnt), &this, dir->dentry);
-}
+// commented out for now until the new rename architecture gets active on 7.1
+// otherwise it produces a compile error on 7.0 - no prob since it is not used for 7.0
+
+// static struct dentry *mattx_vfs_lookup_one(struct path *dir, const char *name)
+// {
+//     struct qstr this = QSTR_INIT(name, strlen(name));
+// 
+//     return lookup_one(mnt_idmap(dir->mnt), &this, dir->dentry);
+// }
+
 #else
+
 static struct dentry *mattx_vfs_lookup_one(struct path *dir, const char *name)
 {
     return lookup_one_len(name, dir->dentry, strlen(name));
