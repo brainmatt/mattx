@@ -799,8 +799,39 @@ static int mattxfs_drop_inode(struct inode *inode) {
     return 1; // 1 means "Always delete this inode from memory!"
 }
 
+/*
+ * df / statfs() on /mattxfs (issue #67, P3): simple_statfs() reported an empty filesystem (0 blocks), so df showed
+ * nothing and programs that check the free space before they write (Python, databases, package tools) saw "no
+ * space" or "unknown". Ask the home node for the numbers of the filesystem the path lives on. Above the node
+ * directories (the /mattxfs root itself) there is no home node: the simple_statfs() answer stays. If the home
+ * node cannot answer, the same: an empty answer is what the filesystem always gave, a signal is passed on.
+ */
+static int mattxfs_statfs(struct dentry *dentry, struct kstatfs *buf) {
+    char path_buf[256];
+    int node_id, err;
+
+    err = simple_statfs(dentry, buf);        // f_type (magic), f_fsid and the defaults
+    if (err)
+        return err;
+
+    node_id = get_node_id_from_dentry(dentry);
+    if (node_id < 0)
+        return 0;
+
+    get_remote_path_from_dentry(dentry, path_buf, sizeof(path_buf));
+    err = mattx_rpc_vfs_statfs(node_id, path_buf, buf);
+    if (err == -ERESTARTSYS)
+        return err;
+    if (err)
+        mattx_dbg("[STATFS] %s on Node %d: home node says %d, empty answer used\n", path_buf, node_id, err);
+    else
+        mattx_dbg("[STATFS] %s on Node %d: %llu blocks, %llu free\n", path_buf, node_id,
+                  (unsigned long long)buf->f_blocks, (unsigned long long)buf->f_bfree);
+    return 0;
+}
+
 static const struct super_operations mattxfs_s_ops = {
-    .statfs         = simple_statfs,
+    .statfs         = mattxfs_statfs,
     .drop_inode     = mattxfs_drop_inode, 
 };
 

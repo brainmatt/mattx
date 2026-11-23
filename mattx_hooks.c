@@ -8977,6 +8977,10 @@ struct statfs_kretprobe_data { const char __user *path; void __user *buf; bool i
 static int entry_handler_statfs(struct kretprobe_instance *ri, struct pt_regs *regs) {
     if (is_guest_process(current->tgid)) {
         struct statfs_kretprobe_data *data = (struct statfs_kretprobe_data *)ri->data;
+        if (config_mattxfs_enabled) {   // MattXFS mode: the native syscall runs against the VFS (lookup/getattr/get_link), no second RPC through the old path
+            data->is_hpc_fastpath = true;   // bypass: nothing to do in the ret handler
+            return 0;
+        }
         data->path = (const char __user *)SYSCALL_REGS(regs)->di; 
         data->buf = (void __user *)SYSCALL_REGS(regs)->si;
         
@@ -9077,6 +9081,10 @@ struct newfstatat_kretprobe_data { int dfd; const char __user *path; void __user
 static int entry_handler_newfstatat(struct kretprobe_instance *ri, struct pt_regs *regs) {
     if (is_guest_process(current->tgid)) {
         struct newfstatat_kretprobe_data *data = (struct newfstatat_kretprobe_data *)ri->data;
+        if (config_mattxfs_enabled) {   // MattXFS mode: the native syscall runs against the VFS (lookup/getattr/get_link), no second RPC through the old path
+            data->is_ghost = false; data->is_hpc_fastpath = false;
+            return 0;
+        }
         int local_dfd = (int)SYSCALL_REGS(regs)->di;
         data->dfd = local_dfd;
         data->is_ghost = false;
@@ -9144,6 +9152,10 @@ struct faccessat2_kretprobe_data { int dfd; const char __user *path; int mode; i
 static int entry_handler_faccessat2(struct kretprobe_instance *ri, struct pt_regs *regs) {
     if (is_guest_process(current->tgid)) {
         struct faccessat2_kretprobe_data *data = (struct faccessat2_kretprobe_data *)ri->data;
+        if (config_mattxfs_enabled) {   // MattXFS mode: the native syscall runs against the VFS (lookup/getattr/get_link), no second RPC through the old path
+            data->is_ghost = false; data->is_hpc_fastpath = false;
+            return 0;
+        }
         int local_dfd = (int)SYSCALL_REGS(regs)->di;
         data->dfd = local_dfd;
         data->is_ghost = false;
@@ -9211,6 +9223,10 @@ struct readlink_kretprobe_data { const char __user *path; void __user *buf; size
 static int entry_handler_readlink(struct kretprobe_instance *ri, struct pt_regs *regs) {
     if (is_guest_process(current->tgid)) {
         struct readlink_kretprobe_data *data = (struct readlink_kretprobe_data *)ri->data;
+        if (config_mattxfs_enabled) {   // MattXFS mode: the native syscall runs against the VFS (lookup/getattr/get_link), no second RPC through the old path
+            data->is_hpc_fastpath = true;   // bypass: nothing to do in the ret handler
+            return 0;
+        }
         data->path = (const char __user *)SYSCALL_REGS(regs)->di; 
         data->buf = (void __user *)SYSCALL_REGS(regs)->si;
         data->bufsiz = (size_t)SYSCALL_REGS(regs)->dx;
@@ -9267,6 +9283,10 @@ struct readlinkat_kretprobe_data { int dfd; const char __user *path; void __user
 static int entry_handler_readlinkat(struct kretprobe_instance *ri, struct pt_regs *regs) {
     if (is_guest_process(current->tgid)) {
         struct readlinkat_kretprobe_data *data = (struct readlinkat_kretprobe_data *)ri->data;
+        if (config_mattxfs_enabled) {   // MattXFS mode: the native syscall runs against the VFS (lookup/getattr/get_link), no second RPC through the old path
+            data->is_ghost = false; data->is_hpc_fastpath = false;
+            return 0;
+        }
         int local_dfd = (int)SYSCALL_REGS(regs)->di;
         data->dfd = local_dfd;
         data->is_ghost = false;

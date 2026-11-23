@@ -15106,6 +15106,188 @@ static void handle_vfs_readlink_reply(struct mattx_link *link, struct mattx_head
         mattx_dbg("[RPC] VFS_READLINK_REPLY req %llu: nobody waits for it any more, dropped\n", reply->req_id);
 }
 
+// ---- statfs: df / statfs() of a MattXFS path, the numbers of the home filesystem ----
+static int mattx_vfs_statfs_apply(const char *path, struct mattx_vfs_statfs_reply *r)
+{
+    struct kstatfs ks;
+    struct path p;
+    int err;
+
+    memset(&ks, 0, sizeof(ks));
+    err = kern_path(path, LOOKUP_FOLLOW, &p);
+    if (err)
+        return err;
+    err = vfs_statfs(&p, &ks);
+    if (!err) {
+        r->bsize = ks.f_bsize;
+        r->frsize = ks.f_frsize;
+        r->namelen = ks.f_namelen;
+        r->flags = ks.f_flags;
+        r->blocks = ks.f_blocks;
+        r->bfree = ks.f_bfree;
+        r->bavail = ks.f_bavail;
+        r->files = ks.f_files;
+        r->ffree = ks.f_ffree;
+    }
+    path_put(&p);
+    return err;
+}
+
+// f_type and f_fsid stay the MattXFS ones (the caller's kstatfs comes pre-filled by simple_statfs)
+static void mattx_vfs_statfs_fill(struct kstatfs *out, const struct mattx_vfs_statfs_reply *r)
+{
+    out->f_bsize = r->bsize;
+    out->f_frsize = r->frsize;
+    out->f_namelen = r->namelen;
+    out->f_flags = r->flags;
+    out->f_blocks = r->blocks;
+    out->f_bfree = r->bfree;
+    out->f_bavail = r->bavail;
+    out->f_files = r->files;
+    out->f_ffree = r->ffree;
+}
+
+int mattx_rpc_vfs_statfs(int node_id, const char *path, struct kstatfs *out)
+{
+    struct mattx_vfs_statfs_req *req;
+    struct mattx_vfs_statfs_reply local;
+    struct mattx_ticket *t;
+    int err;
+
+    if (strlen(path) >= sizeof(req->path))
+        return -ENAMETOOLONG;
+
+    if (node_id == my_node_id) {
+        memset(&local, 0, sizeof(local));
+        mattx_dbg("[VFS] STATFS '%s' (local)\n", path);
+        err = mattx_vfs_statfs_apply(path, &local);
+        if (!err)
+            mattx_vfs_statfs_fill(out, &local);
+        return err;
+    }
+
+    if (node_id < 0 || node_id >= MAX_NODES || !READ_ONCE(cluster_map[node_id]))
+        return -ENOTCONN;
+
+    req = kzalloc(sizeof(*req), GFP_KERNEL);
+    if (!req)
+        return -ENOMEM;
+    strscpy(req->path, path, sizeof(req->path));
+
+    t = mattx_ticket_add(0, node_id, sizeof(struct mattx_vfs_statfs_reply));
+    if (!t) {
+        kfree(req);
+        return -ENOMEM;
+    }
+    req->req_id = t->req_id;
+
+    mattx_dbg("[VFS] STATFS '%s' on Node %d as req %u. Sleeping...\n", path, node_id, t->req_id);
+    if (mattx_comm_send(cluster_map[node_id], MATTX_MSG_VFS_STATFS_REQ, req, sizeof(*req)) < 0)
+        err = -EIO;
+    else if (mattx_ticket_wait(t, MAX_SCHEDULE_TIMEOUT))
+        err = -ERESTARTSYS;     // statfs changes nothing: the restart simply asks again
+    else
+        err = (int)t->retval;
+
+    if (err == 0) {
+        if (!t->data || t->data_len < sizeof(local)) {
+            err = -EIO;
+        } else {
+            memcpy(&local, t->data, sizeof(local));
+            mattx_vfs_statfs_fill(out, &local);
+        }
+    }
+    mattx_dbg("[VFS] STATFS '%s' on Node %d (req %u) woke up: %d\n", path, node_id, t->req_id, err);
+    mattx_ticket_del(t);
+    kfree(req);
+    return err;
+}
+EXPORT_SYMBOL(mattx_rpc_vfs_statfs);
+
+struct mattx_vfs_statfs_kworker_ctx { struct work_struct work; struct mattx_vfs_statfs_req req; int target_node; };
+
+static void mattx_vfs_statfs_send(int node, struct mattx_vfs_statfs_reply *reply)
+{
+    struct mattx_link *link = READ_ONCE(cluster_map[node]);
+
+    if (link)
+        mattx_comm_send(link, MATTX_MSG_VFS_STATFS_REPLY, reply, sizeof(*reply));
+}
+
+static void mattx_vfs_statfs_kworker(struct work_struct *work)
+{
+    struct mattx_vfs_statfs_kworker_ctx *ctx = container_of(work, struct mattx_vfs_statfs_kworker_ctx, work);
+    struct mattx_vfs_statfs_req *req = &ctx->req;
+    struct mattx_vfs_statfs_reply reply;
+    bool abandoned = false;
+    int err;
+
+    memset(&reply, 0, sizeof(reply));
+    reply.req_id = req->req_id;
+    req->path[sizeof(req->path) - 1] = '\0';
+
+    if (mattx_req_take_cancelled(ctx->target_node, 0, (u32)req->req_id)) {
+        mattx_dbg("[VFS] STATFS (req %llu) cancelled by the Surrogate before it started, skipped\n", req->req_id);
+        err = -EINTR;
+    } else if (READ_ONCE(mattx_cancellable_stopping) || !READ_ONCE(cluster_map[ctx->target_node])) {
+        abandoned = true;
+        err = -EINTR;
+    } else {
+        mattx_dbg("[VFS] STATFS '%s' (req %llu) from Node %d (kworker)\n", req->path, req->req_id, ctx->target_node);
+        err = mattx_vfs_statfs_apply(req->path, &reply);
+        mattx_req_take_cancelled(ctx->target_node, 0, (u32)req->req_id);
+    }
+    reply.error = err;
+
+    if (abandoned) {
+        mattx_dbg("[VFS] STATFS (req %llu): nobody left to answer, reply dropped\n", req->req_id);
+    } else {
+        mattx_dbg("[VFS] STATFS (req %llu) done: %d\n", req->req_id, err);
+        mattx_vfs_statfs_send(ctx->target_node, &reply);
+    }
+
+    kfree(ctx);
+    atomic_dec(&mattx_cancellable_inflight);
+}
+
+static void handle_vfs_statfs_req(struct mattx_link *link, struct mattx_header *hdr, void *payload)
+{
+    struct mattx_vfs_statfs_req *req = payload;
+    struct mattx_vfs_statfs_kworker_ctx *ctx;
+
+    if (!payload || hdr->length < sizeof(*req)) return;
+    if (hdr->sender_id >= MAX_NODES || READ_ONCE(mattx_cancellable_stopping)) return;
+
+    ctx = kmalloc(sizeof(*ctx), GFP_ATOMIC);
+    if (!ctx) {
+        struct mattx_vfs_statfs_reply reply;
+
+        printk(KERN_ERR "MattX:[VFS] STATFS_REQ %llu: out of memory\n", req->req_id);
+        memset(&reply, 0, sizeof(reply));
+        reply.req_id = req->req_id;
+        reply.error = -ENOMEM;
+        mattx_vfs_statfs_send(hdr->sender_id, &reply);
+        return;
+    }
+    INIT_WORK(&ctx->work, mattx_vfs_statfs_kworker);
+    memcpy(&ctx->req, req, sizeof(*req));
+    ctx->target_node = hdr->sender_id;
+    atomic_inc(&mattx_cancellable_inflight);
+    mattx_queue_wait_work(&ctx->work);
+}
+
+static void handle_vfs_statfs_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload)
+{
+    struct mattx_vfs_statfs_reply *reply = payload;
+
+    if (!payload || hdr->length < sizeof(*reply)) return;
+
+    mattx_dbg("[RPC] Received VFS_STATFS_REPLY req %llu. Result: %d\n", reply->req_id, reply->error);
+    if (!mattx_ticket_complete(hdr->sender_id, 0, (u32)reply->req_id, reply->error,
+                               reply->error == 0 ? reply : NULL, reply->error == 0 ? sizeof(*reply) : 0))
+        mattx_dbg("[RPC] VFS_STATFS_REPLY req %llu: nobody waits for it any more, dropped\n", reply->req_id);
+}
+
 // ---- fallocate of an open MattXFS file ----
 /*
  * COLLAPSE_RANGE / INSERT_RANGE are not idempotent: an interrupted wait cannot restart them (the home node may have done
@@ -15375,6 +15557,8 @@ void mattx_fileio_init_handlers(void) {
     mattx_register_handler(MATTX_MSG_VFS_LINK_REPLY, handle_vfs_link_reply);
     mattx_register_handler(MATTX_MSG_VFS_READLINK_REQ, handle_vfs_readlink_req);
     mattx_register_handler(MATTX_MSG_VFS_READLINK_REPLY, handle_vfs_readlink_reply);
+    mattx_register_handler(MATTX_MSG_VFS_STATFS_REQ, handle_vfs_statfs_req);
+    mattx_register_handler(MATTX_MSG_VFS_STATFS_REPLY, handle_vfs_statfs_reply);
     mattx_register_handler(MATTX_MSG_VFS_FALLOCATE_REQ, handle_vfs_fallocate_req);
     mattx_register_handler(MATTX_MSG_VFS_FALLOCATE_REPLY, handle_vfs_fallocate_reply);
     mattx_register_handler(MATTX_MSG_SYS_EPOLL_CREATE_REQ, handle_sys_epoll_create_req);

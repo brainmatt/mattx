@@ -318,6 +318,8 @@ enum mattx_msg_type {
     MATTX_MSG_SYS_FCHDIR_REPLY,
     MATTX_MSG_SYS_GETCWD_REQ,  // issue #67 (P3, Track K): getcwd of a Surrogate (kprobe mode), Identity Theft, ticket based
     MATTX_MSG_SYS_GETCWD_REPLY,
+    MATTX_MSG_VFS_STATFS_REQ,  // issue #67 (P3, Track M): statfs() / df of /mattxfs: the numbers of the home filesystem, ticket based
+    MATTX_MSG_VFS_STATFS_REPLY,
 };
 
 struct mattx_header {
@@ -1959,6 +1961,26 @@ struct mattx_vfs_readlink_reply {
     char target[256];
 };
 
+// statfs() of a MattXFS path: the home filesystem's numbers (struct kstatfs is not a wire format, so explicit fields)
+struct mattx_vfs_statfs_req {
+    u64 req_id;
+    char path[256];
+};
+
+struct mattx_vfs_statfs_reply {
+    u64 req_id;
+    int error;
+    u32 bsize;
+    u32 frsize;
+    u32 namelen;
+    u32 flags;
+    u64 blocks;
+    u64 bfree;
+    u64 bavail;
+    u64 files;
+    u64 ffree;
+};
+
 // fallocate() of an open MattXFS file: the mode (FALLOC_FL_*) goes through unchanged, the home filesystem decides what it can do
 struct mattx_vfs_fallocate_req {
     u64 req_id;
@@ -2490,6 +2512,7 @@ int mattx_rpc_vfs_symlink(int node_id, const char *target, const char *linkpath)
 int mattx_rpc_vfs_link(int node_id, const char *oldpath, const char *newpath);                         // MattXFS .link
 int mattx_rpc_vfs_fallocate(int node_id, int remote_fd, int mode, loff_t offset, loff_t len);                // MattXFS .fallocate
 int mattx_rpc_vfs_readlink(int node_id, const char *path, char *buf, size_t size);                     // MattXFS .get_link (returns the length)
+int mattx_rpc_vfs_statfs(int node_id, const char *path, struct kstatfs *out);                          // MattXFS .statfs (df): the home filesystem's numbers
 int mattx_rpc_vfs_readdir(int node_id, const char *path, u64 *offset, struct mattx_dirent *entries, u32 *out_count);
 int mattx_rpc_vfs_open(int node_id, const char *path, int flags, int mode, int *remote_fd);
 ssize_t mattx_rpc_vfs_read(int node_id, int remote_fd, void *buf, size_t count, loff_t *pos);
