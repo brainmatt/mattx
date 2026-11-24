@@ -44,6 +44,8 @@
 
 #include <sys/mount.h>  // For mount()
 #include <sys/stat.h>   // For mkdir()
+#include <fcntl.h>      // open() for the file mappings
+#include <errno.h>
 #include <limits.h>      // PATH_MAX
 #include <netlink/netlink.h>
 #include <netlink/genl/genl.h>
@@ -68,7 +70,18 @@ struct mattx_vma_info {
     uint64_t vm_flags;
     uint32_t shmid;
     uint8_t is_shm;    
+    uint8_t is_file;    // MUST STAY IN SYNC with struct mattx_vma_info in mattx.h (uses the padding: sizeof() is 32)
+    uint16_t file_idx;  // index into the mattx_vma_file table behind vmas[vma_count]
 };
+
+// One entry per is_file VMA, behind vmas[vma_count] (file_count entries). MUST STAY IN SYNC with mattx.h.
+struct mattx_vma_file {
+    uint64_t pgoff;     // offset into the file, in BYTES
+    uint64_t size;      // i_size at the home node
+    int64_t mtime_sec;  // mtime at the home node
+    int64_t mtime_nsec;
+    char path[256];
+} __attribute__((packed));
 
 struct mattx_cpu_regs {
     uint64_t r15, r14, r13, r12, rbp, rbx, r11, r10;
@@ -127,9 +140,77 @@ struct mattx_migration_req {
     uint32_t vma_count;
     uint8_t mattxfs_enabled;
     uint8_t local_libs;     // MUST STAY IN SYNC with struct mattx_migration_req in mattx.h (packed: vmas[] follows)
+    uint32_t file_count;    // mattx_vma_file entries behind vmas[vma_count]
     struct mattx_vma_info vmas[]; 
 } __attribute__((packed)); // <-- FORCE EXACT LAYOUT
 
+
+/*
+ * --- FILE MAPPINGS OF THE BLUEPRINT (issue #67, P3, 0032) ---
+ * The home node did not send the pages of a big read-only file mapping (the weights of an LLM): it sent the file's path,
+ * the offset, the size and the mtime. The file is mapped here, at the same address, with the same protection; the pages
+ * come from this node's own page cache on demand. A path under DFSA_DIR (the shared NAS: the very same file is mounted
+ * at the very same path on this node, native speed, no MattX traffic) is opened as it is; any other path is opened
+ * through MattXFS (/mattxfs/<home>/...: the MattXFS .mmap, pages come from the home node). The file must be the file of the home
+ * node: size and mtime are compared. There is no way back to "send the pages" any more, so a mapping that cannot be made
+ * is fatal (a zero filled hole in the weights would be silently wrong): the stub says why and ends, the home node keeps
+ * its process.
+ */
+static int map_file_vma(const struct mattx_migration_req *req, const struct mattx_vma_info *v, const struct mattx_vma_file *vf)
+{
+    size_t dlen = strnlen(req->dfsa_dir, sizeof(req->dfsa_dir));
+    char path[sizeof(vf->path) + 1];
+    char mpath[sizeof(vf->path) + 32];
+    const char *openpath = path;
+    struct stat st;
+    int prot = 0, flags = MAP_FIXED;
+    void *addr;
+    int fd;
+
+    memcpy(path, vf->path, sizeof(vf->path));
+    path[sizeof(vf->path)] = '\0';
+
+    while (dlen > 1 && req->dfsa_dir[dlen - 1] == '/') dlen--;
+    if (dlen == 0 || strncmp(path, req->dfsa_dir, dlen) != 0 || (path[dlen] != '/' && path[dlen] != '\0')) {
+        if (!req->mattxfs_enabled) {
+            fprintf(stderr, "MattX-Stub: FATAL: file mapping '%s' is not under DFSA_DIR '%s' and MattXFS is off\n", path, req->dfsa_dir);
+            return -1;
+        }
+        snprintf(mpath, sizeof(mpath), "/mattxfs/%u%s", req->home_node, path);     // the home node's file, through MattXFS
+        openpath = mpath;
+    }
+
+    fd = open(openpath, O_RDONLY);
+    if (fd < 0) {
+        fprintf(stderr, "MattX-Stub: FATAL: cannot open '%s' for the file mapping at 0x%lx: %s (DFSA_DIR mounted / MattXFS up on this node?)\n",
+                openpath, (unsigned long)v->vm_start, strerror(errno));
+        return -1;
+    }
+    if (fstat(fd, &st) != 0 || (uint64_t)st.st_size != vf->size ||
+        (int64_t)st.st_mtim.tv_sec != vf->mtime_sec || (int64_t)st.st_mtim.tv_nsec != vf->mtime_nsec) {
+        fprintf(stderr, "MattX-Stub: FATAL: '%s' here is not the file of the home node (size %llu/%llu, mtime %lld.%09ld/%lld.%09lld)\n",
+                openpath, (unsigned long long)st.st_size, (unsigned long long)vf->size,
+                (long long)st.st_mtim.tv_sec, (long)st.st_mtim.tv_nsec, (long long)vf->mtime_sec, (long long)vf->mtime_nsec);
+        close(fd);
+        return -1;
+    }
+
+    if (v->vm_flags & 0x1) prot |= PROT_READ;     // VM_READ
+    if (v->vm_flags & 0x2) prot |= PROT_WRITE;    // VM_WRITE
+    if (v->vm_flags & 0x4) prot |= PROT_EXEC;     // VM_EXEC
+    flags |= (v->vm_flags & 0x8) ? MAP_SHARED : MAP_PRIVATE;     // VM_SHARED
+
+    addr = mmap((void *)v->vm_start, v->vm_end - v->vm_start, prot, flags, fd, (off_t)vf->pgoff);
+    close(fd);
+    if (addr == MAP_FAILED) {
+        fprintf(stderr, "MattX-Stub: FATAL: mmap of '%s' at 0x%lx failed: %s\n", openpath, (unsigned long)v->vm_start, strerror(errno));
+        return -1;
+    }
+    printf("MattX-Stub: File mapping 0x%lx - 0x%lx = '%s' offset %llu (%s, no pages sent)\n",
+           (unsigned long)v->vm_start, (unsigned long)v->vm_end, openpath, (unsigned long long)vf->pgoff,
+           (v->vm_flags & 0x8) ? "shared" : "private");
+    return 0;
+}
 
 /*
  * --- THE HPC FAST-PATH OF MATTXFS (LOCAL_LIBS) ---
@@ -311,6 +392,20 @@ int main() {
         // --- FIXED: Copy by value to avoid unaligned pointer warnings! ---
         struct mattx_vma_info v = received_req->vmas[i]; 
         size_t size = v.vm_end - v.vm_start;
+
+        // --- 0032: a file mapping: map the file here, nothing was sent for it ---
+        if (v.is_file) {
+            struct mattx_vma_file vf;
+            if (v.file_idx >= received_req->file_count) {
+                fprintf(stderr, "MattX-Stub: FATAL: VMA %u wants file entry %u, the blueprint has %u\n", i, v.file_idx, received_req->file_count);
+                exit(1);
+            }
+            // the table is behind vmas[vma_count], packed: copy it out
+            memcpy(&vf, (const char *)&received_req->vmas[received_req->vma_count] + (size_t)v.file_idx * sizeof(vf), sizeof(vf));
+            if (map_file_vma(received_req, &v, &vf) != 0)
+                exit(1);
+            continue;
+        }
 
         int prot = PROT_READ | PROT_WRITE | PROT_EXEC;
 

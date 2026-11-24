@@ -26,6 +26,8 @@
 #include <linux/completion.h>  // For wait_for_completion
 #include <linux/kprobes.h>
 #include <linux/timekeeping.h>
+#include <linux/magic.h>
+#include <linux/dcache.h>
 
 // twa resolver
 mattx_task_work_add_fn real_task_work_add = NULL;
@@ -650,6 +652,85 @@ EXPORT_SYMBOL(mattx_freeze_task_safely);
  * task->stack is NULL, so task_pt_regs(task) -- stack + THREAD_SIZE - sizeof(pt_regs) --
  * is a read at 0x3f48 and oopses (mattx#37). Such a task has nothing left to migrate.
  */
+/*
+ * 0032 (issue #67, P3): file mappings do not travel as pages.
+ * A read-only, non-executable mapping of a big regular file (the weights of an LLM, a dataset) used to be read page by
+ * page through access_process_vm() and pushed through the Wormhole as anonymous memory: 19 GB per worker. If the target
+ * can reach the same file (under DFSA_DIR: the same path on the shared NAS, otherwise through /mattxfs/<home>), the
+ * blueprint only says "this file, this offset, this size, this mtime" and the stub maps it. Pages are then fetched by the
+ * target's own page cache on demand.
+ * Only what is safe: regular file, !VM_WRITE, !VM_EXEC (libraries keep their path: LOCAL_LIBS), no memory filesystems
+ * (tmpfs, ramfs, hugetlbfs: nobody else can reach them / they change), not deleted, path < 256, size >= mmap_file_min_mb,
+ * a private mapping without COW pages, and below DFSA_DIR or in MattXFS mode (the target maps it through /mattxfs/<home>).
+ * Anything else stays on the page push (nothing changes for it).
+ */
+static unsigned int mmap_file_min_mb = 16;
+module_param_named(mmap_file_min_mb, mmap_file_min_mb, uint, 0644);
+MODULE_PARM_DESC(mmap_file_min_mb, "Read-only file mappings of at least this many MB are mapped again at the target instead of sent page by page (0 = off)");
+
+// Is the path below DFSA_DIR (same component boundary)? There the target has the very same file at the very same path.
+static bool mattx_path_in_dfsa(const char *p)
+{
+    size_t n = strnlen(config_dfsa_dir, sizeof(config_dfsa_dir));
+
+    while (n > 1 && config_dfsa_dir[n - 1] == '/')
+        n--;
+    if (n == 0)
+        return false;
+    return !strncmp(p, config_dfsa_dir, n) && (p[n] == '/' || p[n] == '\0');
+}
+
+static bool mattx_vma_is_file_candidate(struct vm_area_struct *vma, char *pathbuf, struct mattx_vma_file *out)
+{
+    struct file *f = vma->vm_file;
+    struct inode *inode;
+    struct timespec64 mt;
+    const char *p;
+    size_t len;
+    loff_t isize;
+
+    if (!f || !mmap_file_min_mb)
+        return false;
+    if (vma->vm_flags & (VM_WRITE | VM_EXEC | VM_IO | VM_PFNMAP | VM_HUGETLB))
+        return false;
+    // a private mapping that was written and then made read-only has anonymous (COW) pages that are NOT the file
+    if (!(vma->vm_flags & VM_SHARED) && vma->anon_vma)
+        return false;
+    inode = file_inode(f);
+    if (!S_ISREG(inode->i_mode))
+        return false;
+    switch (inode->i_sb->s_magic) {
+    case TMPFS_MAGIC: case RAMFS_MAGIC: case HUGETLBFS_MAGIC: case PROC_SUPER_MAGIC: case SYSFS_MAGIC:
+    case DEVPTS_SUPER_MAGIC: case CGROUP_SUPER_MAGIC: case CGROUP2_SUPER_MAGIC: case ANON_INODE_FS_MAGIC:
+        return false;
+    }
+    isize = i_size_read(inode);
+    if (isize < ((loff_t)mmap_file_min_mb << 20))
+        return false;
+    if ((vma->vm_end - vma->vm_start) < ((unsigned long)mmap_file_min_mb << 20))
+        return false;
+
+    p = d_path(&f->f_path, pathbuf, PATH_MAX);
+    if (IS_ERR(p) || p[0] != '/')
+        return false;
+    len = strlen(p);
+    if (len >= sizeof(out->path) || (len > 10 && !strcmp(p + len - 10, " (deleted)")))
+        return false;
+    // DFSA_DIR: the same file at the same path on the target. Elsewhere: the target maps it through /mattxfs/<home>
+    // (MattXFS .mmap, 0032a), which needs MattXFS mode.
+    if (!mattx_path_in_dfsa(p) && !config_mattxfs_enabled)
+        return false;
+
+    mt = inode_get_mtime(inode);
+    memset(out, 0, sizeof(*out));
+    out->pgoff = (u64)vma->vm_pgoff << PAGE_SHIFT;
+    out->size = (u64)isize;
+    out->mtime_sec = mt.tv_sec;
+    out->mtime_nsec = mt.tv_nsec;
+    memcpy(out->path, p, len);
+    return true;
+}
+
 static bool mattx_task_capturable(struct task_struct *task)
 {
     return !(READ_ONCE(task->flags) & PF_EXITING) && !READ_ONCE(task->exit_state) &&
@@ -664,6 +745,9 @@ static void mattx_do_capture_and_send_state(struct task_struct *task, int target
     size_t max_payload_size;
     size_t actual_payload_size;
     int vma_count = 0;
+    int file_count = 0;                         // 0032: file mappings that go as "map this file" instead of pages
+    struct mattx_vma_file *files = NULL;
+    char *pathbuf = NULL;
     unsigned char rip_buf[8] = {0}; 
 
     is_returning = false; 
@@ -673,7 +757,8 @@ static void mattx_do_capture_and_send_state(struct task_struct *task, int target
         return;
     }
 
-    max_payload_size = sizeof(struct mattx_migration_req) + (MAX_VMAS * sizeof(struct mattx_vma_info));
+    max_payload_size = sizeof(struct mattx_migration_req) + (MAX_VMAS * sizeof(struct mattx_vma_info))
+                       + (MAX_FILE_VMAS * sizeof(struct mattx_vma_file));      // 0032: file table behind vmas[]
     
     // FIX: Use kvzalloc to prevent fragmentation failures!
     req = kvzalloc(max_payload_size, GFP_KERNEL);
@@ -841,6 +926,8 @@ static void mattx_do_capture_and_send_state(struct task_struct *task, int target
         req->brk = mm->brk;             // Capture Heap End
         req->vdso_addr = (uint64_t)mm->context.vdso; // Capture the vDSO!
 
+        files = kcalloc(MAX_FILE_VMAS, sizeof(*files), GFP_KERNEL);
+        pathbuf = kmalloc(PATH_MAX, GFP_KERNEL);       // both can fail: then every mapping simply stays on the page push
         mmap_read_lock(mm);
         VMA_ITERATOR(vmi, mm, 0);
         for_each_vma(vmi, vma) {
@@ -863,13 +950,32 @@ static void mattx_do_capture_and_send_state(struct task_struct *task, int target
                 }
             }
                         
+            // 0032: a big read-only file mapping is not sent as pages, the target maps the file itself
+            req->vmas[vma_count].is_file = 0;
+            req->vmas[vma_count].file_idx = 0;
+            if (!req->vmas[vma_count].is_shm && files && pathbuf && file_count < MAX_FILE_VMAS &&
+                mattx_vma_is_file_candidate(vma, pathbuf, &files[file_count])) {
+                req->vmas[vma_count].is_file = 1;
+                req->vmas[vma_count].file_idx = file_count;
+                mattx_dbg("[EXTRACT] File mapping 0x%lx-0x%lx: '%s' offset %llu size %llu: sent as a file, not as pages\n",
+                          vma->vm_start, vma->vm_end, files[file_count].path,
+                          (unsigned long long)files[file_count].pgoff, (unsigned long long)files[file_count].size);
+                file_count++;
+            }
+
             vma_count++;
         }
         mmap_read_unlock(mm);
     }
     
     req->vma_count = vma_count;
-    actual_payload_size = sizeof(struct mattx_migration_req) + (vma_count * sizeof(struct mattx_vma_info));
+    req->file_count = file_count;
+    if (file_count)
+        memcpy(&req->vmas[vma_count], files, file_count * sizeof(*files));
+    kfree(files);
+    kfree(pathbuf);
+    actual_payload_size = sizeof(struct mattx_migration_req) + (vma_count * sizeof(struct mattx_vma_info))
+                          + (file_count * sizeof(struct mattx_vma_file));
 
     // FIX: Use kvfree and kvmalloc!
     if (local_migration_req) kvfree(local_migration_req);
@@ -1208,6 +1314,14 @@ void mattx_send_vma_data(void) {
         // We want it to arrive on VM2 completely hollow so the Page Fault Tripwire catches it.
         if (!is_returning && local_migration_req->vmas[i].is_shm) {
             mattx_dbg("[MIGRATE] -> Skipping VMA %d (DSM Segment - Leaving Hollow for Tripwire)\n", i);
+            continue;
+        }
+
+        // --- 0032: FILE MAPPING FILTER ---
+        // The stub maps the file itself at the target (DFSA path or /mattxfs/<home>): its pages come from the target's
+        // own page cache on demand. Sending them would push the whole file through the Wormhole.
+        if (!is_returning && local_migration_req->vmas[i].is_file) {
+            mattx_dbg("[MIGRATE] -> Skipping VMA %d (File mapping - the Surrogate maps the file itself)\n", i);
             continue;
         }
 

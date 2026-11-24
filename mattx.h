@@ -115,6 +115,7 @@
 #define FIXED_LOAD_1_0 2048
 #define FIXED_LOAD_0_2 409
 #define MAX_VMAS 1024 
+#define MAX_FILE_VMAS 64        // file-backed read-only VMAs a blueprint can carry as "map this file there" (issue #67, P3, 0032)
 #define MAX_GUESTS 1024 
 #define MAX_GANG_THREADS 16
 #define MAX_FDS 256
@@ -342,7 +343,18 @@ struct mattx_vma_info {
     unsigned long vm_flags;
     u32 shmid; // The unique DSM ID
     u8 is_shm; // Flag indicating this is Shared Memory    
-};
+    u8 is_file;     // issue #67 (P3, 0032): a file mapping: no pages are sent, the stub maps the file at the target (mattx_vma_file)
+    u16 file_idx;   // index into the mattx_vma_file table behind vmas[] (only if is_file)
+};                  // (is_file + file_idx use the padding: sizeof() is still 32, the stub mirror is unchanged in size)
+
+// One entry per is_file VMA, stored behind vmas[vma_count] in the blueprint (file_count entries)
+struct mattx_vma_file {
+    u64 pgoff;          // offset into the file, in BYTES
+    u64 size;           // i_size at the home node: the target compares it before it maps
+    s64 mtime_sec;      // mtime at the home node: same check
+    s64 mtime_nsec;
+    char path[256];     // absolute path at the home node (under DFSA_DIR: also on the target, else via /mattxfs/<home>)
+} __attribute__((packed));
 
 struct mattx_cpu_regs {
     uint64_t r15, r14, r13, r12, rbp, rbx, r11, r10;
@@ -417,6 +429,7 @@ struct mattx_migration_req {
     u32 vma_count;
     u8 mattxfs_enabled; 
     u8 local_libs;          // LOCAL_LIBS of the home node: the stub bind-mounts the local library trees into the MattXFS namespace (HPC fast path)
+    u32 file_count;         // issue #67 (P3, 0032): mattx_vma_file entries behind vmas[vma_count]
     struct mattx_vma_info vmas[]; 
 } __attribute__((packed)); // <-- FORCE EXACT LAYOUT
 
@@ -2516,6 +2529,7 @@ int mattx_rpc_vfs_statfs(int node_id, const char *path, struct kstatfs *out);   
 int mattx_rpc_vfs_readdir(int node_id, const char *path, u64 *offset, struct mattx_dirent *entries, u32 *out_count);
 int mattx_rpc_vfs_open(int node_id, const char *path, int flags, int mode, int *remote_fd);
 ssize_t mattx_rpc_vfs_read(int node_id, int remote_fd, void *buf, size_t count, loff_t *pos);
+ssize_t mattx_rpc_vfs_read_mmap(int node_id, int remote_fd, void *buf, size_t count, loff_t *pos);     // 0032a: page cache reads, only a fatal signal aborts
 ssize_t mattx_rpc_vfs_write(int node_id, int remote_fd, const void *buf, size_t count, loff_t *pos);
 void mattx_rpc_vfs_close(int node_id, int remote_fd);
 loff_t mattx_rpc_vfs_llseek(int node_id, int remote_fd, loff_t offset, int whence);

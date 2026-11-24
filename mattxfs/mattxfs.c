@@ -27,6 +27,8 @@
 #include <linux/version.h>
 #include <linux/falloc.h>
 #include <linux/fs_context.h>
+#include <linux/mm.h>
+#include <linux/highmem.h>
 #include "../mattx.h" 
 
 MODULE_LICENSE("GPL v2");
@@ -40,6 +42,7 @@ static const struct inode_operations mattxfs_remote_iops;
 static const struct inode_operations mattxfs_remote_file_iops;
 static const struct inode_operations mattxfs_remote_symlink_iops;
 static const struct file_operations mattxfs_remote_dir_fops;
+static const struct address_space_operations mattxfs_aops;     // 0032a: mmap of remote files
 
 // 1: Path Building Magic ---
 static int get_node_id_from_dentry(struct dentry *dentry) {
@@ -167,6 +170,10 @@ static ssize_t mattxfs_remote_file_write(struct file *file, const char __user *b
 
     kvfree(kbuf);
 
+    // 0032a: pages of this file in this node's page cache (mmap) are older than what was just written. Cheap when there are none.
+    if (done)
+        invalidate_inode_pages2(file->f_mapping);
+
     // The SIGPIPE of the real pipe_write() / sock_write_iter() goes to the writing thread, here the Surrogate's
     if (err == -EPIPE)
         send_sig(SIGPIPE, current, 0);
@@ -253,6 +260,154 @@ static long mattxfs_remote_file_fallocate(struct file *file, int mode, loff_t of
 }
 
 // Wire them up!
+/*
+ * mmap() of a remote file (issue #67, P3, 0032a)
+ * The Surrogate's own page cache does the work: filemap_fault() asks .read_folio / .readahead, those ask the home node
+ * (the same VFS_READ ticket RPC as read()). Pages are shared by every process of this node, kept as long as there is
+ * memory and refetched when reclaim took them: the weights of an LLM that do not fit are simply read again.
+ * Read-only is what is supported: MAP_PRIVATE (a write is a COW copy, local) and MAP_SHARED without PROT_WRITE. MAP_SHARED +
+ * PROT_WRITE would need write back to the home node and coherence between writers: -EACCES.
+ * Coherence is "files that nobody changes": size / mtime of the home node are looked at on mmap(), on stat() and after
+ * our own write(); a change drops the cached pages. A file changed by somebody else while it is mapped is NOT noticed.
+ */
+#define MATTXFS_MMAP_RA_PAGES   (MATTX_VFS_READ_MAX >> PAGE_SHIFT)     // one fault fetches up to one read RPC (1 MB)
+
+// Compare the home node's size/mtime with the cached ones: a change drops the cached pages. Also takes the new values.
+static void mattxfs_pagecache_check(struct inode *inode, const struct kstat *remote) {
+    struct timespec64 mt = inode_get_mtime(inode);
+
+    if (remote->size != i_size_read(inode) ||
+        remote->mtime.tv_sec != mt.tv_sec || remote->mtime.tv_nsec != mt.tv_nsec) {
+        mattx_dbg("[MMAP] inode %lu changed at the home node (size %lld -> %lld): cached pages dropped\n",
+                  inode->i_ino, (long long)i_size_read(inode), (long long)remote->size);
+        i_size_write(inode, remote->size);
+        inode_set_mtime_to_ts(inode, remote->mtime);
+        invalidate_inode_pages2(inode->i_mapping);
+    }
+}
+
+// Fill the folios of one chunk [pos, pos+len) of the file from buf (n bytes were read, the rest of it is past EOF: zeros)
+static void mattxfs_fill_folio(struct folio *folio, const void *buf, loff_t start, ssize_t n) {
+    loff_t off = folio_pos(folio) - start;
+    size_t sz = folio_size(folio);
+    size_t have = 0;
+
+    if (n > 0 && off < n)
+        have = min_t(size_t, sz, (size_t)(n - off));
+    if (have)
+        memcpy_to_folio(folio, 0, (const char *)buf + off, have);
+    if (have < sz)
+        folio_zero_segment(folio, have, sz);
+    folio_mark_uptodate(folio);
+}
+
+static int mattxfs_read_folio(struct file *file, struct folio *folio) {
+    struct mattxfs_file_info *fi = file ? file->private_data : NULL;
+    loff_t pos = folio_pos(folio);
+    size_t len = folio_size(folio);
+    ssize_t n;
+    void *kbuf;
+
+    if (!fi) {
+        folio_unlock(folio);
+        return -EIO;
+    }
+    kbuf = kvmalloc(len, GFP_NOFS);
+    if (!kbuf) {
+        folio_unlock(folio);
+        return -ENOMEM;
+    }
+    n = mattx_rpc_vfs_read_mmap(fi->node_id, fi->remote_fd, kbuf, len, &pos);
+    if (n < 0 || n > (ssize_t)len) {
+        mattx_dbg("[MMAP] read_folio at %lld on Node %d: %zd\n", (long long)folio_pos(folio), fi->node_id, n);
+        kvfree(kbuf);
+        folio_unlock(folio);
+        return n < 0 ? (int)n : -EIO;
+    }
+    mattxfs_fill_folio(folio, kbuf, folio_pos(folio), n);
+    kvfree(kbuf);
+    folio_unlock(folio);
+    return 0;
+}
+
+// Read-ahead: one RPC (up to MATTX_VFS_READ_MAX) per round instead of one per page
+static void mattxfs_readahead(struct readahead_control *ractl) {
+    struct mattxfs_file_info *fi = ractl->file ? ractl->file->private_data : NULL;
+    struct folio *folio;
+
+    while (readahead_count(ractl)) {
+        loff_t start = readahead_pos(ractl);
+        size_t chunk = min_t(size_t, readahead_length(ractl), MATTX_VFS_READ_MAX);
+        size_t used = 0;
+        loff_t pos = start;
+        ssize_t n = -EIO;
+        void *kbuf = NULL;
+
+        if (fi)
+            kbuf = kvmalloc(chunk, GFP_NOFS);
+        if (kbuf)
+            n = mattx_rpc_vfs_read_mmap(fi->node_id, fi->remote_fd, kbuf, chunk, &pos);
+        if (n > (ssize_t)chunk)
+            n = -EIO;
+        mattx_dbg("[MMAP] readahead %zu bytes at %lld: %zd\n", chunk, (long long)start, n);
+
+        // On an error the folios are only unlocked (not uptodate): filemap_fault() reads them again one by one
+        while (used < chunk && (folio = readahead_folio(ractl))) {
+            if (n >= 0)
+                mattxfs_fill_folio(folio, kbuf, start, n);
+            used += folio_size(folio);
+            folio_unlock(folio);
+        }
+        kvfree(kbuf);
+    }
+}
+
+static const struct address_space_operations mattxfs_aops = {
+    .read_folio = mattxfs_read_folio,
+    .readahead  = mattxfs_readahead,
+};
+
+static const struct vm_operations_struct mattxfs_file_vm_ops = {
+    .fault      = filemap_fault,
+    .map_pages  = filemap_map_pages,
+};
+
+static int mattxfs_remote_file_mmap(struct file *file, struct vm_area_struct *vma) {
+    struct dentry *dentry = file->f_path.dentry;
+    struct inode *inode = file_inode(file);
+    struct kstat remote;
+    char path_buf[256];
+    int node_id = get_node_id_from_dentry(dentry);
+    int err;
+
+    if ((vma->vm_flags & VM_SHARED) && (vma->vm_flags & VM_WRITE)) {
+        mattx_dbg("[MMAP] MAP_SHARED + PROT_WRITE of a MattXFS file is not supported\n");
+        return -EACCES;
+    }
+    if (vma->vm_flags & VM_SHARED) {        // nothing can ever be written through this mapping (mprotect included)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
+        vm_flags_clear(vma, VM_MAYWRITE);
+#else
+        vma->vm_flags &= ~VM_MAYWRITE;
+#endif
+    }
+
+    get_remote_path_from_dentry(dentry, path_buf, sizeof(path_buf));
+    err = mattx_rpc_vfs_getattr(node_id, path_buf, &remote);
+    if (err == -ERESTARTSYS)
+        return err;
+    if (!err)
+        mattxfs_pagecache_check(inode, &remote);
+
+    file->f_ra.ra_pages = MATTXFS_MMAP_RA_PAGES;
+    file_accessed(file);
+    vma->vm_ops = &mattxfs_file_vm_ops;
+    mattx_dbg("[MMAP] %s on Node %d: %s mapping, %lu bytes at pgoff %lu, size %lld\n", path_buf, node_id,
+              (vma->vm_flags & VM_SHARED) ? "shared" : "private", vma->vm_end - vma->vm_start, vma->vm_pgoff,
+              (long long)i_size_read(inode));
+    return 0;
+}
+
 static const struct file_operations mattxfs_remote_file_fops = {
     .open    = mattxfs_remote_file_open,
     .read    = mattxfs_remote_file_read,
@@ -261,6 +416,7 @@ static const struct file_operations mattxfs_remote_file_fops = {
     .llseek  = mattxfs_remote_file_llseek,
     .fsync   = mattxfs_remote_file_fsync,
     .fallocate = mattxfs_remote_file_fallocate,
+    .mmap    = mattxfs_remote_file_mmap,
     .lock    = mattxfs_remote_file_lock,
     .flock   = mattxfs_remote_file_flock,
 };
@@ -336,6 +492,7 @@ static struct inode *mattxfs_new_inode(struct super_block *sb, const struct ksta
         // Give regular files the ability to be read and written! ---
         inode->i_op = &mattxfs_remote_file_iops;
         inode->i_fop = &mattxfs_remote_file_fops;
+        inode->i_mapping->a_ops = &mattxfs_aops;
         set_nlink(inode, stat->nlink ? stat->nlink : 1);        // hard links of the home node
     }
     return inode;
@@ -413,6 +570,7 @@ static int mattxfs_remote_create(struct user_namespace *mnt_userns, struct inode
     
     inode->i_op = &mattxfs_remote_file_iops;
     inode->i_fop = &mattxfs_remote_file_fops;
+    inode->i_mapping->a_ops = &mattxfs_aops;
     set_nlink(inode, 1);
     
     d_instantiate(dentry, inode);
@@ -452,6 +610,8 @@ static int mattxfs_remote_getattr(struct user_namespace *idmap, const struct pat
         } else {
             mattx_dbg("[GETATTR] %s on Node %d: size %lld (cached %lld)\n", path_buf, node_id,
                       (long long)remote.size, (long long)i_size_read(inode));
+            if (S_ISREG(inode->i_mode))
+                mattxfs_pagecache_check(inode, &remote);    // 0032a: size/mtime changed at the home node: drop the mmap page cache
             i_size_write(inode, remote.size);
             inode->i_mode = (inode->i_mode & S_IFMT) | (remote.mode & ~S_IFMT);     // chmod of anybody
             inode->i_blocks = remote.blocks;

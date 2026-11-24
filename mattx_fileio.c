@@ -5078,6 +5078,29 @@ int mattx_ticket_wait(struct mattx_ticket *t, long timeout)
     return -EINTR;
 }
 
+/*
+ * Same, but only a FATAL signal ends the wait (0032a). A page fault cannot be restarted by the filesystem: an ordinary signal
+ * (the SIGSTOP of a migration freeze, a timer, SIGCHLD) that interrupted the read would end in SIGBUS, and a retry loop
+ * would spin because the signal stays pending until the task is back in user mode. The stop / handler simply comes after the fault.
+ */
+static int mattx_ticket_wait_killable(struct mattx_ticket *t)
+{
+    struct mattx_sys_req_cancel cancel = { .orig_pid = t->orig_pid, .req_id = t->req_id };
+    struct mattx_link *link;
+
+    if (wait_for_completion_killable(&t->done) == 0)
+        return 0;
+
+    if (t->home_node < 0 || t->home_node >= MAX_NODES)
+        return -EINTR;
+    link = READ_ONCE(cluster_map[t->home_node]);
+    if (!link || mattx_comm_send(link, MATTX_MSG_SYS_REQ_CANCEL, &cancel, sizeof(cancel)) < 0)
+        return -EINTR;
+    if (wait_for_completion_killable_timeout(&t->done, MATTX_TICKET_CANCEL_WAIT) > 0)
+        return 0;
+    return -EINTR;
+}
+
 
 /*
  * ENGINE 2: an interruptible helper kthread for the waits that have no poll interface (issue #67, P2).
@@ -10247,6 +10270,53 @@ out:
     return bytes_read;
 }
 EXPORT_SYMBOL(mattx_rpc_vfs_read);
+
+// read() for the page cache of a mmap (0032a): the same request, but a signal does not abort it (see mattx_ticket_wait_killable)
+ssize_t mattx_rpc_vfs_read_mmap(int node_id, int remote_fd, void *buf, size_t count, loff_t *pos) {
+    struct mattx_ticket *t;
+    struct mattx_vfs_read_req req;
+    ssize_t bytes_read = -EIO;
+
+    if (node_id == my_node_id)
+        return mattx_rpc_vfs_read(node_id, remote_fd, buf, count, pos);       // the local fast path: kernel_read(), no wait
+
+    if (node_id < 0 || node_id >= MAX_NODES || !cluster_map[node_id]) return -ENOTCONN;
+    if (!count) return 0;
+    if (count > MATTX_VFS_READ_MAX) count = MATTX_VFS_READ_MAX;
+
+    t = mattx_ticket_add(0, node_id, count);
+    if (!t) return -ENOMEM;
+
+    memset(&req, 0, sizeof(req));
+    req.req_id = t->req_id;
+    req.remote_fd = remote_fd;
+    req.count = count;
+    req.pos = *pos;
+
+    mattx_dbg("[VFS] READ(mmap) %zu bytes at %lld of fd %d on Node %d as req %u. Sleeping...\n", count, (long long)*pos, remote_fd, node_id, t->req_id);
+    if (mattx_comm_send(cluster_map[node_id], MATTX_MSG_VFS_READ_REQ, &req, sizeof(req)) < 0) {
+        bytes_read = -EIO;
+        goto out;
+    }
+    if (mattx_ticket_wait_killable(t)) {
+        bytes_read = -EINTR;                    // the process is being killed
+        goto out;
+    }
+
+    bytes_read = t->retval;
+    if (bytes_read > 0) {
+        if (!t->data || (size_t)bytes_read > t->data_len || (size_t)bytes_read > count) {
+            bytes_read = -EIO;
+        } else {
+            memcpy(buf, t->data, bytes_read);
+            *pos += bytes_read;
+        }
+    }
+out:
+    mattx_ticket_del(t);
+    return bytes_read;
+}
+EXPORT_SYMBOL(mattx_rpc_vfs_read_mmap);
 
 ssize_t mattx_rpc_vfs_write(int node_id, int remote_fd, const void *buf, size_t count, loff_t *pos) {
     struct mattx_ticket *t;
