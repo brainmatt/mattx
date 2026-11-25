@@ -1486,6 +1486,17 @@ struct mattx_fake_fd_info {
     u32 remote_fd;
 };
 
+/*
+ * An anon_inode file never gets FMODE_PREAD / FMODE_PWRITE (only do_dentry_open() sets them), so pread64() / pwrite64()
+ * on an inherited or proxied fd failed with ESPIPE in the Surrogate before the request left the node. The Deputy's
+ * node decides: it answers ESPIPE itself when the real file cannot do positional I/O (a pipe, a socket).
+ */
+static inline void mattx_proxy_allow_positional(struct file *f)
+{
+    if (f && !IS_ERR(f))
+        f->f_mode |= FMODE_PREAD | FMODE_PWRITE;
+}
+
 struct mattx_rpc_work {
     struct work_struct work;
     pid_t local_pid;

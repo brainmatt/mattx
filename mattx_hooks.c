@@ -873,6 +873,7 @@ static void mattx_rpc_worker(struct work_struct *work) {
                         fd_info->remote_fd = remote_fd;
                         
                         struct file *fake_file = anon_inode_getfile("mattx_vfs_proxy", &mattx_fops, fd_info, O_RDWR);
+                        mattx_proxy_allow_positional(fake_file);
                         
                         if (!IS_ERR(fake_file) && surrogate->files) {
                             spin_lock(&surrogate->files->file_lock);
@@ -1674,6 +1675,7 @@ static void mattx_rpc_worker(struct work_struct *work) {
                         
                         // Use the original flags (filtered to file access modes) to create the fake file
                         struct file *fake_file = anon_inode_getfile("mattx_vfs_proxy", &mattx_fops, fd_info, rpc->flags & O_ACCMODE);
+                        mattx_proxy_allow_positional(fake_file);
                         struct file *old_file = NULL;
 
                         if (!IS_ERR(fake_file) && surrogate->files) {
@@ -1945,6 +1947,7 @@ static void mattx_open_tw_fn(struct callback_head *cb) {
 
             // Use the original flags (filtered to file access modes) to create the fake file
             fake_file = anon_inode_getfile("mattx_vfs_proxy", &mattx_fops, fd_info, tw->flags & O_ACCMODE);
+            mattx_proxy_allow_positional(fake_file);
             if (IS_ERR(fake_file)) {
                 kfree(fd_info);
                 mattx_open_tw_close_remote(tw, remote_fd);
@@ -5749,6 +5752,7 @@ static void mattx_accept_tw_fn(struct callback_head *cb) {
             fd_info->remote_fd = remote_fd;
 
             fake_file = anon_inode_getfile("mattx_vfs_proxy", &mattx_fops, fd_info, O_RDWR);
+            mattx_proxy_allow_positional(fake_file);
             if (IS_ERR(fake_file)) {
                 kfree(fd_info);
                 mattx_accept_tw_close_remote(tw, remote_fd);
@@ -9795,6 +9799,7 @@ static void mattx_inotify_init_tw_fn(struct callback_head *cb) {
             fd_info->orig_pid = tw->orig_pid;
             fd_info->remote_fd = remote_fd;
             fake_file = anon_inode_getfile("mattx_vfs_proxy", &mattx_fops, fd_info, O_RDONLY);
+            mattx_proxy_allow_positional(fake_file);
             if (IS_ERR(fake_file)) kfree(fd_info);
         }
 

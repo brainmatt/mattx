@@ -33,6 +33,7 @@
 #include <linux/pagemap.h> // Required for read_mapping_page
 #include <linux/moduleparam.h>
 #include <linux/random.h>
+#include <asm/syscall.h>
 
 #define MAX_VFS_RPC 64
 
@@ -1569,21 +1570,72 @@ out:
     return ret;
 }
 
-static ssize_t mattx_fake_read(struct file *file, char __user *buf, size_t count, loff_t *pos) {
-    ssize_t ret = mattx_fake_read_one(file->private_data, count, false, 0, buf, NULL);
+/*
+ * pread64()/pwrite64() versus read(2)/write(2) on the scalar ->read/->write of the proxy. ksys_read()/ksys_write() copy
+ * f_pos into a local and pass the address of that copy, so "pos != &file->f_pos" is true for EVERY plain read(2)/write(2)
+ * and told nothing: all of them used to be sent as positional, at the proxy's own position (0 after the migration), and
+ * the Deputy's file position never moved (the inherited "2> log" of a migrated process was overwritten from byte 0).
+ * A plain read/write enters with *pos == f_pos; only pread64/pwrite64 can differ. When they happen to ask for exactly
+ * the current position the syscall number tells them apart.
+ */
+static bool mattx_scalar_is_positional(struct file *file, const loff_t *pos, bool write)
+{
+    if (!pos || pos == &file->f_pos)
+        return false;
+    if (*pos != file->f_pos)
+        return true;
+#if defined(__NR_pread64) && defined(__NR_pwrite64)
+    {
+        int nr = syscall_get_nr(current, task_pt_regs(current));
 
-    if (ret > 0)
+        return nr == (write ? __NR_pwrite64 : __NR_pread64);
+    }
+#else
+    return false;
+#endif
+}
+
+// The iov_iter variants (readv/writev/preadv/pwritev): ki_pos is a copy of f_pos for readv/writev; only preadv/pwritev
+// can differ, and a preadv at exactly the current position is told apart by the syscall number.
+static bool mattx_iter_is_positional(struct kiocb *iocb, bool write)
+{
+    if (iocb->ki_pos != iocb->ki_filp->f_pos)
+        return true;
+#if defined(__NR_preadv) && defined(__NR_pwritev)
+    {
+        struct pt_regs *regs = task_pt_regs(current);
+        int nr = syscall_get_nr(current, regs);
+
+        if (nr == (write ? __NR_pwritev : __NR_preadv))
+            return true;
+#if defined(__NR_preadv2) && defined(__NR_pwritev2)
+        if (nr == (write ? __NR_pwritev2 : __NR_preadv2)) {      // glibc / python: an offset of -1 means "current position"
+            unsigned long args[6];
+
+            syscall_get_arguments(current, regs, args);
+            return args[3] != (unsigned long)-1;
+        }
+#endif
+    }
+#endif
+    return false;
+}
+
+static ssize_t mattx_fake_read(struct file *file, char __user *buf, size_t count, loff_t *pos) {
+    bool positional = mattx_scalar_is_positional(file, pos, false);
+    ssize_t ret = mattx_fake_read_one(file->private_data, count, positional, positional ? *pos : 0, buf, NULL);
+
+    if (ret > 0 && pos)
         *pos += ret; // Advance the file position!
     return ret;
 }
 
 // readv / preadv / sendfile / splice (read(2) keeps the scalar fop). preadv() passes its own offset: ki_pos then
 // differs from the file position (read(2) and readv() start at f_pos), so it is read THERE and f_pos stays.
-// (A preadv() at exactly the current f_pos cannot be told from readv(): it reads at the Deputy's position.)
 static ssize_t mattx_fake_read_iter(struct kiocb *iocb, struct iov_iter *to)
 {
     struct file *file = iocb->ki_filp;
-    bool positional = iocb->ki_pos != file->f_pos;
+    bool positional = mattx_iter_is_positional(iocb, false);
     ssize_t ret;
 
     if (!iov_iter_count(to))
@@ -1716,9 +1768,9 @@ static ssize_t mattx_fake_write(struct file *file, const char __user *buf, size_
     struct mattx_fake_fd_info *fd_info = file->private_data;
     ssize_t ret;
 
-    // pwrite64() calls us with the offset of the caller (vfs_write() passes &file->f_pos only for write(2)): it must
-    // be written THERE, not at the position of the Deputy's file, and that position must stay where it is
-    bool positional = pos && pos != &file->f_pos;
+    // pwrite64() calls us with the offset of the caller: it must be written THERE, not at the position of the
+    // Deputy's file, and that position must stay where it is (write(2) must NOT be taken for it, see above)
+    bool positional = mattx_scalar_is_positional(file, pos, true);
 
     if (!fd_info || !cluster_map[fd_info->home_node]) return count; 
 
@@ -1735,7 +1787,7 @@ static ssize_t mattx_fake_write_iter(struct kiocb *iocb, struct iov_iter *from)
 {
     struct file *file = iocb->ki_filp;
     struct mattx_fake_fd_info *fd_info = file->private_data;
-    bool positional = iocb->ki_pos != file->f_pos;
+    bool positional = mattx_iter_is_positional(iocb, true);
     ssize_t ret;
 
     if (!fd_info || fd_info->home_node < 0 || fd_info->home_node >= MAX_NODES || !READ_ONCE(cluster_map[fd_info->home_node]))
@@ -2220,6 +2272,8 @@ static void mattx_read_kworker(struct work_struct *work) {
         reply = malformed ? NULL : kmalloc(sizeof(*reply) + count, GFP_KERNEL);
         if (malformed) {
             ret = -EINVAL;
+        } else if (positional && !(file->f_mode & FMODE_PREAD)) {
+            ret = -ESPIPE;      // pread() of a pipe / socket / stream: the Surrogate's proxy cannot tell, we can
         } else if (reply) {
             loff_t pos = positional ? req->pos : file->f_pos;   // preadv: the offset of the caller, f_pos is not touched
 
@@ -2519,6 +2573,9 @@ static ssize_t mattx_write_file_cancellable(struct file *file, struct task_struc
     unsigned long delay_us = 200;
     loff_t pos = positional ? ppos : file->f_pos;   // pwrite64: the offset of the caller, f_pos is not touched
     ssize_t ret;
+
+    if (positional && !(file->f_mode & FMODE_PWRITE))
+        return -ESPIPE;     // pwrite() of a pipe / socket / stream: the Surrogate's proxy cannot tell, we can
 
     /*
      * A pipe or FIFO write that may block runs in an interruptible Engine 2 helper instead of poll-then-write
