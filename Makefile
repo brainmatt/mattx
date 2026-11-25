@@ -34,7 +34,7 @@ PWD := $(shell pwd)
 CFLAGS_USER := -fPIE -pie -Wall -O2 $(shell pkg-config --cflags libnl-3.0 libnl-genl-3.0)
 LDFLAGS_USER := $(shell pkg-config --libs libnl-3.0 libnl-genl-3.0)
 
-all: module daemon stub migtest migtest2 migtest3 migtest4 servertestpoll servertestselect dfsatest epolltest threadtest threadtest2 threadtest_nofork dsmtest dsmstresstest dsmstresstest-debug dsmimagetest dsmimagetest-v1 dsmreadwritetest
+all: module daemon stub migtest migtest2 migtest3 migtest4 servertestpoll servertestselect dfsatest epolltest threadtest threadtest2 threadtest_nofork dsmtest dsmstresstest dsmstresstest-debug dsmimagetest dsmimagetest-v1 dsmreadwritetest pipestorm
 
 module:
 	$(MAKE) -C $(KDIR) M=$(PWD) modules
@@ -98,9 +98,13 @@ dsmreadwritetest: bin/dsmreadwritetest.c
 dsmimagetest-v1: bin/dsmimagetest-v1.c
 	gcc -o bin/dsmimagetest-v1 bin/dsmimagetest-v1.c
 
+pipestorm: bin/pipestorm.c
+	gcc -O2 -pthread -o bin/pipestorm bin/pipestorm.c
+
+
 clean:
 	$(MAKE) -C $(KDIR) M=$(PWD) clean
-	rm -f bin/migtest bin/migtest2 bin/migtest3 bin/migtest4 bin/servertestpoll bin/servertestselect bin/mattx-stub sbin/mattx-discd bin/dfsatest bin/epolltest bin/threadtest bin/threadtest2 bin/threadtest_nofork bin/dsmtest bin/dsmstresstest bin/dsmstresstest-debug bin/dsmimagetest bin/dsmreadwritetest bin/dsmimagetest-v1
+	rm -f bin/migtest bin/migtest2 bin/migtest3 bin/migtest4 bin/servertestpoll bin/servertestselect bin/mattx-stub sbin/mattx-discd bin/dfsatest bin/epolltest bin/threadtest bin/threadtest2 bin/threadtest_nofork bin/dsmtest bin/dsmstresstest bin/dsmstresstest-debug bin/dsmimagetest bin/dsmreadwritetest bin/dsmimagetest-v1 bin/pipestorm
 	rm -f mattxfs/Module.symvers
 
 install:
@@ -123,6 +127,7 @@ install:
 	sudo rm -f /usr/local/bin/dsmimagetest
 	sudo rm -f /usr/local/bin/dsmimagetest-v1
 	sudo rm -f /usr/local/bin/dsmreadwritetest
+	sudo rm -f /usr/local/bin/pipestorm
 	sudo rm -f /etc/mattx.conf
 	sudo rm -f /etc/systemd/system/mattx.service
 	sudo cp -f bin/migtest /usr/local/bin/migtest
@@ -137,6 +142,7 @@ install:
 	sudo cp -f bin/dsmimagetest /usr/local/bin/dsmimagetest
 	sudo cp -f bin/dsmimagetest-v1 /usr/local/bin/dsmimagetest-v1
 	sudo cp -f bin/dsmreadwritetest /usr/local/bin/dsmreadwritetest
+	sudo cp -f bin/pipestorm /usr/local/bin/pipestorm
 	sudo cp -f bin/epolltest /usr/local/bin/epolltest
 	sudo cp -f bin/threadtest /usr/local/bin/threadtest
 	sudo cp -f bin/threadtest2 /usr/local/bin/threadtest2
@@ -185,6 +191,7 @@ uninstall:
 	sudo rm -f /usr/local/bin/dsmimagetest
 	sudo rm -f /usr/local/bin/dsmimagetest-v1
 	sudo rm -f /usr/local/bin/dsmreadwritetest
+	sudo rm -f /usr/local/bin/pipestorm
 	sudo rm -f /usr/local/bin/mattx-stub
 	sudo rm -f /usr/local/sbin/mattx-discd
 	sudo rm -f /usr/local/bin/mattx-admin
