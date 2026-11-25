@@ -1595,6 +1595,32 @@ static bool mattx_scalar_is_positional(struct file *file, const loff_t *pos, boo
 #endif
 }
 
+// The iov_iter variants (readv/writev/preadv/pwritev): ki_pos is a copy of f_pos for readv/writev; only preadv/pwritev
+// can differ, and a preadv at exactly the current position is told apart by the syscall number.
+static bool mattx_iter_is_positional(struct kiocb *iocb, bool write)
+{
+    if (iocb->ki_pos != iocb->ki_filp->f_pos)
+        return true;
+#if defined(__NR_preadv) && defined(__NR_pwritev)
+    {
+        struct pt_regs *regs = task_pt_regs(current);
+        int nr = syscall_get_nr(current, regs);
+
+        if (nr == (write ? __NR_pwritev : __NR_preadv))
+            return true;
+#if defined(__NR_preadv2) && defined(__NR_pwritev2)
+        if (nr == (write ? __NR_pwritev2 : __NR_preadv2)) {      // glibc / python: an offset of -1 means "current position"
+            unsigned long args[6];
+
+            syscall_get_arguments(current, regs, args);
+            return args[3] != (unsigned long)-1;
+        }
+#endif
+    }
+#endif
+    return false;
+}
+
 static ssize_t mattx_fake_read(struct file *file, char __user *buf, size_t count, loff_t *pos) {
     bool positional = mattx_scalar_is_positional(file, pos, false);
     ssize_t ret = mattx_fake_read_one(file->private_data, count, positional, positional ? *pos : 0, buf, NULL);
@@ -1606,11 +1632,10 @@ static ssize_t mattx_fake_read(struct file *file, char __user *buf, size_t count
 
 // readv / preadv / sendfile / splice (read(2) keeps the scalar fop). preadv() passes its own offset: ki_pos then
 // differs from the file position (read(2) and readv() start at f_pos), so it is read THERE and f_pos stays.
-// (A preadv() at exactly the current f_pos cannot be told from readv(): it reads at the Deputy's position.)
 static ssize_t mattx_fake_read_iter(struct kiocb *iocb, struct iov_iter *to)
 {
     struct file *file = iocb->ki_filp;
-    bool positional = iocb->ki_pos != file->f_pos;
+    bool positional = mattx_iter_is_positional(iocb, false);
     ssize_t ret;
 
     if (!iov_iter_count(to))
@@ -1762,7 +1787,7 @@ static ssize_t mattx_fake_write_iter(struct kiocb *iocb, struct iov_iter *from)
 {
     struct file *file = iocb->ki_filp;
     struct mattx_fake_fd_info *fd_info = file->private_data;
-    bool positional = iocb->ki_pos != file->f_pos;
+    bool positional = mattx_iter_is_positional(iocb, true);
     ssize_t ret;
 
     if (!fd_info || fd_info->home_node < 0 || fd_info->home_node >= MAX_NODES || !READ_ONCE(cluster_map[fd_info->home_node]))
