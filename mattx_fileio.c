@@ -6994,7 +6994,12 @@ static void mattx_pread64_kworker(struct work_struct *work) {
     struct file *file = mattx_get_remote_file(ctx->req.orig_pid, ctx->req.fd);
     ssize_t ret_bytes = -EBADF; void *read_buf = NULL;
 
-    if (file) {
+    if (file && !(file->f_mode & FMODE_PREAD)) {
+        // A pipe / FIFO / socket / stream: natively pread() fails at once with ESPIPE. kernel_read() would ignore the
+        // offset and BLOCK on an empty pipe, in this kworker, while the Surrogate stays group-stopped for ever (#79).
+        ret_bytes = -ESPIPE;
+        fput(file);
+    } else if (file) {
         read_buf = kmalloc(ctx->req.count, GFP_KERNEL);
         if (read_buf) {
             loff_t pos = ctx->req.pos;
