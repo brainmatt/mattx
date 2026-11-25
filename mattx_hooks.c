@@ -539,10 +539,6 @@ static void mattx_rpc_worker(struct work_struct *work) {
             if (cluster_map[rpc->home_node]) mattx_comm_send(cluster_map[rpc->home_node], MATTX_MSG_SYS_IOCTL_REQ, &req, sizeof(req));
         }
 
-    } else if (rpc->is_pread64) {
-        struct mattx_sys_pread64_req req = { .orig_pid = rpc->orig_pid, .fd = rpc->remote_fd, .count = min_t(size_t, rpc->len, 4096), .pos = rpc->pread64_pos };
-        if (cluster_map[rpc->home_node]) mattx_comm_send(cluster_map[rpc->home_node], MATTX_MSG_SYS_PREAD64_REQ, &req, sizeof(req));
-
     } else if (rpc->is_statfs) {
         struct mattx_sys_statfs_req req = { .orig_pid = rpc->orig_pid }; strscpy_pad(req.path, rpc->meta_path, sizeof(req.path));
         if (cluster_map[rpc->home_node]) mattx_comm_send(cluster_map[rpc->home_node], MATTX_MSG_SYS_STATFS_REQ, &req, sizeof(req));
@@ -1351,24 +1347,6 @@ static void mattx_rpc_worker(struct work_struct *work) {
                 }
                 if (read_buf) kfree(read_buf);
                 if (regs) regs->ax = error;
-
-            // --- PREAD64 AWAKENING ---
-            } else if (rpc->is_pread64) {
-                struct pt_regs *regs = task_pt_regs(surrogate);
-                ssize_t ret_bytes = -1; void *read_buf = NULL;
-                spin_lock(&guest_lock);
-                for (i = 0; i < guest_count; i++) {
-                    if (mattx_pid_shares_tgid_with_guest(rpc->local_pid, guest_registry[i].local_pid)) {
-                        if (guest_registry[i].rpc_done) { ret_bytes = guest_registry[i].rpc_read_bytes; read_buf = guest_registry[i].rpc_read_buf; }
-                        guest_registry[i].rpc_read_buf = NULL; break;
-                    }
-                }
-                spin_unlock(&guest_lock);
-                if (ret_bytes > 0 && read_buf) {
-                    if (access_process_vm(surrogate, (unsigned long)rpc->buff, read_buf, ret_bytes, FOLL_WRITE | FOLL_FORCE) != ret_bytes) ret_bytes = -EFAULT;
-                }
-                if (read_buf) kfree(read_buf);
-                if (regs) regs->ax = ret_bytes;
 
             // --- META AWAKENING ---
             } else if (rpc->is_statfs || rpc->is_fstatfs || rpc->is_newfstatat || rpc->is_faccessat2 || rpc->is_readlink || rpc->is_readlinkat) {

@@ -34,6 +34,7 @@
 #include <linux/moduleparam.h>
 #include <linux/random.h>
 #include <asm/syscall.h>
+#include <linux/compat.h>      // in_compat_syscall()
 
 #define MAX_VFS_RPC 64
 
@@ -1598,54 +1599,87 @@ static ssize_t mattx_fake_read_one(struct mattx_fake_fd_info *fd_info, size_t co
 }
 
 /*
- * pread64()/pwrite64() versus read(2)/write(2) on the scalar ->read/->write of the proxy. ksys_read()/ksys_write() copy
- * f_pos into a local and pass the address of that copy, so "pos != &file->f_pos" is true for EVERY plain read(2)/write(2)
- * and told nothing: all of them used to be sent as positional, at the proxy's own position (0 after the migration), and
- * the Deputy's file position never moved (the inherited "2> log" of a migrated process was overwritten from byte 0).
- * A plain read/write enters with *pos == f_pos; only pread64/pwrite64 can differ. When they happen to ask for exactly
- * the current position the syscall number tells them apart.
+ * Plain (stream) or positional? A proxy file has to tell read(2)/readv(2)/write(2)/writev(2) (they use and advance the
+ * file position of the Deputy's file) from pread64/preadv/pwrite64/pwritev (they carry their own offset, the Deputy's
+ * position must not move). ksys_read()/ksys_write()/vfs_readv()... pass a COPY of f_pos, so the address of f_pos never
+ * tells (the 2> log of a migrated process was once overwritten from byte 0), and comparing the copy with f_pos is racy:
+ * a proxy is an anon_inode file without FMODE_ATOMIC_POS (no f_pos_lock), so when two threads write() the same fd the copy of
+ * the one that lost the race differs from f_pos by what the other one has written, and that plain write() was taken for a
+ * pwrite64() at a stale offset (#80 review, 0034d).
+ *
+ * The syscall number is therefore authoritative whenever the call comes from one of the eight syscalls above. Everything
+ * else (sendfile/splice/copy_file_range with an explicit offset, io_uring, 32 bit compat, no syscall at all) keeps the
+ * comparison: there the caller itself chose the offset and the copy is not a snapshot of a shared position.
  */
-static bool mattx_scalar_is_positional(struct file *file, const loff_t *pos, bool write)
-{
-    if (!pos || pos == &file->f_pos)
-        return false;
-    if (*pos != file->f_pos)
-        return true;
-#if defined(__NR_pread64) && defined(__NR_pwrite64)
-    {
-        int nr = syscall_get_nr(current, task_pt_regs(current));
+enum mattx_pos_mode { MATTX_POS_UNKNOWN, MATTX_POS_STREAM, MATTX_POS_EXPLICIT };
 
-        return nr == (write ? __NR_pwrite64 : __NR_pread64);
+static enum mattx_pos_mode mattx_syscall_pos_mode(bool write)
+{
+#if defined(__NR_read) && defined(__NR_pread64) && defined(__NR_readv) && defined(__NR_preadv) && defined(__NR_preadv2) && \
+    defined(__NR_write) && defined(__NR_pwrite64) && defined(__NR_writev) && defined(__NR_pwritev) && defined(__NR_pwritev2)
+    struct pt_regs *regs = task_pt_regs(current);
+    int nr;
+
+    if (!regs || in_compat_syscall())
+        return MATTX_POS_UNKNOWN;       // the 32 bit numbers are not these ones
+    nr = syscall_get_nr(current, regs);
+
+    if (write) {
+        if (nr == __NR_write || nr == __NR_writev)
+            return MATTX_POS_STREAM;
+        if (nr == __NR_pwrite64 || nr == __NR_pwritev)
+            return MATTX_POS_EXPLICIT;
+    } else {
+        if (nr == __NR_read || nr == __NR_readv)
+            return MATTX_POS_STREAM;
+        if (nr == __NR_pread64 || nr == __NR_preadv)
+            return MATTX_POS_EXPLICIT;
     }
-#else
-    return false;
+    if (nr == (write ? __NR_pwritev2 : __NR_preadv2)) {
+        unsigned long args[6];
+
+        syscall_get_arguments(current, regs, args);
+        // glibc / python: an offset of -1 means "current position" (a plain readv/writev with flags)
+        return args[3] == (unsigned long)-1 ? MATTX_POS_STREAM : MATTX_POS_EXPLICIT;
+    }
 #endif
+    return MATTX_POS_UNKNOWN;
 }
 
-// The iov_iter variants (readv/writev/preadv/pwritev): ki_pos is a copy of f_pos for readv/writev; only preadv/pwritev
-// can differ, and a preadv at exactly the current position is told apart by the syscall number.
+// The scalar ->read/->write (read(2), write(2), pread64(), pwrite64(), and the callers of "unknown" kind)
+static bool mattx_scalar_is_positional(struct file *file, const loff_t *pos, bool write)
+{
+    enum mattx_pos_mode mode;
+
+    if (!pos || pos == &file->f_pos)
+        return false;
+    mode = mattx_syscall_pos_mode(write);
+    if (mode == MATTX_POS_STREAM) {
+        if (*pos != file->f_pos)
+            mattx_dbg("[POS] plain %s on a shared proxy fd: f_pos moved under us (copy %lld, f_pos %lld), stays stream\n",
+                      write ? "write" : "read", (long long)*pos, (long long)file->f_pos);
+        return false;
+    }
+    if (mode == MATTX_POS_EXPLICIT)
+        return true;
+    return *pos != file->f_pos;
+}
+
+// The iov_iter variants (readv/writev/preadv/pwritev, sendfile, splice): ki_pos is a copy of f_pos for readv/writev
+// (see above), the offset of the caller for preadv/pwritev, sendfile(offset) and friends.
 static bool mattx_iter_is_positional(struct kiocb *iocb, bool write)
 {
-    if (iocb->ki_pos != iocb->ki_filp->f_pos)
-        return true;
-#if defined(__NR_preadv) && defined(__NR_pwritev)
-    {
-        struct pt_regs *regs = task_pt_regs(current);
-        int nr = syscall_get_nr(current, regs);
+    enum mattx_pos_mode mode = mattx_syscall_pos_mode(write);
 
-        if (nr == (write ? __NR_pwritev : __NR_preadv))
-            return true;
-#if defined(__NR_preadv2) && defined(__NR_pwritev2)
-        if (nr == (write ? __NR_pwritev2 : __NR_preadv2)) {      // glibc / python: an offset of -1 means "current position"
-            unsigned long args[6];
-
-            syscall_get_arguments(current, regs, args);
-            return args[3] != (unsigned long)-1;
-        }
-#endif
+    if (mode == MATTX_POS_STREAM) {
+        if (iocb->ki_pos != iocb->ki_filp->f_pos)
+            mattx_dbg("[POS] plain %sv on a shared proxy fd: f_pos moved under us (copy %lld, f_pos %lld), stays stream\n",
+                      write ? "write" : "read", (long long)iocb->ki_pos, (long long)iocb->ki_filp->f_pos);
+        return false;
     }
-#endif
-    return false;
+    if (mode == MATTX_POS_EXPLICIT)
+        return true;
+    return iocb->ki_pos != iocb->ki_filp->f_pos;
 }
 
 static ssize_t mattx_fake_read(struct file *file, char __user *buf, size_t count, loff_t *pos) {
@@ -2361,7 +2395,7 @@ static void handle_sys_read_req(struct mattx_link *link, struct mattx_header *hd
 
 static void handle_sys_read_reply(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
     // A reply that carries a ticket id belongs to exactly one waiting thread (mattx_ticket_*).
-    // req_id 0 is the legacy reply (pread64): it still goes through the per-guest slot below.
+    // req_id 0 is the legacy reply (read(2) SIGSTOP fallback, no task_work): it still goes through the per-guest slot below.
     if (payload && hdr->length >= sizeof(struct mattx_sys_read_reply) &&
         ((struct mattx_sys_read_reply *)payload)->req_id) {
         struct mattx_sys_read_reply *reply = (struct mattx_sys_read_reply *)payload;
@@ -7015,50 +7049,6 @@ static void handle_sys_prlimit64_reply(struct mattx_link *link, struct mattx_hea
     spin_unlock(&guest_lock);
 }
 
-
-
-// The pread64 kworker
-struct mattx_pread64_kworker_ctx { struct work_struct work; struct mattx_sys_pread64_req req; int target_node; };
-static void mattx_pread64_kworker(struct work_struct *work) {
-    struct mattx_pread64_kworker_ctx *ctx = container_of(work, struct mattx_pread64_kworker_ctx, work);
-    struct file *file = mattx_get_remote_file(ctx->req.orig_pid, ctx->req.fd);
-    ssize_t ret_bytes = -EBADF; void *read_buf = NULL;
-
-    if (file && !(file->f_mode & FMODE_PREAD)) {
-        // A pipe / FIFO / socket / stream: natively pread() fails at once with ESPIPE. kernel_read() would ignore the
-        // offset and BLOCK on an empty pipe, in this kworker, while the Surrogate stays group-stopped for ever (#79).
-        ret_bytes = -ESPIPE;
-        fput(file);
-    } else if (file) {
-        read_buf = kmalloc(ctx->req.count, GFP_KERNEL);
-        if (read_buf) {
-            loff_t pos = ctx->req.pos;
-            ret_bytes = kernel_read(file, read_buf, ctx->req.count, &pos);
-        } else { ret_bytes = -ENOMEM; }
-        fput(file);
-    }
-
-    size_t reply_size = sizeof(struct mattx_sys_read_reply) + (ret_bytes > 0 ? ret_bytes : 0);
-    struct mattx_sys_read_reply *reply = kmalloc(reply_size, GFP_KERNEL);
-    if (reply) {
-        reply->orig_pid = ctx->req.orig_pid; reply->req_id = 0; reply->bytes_read = ret_bytes; reply->error = (ret_bytes < 0) ? ret_bytes : 0;
-        if (ret_bytes > 0) memcpy(reply->data, read_buf, ret_bytes);
-        if (cluster_map[ctx->target_node]) mattx_comm_send(cluster_map[ctx->target_node], MATTX_MSG_SYS_PREAD64_REPLY, reply, reply_size);
-        kfree(reply);
-    }
-    if (read_buf) kfree(read_buf); 
-        kfree(ctx);
-}
-
-static void handle_sys_pread64_req(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
-    struct mattx_sys_pread64_req *req = payload;
-    struct mattx_pread64_kworker_ctx *ctx = kmalloc(sizeof(*ctx), GFP_ATOMIC);
-    if (ctx) {
-        INIT_WORK(&ctx->work, mattx_pread64_kworker);
-        memcpy(&ctx->req, req, sizeof(*req)); ctx->target_node = hdr->sender_id;
-        schedule_work(&ctx->work);
-    }
-}
 
 
 // The fcntl & ioctl Deputy Hijack:
@@ -15753,8 +15743,6 @@ void mattx_fileio_init_handlers(void) {
     mattx_register_handler(MATTX_MSG_SYS_FCNTL_REQ, handle_sys_fcntl_req);
     mattx_register_handler(MATTX_MSG_SYS_IOCTL_REPLY, handle_sys_fio_reply);        // Reusing the sys fio reply for ioctl!
     mattx_register_handler(MATTX_MSG_SYS_IOCTL_REQ, handle_sys_ioctl_req);
-    mattx_register_handler(MATTX_MSG_SYS_PREAD64_REPLY, handle_sys_read_reply);     // Reusing the generic read reply!
-    mattx_register_handler(MATTX_MSG_SYS_PREAD64_REQ, handle_sys_pread64_req);
     mattx_register_handler(MATTX_MSG_SYS_STATFS_REQ, handle_sys_statfs_req);
     mattx_register_handler(MATTX_MSG_SYS_STATFS_REPLY, handle_sys_statfs_reply);
     mattx_register_handler(MATTX_MSG_SYS_FSTATFS_REQ, handle_sys_fstatfs_req);

@@ -228,8 +228,6 @@ enum mattx_msg_type {
     MATTX_MSG_SYS_FCNTL_REPLY,
     MATTX_MSG_SYS_IOCTL_REQ,
     MATTX_MSG_SYS_IOCTL_REPLY,
-    MATTX_MSG_SYS_PREAD64_REQ,
-    MATTX_MSG_SYS_PREAD64_REPLY,
     MATTX_MSG_SYS_STATFS_REQ, 
     MATTX_MSG_SYS_STATFS_REPLY,
     MATTX_MSG_SYS_FSTATFS_REQ, 
@@ -502,7 +500,7 @@ struct mattx_sys_read_reply {
     u32 orig_pid;
     ssize_t bytes_read;
     int error;
-    u32 req_id; // echo of the request's ticket id; 0 = legacy reply (pread64 reuses this struct)
+    u32 req_id; // echo of the request's ticket id; 0 = legacy reply (read(2) SIGSTOP fallback, no task_work)
     char data[];
 };
 
@@ -1379,13 +1377,6 @@ struct mattx_sys_ioctl_reply {
     char data[256]; 
 };
 
-struct mattx_sys_pread64_req { 
-    u32 orig_pid; 
-    int fd; 
-    size_t count; 
-    loff_t pos; 
-};
-// Note: We will reuse mattx_sys_read_reply for pread64's reply!
 
 struct mattx_sys_statfs_req { 
     u32 orig_pid; 
@@ -1638,10 +1629,6 @@ struct mattx_rpc_work {
     unsigned long ioctl_arg; // Reused for fcntl_arg
     bool ioctl_has_ptr;      // Reused for fcntl
     char ioctl_data[256];    // Reused for fcntl
-
-    // For PREAD64
-    bool is_pread64;
-    loff_t pread64_pos;
 
     // For META FETCHERS (Microstep 2.2)
     bool is_statfs, is_fstatfs, is_newfstatat, is_faccessat2, is_readlink, is_readlinkat;
