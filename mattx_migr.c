@@ -926,7 +926,7 @@ static void mattx_do_capture_and_send_state(struct task_struct *task, int target
         req->brk = mm->brk;             // Capture Heap End
         req->vdso_addr = (uint64_t)mm->context.vdso; // Capture the vDSO!
 
-        files = kcalloc(MAX_FILE_VMAS, sizeof(*files), GFP_KERNEL);
+        files = kvcalloc(MAX_FILE_VMAS, sizeof(*files), GFP_KERNEL);   // 0033: ~147 KB, heap (kvcalloc survives fragmentation), never the stack
         pathbuf = kmalloc(PATH_MAX, GFP_KERNEL);       // both can fail: then every mapping simply stays on the page push
         mmap_read_lock(mm);
         VMA_ITERATOR(vmi, mm, 0);
@@ -972,7 +972,7 @@ static void mattx_do_capture_and_send_state(struct task_struct *task, int target
     req->file_count = file_count;
     if (file_count)
         memcpy(&req->vmas[vma_count], files, file_count * sizeof(*files));
-    kfree(files);
+    kvfree(files);
     kfree(pathbuf);
     actual_payload_size = sizeof(struct mattx_migration_req) + (vma_count * sizeof(struct mattx_vma_info))
                           + (file_count * sizeof(struct mattx_vma_file));

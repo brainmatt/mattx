@@ -58,7 +58,10 @@
 // bumped to PAGE_SIZE (netlink attribute length is a 16-bit field).
 #define MATTX_FPU_STATE_MAX 1024
 
-enum { MATTX_ATTR_UNSPEC, MATTX_ATTR_NODE_ID, MATTX_ATTR_IPV4_ADDR, MATTX_ATTR_STUB_PID, MATTX_ATTR_BLUEPRINT, MATTX_ATTR_MY_NODE_ID, MATTX_ATTR_LOCAL_IP, __MATTX_ATTR_MAX };
+enum { MATTX_ATTR_UNSPEC, MATTX_ATTR_NODE_ID, MATTX_ATTR_IPV4_ADDR, MATTX_ATTR_STUB_PID, MATTX_ATTR_BLUEPRINT, MATTX_ATTR_MY_NODE_ID, MATTX_ATTR_LOCAL_IP,
+       MATTX_ATTR_CONFIG_FILE_IO, MATTX_ATTR_CONFIG_NET_IO, MATTX_ATTR_MATTXFS_ENABLED, MATTX_ATTR_DFSA_DIR, MATTX_ATTR_ACCEPT_GUESTS,
+       MATTX_ATTR_CONFIG_LOCAL_LIBS, MATTX_ATTR_DSM_MODE, MATTX_ATTR_MESI_MODE,   /* MUST STAY IN SYNC with the enum in mattx_main.c */
+       MATTX_ATTR_BP_OFFSET, MATTX_ATTR_BP_TOTAL, __MATTX_ATTR_MAX };
 #define MATTX_ATTR_MAX (__MATTX_ATTR_MAX - 1)
 
 enum { MATTX_CMD_UNSPEC, MATTX_CMD_NODE_JOIN, MATTX_CMD_NODE_LEAVE, MATTX_CMD_HIJACK_ME, MATTX_CMD_GET_BLUEPRINT, MATTX_CMD_SET_LOCAL_IP, __MATTX_CMD_MAX };
@@ -270,6 +273,8 @@ static void bind_local_libs(const char *mfs_path)
 }
 
 static struct mattx_migration_req *received_req = NULL;
+static uint32_t bp_total = 0;   // 0033: full blueprint length announced by the kernel
+static uint32_t bp_got = 0;     // 0033: bytes assembled so far
 
 static int blueprint_cb(struct nl_msg *msg, void *arg) {
     struct nlmsghdr *nlh = nlmsg_hdr(msg);
@@ -280,6 +285,8 @@ static int blueprint_cb(struct nl_msg *msg, void *arg) {
 
     memset(policy, 0, sizeof(policy));
     policy[MATTX_ATTR_BLUEPRINT].type = NLA_BINARY;
+    policy[MATTX_ATTR_BP_OFFSET].type = NLA_U32;
+    policy[MATTX_ATTR_BP_TOTAL].type = NLA_U32;
 
     if (genlmsg_parse(nlh, 0, attrs, MATTX_ATTR_MAX, policy) < 0) {
         printf("MattX-Stub:[CALLBACK] Message parsed, but no blueprint found (likely an ACK).\n");
@@ -288,11 +295,29 @@ static int blueprint_cb(struct nl_msg *msg, void *arg) {
 
     if (attrs[MATTX_ATTR_BLUEPRINT]) {
         printf("MattX-Stub: [CALLBACK] SUCCESS: Blueprint attribute found!\n");
-        struct mattx_migration_req *req = nla_data(attrs[MATTX_ATTR_BLUEPRINT]);
+        void *chunk = nla_data(attrs[MATTX_ATTR_BLUEPRINT]);
         int len = nla_len(attrs[MATTX_ATTR_BLUEPRINT]);
-        
-        received_req = malloc(len);
-        if (received_req) memcpy(received_req, req, len);
+        uint32_t off = attrs[MATTX_ATTR_BP_OFFSET] ? nla_get_u32(attrs[MATTX_ATTR_BP_OFFSET]) : 0;
+        uint32_t total = attrs[MATTX_ATTR_BP_TOTAL] ? nla_get_u32(attrs[MATTX_ATTR_BP_TOTAL]) : (uint32_t)len;
+
+        // 0033: the kernel sends the blueprint in chunks (a netlink attribute holds at most 65535 bytes)
+        if (!received_req) {
+            if (off != 0 || total == 0 || total < (uint32_t)len) {
+                fprintf(stderr, "MattX-Stub: FATAL - bad first blueprint chunk (offset %u, len %d, total %u)\n", off, len, total);
+                return NL_SKIP;
+            }
+            received_req = malloc(total);
+            if (!received_req) return NL_SKIP;
+            bp_total = total;
+            bp_got = 0;
+        }
+        if (off == bp_got && off + (uint32_t)len <= bp_total) {
+            memcpy((char *)received_req + off, chunk, len);
+            bp_got += len;
+            printf("MattX-Stub: [CALLBACK] Blueprint chunk: offset %u, %d bytes (%u of %u)\n", off, len, bp_got, bp_total);
+        } else {
+            fprintf(stderr, "MattX-Stub: WARNING - unexpected blueprint chunk (offset %u, len %d, have %u of %u): ignored\n", off, len, bp_got, bp_total);
+        }
     }
     return NL_OK;
 }
@@ -384,6 +409,32 @@ int main() {
         fprintf(stderr, "MattX-Stub: FATAL - No blueprint received after 10 attempts!\n");
         return -1;
     }
+
+    // 0033: fetch the rest of the blueprint, one chunk per request
+    while (bp_got < bp_total) {
+        uint32_t before = bp_got;
+        int tries = 10;
+
+        msg = nlmsg_alloc();
+        genlmsg_put(msg, NL_AUTO_PORT, NL_AUTO_SEQ, family_id, 0, 0, MATTX_CMD_GET_BLUEPRINT, 1);
+        nla_put_u32(msg, MATTX_ATTR_BP_OFFSET, bp_got);
+        if (nl_send_auto(sock, msg) < 0) {
+            fprintf(stderr, "MattX-Stub: FATAL - Failed to request blueprint chunk at offset %u.\n", bp_got);
+            return -1;
+        }
+        nlmsg_free(msg);
+
+        while (bp_got == before && tries > 0) {
+            int err = nl_recvmsgs_default(sock);
+            if (err < 0) fprintf(stderr, "MattX-Stub: Error receiving blueprint chunk: %d\n", err);
+            tries--;
+        }
+        if (bp_got == before) {
+            fprintf(stderr, "MattX-Stub: FATAL - Blueprint chunk at offset %u never arrived (have %u of %u)!\n", before, bp_got, bp_total);
+            return -1;
+        }
+    }
+    printf("MattX-Stub: Blueprint complete: %u bytes\n", bp_total);
 
     printf("MattX-Stub: Blueprint received. Original PID: %u, Name: '%s', UID: %u, GID: %u, VMAs: %u, FDs: %u\n", 
            received_req->orig_pid, received_req->comm, received_req->uid, received_req->gid, received_req->vma_count, received_req->fd_count);

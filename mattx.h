@@ -115,7 +115,7 @@
 #define FIXED_LOAD_1_0 2048
 #define FIXED_LOAD_0_2 409
 #define MAX_VMAS 1024 
-#define MAX_FILE_VMAS 64        // file-backed read-only VMAs a blueprint can carry as "map this file there" (issue #67, P3, 0032)
+#define MAX_FILE_VMAS 512       // file-backed read-only VMAs a blueprint can carry as "map this file there" (issue #67, P3, 0032/0033: one per shard for colibri COLI_MMAP)
 #define MAX_GUESTS 1024 
 #define MAX_GANG_THREADS 16
 #define MAX_FDS 256

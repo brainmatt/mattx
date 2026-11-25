@@ -65,7 +65,7 @@ static struct task_struct *dsm_sweeper_thread;
 
 
 
-enum { MATTX_ATTR_UNSPEC, MATTX_ATTR_NODE_ID, MATTX_ATTR_IPV4_ADDR, MATTX_ATTR_STUB_PID, MATTX_ATTR_BLUEPRINT, MATTX_ATTR_MY_NODE_ID, MATTX_ATTR_LOCAL_IP, MATTX_ATTR_CONFIG_FILE_IO, MATTX_ATTR_CONFIG_NET_IO, MATTX_ATTR_MATTXFS_ENABLED, MATTX_ATTR_DFSA_DIR, MATTX_ATTR_ACCEPT_GUESTS, MATTX_ATTR_CONFIG_LOCAL_LIBS, MATTX_ATTR_DSM_MODE, MATTX_ATTR_MESI_MODE, __MATTX_ATTR_MAX };
+enum { MATTX_ATTR_UNSPEC, MATTX_ATTR_NODE_ID, MATTX_ATTR_IPV4_ADDR, MATTX_ATTR_STUB_PID, MATTX_ATTR_BLUEPRINT, MATTX_ATTR_MY_NODE_ID, MATTX_ATTR_LOCAL_IP, MATTX_ATTR_CONFIG_FILE_IO, MATTX_ATTR_CONFIG_NET_IO, MATTX_ATTR_MATTXFS_ENABLED, MATTX_ATTR_DFSA_DIR, MATTX_ATTR_ACCEPT_GUESTS, MATTX_ATTR_CONFIG_LOCAL_LIBS, MATTX_ATTR_DSM_MODE, MATTX_ATTR_MESI_MODE, MATTX_ATTR_BP_OFFSET, MATTX_ATTR_BP_TOTAL, __MATTX_ATTR_MAX };
 #define MATTX_ATTR_MAX (__MATTX_ATTR_MAX - 1)
 
 enum { MATTX_CMD_UNSPEC, MATTX_CMD_NODE_JOIN, MATTX_CMD_NODE_LEAVE, MATTX_CMD_HIJACK_ME, MATTX_CMD_GET_BLUEPRINT, MATTX_CMD_SET_LOCAL_IP, MATTX_CMD_SET_CONFIG, __MATTX_CMD_MAX };
@@ -84,6 +84,8 @@ static const struct nla_policy mattx_genl_policy[MATTX_ATTR_MAX + 1] = {[MATTX_A
     [MATTX_ATTR_CONFIG_LOCAL_LIBS] = { .type = NLA_U8 },
     [MATTX_ATTR_DSM_MODE] = { .type = NLA_U8 },        
     [MATTX_ATTR_MESI_MODE] = { .type = NLA_U8 },
+    [MATTX_ATTR_BP_OFFSET] = { .type = NLA_U32 },      // 0033: chunked blueprint transfer (a netlink attribute is limited to 65535 bytes)
+    [MATTX_ATTR_BP_TOTAL] = { .type = NLA_U32 },
 };
 
 static int mattx_nl_cmd_node_join(struct sk_buff *skb, struct genl_info *info) {
@@ -112,10 +114,17 @@ static int mattx_nl_cmd_node_leave(struct sk_buff *skb, struct genl_info *info) 
     return 0;
 }
 
+// 0033: a netlink attribute carries at most 65535 bytes (nla_len is a u16). The blueprint
+// (header + vmas[] + file table) can be bigger, so the stub fetches it in chunks:
+// every request may carry MATTX_ATTR_BP_OFFSET, every reply carries one chunk of
+// MATTX_ATTR_BLUEPRINT plus its offset and the total length (MATTX_ATTR_BP_TOTAL).
+#define MATTX_BP_CHUNK 60000
+
 static int mattx_nl_cmd_get_blueprint(struct sk_buff *skb, struct genl_info *info) {
     struct sk_buff *reply_skb;
     void *msg_head;
-    int len;
+    int len, chunk;
+    u32 off = 0;
 
     if (!pending_migration) {
         printk(KERN_ERR "MattX: [NL] Stub requested blueprint, but pending_migration is NULL!\n");
@@ -124,8 +133,16 @@ static int mattx_nl_cmd_get_blueprint(struct sk_buff *skb, struct genl_info *inf
 
     len = sizeof(struct mattx_migration_req) + (pending_migration->vma_count * sizeof(struct mattx_vma_info))
           + (pending_migration->file_count * sizeof(struct mattx_vma_file));      // 0032: the file table is behind vmas[]
-    
-    reply_skb = nlmsg_new(nla_total_size(len), GFP_KERNEL);
+
+    if (info->attrs[MATTX_ATTR_BP_OFFSET])
+        off = nla_get_u32(info->attrs[MATTX_ATTR_BP_OFFSET]);
+    if (off >= (u32)len) {
+        printk(KERN_ERR "MattX: [NL] Stub asked for blueprint offset %u, but the blueprint has only %d bytes!\n", off, len);
+        return -EINVAL;
+    }
+    chunk = min_t(int, len - (int)off, MATTX_BP_CHUNK);
+
+    reply_skb = genlmsg_new(nla_total_size(chunk) + 2 * nla_total_size(sizeof(u32)), GFP_KERNEL);
     if (!reply_skb) return -ENOMEM;
 
     msg_head = genlmsg_put_reply(reply_skb, info, &mattx_genl_family, 0, MATTX_CMD_GET_BLUEPRINT);
@@ -134,14 +151,16 @@ static int mattx_nl_cmd_get_blueprint(struct sk_buff *skb, struct genl_info *inf
         return -ENOMEM;
     }
 
-    if (nla_put(reply_skb, MATTX_ATTR_BLUEPRINT, len, pending_migration)) {
+    if (nla_put(reply_skb, MATTX_ATTR_BLUEPRINT, chunk, (char *)pending_migration + off) ||
+        nla_put_u32(reply_skb, MATTX_ATTR_BP_OFFSET, off) ||
+        nla_put_u32(reply_skb, MATTX_ATTR_BP_TOTAL, (u32)len)) {
         genlmsg_cancel(reply_skb, msg_head);
         nlmsg_free(reply_skb);
         return -EMSGSIZE;
     }
 
     genlmsg_end(reply_skb, msg_head);
-    mattx_dbg(" [NL] Sending Blueprint (%d bytes) back to Stub PID %u\n", len, info->snd_portid);
+    mattx_dbg(" [NL] Sending Blueprint chunk (offset %u, %d of %d bytes) back to Stub PID %u\n", off, chunk, len, info->snd_portid);
     return genlmsg_reply(reply_skb, info);
 }
 
