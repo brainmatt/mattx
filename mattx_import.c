@@ -435,6 +435,7 @@ static void handle_migrate_done(struct mattx_link *link, struct mattx_header *hd
                     // mattx#14). The home node does the real access and returns its own error if the fd
                     // cannot be read.
                     fake_files[i] = anon_inode_getfile("mattx_vfs_proxy", &mattx_fops, fd_info, O_RDWR);
+                    mattx_proxy_allow_positional(fake_files[i]);
                 }
             }
 
