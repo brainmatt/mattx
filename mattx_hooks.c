@@ -6716,7 +6716,7 @@ struct mattx_read_tw {
 static void mattx_read_tw_fn(struct callback_head *cb) {
     struct mattx_read_tw *tw = container_of(cb, struct mattx_read_tw, cb);
     struct pt_regs *regs = task_pt_regs(current);
-    size_t count = min_t(size_t, tw->count, 4096);
+    size_t count = min_t(size_t, tw->count, MATTX_SYS_READ_MAX);   // 0034: the home node still answers 4096 at most for pipes / sockets
     struct mattx_sys_read_req req;
     struct mattx_ticket *t;
     struct mattx_link *link;
@@ -8927,50 +8927,10 @@ static int ret_handler_fcntl(struct kretprobe_instance *ri, struct pt_regs *regs
 }
 
 // --- BATCH 2.1: PREAD64 ---
-struct pread64_kretprobe_data { int fd; void __user *buf; size_t count; loff_t pos; bool is_ghost; int remote_fd; };
-static struct kretprobe pread64_kprobe;
-
-static int entry_handler_pread64(struct kretprobe_instance *ri, struct pt_regs *regs) {
-    if (is_guest_process(current->tgid)) {
-        struct pread64_kretprobe_data *data = (struct pread64_kretprobe_data *)ri->data;
-        struct pt_regs *sys_regs = SYSCALL_REGS(regs);
-        data->fd = (int)sys_regs->di; data->buf = (void __user *)sys_regs->si;
-        data->count = (size_t)sys_regs->dx; data->pos = (loff_t)sys_regs->r10;
-        data->is_ghost = is_wormhole_fd(data->fd, &data->remote_fd);
-        if (data->is_ghost) sys_regs->di = -1; // Sabotage!
-    }
-    return 0;
-}
-
-static int ret_handler_pread64(struct kretprobe_instance *ri, struct pt_regs *regs) {
-    struct pread64_kretprobe_data *data = (struct pread64_kretprobe_data *)ri->data;
-    if (!is_guest_process(current->tgid) || !data->is_ghost) return 0;
-    if (fatal_signal_pending(current) || (current->flags & PF_EXITING)) return 0;
-
-    int home_node = -1; u32 orig_pid = 0;
-    spin_lock(&guest_lock);
-    for (int i = 0; i < guest_count; i++) {
-        if (guest_registry[i].local_pid == current->tgid) {
-            home_node = guest_registry[i].home_node; orig_pid = guest_registry[i].orig_pid;
-            guest_registry[i].rpc_done = false; break;
-        }
-    }
-    spin_unlock(&guest_lock);
-
-    if (home_node != -1) {
-        struct mattx_rpc_work *rpc = kzalloc(sizeof(*rpc), GFP_ATOMIC); 
-        if (rpc) {
-            INIT_WORK(&rpc->work, mattx_rpc_worker);
-            rpc->local_pid = current->pid; rpc->orig_pid = orig_pid; rpc->home_node = home_node; rpc->remote_fd = data->remote_fd;
-            rpc->is_pread64 = true; rpc->buff = data->buf; rpc->len = data->count; rpc->pread64_pos = data->pos;
-            send_sig(SIGSTOP, current, 0); schedule_work(&rpc->work);
-        }
-    }
-    return 0;
-}
-
-
-
+// 0034: there is no pread64 kretprobe any more. An inherited or proxied fd is a mattx_vfs_proxy with FMODE_PREAD: pread64()
+// reaches mattx_fake_read() in the thread that called it (positional READ_REQ on its own ticket, no group stop, no
+// task_work). A MattXFS file is read by the VFS. The old hook froze the whole process (SIGSTOP + msleep(100) poll) for every
+// 4096 bytes (#74, #79).
 
 // --- BATCH 2.2: DEDICATED METADATA FETCHERS ---
 static struct kretprobe statfs_kprobe, fstatfs_kprobe, newfstatat_kprobe, faccessat2_kprobe, readlink_kprobe, readlinkat_kprobe;
@@ -11511,15 +11471,6 @@ int mattx_hooks_init(void) {
     ioctl_kprobe.maxactive = 64;
     ret = mattx_register_kretprobe(&ioctl_kprobe);
     if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for ioctl, returned %d\n", ret);
-
-    memset(&pread64_kprobe, 0, sizeof(pread64_kprobe));
-    pread64_kprobe.kp.symbol_name = "__x64_sys_pread64";
-    pread64_kprobe.entry_handler = entry_handler_pread64;
-    pread64_kprobe.handler = ret_handler_pread64;
-    pread64_kprobe.data_size = sizeof(struct pread64_kretprobe_data);
-    pread64_kprobe.maxactive = 64;
-    ret = mattx_register_kretprobe(&pread64_kprobe);
-    if (ret < 0) printk(KERN_ERR "MattX: register_kretprobe failed for pread64, returned %d\n", ret);
 
     memset(&statfs_kprobe, 0, sizeof(statfs_kprobe)); 
     statfs_kprobe.kp.symbol_name = "__x64_sys_statfs"; 

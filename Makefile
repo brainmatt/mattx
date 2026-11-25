@@ -34,7 +34,7 @@ PWD := $(shell pwd)
 CFLAGS_USER := -fPIE -pie -Wall -O2 $(shell pkg-config --cflags libnl-3.0 libnl-genl-3.0)
 LDFLAGS_USER := $(shell pkg-config --libs libnl-3.0 libnl-genl-3.0)
 
-all: module daemon stub migtest migtest2 migtest3 migtest4 servertestpoll servertestselect dfsatest epolltest threadtest threadtest2 threadtest_nofork dsmtest dsmstresstest dsmstresstest-debug dsmimagetest dsmimagetest-v1 dsmreadwritetest pipestorm mmaptest
+all: module daemon stub migtest migtest2 migtest3 migtest4 servertestpoll servertestselect dfsatest epolltest threadtest threadtest2 threadtest_nofork dsmtest dsmstresstest dsmstresstest-debug dsmimagetest dsmimagetest-v1 dsmreadwritetest pipestorm mmaptest preadtest
 
 module:
 	$(MAKE) -C $(KDIR) M=$(PWD) modules
@@ -104,10 +104,13 @@ pipestorm: bin/pipestorm.c
 mmaptest: bin/mmaptest.c
 	gcc -O2 -Wall -pthread -o bin/mmaptest bin/mmaptest.c
 
+preadtest: bin/preadtest.c
+	gcc -O2 -Wall -pthread -o bin/preadtest bin/preadtest.c
+
 
 clean:
 	$(MAKE) -C $(KDIR) M=$(PWD) clean
-	rm -f bin/migtest bin/migtest2 bin/migtest3 bin/migtest4 bin/servertestpoll bin/servertestselect bin/mattx-stub sbin/mattx-discd bin/dfsatest bin/epolltest bin/threadtest bin/threadtest2 bin/threadtest_nofork bin/dsmtest bin/dsmstresstest bin/dsmstresstest-debug bin/dsmimagetest bin/dsmreadwritetest bin/dsmimagetest-v1 bin/pipestorm bin/mmaptest
+	rm -f bin/migtest bin/migtest2 bin/migtest3 bin/migtest4 bin/servertestpoll bin/servertestselect bin/mattx-stub sbin/mattx-discd bin/dfsatest bin/epolltest bin/threadtest bin/threadtest2 bin/threadtest_nofork bin/dsmtest bin/dsmstresstest bin/dsmstresstest-debug bin/dsmimagetest bin/dsmreadwritetest bin/dsmimagetest-v1 bin/pipestorm bin/mmaptest bin/preadtest
 	rm -f mattxfs/Module.symvers
 
 install:
@@ -132,6 +135,7 @@ install:
 	sudo rm -f /usr/local/bin/dsmreadwritetest
 	sudo rm -f /usr/local/bin/pipestorm
 	sudo rm -f /usr/local/bin/mmaptest
+	sudo rm -f /usr/local/bin/preadtest
 	sudo rm -f /etc/mattx.conf
 	sudo rm -f /etc/systemd/system/mattx.service
 	sudo cp -f bin/migtest /usr/local/bin/migtest
@@ -148,6 +152,7 @@ install:
 	sudo cp -f bin/dsmreadwritetest /usr/local/bin/dsmreadwritetest
 	sudo cp -f bin/pipestorm /usr/local/bin/pipestorm
 	sudo cp -f bin/mmaptest /usr/local/bin/mmaptest
+	sudo cp -f bin/preadtest /usr/local/bin/preadtest
 	sudo cp -f bin/epolltest /usr/local/bin/epolltest
 	sudo cp -f bin/threadtest /usr/local/bin/threadtest
 	sudo cp -f bin/threadtest2 /usr/local/bin/threadtest2
@@ -198,6 +203,7 @@ uninstall:
 	sudo rm -f /usr/local/bin/dsmreadwritetest
 	sudo rm -f /usr/local/bin/pipestorm
 	sudo rm -f /usr/local/bin/mmaptest
+	sudo rm -f /usr/local/bin/preadtest
 	sudo rm -f /usr/local/bin/mattx-stub
 	sudo rm -f /usr/local/sbin/mattx-discd
 	sudo rm -f /usr/local/bin/mattx-admin

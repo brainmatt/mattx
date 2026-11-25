@@ -1509,8 +1509,8 @@ static int mattx_fake_flock(struct file *file, int cmd, struct file_lock *fl)
  * sendfile / splice (issue #67, P3), straight into the iov_iter. positional: preadv, read at ppos and leave the
  * file position of the Deputy's file alone. The caller advances its own position.
  */
-static ssize_t mattx_fake_read_one(struct mattx_fake_fd_info *fd_info, size_t count, bool positional, loff_t ppos,
-                                   char __user *buf, struct iov_iter *to)
+static ssize_t mattx_fake_read_chunk(struct mattx_fake_fd_info *fd_info, size_t count, bool positional, loff_t ppos,
+                                     char __user *buf, struct iov_iter *to)
 {
     struct mattx_sys_read_req req;
     struct mattx_ticket *t;
@@ -1518,8 +1518,9 @@ static ssize_t mattx_fake_read_one(struct mattx_fake_fd_info *fd_info, size_t co
     pid_t my_pid = current->pid;
     ssize_t ret;
 
-    // Cap read size to prevent massive kmallocs on the network
-    size_t to_read = min_t(size_t, count, 4096);
+    // Cap one request (0034: 1 MB instead of 4096). The home node still answers with at most 4096 bytes for
+    // pipes / sockets / ttys, whatever is asked here.
+    size_t to_read = min_t(size_t, count, MATTX_SYS_READ_MAX);
 
     if (!fd_info || fd_info->home_node < 0 || fd_info->home_node >= MAX_NODES) return -EIO;
     link = READ_ONCE(cluster_map[fd_info->home_node]);
@@ -1568,6 +1569,32 @@ out:
     mattx_dbg("[WORMHOLE] Surrogate %d woke up! Read %zd bytes (req %u).\n", my_pid, ret, req.req_id);
     mattx_ticket_del(t);
     return ret;
+}
+
+/*
+ * A read of any size on a proxy fd (read, pread64, readv, preadv, ...). One request carries at most MATTX_SYS_READ_MAX
+ * bytes; a regular file at home answers a full chunk, so the next chunk is asked for until count is served, a reply is
+ * short (EOF) or an error comes. A pipe / socket / tty answers 4096 bytes at most, so a reply is never a full chunk
+ * there and this never sends a second request that could block: it behaves exactly like one plain read().
+ * After a partial result the bytes read so far are returned (POSIX), the error is seen by the next call.
+ * Only the first chunk may wait for data of the caller's choosing; the others are plain file reads.
+ */
+static ssize_t mattx_fake_read_one(struct mattx_fake_fd_info *fd_info, size_t count, bool positional, loff_t ppos,
+                                   char __user *buf, struct iov_iter *to)
+{
+    size_t done = 0;
+
+    for (;;) {
+        size_t want = min_t(size_t, count - done, MATTX_SYS_READ_MAX);
+        ssize_t ret = mattx_fake_read_chunk(fd_info, want, positional, ppos + done, buf ? buf + done : NULL, to);
+
+        if (ret < 0)
+            return done ? (ssize_t)done : ret;
+        done += ret;
+        if (ret != MATTX_SYS_READ_MAX || done >= count)
+            break;          // short reply (EOF, pipe, ...), or everything served
+    }
+    return done;
 }
 
 /*
@@ -2221,8 +2248,9 @@ static void mattx_read_kworker(struct work_struct *work) {
     struct file *file = NULL;
     struct mattx_link *link;
     bool abandoned = false;
-    // Both senders (mattx_fake_read and the rpc worker) cap a READ_REQ at 4096 bytes as well
-    size_t count = min_t(size_t, req->count, 4096);
+    // 0034: up to MATTX_SYS_READ_MAX for a regular file, 4096 for a file with ->poll (decided below, once the file is known).
+    // The legacy rpc worker (the (fallback) path of read) still asks for 4096.
+    size_t count = min_t(size_t, req->count, MATTX_SYS_READ_MAX);
     ssize_t ret = -EBADF;
     int i;
 
@@ -2269,7 +2297,9 @@ static void mattx_read_kworker(struct work_struct *work) {
         if (malformed)
             printk(KERN_ERR "MattX:[WORMHOLE] READ_REQ %u of PID %u malformed (flags 0x%x, pos %lld)\n",
                    req->req_id, req->orig_pid, req->flags, (long long)req->pos);
-        reply = malformed ? NULL : kmalloc(sizeof(*reply) + count, GFP_KERNEL);
+        if (file->f_op && file->f_op->poll)
+            count = min_t(size_t, count, 4096);     // pipe / socket / tty: short reads are normal, keep the replies small
+        reply = malformed ? NULL : kvmalloc(sizeof(*reply) + count, GFP_KERNEL);   // up to 1 MB: not a kmalloc
         if (malformed) {
             ret = -EINVAL;
         } else if (positional && !(file->f_mode & FMODE_PREAD)) {
@@ -2306,7 +2336,7 @@ static void mattx_read_kworker(struct work_struct *work) {
         mattx_comm_send(link, MATTX_MSG_SYS_READ_REPLY, &fail, sizeof(fail));
     }
 
-    if (reply) kfree(reply);
+    if (reply) kvfree(reply);
     kfree(ctx);
     atomic_dec(&mattx_cancellable_inflight);
 }

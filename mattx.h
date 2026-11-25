@@ -493,6 +493,11 @@ struct mattx_sys_read_req {
 // preadv(): read at pos and leave the file position of the Deputy's file alone (like MATTX_WRITE_POSITIONAL)
 #define MATTX_READ_POSITIONAL 0x1
 
+// issue #67, P3 (0034): the most one READ_REQ asks for. The home node decides what it really reads: a file with
+// ->poll (pipe, socket, tty: a short read is normal there) keeps the old 4096 bytes, a regular file gets up to this.
+// A bigger read() / pread() is split by the Surrogate into several requests (mattx_fake_read_one()).
+#define MATTX_SYS_READ_MAX (1024 * 1024)
+
 struct mattx_sys_read_reply {
     u32 orig_pid;
     ssize_t bytes_read;
