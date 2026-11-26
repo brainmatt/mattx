@@ -132,7 +132,8 @@ static int mattx_nl_cmd_get_blueprint(struct sk_buff *skb, struct genl_info *inf
     }
 
     len = sizeof(struct mattx_migration_req) + (pending_migration->vma_count * sizeof(struct mattx_vma_info))
-          + (pending_migration->file_count * sizeof(struct mattx_vma_file));      // 0032: the file table is behind vmas[]
+          + (pending_migration->file_count * sizeof(struct mattx_vma_file))      // 0032: the file table is behind vmas[]
+          + (pending_migration->fdfile_count * sizeof(struct mattx_fd_file));     // 0035: the fd table is behind the file table
 
     if (info->attrs[MATTX_ATTR_BP_OFFSET])
         off = nla_get_u32(info->attrs[MATTX_ATTR_BP_OFFSET]);

@@ -731,6 +731,144 @@ static bool mattx_vma_is_file_candidate(struct vm_area_struct *vma, char *pathbu
     return true;
 }
 
+/*
+ * 0035 (issue #74 follow-up): inherited fds of big files are opened again at the target.
+ * Every fd of a migrated process used to become a mattx_vfs_proxy file: each read() / pread64() of a model file on the shared
+ * NAS crossed the Wormhole and the home node (colibri: ~100 MB of weights per token, ~30x slower than at home). A read-only
+ * regular file below DFSA_DIR is the very same file at the very same path on the target: the blueprint carries its path,
+ * flags, offset, size and mtime (struct mattx_fd_file) and the target opens it natively (bare metal speed, mmap works).
+ * Only what is safe: regular file, not open for writing, no memory filesystem, not deleted, path < 256, below DFSA_DIR, not
+ * a proxy of an earlier hop, fd >= 3 (stdio stays a proxy). fds that share one open file description (dup, fork) share one
+ * group, so they keep sharing one file offset. Anything else stays a proxy, nothing changes for it.
+ */
+static bool fd_rebind = true;
+module_param_named(fd_rebind, fd_rebind, bool, 0644);
+MODULE_PARM_DESC(fd_rebind, "Open inherited read-only regular files below DFSA_DIR again at the target instead of proxying them through the home node");
+
+static bool mattx_fd_is_rebindable(struct file *f, char *pathbuf, struct mattx_fd_file *out)
+{
+    struct inode *inode = file_inode(f);
+    struct timespec64 mt;
+    const char *p;
+    size_t len;
+
+    if (f->f_op == &mattx_fops)
+        return false;                   // a proxy of an earlier hop stays a proxy
+    if ((f->f_mode & (FMODE_WRITE | FMODE_PATH)) || !S_ISREG(inode->i_mode))
+        return false;
+    switch (inode->i_sb->s_magic) {
+    case TMPFS_MAGIC: case RAMFS_MAGIC: case HUGETLBFS_MAGIC: case PROC_SUPER_MAGIC: case SYSFS_MAGIC:
+    case DEVPTS_SUPER_MAGIC: case CGROUP_SUPER_MAGIC: case CGROUP2_SUPER_MAGIC: case ANON_INODE_FS_MAGIC:
+        return false;
+    }
+    p = d_path(&f->f_path, pathbuf, PATH_MAX);
+    if (IS_ERR(p) || p[0] != '/')
+        return false;
+    len = strlen(p);
+    if (len >= sizeof(out->path) || (len > 10 && !strcmp(p + len - 10, " (deleted)")))
+        return false;
+    if (!mattx_path_in_dfsa(p))
+        return false;                   // phase 1: only the shared tree, there the target has the very same file
+
+    mt = inode_get_mtime(inode);
+    memset(out, 0, sizeof(*out));
+    out->flags = f->f_flags;
+    out->pos = (u64)READ_ONCE(f->f_pos);
+    out->size = (u64)i_size_read(inode);
+    out->mtime_sec = mt.tv_sec;
+    out->mtime_nsec = mt.tv_nsec;
+    memcpy(out->path, p, len);
+    return true;
+}
+
+// Fills out[] (room for MAX_FDS entries) and returns how many fds the target can open itself.
+static int mattx_collect_fd_files(struct task_struct *task, struct mattx_fd_file *out)
+{
+    struct file **held;
+    int *acc;                           // the entry each held file got, -1 = it stays a proxy
+    u32 *fdn;
+    u8 *cx;
+    char *pathbuf;
+    int n = 0, cnt = 0, k, m;
+
+    BUILD_BUG_ON(sizeof(struct mattx_fd_file) != MATTX_FD_FILE_SIZE);
+
+    if (!task->files || !config_dfsa_dir[0])
+        return 0;
+
+    held = kcalloc(MAX_FDS, sizeof(*held), GFP_KERNEL);
+    acc = kcalloc(MAX_FDS, sizeof(*acc), GFP_KERNEL);
+    fdn = kcalloc(MAX_FDS, sizeof(*fdn), GFP_KERNEL);
+    cx = kcalloc(MAX_FDS, sizeof(*cx), GFP_KERNEL);
+    pathbuf = kmalloc(PATH_MAX, GFP_KERNEL);
+    if (!held || !acc || !fdn || !cx || !pathbuf)
+        goto out;                       // no memory: every fd simply stays a proxy
+
+    // pin the candidates under the table lock, look at them (d_path may take locks) after it
+    spin_lock(&task->files->file_lock);
+    {
+        struct fdtable *fdt = files_fdtable(task->files);
+        int i;
+
+        for (i = 3; i < fdt->max_fds && n < MAX_FDS; i++) {
+            struct file *f = rcu_dereference_raw(fdt->fd[i]);
+
+            if (!f || f->f_op == &mattx_fops || (f->f_mode & (FMODE_WRITE | FMODE_PATH)) || !S_ISREG(file_inode(f)->i_mode))
+                continue;
+            held[n] = get_file(f);
+            fdn[n] = i;
+            cx[n] = test_bit(i, fdt->close_on_exec) ? 1 : 0;
+            n++;
+        }
+    }
+    spin_unlock(&task->files->file_lock);
+
+    for (k = 0; k < n; k++) {
+        int first = -1;
+
+        acc[k] = -1;
+        for (m = 0; m < k; m++) {
+            if (held[m] == held[k]) {
+                first = m;
+                break;
+            }
+        }
+        if (first >= 0) {               // dup / fork: the same open file description again
+            if (acc[first] < 0)
+                continue;
+            out[cnt] = out[acc[first]];
+            out[cnt].fd = fdn[k];
+            out[cnt].cloexec = cx[k];
+            acc[k] = cnt++;
+            mattx_dbg("[EXTRACT] fd %u shares the open file description of fd %u ('%s'): same group\n",
+                      fdn[k], fdn[first], out[acc[k]].path);
+            continue;
+        }
+        if (!mattx_fd_is_rebindable(held[k], pathbuf, &out[cnt])) {
+            mattx_dbg("[EXTRACT] fd %u stays a proxy (not a read-only regular file below DFSA_DIR, or not reachable)\n", fdn[k]);
+            continue;
+        }
+        out[cnt].fd = fdn[k];
+        out[cnt].group = cnt;
+        out[cnt].cloexec = cx[k];
+        mattx_dbg("[EXTRACT] fd %u: '%s' pos %llu size %llu flags 0x%x: the target opens it itself\n", fdn[k], out[cnt].path,
+                  (unsigned long long)out[cnt].pos, (unsigned long long)out[cnt].size, out[cnt].flags);
+        acc[k] = cnt++;
+    }
+
+out:
+    if (held) {
+        for (k = 0; k < n; k++)
+            fput(held[k]);
+    }
+    kfree(held);
+    kfree(acc);
+    kfree(fdn);
+    kfree(cx);
+    kfree(pathbuf);
+    return cnt;
+}
+
 static bool mattx_task_capturable(struct task_struct *task)
 {
     return !(READ_ONCE(task->flags) & PF_EXITING) && !READ_ONCE(task->exit_state) &&
@@ -758,7 +896,8 @@ static void mattx_do_capture_and_send_state(struct task_struct *task, int target
     }
 
     max_payload_size = sizeof(struct mattx_migration_req) + (MAX_VMAS * sizeof(struct mattx_vma_info))
-                       + (MAX_FILE_VMAS * sizeof(struct mattx_vma_file));      // 0032: file table behind vmas[]
+                       + (MAX_FILE_VMAS * sizeof(struct mattx_vma_file))       // 0032: file table behind vmas[]
+                       + (MAX_FDS * sizeof(struct mattx_fd_file));             // 0035: fd table behind the file table
     
     // FIX: Use kvzalloc to prevent fragmentation failures!
     req = kvzalloc(max_payload_size, GFP_KERNEL);
@@ -974,8 +1113,15 @@ static void mattx_do_capture_and_send_state(struct task_struct *task, int target
         memcpy(&req->vmas[vma_count], files, file_count * sizeof(*files));
     kvfree(files);
     kfree(pathbuf);
+
+    // 0035: inherited fds of big files below DFSA_DIR: the target opens them itself (table behind the file table)
+    req->fdfile_count = fd_rebind ? mattx_collect_fd_files(task, (struct mattx_fd_file *)((char *)&req->vmas[vma_count] +
+                                               (size_t)file_count * sizeof(struct mattx_vma_file))) : 0;
+    mattx_dbg("[EXTRACT] %u of %u fds go as 'open it again at the target' (the others stay proxies)\n", req->fdfile_count, req->fd_count);
+
     actual_payload_size = sizeof(struct mattx_migration_req) + (vma_count * sizeof(struct mattx_vma_info))
-                          + (file_count * sizeof(struct mattx_vma_file));
+                          + (file_count * sizeof(struct mattx_vma_file))
+                          + (req->fdfile_count * sizeof(struct mattx_fd_file));
 
     // FIX: Use kvfree and kvmalloc!
     if (local_migration_req) kvfree(local_migration_req);
@@ -1041,7 +1187,8 @@ static void mattx_do_capture_and_return_state(struct task_struct *task, u32 orig
     }
     spin_unlock(&guest_lock);  
       
-    max_payload_size = sizeof(struct mattx_migration_req) + (MAX_VMAS * sizeof(struct mattx_vma_info));
+    max_payload_size = sizeof(struct mattx_migration_req) + (MAX_VMAS * sizeof(struct mattx_vma_info))
+                       + (MAX_FDS * sizeof(struct mattx_fd_file));             // 0035: offsets of the files opened here, behind vmas[]
     
     // FIX: Use kvzalloc!
     req = kvzalloc(max_payload_size, GFP_KERNEL);
@@ -1201,7 +1348,16 @@ static void mattx_do_capture_and_return_state(struct task_struct *task, u32 orig
     }
     
     req->vma_count = vma_count;
-    actual_payload_size = sizeof(struct mattx_migration_req) + (vma_count * sizeof(struct mattx_vma_info));
+
+    // 0035: the read-only DFSA files this process has open here (the ones 0035b opened natively, and any it opened itself)
+    // go home with their file offsets: the Deputy's own file offset did not move while a native fd advanced here. The
+    // home node applies an entry only to an fd of the Deputy that is the very same file (same path). file_count is 0.
+    req->file_count = 0;
+    req->fdfile_count = mattx_collect_fd_files(task, (struct mattx_fd_file *)&req->vmas[vma_count]);
+    mattx_dbg("[EXTRACT] %u native file offsets travel home in the Return Blueprint\n", req->fdfile_count);
+
+    actual_payload_size = sizeof(struct mattx_migration_req) + (vma_count * sizeof(struct mattx_vma_info))
+                          + (req->fdfile_count * sizeof(struct mattx_fd_file));
 
     // FIX: Use kvfree and kvmalloc!
     if (local_migration_req) kvfree(local_migration_req);

@@ -86,6 +86,22 @@ struct mattx_vma_file {
     char path[256];
 } __attribute__((packed));
 
+// One entry per inherited fd that the TARGET KERNEL opens itself (0035). The stub does not use the table (the fd numbers
+// it would have to open are the ones of its own netlink socket and log file): the mirror and the size check are here to
+// keep the layout honest. MUST STAY IN SYNC with struct mattx_fd_file in mattx.h.
+struct mattx_fd_file {
+    uint32_t fd;
+    uint32_t group;
+    uint32_t flags;
+    uint32_t cloexec;
+    uint64_t pos;
+    uint64_t size;
+    int64_t mtime_sec;
+    int64_t mtime_nsec;
+    char path[256];
+} __attribute__((packed));
+_Static_assert(sizeof(struct mattx_fd_file) == 304, "struct mattx_fd_file is out of sync with mattx.h (MATTX_FD_FILE_SIZE)");
+
 struct mattx_cpu_regs {
     uint64_t r15, r14, r13, r12, rbp, rbx, r11, r10;
     uint64_t r9, r8, rax, rcx, rdx, rsi, rdi, orig_rax;
@@ -144,6 +160,7 @@ struct mattx_migration_req {
     uint8_t mattxfs_enabled;
     uint8_t local_libs;     // MUST STAY IN SYNC with struct mattx_migration_req in mattx.h (packed: vmas[] follows)
     uint32_t file_count;    // mattx_vma_file entries behind vmas[vma_count]
+    uint32_t fdfile_count;  // mattx_fd_file entries behind the mattx_vma_file table (0035: the kernel opens them, the stub only keeps the layout)
     struct mattx_vma_info vmas[]; 
 } __attribute__((packed)); // <-- FORCE EXACT LAYOUT
 

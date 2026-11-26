@@ -354,6 +354,25 @@ struct mattx_vma_file {
     char path[256];     // absolute path at the home node (under DFSA_DIR: also on the target, else via /mattxfs/<home>)
 } __attribute__((packed));
 
+/*
+ * One entry per inherited fd that the target opens itself instead of proxying (issue #74 follow-up, P3, 0035): a read-only
+ * regular file below DFSA_DIR. Stored behind the file table of the blueprint (fdfile_count entries). The fds of the entries
+ * that share one open file description (dup, fork) share one entry group: "group" is the index of the first entry of the
+ * group, an entry with group == its own index opens the file, the others only get the same struct file again.
+ */
+struct mattx_fd_file {
+    u32 fd;             // fd number
+    u32 group;          // index of the first entry that has the same open file description (own index: the first)
+    u32 flags;          // f_flags at the home node (O_NONBLOCK, O_DIRECT, ...)
+    u32 cloexec;        // FD_CLOEXEC of this fd number
+    u64 pos;            // f_pos at the home node (the freeze point)
+    u64 size;           // i_size at the home node: the target compares it before it uses the file
+    s64 mtime_sec;      // mtime at the home node: same check
+    s64 mtime_nsec;
+    char path[256];     // absolute path below DFSA_DIR
+} __attribute__((packed));
+#define MATTX_FD_FILE_SIZE 304   // sizeof(struct mattx_fd_file): the stub carries a mirror of it, both sides check this
+
 struct mattx_cpu_regs {
     uint64_t r15, r14, r13, r12, rbp, rbx, r11, r10;
     uint64_t r9, r8, rax, rcx, rdx, rsi, rdi, orig_rax;
@@ -428,6 +447,7 @@ struct mattx_migration_req {
     u8 mattxfs_enabled; 
     u8 local_libs;          // LOCAL_LIBS of the home node: the stub bind-mounts the local library trees into the MattXFS namespace (HPC fast path)
     u32 file_count;         // issue #67 (P3, 0032): mattx_vma_file entries behind vmas[vma_count]
+    u32 fdfile_count;       // issue #74 (P3, 0035): mattx_fd_file entries behind the mattx_vma_file table
     struct mattx_vma_info vmas[]; 
 } __attribute__((packed)); // <-- FORCE EXACT LAYOUT
 

@@ -115,7 +115,18 @@ static void do_handle_migrate_req(struct mattx_link *link, struct mattx_header *
         // FIX: Use kvmalloc to prevent fragmentation failures!
         pending_migration = kvmalloc(hdr->length, GFP_KERNEL);
         if (pending_migration) {
+            size_t need;
+
             memcpy(pending_migration, req, hdr->length);
+            // 0035: the fd table sits behind vmas[] and the file table; never trust a count that does not fit the message
+            need = sizeof(struct mattx_migration_req) + ((size_t)pending_migration->vma_count * sizeof(struct mattx_vma_info))
+                   + ((size_t)pending_migration->file_count * sizeof(struct mattx_vma_file))
+                   + ((size_t)pending_migration->fdfile_count * sizeof(struct mattx_fd_file));
+            if (pending_migration->fdfile_count > MAX_FDS || need > hdr->length) {
+                printk(KERN_WARNING "MattX:[IMPORT] fd table of the blueprint does not fit (%u entries, need %zu of %u bytes): all fds stay proxies\n",
+                       pending_migration->fdfile_count, need, hdr->length);
+                pending_migration->fdfile_count = 0;
+            }
         } else {
             printk(KERN_ERR "MattX:[IMPORT] FATAL: Failed to allocate memory for blueprint!\n");
             return;
@@ -245,6 +256,49 @@ static void mattx_vdso_transplant_cb(struct callback_head *cb) {
 }
 // ==============================================================================
 
+
+/*
+ * 0035 (issue #74 follow-up): open an inherited fd of the home node natively here. The blueprint says: this file below
+ * DFSA_DIR, these flags, this offset, this size and mtime. It is the very same file at the very same path on the shared
+ * tree, so the Surrogate reads it at native speed instead of through the home node, and mmap() / fstat() / lseek() on it
+ * are the kernel's own. The file must be the file of the home node (size and mtime are compared): if it is not, or it cannot
+ * be opened, the fd stays a proxy and everything works as before. The open runs in the context of this kernel thread
+ * (init namespace): the DFSA tree is there at the same path; the process held the file open at the home node already, so
+ * no access is granted that it did not have.
+ */
+static struct file *mattx_rebind_open(const struct mattx_fd_file *e)
+{
+    char path[sizeof(e->path) + 1];
+    struct kstat st = {};
+    struct file *f;
+    int oflags;
+    int err;
+
+    memcpy(path, e->path, sizeof(e->path));
+    path[sizeof(e->path)] = '\0';
+    oflags = O_RDONLY | O_LARGEFILE | (e->flags & (O_NONBLOCK | O_NOATIME | O_DIRECT));
+
+    f = filp_open(path, oflags, 0);
+    if (IS_ERR(f) && (oflags & O_DIRECT)) {
+        mattx_dbg("[IMPORT] fd %u: '%s' cannot be opened O_DIRECT here (%ld), buffered\n", e->fd, path, PTR_ERR(f));
+        f = filp_open(path, oflags & ~O_DIRECT, 0);
+    }
+    if (IS_ERR(f)) {
+        mattx_dbg("[IMPORT] fd %u: cannot open '%s' here: %ld -> proxy\n", e->fd, path, PTR_ERR(f));
+        return f;
+    }
+    err = S_ISREG(file_inode(f)->i_mode) ? vfs_getattr(&f->f_path, &st, STATX_SIZE | STATX_MTIME, AT_STATX_SYNC_AS_STAT) : -EINVAL;
+    if (err || (u64)st.size != e->size || (s64)st.mtime.tv_sec != e->mtime_sec || (s64)st.mtime.tv_nsec != e->mtime_nsec) {
+        printk(KERN_WARNING "MattX:[IMPORT] fd %u: '%s' here is not the file of the home node (size %llu/%llu, mtime %lld.%09ld/%lld.%09lld, err %d): proxy\n",
+               e->fd, path, err ? 0ULL : (unsigned long long)st.size, (unsigned long long)e->size,
+               err ? 0LL : (long long)st.mtime.tv_sec, err ? 0L : (long)st.mtime.tv_nsec,
+               (long long)e->mtime_sec, (long long)e->mtime_nsec, err);
+        fput(f);
+        return ERR_PTR(-ESTALE);
+    }
+    f->f_pos = (loff_t)e->pos;
+    return f;
+}
 
 static void handle_migrate_done(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
     mattx_dbg("[IMPORT] All memory transferred! Total pages injected: %d\n", injected_pages_count);
@@ -419,12 +473,54 @@ static void handle_migrate_done(struct mattx_link *link, struct mattx_header *hd
 
         fake_files = kmalloc_array(pending_migration->fd_count, sizeof(struct file *), GFP_KERNEL);
         if (fake_files) {
+            // 0035: the files the target opens itself (struct mattx_fd_file table behind the file table)
+            struct mattx_fd_file *rb_tab = (struct mattx_fd_file *)((char *)&pending_migration->vmas[pending_migration->vma_count] +
+                                           (size_t)pending_migration->file_count * sizeof(struct mattx_vma_file));
+            u32 rb_n = pending_migration->fdfile_count;
+            struct file **rb = rb_n ? kcalloc(rb_n, sizeof(*rb), GFP_KERNEL) : NULL;
+            u8 *rb_cx = kcalloc(pending_migration->fd_count, sizeof(u8), GFP_KERNEL);
+            u32 j;
+            int rb_done = 0;
+
             memset(fake_files, 0, pending_migration->fd_count * sizeof(struct file *));
-            
+
+            // entry by entry: the first entry of a group opens the file, the others get the same struct file again
+            // (dup / fork: they keep sharing one file offset)
+            for (j = 0; rb && j < rb_n; j++) {
+                u32 g = rb_tab[j].group;
+
+                if (g > j) {
+                    printk(KERN_WARNING "MattX:[IMPORT] fd table entry %u has group %u: ignored\n", j, g);
+                } else if (g == j) {
+                    struct file *rf = mattx_rebind_open(&rb_tab[j]);
+
+                    if (!IS_ERR(rf))
+                        rb[j] = rf;
+                } else if (rb[g]) {
+                    rb[j] = get_file(rb[g]);
+                }
+            }
+
             for (i = 0; i < pending_migration->fd_count; i++) {
                 u32 fd_num = pending_migration->open_fds[i];
-                
-                struct mattx_fake_fd_info *fd_info = kmalloc(sizeof(*fd_info), GFP_KERNEL);
+                struct mattx_fake_fd_info *fd_info;
+
+                for (j = 0; rb && j < rb_n; j++) {
+                    if (rb[j] && rb_tab[j].fd == fd_num) {
+                        fake_files[i] = rb[j];          // the reference moves to the fd table below
+                        if (rb_cx)
+                            rb_cx[i] = rb_tab[j].cloexec ? 1 : 0;
+                        rb[j] = NULL;
+                        rb_done++;
+                        mattx_dbg("[IMPORT] fd %u is the file '%s' opened natively here (pos %llu): no proxy\n", fd_num,
+                                  rb_tab[j].path, (unsigned long long)rb_tab[j].pos);
+                        break;
+                    }
+                }
+                if (fake_files[i])
+                    continue;
+
+                fd_info = kmalloc(sizeof(*fd_info), GFP_KERNEL);
                 if (fd_info) {
                     fd_info->home_node = pending_source_node;
                     fd_info->orig_pid = pending_migration->orig_pid;
@@ -448,11 +544,20 @@ static void handle_migrate_done(struct mattx_link *link, struct mattx_header *hd
                     if (fd_num < fdt->max_fds && fake_files[i] && !IS_ERR(fake_files[i])) {
                         rcu_assign_pointer(fdt->fd[fd_num], fake_files[i]);
                         __set_bit(fd_num, fdt->open_fds);                        
+                        if (rb_cx && rb_cx[i])
+                            __set_bit(fd_num, fdt->close_on_exec);
                     }
                 }
                 spin_unlock(&hijacked_stub_task->files->file_lock);
-                mattx_dbg("[IMPORT] Successfully injected %u Fake FDs!\n", pending_migration->fd_count);
+                mattx_dbg("[IMPORT] Successfully injected %u Fake FDs (%d of them opened natively, the rest proxies)!\n",
+                          pending_migration->fd_count, rb_done);
             }
+            for (j = 0; rb && j < rb_n; j++) {
+                if (rb[j])
+                    fput(rb[j]);                        // an entry whose fd is not in open_fds[]: never installed
+            }
+            kfree(rb);
+            kfree(rb_cx);
             kfree(fake_files); 
         }
 
@@ -647,7 +752,18 @@ static void do_handle_return_blueprint(struct mattx_link *link, struct mattx_hea
         
         pending_migration = kvmalloc(hdr->length, GFP_KERNEL);
         if (pending_migration) {
+            size_t need;
+
             memcpy(pending_migration, req, hdr->length);
+            // 0035: native file offsets behind vmas[]: never trust a count that does not fit the message
+            need = sizeof(struct mattx_migration_req) + ((size_t)pending_migration->vma_count * sizeof(struct mattx_vma_info))
+                   + ((size_t)pending_migration->fdfile_count * sizeof(struct mattx_fd_file));
+            if (pending_migration->file_count || pending_migration->fdfile_count > MAX_FDS || need > hdr->length) {
+                if (pending_migration->fdfile_count)
+                    printk(KERN_WARNING "MattX:[RECALL] file offset table of the return blueprint does not fit (%u entries): ignored\n",
+                           pending_migration->fdfile_count);
+                pending_migration->fdfile_count = 0;
+            }
         } else {
             printk(KERN_ERR "MattX: [RECALL] FATAL: Failed to allocate memory for return blueprint!\n");
             return;
@@ -839,6 +955,63 @@ static void handle_return_blueprint(struct mattx_link *link, struct mattx_header
     mig_in_enqueue(do_handle_return_blueprint, link, hdr, payload);
 }
 
+/*
+ * 0035: file offsets of the return blueprint. While the Surrogate ran, a read-only DFSA file that 0035b had opened natively
+ * advanced its OWN file offset; the Deputy's file (frozen at the home node) still has the offset of the forward migration.
+ * Each entry is applied to the Deputy's fd of the same number only if that is the very same file (regular, read-only, the
+ * same path): then a plain read() after the return continues where the Surrogate stopped. Anything else is left alone.
+ */
+static void mattx_apply_return_fd_offsets(struct task_struct *deputy, struct mattx_migration_req *req)
+{
+    struct mattx_fd_file *tab = (struct mattx_fd_file *)&req->vmas[req->vma_count];
+    u32 n = req->fdfile_count, k;
+    char *pathbuf;
+    int applied = 0;
+
+    if (!n || !deputy->files)
+        return;
+    pathbuf = kmalloc(PATH_MAX, GFP_KERNEL);
+    if (!pathbuf)
+        return;
+
+    for (k = 0; k < n; k++) {
+        struct file *f = NULL;
+        const char *p;
+        char want[sizeof(tab[k].path) + 1];
+        u32 fd = tab[k].fd;
+
+        spin_lock(&deputy->files->file_lock);
+        {
+            struct fdtable *fdt = files_fdtable(deputy->files);
+
+            if (fd < fdt->max_fds && fd < MAX_FDS) {
+                f = rcu_dereference_raw(fdt->fd[fd]);
+                if (f)
+                    get_file(f);
+            }
+        }
+        spin_unlock(&deputy->files->file_lock);
+        if (!f)
+            continue;
+
+        memcpy(want, tab[k].path, sizeof(tab[k].path));
+        want[sizeof(tab[k].path)] = '\0';
+        p = d_path(&f->f_path, pathbuf, PATH_MAX);
+        if (!IS_ERR(p) && f->f_op != &mattx_fops && !(f->f_mode & FMODE_WRITE) && S_ISREG(file_inode(f)->i_mode) &&
+            !strcmp(p, want)) {
+            mattx_dbg("[RECALL] Deputy fd %u '%s': file offset %lld -> %llu (where the Surrogate stopped)\n", fd, want,
+                      (long long)f->f_pos, (unsigned long long)tab[k].pos);
+            f->f_pos = (loff_t)tab[k].pos;
+            applied++;
+        } else {
+            mattx_dbg("[RECALL] Deputy fd %u is not the file '%s' of the Surrogate: offset not applied\n", fd, want);
+        }
+        fput(f);
+    }
+    kfree(pathbuf);
+    mattx_dbg("[RECALL] %d of %u native file offsets applied to the Deputy\n", applied, n);
+}
+
 static void handle_return_done(struct mattx_link *link, struct mattx_header *hdr, void *payload) {
     mattx_dbg("[IMPORT] Return memory transferred successfully! Pages: %d\n", injected_pages_count);
     
@@ -877,6 +1050,9 @@ static void handle_return_done(struct mattx_link *link, struct mattx_header *hdr
             mattx_dbg("[RECALL] Deputy PID %d is stopped (waited %d ms), injecting its registers\n",
                       hijacked_stub_task->pid, (100 - stop_retries) * 10);
     }
+
+    // 0035: the file offsets of the files the Surrogate read natively
+    mattx_apply_return_fd_offsets(hijacked_stub_task, pending_migration);
         struct task_struct *t;
         int t_idx = 0;
         int i;
