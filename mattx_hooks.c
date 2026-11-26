@@ -8937,6 +8937,16 @@ static int entry_handler_pread64(struct kretprobe_instance *ri, struct pt_regs *
         data->fd = (int)sys_regs->di; data->buf = (void __user *)sys_regs->si;
         data->count = (size_t)sys_regs->dx; data->pos = (loff_t)sys_regs->r10;
         data->is_ghost = is_wormhole_fd(data->fd, &data->remote_fd);
+        if (data->is_ghost && data->fd >= 0) {
+            // An inherited fd is a mattx_vfs_proxy file that allows positional I/O (mattx_proxy_allow_positional):
+            // let pread64 run natively, the file operation sends one ticketed READ_REQ for the offset and the Deputy
+            // answers ESPIPE for a pipe. The sabotage below costs a SIGSTOP + work item per 4 KB (~38 KB/s measured).
+            struct file *f = fget(data->fd);
+            if (f) {
+                if (f->f_op == &mattx_fops && (f->f_mode & FMODE_PREAD)) data->is_ghost = false;
+                fput(f);
+            }
+        }
         if (data->is_ghost) sys_regs->di = -1; // Sabotage!
     }
     return 0;

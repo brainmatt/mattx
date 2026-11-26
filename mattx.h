@@ -493,6 +493,10 @@ struct mattx_sys_read_req {
 // preadv(): read at pos and leave the file position of the Deputy's file alone (like MATTX_WRITE_POSITIONAL)
 #define MATTX_READ_POSITIONAL 0x1
 
+/* Largest chunk one READ_REQ asks for / one READ_REPLY carries. A Surrogate's read()/pread64() of more comes back short
+ * and user space loops, so every 4 KB used to cost a full round trip: 64 KB makes a bulk read ~16x cheaper. */
+#define MATTX_READ_MAX (64 * 1024)
+
 struct mattx_sys_read_reply {
     u32 orig_pid;
     ssize_t bytes_read;

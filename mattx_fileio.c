@@ -1519,7 +1519,7 @@ static ssize_t mattx_fake_read_one(struct mattx_fake_fd_info *fd_info, size_t co
     ssize_t ret;
 
     // Cap read size to prevent massive kmallocs on the network
-    size_t to_read = min_t(size_t, count, 4096);
+    size_t to_read = min_t(size_t, count, MATTX_READ_MAX);
 
     if (!fd_info || fd_info->home_node < 0 || fd_info->home_node >= MAX_NODES) return -EIO;
     link = READ_ONCE(cluster_map[fd_info->home_node]);
@@ -2221,8 +2221,8 @@ static void mattx_read_kworker(struct work_struct *work) {
     struct file *file = NULL;
     struct mattx_link *link;
     bool abandoned = false;
-    // Both senders (mattx_fake_read and the rpc worker) cap a READ_REQ at 4096 bytes as well
-    size_t count = min_t(size_t, req->count, 4096);
+    // The Surrogate asks for at most MATTX_READ_MAX bytes per request (the rpc worker still asks for 4096)
+    size_t count = min_t(size_t, req->count, MATTX_READ_MAX);
     ssize_t ret = -EBADF;
     int i;
 
@@ -2269,7 +2269,7 @@ static void mattx_read_kworker(struct work_struct *work) {
         if (malformed)
             printk(KERN_ERR "MattX:[WORMHOLE] READ_REQ %u of PID %u malformed (flags 0x%x, pos %lld)\n",
                    req->req_id, req->orig_pid, req->flags, (long long)req->pos);
-        reply = malformed ? NULL : kmalloc(sizeof(*reply) + count, GFP_KERNEL);
+        reply = malformed ? NULL : kvmalloc(sizeof(*reply) + count, GFP_KERNEL);
         if (malformed) {
             ret = -EINVAL;
         } else if (positional && !(file->f_mode & FMODE_PREAD)) {
@@ -2306,7 +2306,7 @@ static void mattx_read_kworker(struct work_struct *work) {
         mattx_comm_send(link, MATTX_MSG_SYS_READ_REPLY, &fail, sizeof(fail));
     }
 
-    if (reply) kfree(reply);
+    if (reply) kvfree(reply);
     kfree(ctx);
     atomic_dec(&mattx_cancellable_inflight);
 }
